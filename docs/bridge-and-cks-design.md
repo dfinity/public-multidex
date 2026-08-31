@@ -182,3 +182,19 @@ Arguably, users should be made to claim deposits of chain key asset twins, to pr
 - Gas-pool target sizing per chain and the Treasury rebalancing cadence.
 - Whether large withdrawals get a time-lock / review (custodian hygiene) given NNS-only, no-hotfix upgrades.
 - Concrete `auth_data` shapes per chain (PSBT blob, SOL message, 7702 authorization).
+
+## Season boundaries (W4-12, 2026-08-15)
+
+A season reset is TWO-PHASE with the Bridge: `resetSeason` first calls the
+Bridge's `adminSeasonWipe` (caller must be the wired DEX or a controller),
+which REFUSES while any claim or admission is in flight — a refusal aborts
+the reset before anything is wiped. Only on `#ok` does the DEX proceed to
+wipe its own half: `playReservedUnits`, `creditedSeq` AND `playAdmitSeq`
+(leaving the admit high-water behind inverted the bug — post-reset deposits
+up to the old high-water replayed as already-reserved and were admitted with
+ZERO allowance charge). The Bridge clears `ledgers` + `admittedUnits`, so
+both seq spaces restart together. Design decision recorded: the Bridge gets
+a season hook rather than reservations surviving the boundary — a #play
+season boundary means the venue restarts, and a claimable surviving on one
+side of the pair is exactly the divergence #25.2 reported. In-flight case:
+covered by the refusal above.

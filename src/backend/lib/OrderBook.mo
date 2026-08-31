@@ -369,8 +369,25 @@ module {
     quantity : Nat,
     timestamp : Int,
   ) : Types.Order {
-    let id = store.nextOrderId;
-    store.nextOrderId += 1;
+    createOrderWithId(store, allocateId(store), marketId, owner, side, orderType, price, quantity, timestamp);
+  };
+
+  // W4-22: same as createOrder but with a PRE-RESERVED id (allocateId). The
+  // engine reserves the aggressor's id before its match loop when a sweep
+  // re-homes a resting order, so the trade records it writes mid-loop can
+  // carry the id maker-attribution keys off — the order record itself is
+  // only created after the loop.
+  public func createOrderWithId(
+    store : OrderStore,
+    id : Nat,
+    marketId : Types.MarketId,
+    owner : Principal,
+    side : Types.Side,
+    orderType : Types.OrderType,
+    price : Nat,
+    quantity : Nat,
+    timestamp : Int,
+  ) : Types.Order {
     let order : Types.Order = {
       id; marketId; owner; side; orderType; price; quantity;
       filled = 0; status = #open; timestamp;

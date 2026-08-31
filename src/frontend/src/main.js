@@ -28,7 +28,7 @@ import { appState } from "./state.js";
 // OQL display helpers (shared with the data explorer) + the feature modules.
 import { oqlRowsToObjects, oqlFormatCell, dxEsc } from "./oql.js";
 import { setupIntelli, dxApplyShareLink, dxEnsureSchema, dxOnAuthChange, dxUpdateIdentity } from "./explorer.js";
-import { setupAssistant, assistantOnShow } from "./assistant.js";
+import { setupAssistant, assistantOnShow, resetAssistant } from "./assistant.js";
 import { setIdenticon } from "./identicon.js";
 import { DOCS_PARTS, DOCS_PAGES, docsPage } from "./docs.js";
 import { setupLedger } from "./ledger.js";
@@ -389,6 +389,11 @@ function getIdlFactory() {
       regenCount: IDL.Nat,
       createdAt: IDL.Int,
     });
+    const AdjustmentReason = IDL.Variant({
+      balanceShrank: IDL.Null,
+      marketCapExceeded: IDL.Null,
+      crossMarketCapExceeded: IDL.Null,
+    });
     const OrderAdjustment = IDL.Record({
       orderId: IDL.Nat,
       marketId: IDL.Text,
@@ -397,6 +402,7 @@ function getIdlFactory() {
       newQuantity: IDL.Nat,
       cancelled: IDL.Bool,
       timestamp: IDL.Int,
+      reason: IDL.Opt(AdjustmentReason), // null: recorded before reasons existed
     });
     const DepositRecord = IDL.Record({
       token: IDL.Text,
@@ -427,6 +433,8 @@ function getIdlFactory() {
       debtDelta: IDL.Record({ token: IDL.Text, amount: IDL.Int }),
       lpShareDelta: IDL.Record({ marketId: IDL.Text, amount: IDL.Int }),
       insShareDelta: IDL.Record({ amount: IDL.Int }),
+      gap: IDL.Record({ fromSeq: IDL.Nat, toSeq: IDL.Nat }),
+      config: IDL.Record({ setter: IDL.Text, value: IDL.Text }),
     });
     const UserEvent = IDL.Record({
       seq: IDL.Nat, ts: IDL.Int, user: IDL.Principal,
@@ -619,18 +627,20 @@ function getIdlFactory() {
       bookBidValue: IDL.Nat,
     });
 
-    // OQL query result — shared by execute (Exchange) and archiveExecute (History).
-    const OqlResult = IDL.Record({
-      rows: IDL.Vec(IDL.Vec(IDL.Record({
-        name: IDL.Text,
-        // Wire name is "null" (not "null_"): Motoko escapes the reserved word
-        // as #null_ in SOURCE but exports the candid field as null — declaring
-        // null_ here hashes differently and made every null-valued OQL cell
-        // fail to decode in the browser.
-        value: IDL.Variant({ "null": IDL.Null, bool: IDL.Bool, nat: IDL.Nat, int: IDL.Int, float: IDL.Float64, text: IDL.Text }),
-      }))),
-      hasMore: IDL.Bool,
-    });
+    // OQL result rows — shared by execute (Exchange) and archiveExecute (History).
+    const OqlRows = IDL.Vec(IDL.Vec(IDL.Record({
+      name: IDL.Text,
+      // Wire name is "null" (not "null_"): Motoko escapes the reserved word
+      // as #null_ in SOURCE but exports the candid field as null — declaring
+      // null_ here hashes differently and made every null-valued OQL cell
+      // fail to decode in the browser.
+      value: IDL.Variant({ "null": IDL.Null, bool: IDL.Bool, nat: IDL.Nat, int: IDL.Int, float: IDL.Float64, text: IDL.Text }),
+    })));
+    const OqlResult = IDL.Record({ rows: OqlRows, hasMore: IDL.Bool });
+    // History adds `degraded`: archive segments (canister ids) this pass could
+    // not read — one stopped/frozen segment degrades the page instead of
+    // failing it (W1-03). Empty ⇒ the read was complete.
+    const ArchiveOqlResult = IDL.Record({ rows: OqlRows, hasMore: IDL.Bool, degraded: IDL.Vec(IDL.Text) });
 
     return IDL.Service({
       addTestTokens: IDL.Func([IDL.Text, IDL.Nat], [], []),
@@ -699,11 +709,12 @@ function getIdlFactory() {
       schema: IDL.Func([IDL.Opt(IDL.Text)], [IDL.Text], ["query"]),
       execute: IDL.Func([IDL.Text], [OqlResult], ["query"]),   // upstream OQL main: bearer-token arg removed
       // History (archive) OQL surface — federated by the Exchange canister.
-      // archiveSchema is a plain query; archiveExecute is an UPDATE because it
-      // calls the archive sidecar (so ~consensus latency), and is scoped to the
-      // caller's own archived history.
+      // archiveSchema is a plain query; archiveExecute is a COMPOSITE query
+      // (it calls the archive sidecars), scoped to the caller's own archived
+      // history plus the public money-flow ledger. Its result carries
+      // `degraded` — segments the fan-out could not read this pass.
       archiveSchema: IDL.Func([], [IDL.Text], ["query"]),
-      archiveExecute: IDL.Func([IDL.Text], [OqlResult], ["composite_query"]),
+      archiveExecute: IDL.Func([IDL.Text], [ArchiveOqlResult], ["composite_query"]),
       aiComplete: IDL.Func([IDL.Text], [IDL.Variant({ ok: IDL.Text, err: IDL.Text })], []),
       // Stats-only self-report: a confirmed assistant action actually ran.
       aiActionExecuted: IDL.Func([IDL.Text], [], []),
@@ -966,6 +977,8 @@ function getIdlFactory() {
         archivesSealed: IDL.Nat,
         archiveCycles: IDL.Nat, archiveLifetimeTopUp: IDL.Nat,
         autoFuelEnabled: IDL.Bool, fuelRouteWired: IDL.Bool, fuelLifetimeCycles: IDL.Nat,
+        // opt for the same pre-#47.2-backend reason appVersion is opt above.
+        fuelPendingNotify: IDL.Opt(IDL.Record({ blockIndex: IDL.Nat, icpE8s: IDL.Nat, sinceNs: IDL.Int })),
         treasuryUsdE8s: IDL.Nat, treasuryIcpE8s: IDL.Nat,
         oracleDivergence: IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat, IDL.Int)),
       })], ["query"]),
@@ -989,6 +1002,7 @@ async function init() {
   setupAssistant({
     getMarkets: () => markets,       // inject markets (kept local in main.js)
     ensureActor: setupActor,         // self-heal a missing actor at submit time
+    refreshAccountData,              // refresh Account views after a confirmed action (#46.2 §3)
   });
   setupIntelli();
   // The public Ledger page (top-level Ledger tab): raw (non-money-normalized)
@@ -1089,10 +1103,10 @@ async function init() {
     // Boot client uses default IndexedDB storage so a PERSISTENT (on-disk)
     // session restores across restarts. An in-memory session rebuilds the
     // client with memory storage at sign-in (see doLogin) and never restores.
-    // @icp-sdk/auth 7.x: constructor (not create), sync isAuthenticated,
+    // @icp-sdk/auth 8.x: constructor (not create), sync isAuthenticated,
     // ASYNC getIdentity, signOut (not logout). identityProvider is bound at
-    // construction; requestAttributes (the play verification flow) only
-    // exists on 7.x — the whole reason for the migration.
+    // construction; requestAttributes (the play verification flow) is why
+    // we're on 7.x+ at all — 8.0 changed its nonce to a callback (doLogin).
     authClient = new AuthClient(authClientOpts());
     registerJanitorSW();
     // Stamp the footer badge from the build's version and start watching the
@@ -1272,6 +1286,8 @@ function getArchiveIdlFactory() {
       debtDelta: IDL.Record({ token: IDL.Text, amount: IDL.Int }),
       lpShareDelta: IDL.Record({ marketId: IDL.Text, amount: IDL.Int }),
       insShareDelta: IDL.Record({ amount: IDL.Int }),
+      gap: IDL.Record({ fromSeq: IDL.Nat, toSeq: IDL.Nat }),
+      config: IDL.Record({ setter: IDL.Text, value: IDL.Text }),
     });
     const UserEvent = IDL.Record({ seq: IDL.Nat, ts: IDL.Int, user: IDL.Principal, counterparty: IDL.Opt(IDL.Principal), kind: UserEventKind, prevHash: IDL.Opt(IDL.Vec(IDL.Nat8)) });
     return IDL.Service({
@@ -1370,7 +1386,8 @@ const depFmt = (nat) => (Number(nat) / 1e8).toLocaleString(undefined, { maximumF
 //
 // POPUP RULE: the II window may only open synchronously inside the click
 // gesture (signer-js channel rule) — so requestAttributes is invoked BEFORE
-// any await, with the nonce passed as a PROMISE that resolves in flight,
+// any await, with the nonce supplied as a CALLBACK (the auth 8.x contract)
+// that the client awaits in flight, after the window is already open,
 // and the scoped key is a fixed string (scopedKeys({openIdProvider:'google',
 // keys:['verified_email']}) yields exactly this) so no module load sits in
 // the gesture path either. Google-scoped ON PURPOSE: the backend keys the
@@ -1910,6 +1927,7 @@ function createMockActor() {
       archivesSealed: 0n,
       archiveCycles: 2_000_000_000_000n, archiveLifetimeTopUp: 0n,
       autoFuelEnabled: true, fuelRouteWired: true, fuelLifetimeCycles: 0n,
+      fuelPendingNotify: [],
       treasuryUsdE8s: 96_260_607_603_700n, treasuryIcpE8s: 5_000_000_000n,
       oracleDivergence: [],
     }),
@@ -2034,7 +2052,8 @@ async function doLogin({ ttlMinutes, inMemory, openIdProvider }) {
     // channel rule): the sign-in, and — on the Google path — the attribute
     // request too, so play verification rides the SAME II interaction that
     // signs the player in (docs/play-anti-sybil-design.md). The nonce is a
-    // promise; a throwaway identity mints it (inspect refuses anonymous).
+    // callback the client awaits in flight; a throwaway identity mints it
+    // (inspect refuses anonymous).
     const signInPromise = authClient.signIn({
       maxTimeToLive: BigInt(Math.round(ttlMinutes * 60)) * 1_000_000_000n,
     });
@@ -2042,7 +2061,7 @@ async function doLogin({ ttlMinutes, inMemory, openIdProvider }) {
     if (openIdProvider === "google") {
       attributesPromise = authClient.requestAttributes({
         keys: [GOOGLE_VERIFIED_EMAIL_KEY],
-        nonce: mintNonceEphemeral(),
+        nonce: () => mintNonceEphemeral(),
       });
       attributesPromise.catch(() => {});   // handled below — never an unhandled rejection
     }
@@ -2089,6 +2108,7 @@ async function logout() {
   appState.archiveActor = null; _archiveId = null; _archRows = []; _archSeen = new Set(); _archTradeIds = new Set();
   appState.bridgeActor = null;   // drop the Bridge actor bound to the old identity
   lastVerifyMessage = null;      // verification errors belong to the old identity too
+  resetAssistant();              // the assistant transcript belongs to the old identity — never let it leak across sign-ins (GHSA-6qpg)
   if (statusPollInterval) { clearInterval(statusPollInterval); statusPollInterval = null; }
   renderProfileChip();
   renderAccountPage();
@@ -4345,6 +4365,32 @@ function renderMarginRisk(risk) {
     + (risk.truncated ? `<div class="margin-risk-note">Partial scan — more pools than the per-pass cap.</div>` : "");
 }
 
+// The loan-book haircut disclosure (#50.1). The "Value" tile is the LP's
+// slice of vault NAV, and NAV counts the loan book (what the vault has lent
+// to margin pools) as an asset — but withdrawLp pays IN KIND from what the
+// vault physically HOLDS, leaving the receivable behind for whoever stays
+// (see the PAID FROM HOLDINGS comment in main.mo). While utilisation is
+// non-zero the NAV figure is therefore an UPPER BOUND on what a withdrawal
+// returns today — reaching ~2× at the 0.50 borrow cap — so the
+// physically-backed figure is shown beside it rather than left for the
+// withdrawal receipt to reveal.
+function renderVaultHaircut(lpValue, risk) {
+  const el = document.getElementById("earn-vault-haircut");
+  if (!el) return;
+  // risk fields are pre-normalised by money.js (MONEY_KEYS) — do NOT divide;
+  // vaultUtilisationBps is not a money field and stays in bps.
+  const nav  = risk ? Number(risk.vaultValueUsd) : 0;
+  const debt = risk ? Number(risk.totalDebtUsd)  : 0;
+  if (!(lpValue > 0) || !(nav > 0) || !(debt > 0)) { el.style.display = "none"; return; }
+  const backedFrac = Math.max(0, 1 - debt / nav);          // physical holdings / NAV
+  const utilPct = Number(risk.vaultUtilisationBps) / 100;  // % of the borrow cap
+  el.style.display = "";
+  el.textContent =
+    `Value marks your slice of vault NAV, which counts $${formatNum(debt)} lent to margin pools as an asset. `
+    + `Withdrawals pay in kind from what the vault physically holds — redeemable today ≈ $${formatNum(lpValue * backedFrac)} `
+    + `(loan book at ${utilPct.toFixed(1)}% of the borrow cap), before the 0.4% exit fee.`;
+}
+
 async function renderEarnCard() {
   // Split cards: AMM Vault + Insurance Fund (one renderer feeds both).
   const card = document.getElementById("earn-vault-card");
@@ -4374,12 +4420,17 @@ async function renderEarnCard() {
     // AMM vault
     const lp        = Number(pos.lpBalance);
     const lpValue   = Number(pos.estimatedValue);
-    const sharePct  = Number(pos.sharePercent);
+    // sharePercent crosses the money boundary as a 0..1 FRACTION of the pool
+    // (money.js divides the e8 fixed-point by 1e8, nothing more), so the
+    // render owns the ×100 — exactly like the weight table below. Without it
+    // a 5% holder reads "0.05%" (#50.2).
+    const shareFrac = Number(pos.sharePercent);
     const valuePerLP = Number(vault.valuePerLP);
     setText("earn-vault-lp", formatNum(lp));
     setText("earn-vault-value", "$" + formatNum(lpValue));
-    setText("earn-vault-share", sharePct.toFixed(2) + "%");
+    setText("earn-vault-share", (shareFrac * 100).toFixed(2) + "%");
     setText("earn-vault-vplp", valuePerLP.toFixed(4));
+    renderVaultHaircut(lpValue, risk);
     // Target-weight table: current vs target weight + live deposit bonus/fee.
     const wEl = document.getElementById("earn-vault-weights");
     if (wEl && Array.isArray(weights)) {
@@ -5109,6 +5160,19 @@ async function renderAccountClosedOrders() {
   }
 }
 
+// WHY the venue touched the order (opt variant from getMyAdjustments; [] on
+// fossil rows recorded before reasons existed — rendered as an em dash).
+const ADJ_REASON_LABELS = {
+  balanceShrank: "Balance change",
+  marketCapExceeded: "Per-market cap",
+  crossMarketCapExceeded: "Cross-market cap",
+};
+function adjReasonLabel(reason) {
+  if (!reason || !reason.length) return "—";
+  const key = Object.keys(reason[0])[0];
+  return ADJ_REASON_LABELS[key] || key;
+}
+
 async function renderAccountAdjustments() {
   if (!appState.actor || !appState.isAuthenticated) return;
   const tbody = document.getElementById("account-adj-body");
@@ -5116,7 +5180,7 @@ async function renderAccountAdjustments() {
   try {
     const adjs = await appState.actor.getMyAdjustments();
     if (!adjs.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No adjustments</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No adjustments</td></tr>';
       return;
     }
     tbody.innerHTML = [...adjs].reverse().map((a) => {
@@ -5134,6 +5198,7 @@ async function renderAccountAdjustments() {
         <td>${formatNum(a.oldQuantity)}</td>
         <td>${formatNum(a.newQuantity)}</td>
         <td>${status}</td>
+        <td>${adjReasonLabel(a.reason)}</td>
       </tr>`;
     }).join("");
   } catch (e) {
@@ -6258,11 +6323,21 @@ function renderStatsCanister(info) {
   const csub = document.getElementById("kpi-can-cycles-sub");
   // Auto-fuel state rides along: "armed" = the treasury→cycles loop will
   // self-top-up when spendable headroom runs low (route wired + switch on).
-  const fuelNote = (info.autoFuelEnabled && info.fuelRouteWired)
+  let fuelNote = (info.autoFuelEnabled && info.fuelRouteWired)
     ? (Number(info.fuelLifetimeCycles) > 0
         ? ` · auto-fuel armed (${fmtCycles(Number(info.fuelLifetimeCycles))} self-minted)`
         : " · auto-fuel armed")
     : " · auto-fuel off";
+  // #47.2: the stage-2 saga latch — ICP already sent to the CMC, notify not
+  // yet acknowledged. Normally clears within a retry window; one that AGES
+  // is the ops alarm the backend also raises in the event log after 1h.
+  {
+    const pn = Array.isArray(info.fuelPendingNotify) ? info.fuelPendingNotify[0] : info.fuelPendingNotify;
+    if (pn) {
+      const ageS = Math.max(0, (Number(info.nowNs) - Number(pn.sinceNs)) / 1e9);
+      fuelNote += ` · ⚠ top-up awaiting CMC notify (block ${pn.blockIndex}, ${fmtAgeSec(ageS)})`;
+    }
+  }
   if (csub) csub.textContent = CLOUD_ENGINE
     ? "compute paid by cloud engine"
     // Show SPENDABLE headroom (above the freezing floor) — the figure that
@@ -7578,6 +7653,10 @@ function normalizeUserEvent(e, status) {
     category = "borrow"; summary = `Borrow ${formatNum(Number(k.borrow.amount))} ${k.borrow.token}`;
   } else if ("repay" in k) {
     category = "repay"; summary = `Repay ${formatNum(Number(k.repay.amount))} ${k.repay.token}`;
+  } else if ("config" in k) {
+    // #47.4 — authority rewires/config flips on the durable tape (controller-
+    // attributed; shows on the controller's own timeline).
+    category = "config"; summary = `Config — ${k.config.setter}: ${k.config.value}`;
   }
   // prevHash (Phase-D tamper-evidence chain) rides along for the export: the
   // IDL decodes opt blob as [] | [Uint8Array] — hex-encode when present.
@@ -7592,7 +7671,7 @@ function archAddEvents(events, status) {
     if (_archSeen.has(seq)) continue;
     // Ledger #delta rows are machine records (one per balance mutation, for
     // replay/PoR) — the semantic events already tell the human story here.
-    if ("delta" in e.kind || "debtDelta" in e.kind || "lpShareDelta" in e.kind || "insShareDelta" in e.kind) { _archSeen.add(seq); continue; }
+    if ("delta" in e.kind || "debtDelta" in e.kind || "lpShareDelta" in e.kind || "insShareDelta" in e.kind || "gap" in e.kind) { _archSeen.add(seq); continue; }
     // Dedup fills by tradeId too: a margin fill surfaced from the hot store can
     // also arrive here as an owner-attributed sidecar #fill — show it once.
     if ("fill" in e.kind) {
@@ -7764,7 +7843,8 @@ function renderArchive() {
 
 const ARCH_LABELS = { fill: "Fill", deposit: "Deposit", withdrawal: "Withdrawal", transfer: "Transfer",
   position: "Position", orderClosed: "Order", liquidation: "Liquidation", lp: "AMM vault",
-  insurance: "Insurance", rejection: "Rejection", borrow: "Borrow", repay: "Repay", other: "Event" };
+  insurance: "Insurance", rejection: "Rejection", borrow: "Borrow", repay: "Repay",
+  config: "Config", other: "Event" };
 function archRowHTML(r) {
   const badge = r.status === "pending" ? `<span class="arch-badge arch-pending">pending</span>`
               : r.status === "archived" ? `<span class="arch-badge arch-archived">archived</span>`

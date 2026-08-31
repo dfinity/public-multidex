@@ -187,7 +187,17 @@ module {
     // Widen half-spread when vol is elevated: base half-spread + 0.5 * stdev(bps).
     let volWideningBps = pool.volRegime * 0.5;
     let halfBps = Float.fromInt(pool.spreadBps) + volWideningBps;
-    let half = halfBps / 10000.0;
+    // W4-23 (R12 retargeted): bound the COMBINED half-spread. Every widening
+    // term feeds this line (vol regime, staleness, breaker — the
+    // caller folds the last two in ×2 via withVol), and one unbounded term
+    // was reachable: an UNCONFIRMED breaker pend proposing >2× ref put
+    // breakerBps past 9,980, drove half ≥ 1.0, zeroed the whole bid ladder —
+    // and ammApplyQuotes' off-ladder sweep then CANCELLED every resting bid,
+    // silently. A 50% half-spread already quotes nothing tradeable; beyond
+    // it, extra width only withdraws liquidity. Clamping HERE bounds all
+    // four contributors at once (clamping volRegime alone leaves breakerBps
+    // open — R12 aimed at the wrong term).
+    let half = Float.min(0.5, halfBps / 10000.0);
     let spacing = bpsToFraction(pool.levelSpacingBps);
     let depth = pool.quoteDepthBase;
 
@@ -291,7 +301,10 @@ module {
     let alpha = 0.1;
     let oldVar = (pool.volRegime / 10000.0) * (pool.volRegime / 10000.0);
     let newVar = (1.0 - alpha) * oldVar + alpha * r * r;
-    let newStdBps = Float.sqrt(newVar) * 10000.0;
+    // W4-23: clamp the STABLE field too — 2× the ladder's half-clamp
+    // threshold, so an absurd regime cannot persist across an upgrade or sit
+    // undecayed on a disabled pool (requote early-returns there).
+    let newStdBps = Float.min(20_000.0, Float.sqrt(newVar) * 10000.0);
     withVol(pool, newStdBps, newMid, now);
   };
 

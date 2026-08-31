@@ -65,7 +65,7 @@
     "headers": {
       // One line on purpose: JSON5 has no string concatenation, and a
       // backslash line-continuation is not worth betting a deploy on.
-      "Content-Security-Policy": "default-src 'none'; script-src 'sha256-YY0FxVEZZGX4B7VXw46OCzcr71FbF2tHAW7ZedmJnAk='; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "Content-Security-Policy": "default-src 'none'; script-src 'sha256-s7iO84RG69oGxUSyWJL9PiosgUKEYh18SK1dhXWbsU4='; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     },
   },
 ]

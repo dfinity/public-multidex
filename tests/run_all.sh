@@ -254,8 +254,20 @@ for t in "${ALL_TESTS[@]}"; do
   # failures until someone deletes a file nobody knows about. Trailing X's are
   # portable across BSD and GNU.
   log=$(mktemp /tmp/uplands-test-XXXXXX)
+  # INTER-SUITE HYGIENE (2026-08-15): a suite that pauses the venue's timers
+  # and then FAILS can exit without resuming them — the finaliser stops, and
+  # the next suite's staged orders never release ("no trades" that is not its
+  # own bug; found live as market_walks → matching_engine). Reset the one
+  # venue-global switch every suite depends on. Tests that want a paused
+  # venue pause it in their own setup, so this costs them nothing.
+  echo "y" | icp canister call backend setTestTimersPaused '(false)' --identity anonymous > /dev/null 2>&1 || true
   start=$(date +%s)
-  if bash "$t" > "$log" 2>&1; then
+  # LC_ALL=C pin (#45): under a UTF-8 locale, macOS /bin/bash 3.2 swallows a
+  # multibyte glyph abutting an unbraced $VAR into the variable name, and
+  # `set -u` aborts the suite mid-run. The sites are braced now, but pin the
+  # child locale anyway so the runner's results never depend on the ambient
+  # locale (the counting greps below are already LC_ALL=C).
+  if LC_ALL=C bash "$t" > "$log" 2>&1; then
     rc=0
   else
     rc=1
@@ -276,8 +288,21 @@ for t in "${ALL_TESTS[@]}"; do
     cat "$log"
   fi
 
-  if [ "$rc" -eq 0 ]; then
+  # W5-02: a test that prints ✗ but exits 0 (the W5-01 class) must not be
+  # recorded PASS — the count sat in `failed` one line above the verdict and
+  # was never read. And a test that asserted NOTHING is flagged: that is how
+  # the next dead test gets caught before it needs its own issue.
+  if [ "$rc" -eq 0 ] && [ "${failed:-0}" -gt 0 ]; then
+    echo -e "  ${RED}FAIL${NC} (${dur}s · exit 0 BUT ${failed} failing assertion(s) — the test's own verdict is broken)"
+    LC_ALL=C grep -aE '✗' "$log" | head -10 | sed 's/^/    /'
+    FAIL=$(( FAIL + 1 ))
+    STATUSES+=("fail")
+  elif [ "$rc" -eq 0 ]; then
+    if [ "${passed:-0}" -eq 0 ] && [ "${skipped:-0}" -eq 0 ]; then
+      echo -e "  ${YELLOW}PASS?${NC} (${dur}s · ZERO assertions — a test that asserts nothing proves nothing)"
+    else
     echo -e "  ${GREEN}PASS${NC} (${dur}s · ${passed} assertions${skipnote})"
+    fi
     # Surface the ⊘ REASONS even on a pass. A test that quietly runs fewer
     # assertions than it looks like it does is a blind spot; without this the
     # only trace of a posture/venue skip was the assertion count dropping.

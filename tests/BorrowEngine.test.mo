@@ -3,6 +3,7 @@
 // threshold flip on a collateral crash, partial repay, and the borrow guards.
 
 import BE "../src/backend/lib/BorrowEngine";
+import Fixed "../src/backend/lib/Fixed";
 import ME "../src/backend/lib/MarginEngine";
 import Accounts "../src/backend/lib/Accounts";
 import Types "../src/backend/lib/Types";
@@ -106,3 +107,52 @@ switch (BE.borrow(st3, mg3, acc3, noReserved, vault, alice, ICPUSD, 600_000_000_
 };
 
 Debug.print("── BorrowEngine.test PASSED ──");
+
+// ── W5-03: boundary fixtures — the rounding DIRECTION pinned at the two
+// DECISION call sites (not the primitive; Fixed.test.mo owns that). The
+// operands make the ratio division non-even, so flipping the flag at the
+// site changes the observable verdict and turns this red.
+Debug.print("── W5-03 boundary fixtures ──");
+
+// Liquidation threshold: coll 11_499_999_999 / debt 10_000_000_000 is one
+// dust-unit below 1.15. DOWN → ratio 114_999_999 → LIQUIDATABLE. A flip to
+// UP would read exactly 115_000_000 and spare the position.
+let st4 = BE.emptyState();
+let mg4 = ME.emptyState();
+let acc4 = Accounts.emptyState();
+func pxB(t : Types.TokenId) : ?Nat { switch (t) { case ("BTC") { ?10_000_000_000 }; case (_) { null } } }; // $100
+func pxNone(_ : Types.TokenId) : ?Nat { null };  // BTC leg vanishes; quote counts at par
+Accounts.setBalance(acc4, vault, ICPUSD, 100_000_000_000);
+switch (ME.open(mg4, alice, 0)) { case (#ok(_)) {}; case (#err(e)) { Runtime.trap(e) } };
+Accounts.setBalance(acc4, alice, ICPUSD, 1_499_999_999);
+Accounts.setBalance(acc4, alice, "BTC", 100_000_000);   // admission collateral only
+switch (BE.borrow(st4, mg4, acc4, noReserved, vault, alice, ICPUSD, 10_000_000_000, 0, pxB)) {
+  case (#ok(_)) {}; case (#err(e)) { Runtime.trap("FAIL boundary borrow: " # e) };
+};
+let hb = BE.getHealth(st4, mg4, acc4, noReserved, alice, pxNone);
+eqN("boundary health: collateral 11_499_999_999", hb.collateralUsd, 11_499_999_999);
+eqN("boundary health: debt 10_000_000_000", hb.debtUsd, 10_000_000_000);
+eqN("boundary health: ratio rounds DOWN (114_999_999)", hb.healthRatio, 114_999_999);
+truth("boundary health: DOWN direction LIQUIDATES the boundary position (UP would spare it)", hb.isLiquidatable);
+
+// Borrow admission: projected coll 12_499_999_999 / debt 10_000_000_000 is
+// one dust-unit below 1.25. DOWN → 124_999_999 → REFUSED. A flip to UP
+// would read exactly 125_000_000 and admit it.
+let st5 = BE.emptyState();
+let mg5 = ME.emptyState();
+let acc5 = Accounts.emptyState();
+Accounts.setBalance(acc5, vault, ICPUSD, 100_000_000_000);
+switch (ME.open(mg5, bob, 0)) { case (#ok(_)) {}; case (#err(e)) { Runtime.trap(e) } };
+Accounts.setBalance(acc5, bob, ICPUSD, 2_499_999_999);   // + borrowed 10e9 → proj coll 12_499_999_999
+switch (BE.borrow(st5, mg5, acc5, noReserved, vault, bob, ICPUSD, 10_000_000_000, 0, pxNone)) {
+  case (#err(_)) { Debug.print("  ✓ admission: DOWN direction REFUSES the boundary borrow (UP would admit it)") };
+  case (#ok(_)) { Runtime.trap("FAIL: boundary borrow admitted — projected ratio rounded UP") };
+};
+// One dust-unit more collateral crosses the line: proves the gate sits
+// exactly at the boundary rather than somewhere coarser.
+Accounts.setBalance(acc5, bob, ICPUSD, 2_500_000_001);
+switch (BE.borrow(st5, mg5, acc5, noReserved, vault, bob, ICPUSD, 10_000_000_000, 0, pxNone)) {
+  case (#ok(_)) { Debug.print("  ✓ admission: one dust-unit over the line is admitted") };
+  case (#err(e)) { Runtime.trap("FAIL: over-boundary borrow refused: " # e) };
+};
+Debug.print("W5-03 fixtures green");

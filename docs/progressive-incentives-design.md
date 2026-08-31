@@ -28,8 +28,14 @@ Per scorecard key (margin pools resolve to their **owner** via
 
 - `makerVol / takerVol` — rolling two-bucket window (15d half-window ≈ 30d).
   Maker attribution reads the trade record: the engine stamps the RESTING
-  order's id on its side and 0 on the aggressing side; both ids non-zero
-  (two resting orders crossed by a sweep) ⇒ both sides count as makers.
+  order's id on its side and 0 on the aggressing side; both ids non-zero ⇒
+  both sides count as makers. W4-22 made that rule REAL on the AMM-sweep
+  path: the sweep re-homes a resting order as the aggressor (for the
+  equal-or-better price) and the engine now pre-reserves + stamps its id —
+  before that fix the engine could not produce both-ids on a sweep, so a
+  swept maker's volume was mis-binned as taker (and their post-only
+  "never pays taker" promise broke). Swept makers also keep the maker FEE
+  rate (`aggressorIsMaker` in `ProtectionCtx`).
   AMM/insurance/treasury legs are excluded (`isInternalPrincipal`).
 - `W = 2·maker + taker` — the level input (`MAKER_W_MULT = 2`).
 - `lifetimeVol / lifetimeMakerVol` — monotonic, badge inputs.
@@ -132,3 +138,18 @@ static site, no build step) — linked via `PUBLIC_CANISTER_ID:docs`.
   main.mo and `tests/test_fuel_topup.sh`); compute allocation is a deploy
   setting, now cached from canister_status and surfaced on Stats → Canister,
   with the checklist step in docs/pre-mainnet-checklist.md.
+
+## Volume-credit consolidation (W4-18, 2026-08-15)
+
+Volume credit is written by exactly one place — the credit loop inside
+`updateStatsAfterTrades` — so EVERY settlement path (direct fills, AMM-sweep
+fills, both cross-swap legs, pending-finalize) credits both parties, and a
+new settlement path cannot be added without crediting (it has to book stats
+to exist). Historical injection books stats via `updateStatsCore` and
+credits nobody: backdrop trades must scale no one's level.
+
+Backfill decision, recorded: **start clean from this deploy.** Historical
+under-credit is not reconstructed — the affected quantities are play-money
+scorecard rows, the level scale recalibrates automatically as newly-counted
+volume flows, and a mid-season retroactive rewrite would move everyone's
+level without an action of theirs.

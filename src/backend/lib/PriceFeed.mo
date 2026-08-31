@@ -4,6 +4,7 @@ import Float "mo:core/Float";
 import Char "mo:core/Char";
 import Nat32 "mo:core/Nat32";
 import Option "mo:core/Option";
+import Int "mo:core/Int";
 
 // PriceFeed.mo — multi-source external price aggregation.
 //
@@ -50,11 +51,18 @@ module {
   // A named price-source configuration. urlTemplate has a `{asset}`
   // placeholder that `buildUrl` substitutes with the per-source symbol
   // (so we can map our internal "BTC" to Coingecko's "bitcoin", etc.).
+  // W3-05: the quote asset a venue's ticker is denominated in. The venue's
+  // MARK is denominated in USD; USDT-quoted venues are usable only while
+  // USDT trades at par, and the difference between the two groups IS the
+  // depeg signal — pooling them into one median averaged it away.
+  public type QuoteAsset = { #usd; #usdt };
+
   public type Source = {
     id               : Text;
     urlTemplate      : Text;
     kind             : SourceKind;
     maxResponseBytes : Nat64;
+    quote            : QuoteAsset;
   };
 
   // One fetched sample from one source. Written by main.mo after a
@@ -380,6 +388,59 @@ module {
       timestamp   = now;
       readings;
     };
+  };
+
+  // ── Per-quote aggregation (W3-05) ─────────────────────────────────
+  // Group readings by their source's quote asset, aggregate each group with
+  // the same trim/median machinery, and combine explicitly:
+  //   · both groups present and within `depegThresholdBps` → the pooled
+  //     aggregate (maximal sources; the groups corroborate each other, so
+  //     cross-quote dispersion carries no hidden signal)
+  //   · groups DIVERGED → the USD group is the mark (the venue's mark is
+  //     USD-denominated) with ITS dispersion and ITS source count — the
+  //     divergence is reported to the caller as the depeg signal instead of
+  //     being averaged into the blend
+  //   · one group empty → the other, with no cross-check available
+  // The returned Aggregate keeps the FULL reading fleet for observability
+  // regardless of which group priced the mark.
+  public func aggregateByQuote(
+    asset : Asset, readings : [Reading], sources : [Source], now : Int, depegThresholdBps : Nat
+  ) : { agg : Aggregate; usdCount : Nat; usdtCount : Nat; depegBps : Nat; diverged : Bool } {
+    func quoteOf(sourceId : Text) : QuoteAsset {
+      for (src in sources.vals()) { if (src.id == sourceId) { return src.quote } };
+      #usd;   // unknown source id — treat as the mark's own denomination
+    };
+    var usdReadings : [Reading] = [];
+    var usdtReadings : [Reading] = [];
+    for (r in readings.vals()) {
+      switch (quoteOf(r.sourceId)) {
+        case (#usd)  { usdReadings := appendReading(usdReadings, r) };
+        case (#usdt) { usdtReadings := appendReading(usdtReadings, r) };
+      };
+    };
+    let aggUsd  = aggregate(asset, usdReadings, now);
+    let aggUsdt = aggregate(asset, usdtReadings, now);
+    if (aggUsd.sourceCount == 0 or aggUsdt.sourceCount == 0) {
+      return {
+        agg = aggregate(asset, readings, now);
+        usdCount = aggUsd.sourceCount; usdtCount = aggUsdt.sourceCount;
+        depegBps = 0; diverged = false;
+      };
+    };
+    let diffBps = Float.abs(aggUsd.price - aggUsdt.price) / aggUsd.price * 10000.0;
+    let depegBps = if (diffBps < 0.0) { 0 } else { Int.abs(Float.toInt(diffBps)) };
+    let diverged = depegBps > depegThresholdBps;
+    if (diverged) {
+      { agg = { aggUsd with readings }; usdCount = aggUsd.sourceCount;
+        usdtCount = aggUsdt.sourceCount; depegBps; diverged = true };
+    } else {
+      { agg = aggregate(asset, readings, now); usdCount = aggUsd.sourceCount;
+        usdtCount = aggUsdt.sourceCount; depegBps; diverged = false };
+    };
+  };
+
+  func appendReading(a : [Reading], r : Reading) : [Reading] {
+    Array.tabulate<Reading>(a.size() + 1, func(i) { if (i < a.size()) { a[i] } else { r } });
   };
 
   // ── Body parsing ──────────────────────────────────────────────────

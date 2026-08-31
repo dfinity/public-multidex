@@ -99,7 +99,10 @@ export const DOCS_PAGES = [
       <h2 id="docs-sec-ai">Written by AI, start to finish</h2>
       <p>The novel part isn't just what MULTI/DEX does — it's how it was built. <b>AI agents wrote all
       of the software</b>: the sealed matching engine, the margin system, the oracle, the AMM, the
-      hash-chained archive, the query layer, the AI assistant, and this very page. It's an
+      hash-chained archive, the query layer, the AI assistant, and this very page. (One
+      consequence, stated plainly: raw archive rows are complete — fill records keep their order
+      ids, because chain verification hashes the full canonical row. "De-identified" applies to the
+      live convenience queries, never to the permanent tape.) It's an
       extraordinary demonstration of what agents can now build on the Internet Computer using
       <b>Motoko</b>, a software language designed for AI that codes, and for developing AIware — a
       genuinely sophisticated financial application, produced by AI, running end-to-end as on-chain
@@ -1221,6 +1224,14 @@ export const DOCS_PAGES = [
         <li><b>Withdrawals pay a 0.4% exit fee</b> that stays in the vault for remaining LPs. It
         exists to make "deposit, then immediately withdraw the basket" strictly worse than just
         trading — an honest exit pays it once; a scheme pays it every lap.</li>
+        <li><b>Your displayed value is an upper bound while the vault is lending.</b> The vault
+        is also the <a href="#docs/margin">margin</a> system's lender, and the Earn card values
+        your position against full NAV — the loan book included. A withdrawal is paid in kind
+        from what the vault <i>physically holds</i> (a loan cannot be handed out as inventory),
+        so while utilisation is non-zero it returns less than the headline figure — down to
+        about half of it with the loan book at its cap of 0.50&nbsp;× vault value. The Earn
+        card shows the utilisation-adjusted figure alongside; the difference is the loan book's
+        receivable, left behind for remaining LPs as it is collected — not a fee.</li>
       </ul>
       <p class="docs-dim">Honest risk note: LP capital carries inventory risk. The AMM holds the
       assets it quotes; in a sharp move its inventory marks down like any market maker's would. The

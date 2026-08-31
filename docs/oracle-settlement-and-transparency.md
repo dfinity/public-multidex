@@ -38,9 +38,12 @@ structural defense against engineered margin-call cascades.
 
 Every balance change is journalled to a tamper-evident event chain (the archive), and the
 public Ledger page lets anyone re-hash that chain against the subnet-certified head and
-**fold it into a Proof of Reserves**: total assets held ≥ total owed to users, verifiable
-by anyone, trustlessly. Deposits and withdrawals (the money-flow ledger) and the raw event
-tape stay open precisely so this proof works. Positions, fills, and debts are visible for
+**fold it into the liabilities half of a Proof of Reserves**: total owed to users,
+verifiable by anyone, trustlessly. The reserves half — total assets held ≥ that figure —
+becomes computable only once real custody exists (the bridge's NNS-custody target state,
+`docs/bridge-and-cks-design.md` §11; on the play venue deposits are play money, so there
+are no held assets to attest). Deposits and withdrawals (the money-flow ledger) and the
+raw event tape stay open precisely so this proof works. Positions, fills, and debts are visible for
 the same reason every on-chain perp venue makes them visible: solvency you can check
 yourself beats solvency you have to trust.
 

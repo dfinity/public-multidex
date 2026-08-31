@@ -378,8 +378,18 @@ only the unavoidable transit queue (§3).
   RE-VERIFIES continuity on append (a chain-breaking batch is refused) and
   publishes its head into `certified_data`: `getCertifiedHead()` returns
   head + IC certificate, `verifyChain(from, limit)` re-checks stored
-  slices, and the chain runs UNBROKEN across sealed archives (the
-  successor's first event links to the sealed head — pinned by the test).
+  slices **within one archive only** — an archive anchors at whatever event
+  arrives first and is never told its predecessor's head, so the inbound
+  join is not (and cannot be) enforced on-canister. The cross-archive links
+  hold because capture hashes them at emission; they are *checked* by the
+  off-chain verifiers (which carry the hash across boundaries and, since
+  W2-04, validate a subnet certificate per segment) and pinned by
+  `tests/test_archive_chain.sh` — a shell assertion, not canister
+  enforcement. Certificates make a sealed segment tamper-EVIDENT; they make
+  it tamper-PROOF only once `setBlackholeAtSeal` is in force (pre-mainnet
+  checklist) — until then a controller reinstall could rewrite a sealed
+  segment under a fresh certificate, and the verifiers' guarantee should be
+  read with that dependency stated.
   The chain starts at `chainStartSeq` (pre-chain events stay unverifiable)
   and dies with the tape on a reset. prevHash is surfaced in the Archive
   tab's CSV/JSON export. Still deferred from the original Phase-D list:

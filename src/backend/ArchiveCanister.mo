@@ -252,10 +252,27 @@ persistent actor class Archive(owner : Principal) {
   };
 
   // Recompute + verify the chain over a stored range (bounded per call —
-  // page a full audit). Checks BOTH directions of integrity: each event's
-  // recomputed hash equals its successor's prevHash. `ok=false` pinpoints
-  // the first broken seq. Anyone may call; the stronger, trustless variant
-  // is the same computation done client-side under the certified head.
+  // page a full audit). Two kinds of check: every INTERNAL link (each
+  // event's recomputed hash equals its successor's stored prevHash), and —
+  // when the walk reaches the tape end — the OUTBOUND ANCHOR: the last
+  // event's own recomputed hash must equal the certified chainHead
+  // (W2-01, #18 F50). Without the anchor, the newest event's hash was
+  // never compared against anything (no successor reads it), so
+  // corrupting it — or consistently rewriting any tail suffix — verified
+  // clean; on a sealed season archive nothing would ever surface that.
+  // `ok=false` pinpoints the first broken seq. Anyone may call; the
+  // stronger, trustless variant is the same computation done client-side
+  // under the certified head (src/frontend/src/ledger.js anchors the same
+  // way).
+  //
+  // SCOPE (W2-04/R11): this verifies links WITHIN this archive only. The
+  // anchor below starts at whatever event arrived first — the canister is
+  // never told its predecessor's head, so the inbound cross-archive join
+  // is not checked here and cannot be. That is not a security hole to fix
+  // with plumbing: this is an uncertified self-diagnostic (a hostile host
+  // returns ok=true regardless), for honest bugs and storage corruption.
+  // The cross-archive joins are verified OFF-chain, by the two verifiers,
+  // under per-segment IC certificates.
   //
   // BOUNDARY LINKS: `prev` starts empty on every call, so the first event of a
   // page has nothing to check its inbound prevHash against. Left that way, a
@@ -270,14 +287,18 @@ persistent actor class Archive(owner : Principal) {
   // predecessor cannot be loaded, the link is unverifiable — that is reported
   // as ok=false, never passed over: silence is what made this a bug.
   //
-  // `linksChecked` reports how many prevHash links this call actually verified,
+  // `linksChecked` reports how many hash comparisons this call actually made,
   // so the COVERAGE of an audit is itself auditable — "ok = true" alone cannot
   // distinguish a thorough pass from a vacuous one. A page of k events verifies
   // k links when its inbound link was seeded and k−1 when it starts at the
-  // anchor (whose own prevHash points before this chain), so a paged walk sums
-  // to exactly the single-call total, N−1. That identity is the regression
-  // test: it held only by accident of paging before, and now holds by
-  // construction. tests/test_archive_chain_paged.sh asserts it.
+  // anchor (whose own prevHash points before this chain); a page that reaches
+  // the TAPE END verifies one more — the head anchor. So a paged walk sums to
+  // exactly the single-call total: N−1 for a window strictly inside the tape,
+  // N when the walk reaches the end. That identity is the regression test.
+  // tests/test_archive_chain_paged.sh asserts the interior case (its window
+  // deliberately stops short of the tail, so live appends cannot flake it);
+  // tests/test_archive_chain.sh asserts the anchored case on a SEALED
+  // archive, where the count is deterministic forever.
   public query func verifyChain(fromSeq : Nat, limit : Nat) : async {
     checked : Nat; linksChecked : Nat; ok : Bool; brokenAt : ?Nat; nextSeq : ?Nat;
   } {
@@ -324,6 +345,33 @@ persistent actor class Archive(owner : Principal) {
       checked += 1;
       s += 1;
     };
+    // OUTBOUND ANCHOR (W2-01, #18 F50). The loop above only ever compares an
+    // event's stored prevHash against its predecessor's recomputed hash —
+    // every comparison is INTERNAL to the range. When the walk reaches the
+    // tape end there is no successor to read the last event's hash, so
+    // without this block the newest event was never checked against
+    // anything and the function returned ok = true unconditionally:
+    // corrupting the newest stored event, or consistently rewriting a whole
+    // tail suffix, verified clean — permanently so on a sealed archive. The
+    // certified chainHead is the one value a tamperer cannot forge; anchor
+    // the recomputed tail to it. A range that stops short of the end makes
+    // no claim about the head (nextSeq tells the caller to keep paging).
+    if (s >= nextExpected) {
+      switch (prev, chainHead) {
+        case (?p, ?h) {
+          if (EventChain.hash(p) != h) {
+            return { checked; linksChecked = links; ok = false; brokenAt = ?p.seq; nextSeq = null };
+          };
+          links += 1;
+        };
+        case (?p, null) {
+          // Events were walked but no head is recorded — structurally
+          // impossible (the head advances on every store); refuse to vouch.
+          return { checked; linksChecked = links; ok = false; brokenAt = ?p.seq; nextSeq = null };
+        };
+        case (null, _) {};   // zero-length walk (limit 0): nothing to anchor
+      };
+    };
     { checked; linksChecked = links; ok = true; brokenAt = null; nextSeq = if (s < nextExpected) { ?s } else { null } };
   };
 
@@ -364,8 +412,17 @@ persistent actor class Archive(owner : Principal) {
   // by-principal lookups (leaderboard → rival's principal → position → liq
   // price). The public whole-tape reads (getEventsRange, getDepositWithdrawals)
   // stay open: the chain verifier + PoR need them, and they carry no easy
-  // per-human attribution index. Region offset is monotonic with global seq, so
-  // sorting the gathered index entries by offset descending = newest-first.
+  // per-human attribution INDEX — but not zero attribution (W6-10.1/R6): a
+  // fundMarginPool debits the human and credits the pool in one awaitless
+  // message, and the journal drains in insertion order, so the raw tape
+  // carries the two #delta rows at CONSECUTIVE seqs with matched magnitude —
+  // a derivable owner↔pool join for anyone willing to scan linearly
+  // (getEventsRange pages ≤200/call; there is no by-principal shortcut, that
+  // is what the gate below closes). Derivable-by-scan is the accepted cost
+  // of the replay invariant: #delta rows must fold per REAL principal
+  // (main.mo's drainLedgerJournal cites this note), so remapping them is not
+  // an option. Region offset is monotonic with global seq, so sorting the
+  // gathered index entries by offset descending = newest-first.
   public query (msg) func getEventsForPrincipals(principals : [Principal], offset : Nat, limit : Nat) : async {
     events : [Types.UserEvent];
     total  : Nat;

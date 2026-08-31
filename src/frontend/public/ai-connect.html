@@ -50,10 +50,10 @@ session to the IC connector running on this machine. Your AI assistant will be a
 to act as the signed-in principal until the session expires
 (<strong><span id="ttl">?</span></strong>) or you log out.</p>
 <p class="note">Session keys never leave the connector — this page only relays the
-signed delegation. The principal is derived from <em>this page's origin</em>
-(<span id="origin"></span>): serve this page from an app's own origin and the AI
-acts as the same principal you have in that app. The session is limited to this
-app's backend canister (<span id="target">?</span>).</p>
+signed delegation. The principal is derived from <em><span id="origin"></span></em>
+— the same identity derivation the app's own sign-in uses — so the AI acts as the
+same principal you have in that app. The session is limited to this app's backend
+canister (<span id="target">?</span>).</p>
 <button id="go">Continue with Internet Identity</button>
 <pre id="status"></pre>
 <script>
@@ -74,9 +74,30 @@ const SESSION_PUBKEY_HEX = params.get("pubkey") || "";
 const NONCE = params.get("nonce") || "";
 const II_ORIGIN = "https://id.ai";
 
+// ── Derivation origin ──
+// The app pins ONE canonical derivation origin so every production host
+// (the canister URLs, multidex.ai) yields the SAME principal — see
+// getDerivationOrigin() in src/frontend/src/main.js. Without it, Internet
+// Identity derives from THIS page's origin, and on multidex.ai the connector
+// would act as a DIFFERENT principal than the one the user funded in the app,
+// making the consent text above a lie. Only sent from the pinned production
+// origins: id.ai validates derivationOrigin against the canonical origin's
+// /.well-known/ii-alternative-origins, so sending it from anywhere else (a
+// local venue, a preview deploy) would fail the sign-in instead of scoping it.
+// KEEP THESE IDENTICAL to II_CANONICAL_ORIGIN / II_PINNED_ORIGINS in main.js —
+// tests/frontend_security.test.mjs asserts the two files agree.
+const II_CANONICAL_ORIGIN = "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net";
+const II_PINNED_ORIGINS = [
+  "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp.net",
+  "https://hcv4s-uaaaa-aaabq-qaaba-cai.icp0.io",
+  "https://multidex.ai",
+];
+const DERIVATION_ORIGIN = II_PINNED_ORIGINS.includes(location.origin)
+  ? II_CANONICAL_ORIGIN : undefined;
+
 const statusEl = document.getElementById("status");
 const goBtn = document.getElementById("go");
-document.getElementById("origin").textContent = location.origin;
+document.getElementById("origin").textContent = DERIVATION_ORIGIN || location.origin;
 function log(s) { statusEl.textContent += s + "\n"; }
 function refuse(s) { goBtn.disabled = true; log(s); }
 
@@ -211,6 +232,10 @@ goBtn.onclick = () => {
         maxTimeToLive: TTL_NS,
         // Scope the delegation to this app's backend — see BACKEND_ID above.
         targets: [BACKEND_ID],
+        // Derive the SAME principal the app itself signs in as — see
+        // DERIVATION_ORIGIN above. Omitted entirely (never sent as undefined)
+        // off the pinned origins, so local venues keep II's per-origin default.
+        ...(DERIVATION_ORIGIN ? { derivationOrigin: DERIVATION_ORIGIN } : {}),
       }, II_ORIGIN);
     } else if (msg.kind === "authorize-client-success") {
       window.removeEventListener("message", handler);

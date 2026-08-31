@@ -11,6 +11,7 @@
 import Principal "mo:core/Principal";
 import Text "mo:core/Text";
 import Map "mo:core/Map";
+import Runtime "mo:core/Runtime";
 import List "mo:core/List";
 import Iter "mo:core/Iter";
 import Option "mo:core/Option";
@@ -33,7 +34,11 @@ mixin (
   userProfiles    : Map.Map<Text, Types.UserProfile>,
   userPreferences : Map.Map<Text, Types.UserPreferences>,
   userDeposits    : Map.Map<Text, List.List<Types.DepositRecord>>,
-  userAdjustments : Map.Map<Text, List.List<Types.OrderAdjustment>>,
+  // FOSSIL-PARKED pre-reason rows (frozen at the deployed layout; never
+  // written after the reason field landed) + the live V2 map new records go
+  // to. getMyAdjustments merges them, fossil rows first (strictly older).
+  userAdjustments   : Map.Map<Text, List.List<Types.OrderAdjustmentLegacy>>,
+  userAdjustmentsV2 : Map.Map<Text, List.List<Types.OrderAdjustment>>,
   userStatuses    : Map.Map<Text, Types.UserStatus>,
   registeredUsers : Map.Map<Text, Bool>,
   requireAuth     : Principal -> (),
@@ -142,7 +147,10 @@ mixin (
   // vault-redeemable, and `requireAuth` is NOT a guard (any principal
   // self-authenticates), so this must be dead on any public deploy.
   public shared (msg) func addTestTokens(token : Types.TokenId, amount : Nat) : async () {
-    if (faucetDisabled) { return };
+    // THE RULE (main.mo requireDevHook): refuse loudly — no Result channel
+    // here, so trap. This was the one posture gate still SILENT on the live
+    // #play posture (W6-02 / #41.2 step 5).
+    if (faucetDisabled) { Runtime.trap("addTestTokens is a dev-only faucet (posture: play/production)") };
     requireAuth(msg.caller);
     Accounts.addBalance(accounts, msg.caller, token, amount);
     Map.add(registeredUsers, Text.compare, Principal.toText(msg.caller), true);
@@ -235,8 +243,32 @@ mixin (
 
   public query (msg) func getMyAdjustments() : async [Types.OrderAdjustment] {
     let key = Principal.toText(msg.caller);
-    let lst = Option.get(Map.get(userAdjustments, Text.compare, key), List.empty<Types.OrderAdjustment>());
-    let all = Iter.toArray(List.values(lst));
+    let merged = List.empty<Types.OrderAdjustment>();
+    // Fossil rows first: the legacy map predates the reason field and is
+    // never appended to after the upgrade, so its rows are strictly older
+    // than every V2 row. They surface with reason = null.
+    switch (Map.get(userAdjustments, Text.compare, key)) {
+      case (?lst) {
+        for (a in List.values(lst)) {
+          List.add(merged, {
+            orderId     = a.orderId;
+            marketId    = a.marketId;
+            side        = a.side;
+            oldQuantity = a.oldQuantity;
+            newQuantity = a.newQuantity;
+            cancelled   = a.cancelled;
+            timestamp   = a.timestamp;
+            reason      = null;
+          });
+        };
+      };
+      case null {};
+    };
+    switch (Map.get(userAdjustmentsV2, Text.compare, key)) {
+      case (?lst) { for (a in List.values(lst)) { List.add(merged, a) } };
+      case null {};
+    };
+    let all = Iter.toArray(List.values(merged));
     let n = all.size();
     if (n <= 200) { return all };
     let result = List.empty<Types.OrderAdjustment>();
@@ -289,9 +321,8 @@ mixin (
   // Whole-wallet cross-margin is gone: the Wallet is pure custody, never
   // collateral. Leverage/short happen only in margin pools (main.mo
   // createMarginPool / openPosition), which own their own margin accounts on
-  // the pool principal. getMyMarginAccount stays as a now-always-empty compat
-  // read for the caller's OWN principal. See docs/wallet-and-positions-design.md.
-  public query (msg) func getMyMarginAccount() : async ?Types.MarginAccount {
-    MarginEngine.get(marginAccounts, msg.caller);
-  };
+  // the pool principal. The always-empty compat read getMyMarginAccount was
+  // RETIRED here (W5-23): the frontend dropped its callers when model 2
+  // landed (src/frontend/src/main.js records it), and the removal rides the
+  // still-unpublished API 3.0.0 window. See docs/wallet-and-positions-design.md.
 };

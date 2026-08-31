@@ -115,6 +115,30 @@ H1=$(arc "$SEALED_ID" getCertifiedHead '()' --query | tr -d '_\n' | tr -s ' ')
 if echo "$H1" | grep -q "headSeq = opt ($SEALED_LAST"; then ok "certified head covers seq $SEALED_LAST"; else nok "head seq wrong" "$(echo "$H1" | head -c 150)"; fi
 if echo "$H1" | grep -qE 'certificate = opt blob'; then ok "IC certificate present (query-call certified data)"; else nok "no certificate" "$(echo "$H1" | head -c 150)"; fi
 
+# ── W2-01: the recomputed tail is anchored to the certified head ──
+# (Sealed segment = deterministic forever: no append can move its head.)
+# Full range: WANT−1 internal links + the head anchor = WANT — linksChecked
+# equals checked exactly when the head is derivable from the tape. Pre-fix
+# this was WANT−1, and ok=true never involved the certified head at all.
+if echo "$V1" | grep -q "linksChecked = $WANT"; then
+  ok "full sealed range is head-anchored (linksChecked = checked = $WANT)"
+else nok "tail anchor did not fire on the full range" "$V1"; fi
+# The reporter's reproduction: a single-event page at the tape end. Pre-fix
+# it performed ZERO hash comparisons and returned ok=true; now it verifies
+# its inbound link AND the head anchor.
+VT=$(arc "$SEALED_ID" verifyChain "($SEALED_LAST : nat, 1 : nat)" --query | tr -d '_\n' | tr -s ' ')
+if echo "$VT" | grep -q "ok = true" && echo "$VT" | grep -q "checked = 1" && echo "$VT" | grep -q "linksChecked = 2"; then
+  ok "verifyChain(headSeq, 1) = 2 comparisons (inbound + anchor) — no longer a vacuous ok"
+else nok "tail page not anchored" "$VT"; fi
+# An interior range that stops short of the end still passes and makes no
+# head claim: links = checked (inbound seeded), nextSeq points onward.
+if [ "$SEALED_LAST" -ge 4 ]; then
+  VP=$(arc "$SEALED_ID" verifyChain "(1 : nat, 3 : nat)" --query | tr -d '_\n' | tr -s ' ')
+  if echo "$VP" | grep -q "ok = true" && echo "$VP" | grep -q "linksChecked = 3" && echo "$VP" | grep -q "nextSeq = opt"; then
+    ok "interior range: ok with no head claim (links = 3, nextSeq set)"
+  else nok "interior range wrong" "$VP"; fi
+fi
+
 echo "── §4 active archive: verifies + links to its predecessor's head ──"
 PH=$(arc "$PREV_ID" getCertifiedHead '()' --query | tr -d '\n' | tr -s ' ' | grep -oE 'headHash = opt blob "[^"]+"' | sed 's/headHash = opt blob //')
 V2=$(arc "$ACTIVE_ID" verifyChain "($ACTIVE_FIRST : nat, 10_000 : nat)" --query | tr -d '_\n' | tr -s ' ')

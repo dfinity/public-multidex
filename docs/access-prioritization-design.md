@@ -87,11 +87,14 @@ ingress calls.
   had two-sided resting quotes within `MM_MAX_SPREAD_BPS` of mid, at
   ≥ `MM_MIN_DEPTH` per side. Sampled by the pass itself (it already walks the
   book).
-- *Maker share*: maker-side fill value over the window. `CounterpartyStats`
-  (`totalFills`, `totalFillValue`, `lastFillNs`) is the seed of this; it needs a
-  maker/taker split and a rolling window rather than lifetime totals.
-- *Toxicity guard*: `adverseRate` (already EWMA'd) below a ceiling — a "maker"
-  who only snipes doesn't qualify.
+- *Maker share*: maker-side fill value over the window. (`CounterpartyStats`
+  was once suggested as the seed of this, but that machinery was RETIRED
+  2026-08-20 — #49.5: its map was provably never fed, and per-counterparty
+  scoring was rejected as attacker-influenceable. A maker-share metric would
+  be built fresh, with a maker/taker split and a rolling window.)
+- *Toxicity guard*: an adverse-selection rate below a ceiling — a "maker" who
+  only snipes doesn't qualify. (The retired `adverseRate` EWMA is NOT the
+  input here; any such measure would be designed fresh — markout-based.)
 
 A new heartbeat task (`HB_TIER_NS = 60s`, alongside the existing `HB_*` family)
 folds the window into tier assignments with **hysteresis** (qualify above X,

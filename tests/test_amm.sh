@@ -10,7 +10,9 @@ echo "── test_amm ──"
 setup_mode amm
 
 POOL=$(call getAmmPool '("BTC-ICPUSD")')
-assert_contains "pool refPrice 75000"  "$POOL" "refPrice = 75000.0"
+# refPrice is a base-unit Nat (75000 * 10^8); the old "75000.0" needle's `.`
+# was a grep wildcard over the digits, not a decimal point (#51.8).
+assert_contains "pool refPrice 75000"  "$POOL" "refPrice = 7500000000000 "
 assert_contains "pool enabled"         "$POOL" "enabled = true"
 assert_contains "pool has baseToken"   "$POOL" "baseToken = \"BTC\""
 

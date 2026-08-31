@@ -129,6 +129,9 @@ cd "$PROJECT_ROOT"
 # scripts/lib/runfiles.sh.
 # shellcheck source=scripts/lib/runfiles.sh
 . "$SCRIPT_DIR/lib/runfiles.sh"
+# Target table + the shared posture reader (mdx_posture_of) — see W1-02.
+# shellcheck source=scripts/lib/targets.sh
+. "$SCRIPT_DIR/lib/targets.sh"
 
 log()  { echo -e "${CYAN}▶${NC} $1"; }
 ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
@@ -146,17 +149,23 @@ hdr()  { echo -e "\n${YELLOW}═══ $1 ═══${NC}"; }
 # Refuse up front instead. Only guards runs that will actually SEED:
 # --no-seed (pure code update) and `empty` are posture-agnostic.
 if $DO_SEED; then
-  # `|| true`: an unreadable/unmatched literal is HANDLED below (the -n
-  # checks), but grep-finds-nothing exits 1 and `head -1` can SIGPIPE the
-  # producer — either way pipefail fails the assignment and -e would kill the
-  # script before the handling ran.
-  SRC_POSTURE=$(grep -oE 'DEPLOY_MODE : DeployMode = #[a-z]+' src/backend/main.mo 2>/dev/null | head -1 | sed 's/.*#//' || true)
+  # Resolved by mdx_posture_of (lib/targets.sh): comment-aware, and it
+  # REFUSES unless exactly one uncommented declaration exists. `|| true`: the
+  # refusal is re-raised by the -z check with seeding-specific text — a bare
+  # failed substitution under -e would exit before that handling ran. (The
+  # old grep here tolerated an EMPTY read and seeded anyway — an unreadable
+  # posture is exactly when seeding must not proceed.)
+  SRC_POSTURE=$(mdx_posture_of src/backend/main.mo || true)
+  if [ -z "$SRC_POSTURE" ]; then
+    err "seeding needs an unambiguous DEPLOY_MODE in src/backend/main.mo (diagnostic above)"
+    exit 1
+  fi
   if [ "$MODE" = "play" ]; then
-    if [ -n "$SRC_POSTURE" ] && [ "$SRC_POSTURE" != "play" ]; then
+    if [ "$SRC_POSTURE" != "play" ]; then
       err "--mode play needs DEPLOY_MODE = #play in src/backend/main.mo (found #$SRC_POSTURE)"
       exit 1
     fi
-  elif [ "$MODE" != "empty" ] && [ -n "$SRC_POSTURE" ] && [ "$SRC_POSTURE" != "dev" ]; then
+  elif [ "$MODE" != "empty" ] && [ "$SRC_POSTURE" != "dev" ]; then
     err "--mode $MODE is a #dev fixture, but src/backend/main.mo is on #$SRC_POSTURE"
     echo "  → default #play bring-up (seeded AMM + insurance fund): bash scripts/cold_start.sh" >&2
     echo "  → for dev fixtures: set DEPLOY_MODE = #dev in src/backend/main.mo, then rerun" >&2
@@ -179,26 +188,16 @@ hdr "Replica"
 # gateway. Masters carry `--ttl`; sandboxes carry `--run-as-canister-sandbox`.
 # Seen 2026-07-06.
 #
-# SCOPED BY WORKING DIRECTORY. The old note here claimed "icp-cli's local
-# network is machine-global, so every master here belongs to it — safe to
-# reap." That is false: each project that runs `icp network start` gets its
-# own master rooted at its own checkout, so the unscoped version reaped OTHER
-# PROJECTS' replicas (~/Projects/open-saas was running one). Never widen this
-# back to every pocket-ic on the machine.
-zombie_masters() {
-  local owner repo pcwd
-  # Both lsof probes are ALLOWED to find nothing (no replica running / a pid
-  # that just exited): lsof exits non-zero and pipefail would fail the whole
-  # assignment under -e. Same trap deploy.sh documents at its own GATEWAY_PID.
-  owner=$(lsof -nP -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -1 || true)   # -t: bare PID
-  repo=$(pwd -P)
-  for pid in $(pgrep -f "pocket-ic --ttl" 2>/dev/null || true); do
-    pcwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)
-    [ "$pcwd" = "$repo" ] || continue           # someone else's network — leave it alone
-    [ "$pid" = "${owner:-}" ] || echo "$pid"
-  done
-}
-STRAYS=$(zombie_masters || true)
+# Detection is mdx_stray_masters (lib/targets.sh, W1-06): repo-scoped by
+# process cwd (never widen back to every pocket-ic on the machine — the
+# unscoped version reaped ~/Projects/open-saas's replica), and the OWNER is
+# whoever holds the gateway `icp network status` records for THIS checkout —
+# 8000 on the canonical checkout, a random port under the worktree-parallel
+# workflow. The old hardwired :8000 owner test killed a worktree's own
+# healthy master. Judgment and the `icp network stop` below now share one
+# scope: both resolve through the ambient ICP_HOME + this cwd, so the
+# network being stopped is provably the one whose master is being reaped.
+STRAYS=$(mdx_stray_masters || true)
 if [ -n "$STRAYS" ]; then
   warn "zombie pocket-ic master(s): $(echo $STRAYS | tr '\n' ' ')— network is half-alive (calls/outcalls break); restarting it cleanly"
   icp network stop > /dev/null 2>&1 || true
@@ -207,24 +206,29 @@ if [ -n "$STRAYS" ]; then
   # NO belt-and-braces `pkill -f pocket-ic` here. It used to be, and it would
   # SIGKILL every pocket-ic on the machine — including other projects' local
   # networks, which are separate masters rooted at their own checkouts. Kill
-  # by the PIDs zombie_masters resolved for THIS repo, and nothing else.
+  # by the PIDs mdx_stray_masters resolved for THIS repo, and nothing else.
   sleep 1
 fi
 
-if curl -s --max-time 2 http://127.0.0.1:8000/api/v2/status > /dev/null 2>&1; then
-  ok "replica already running at 127.0.0.1:8000 (single master owns the gateway)"
+# Health-check against THIS checkout's recorded gateway, not a hardwired
+# port (W1-06). Re-resolve after a start: a fresh worktree network binds a
+# random port.
+GW_PORT=$(mdx_local_gateway || true); GW_PORT=${GW_PORT##* }
+if [ -n "$GW_PORT" ] && curl -s --max-time 2 "http://127.0.0.1:$GW_PORT/api/v2/status" > /dev/null 2>&1; then
+  ok "replica already running at 127.0.0.1:$GW_PORT (single master owns the gateway)"
 else
   log "starting local replica (background)"
   icp network start --background > "$MDX_NETWORK_START_LOG" 2>&1 || true
   # Give it a moment to come up.
   for i in $(seq 1 15); do
-    if curl -s --max-time 1 http://127.0.0.1:8000/api/v2/status > /dev/null 2>&1; then
-      ok "replica ready"
+    GW_PORT=$(mdx_local_gateway || true); GW_PORT=${GW_PORT##* }
+    if [ -n "$GW_PORT" ] && curl -s --max-time 1 "http://127.0.0.1:$GW_PORT/api/v2/status" > /dev/null 2>&1; then
+      ok "replica ready on :$GW_PORT"
       break
     fi
     sleep 1
   done
-  if ! curl -s --max-time 2 http://127.0.0.1:8000/api/v2/status > /dev/null 2>&1; then
+  if [ -z "$GW_PORT" ] || ! curl -s --max-time 2 "http://127.0.0.1:$GW_PORT/api/v2/status" > /dev/null 2>&1; then
     err "replica failed to start — check $MDX_NETWORK_START_LOG"
     exit 1
   fi
@@ -386,13 +390,16 @@ if [ "$SIMULATE" = "yes" ]; then
   # This block used to be:
   #     pkill -f "simulate_trading.sh"
   #     pkill -KILL -f "simulate_trading.sh"
-  # which is the exact pattern scripts/lib/targets.sh and
-  # scripts/stop_local_bots.sh document as having killed the LIVE multidex.ai
-  # fleet — 2026-07-23, 2026-07-28, and again on 2026-08-01. A pattern cannot
-  # tell a local simulator from one driving the subnet: the target used to
-  # live only in IC_ENV, and environment assignments are not part of argv, so
-  # `ps` shows the same string either way. play_start.sh was migrated to the
-  # PID-file architecture; this script was missed.
+  # which is the exact pattern scripts/lib/targets.sh documents as having
+  # killed the LIVE multidex.ai fleet — 2026-07-23, 2026-07-28, and again on
+  # 2026-08-01. A pattern cannot tell a local simulator from one driving the
+  # subnet: the target used to live only in IC_ENV, and environment
+  # assignments are not part of argv, so `ps` shows the same string either
+  # way. play_start.sh was migrated to the PID-file architecture; this script
+  # was missed. (stop_local_bots.sh, the stopper that excluded the live
+  # engine BY NAME, fell to the same class when 16137cf renamed the live
+  # fleet's engine into its "local-only" pattern — retired 2026-08-14, and
+  # test_deploy_hygiene.sh §3 now bans the mechanism tree-wide.)
   #
   # Bots are now started and stopped through the same wrappers play_start.sh
   # uses. mdx_bots_stop kills by ANCESTRY from the PID recorded at launch, so
@@ -491,8 +498,8 @@ fi
 echo ""
 echo -e "${GREEN}UPLANDS cold-start complete in ${ELAPSED}s (plus diagnostics).${NC}"
 echo ""
-echo "  Frontend: http://frontend.local.localhost:8000/"
-echo "  Backend : http://$(icp canister list 2>/dev/null | head -1).localhost:8000/"
+echo "  Frontend: http://frontend.local.localhost:$GW_PORT/"
+echo "  Backend : http://$(icp canister list 2>/dev/null | head -1).localhost:$GW_PORT/"
 echo "  Mode    : $MODE"
 # play mode's bots are launched by play_start.sh, logging to the same file.
 # Both paths now launch the fleet through scripts/start_bots_local.sh, which

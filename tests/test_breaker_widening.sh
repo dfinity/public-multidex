@@ -63,7 +63,7 @@ else nok "baseline should quote ±20bp" "ask=$A0 bid=$B0"; fi
 # ── 1. Pend a +10% jump → both sides widen by ≥ the gap ────────────
 echo ""
 echo "── 1. pending +10% jump → ladder spans the proposed gap immediately ──"
-adm setTestPendingJump "(\"ICP\", opt ($(e8 11.0):nat))" >/dev/null
+adm setTestPendingJump "(\"ICP\", opt ($(e8 11.0):nat), null)" >/dev/null
 adm requoteAmm "(\"$MKT\")" >/dev/null
 A1=$(best asks); B1=$(best bids)
 echo "   widened: ask=${A1:-none} bid=${B1:-none}"
@@ -98,7 +98,7 @@ else nok "pend should clear on a direct set" "ask=${A2:-none} bid=${B2:-none}"; 
 DEP2=$(u depositLp "(\"$MKT\", $(e8 10.0):nat, $(e8 1000.0):nat)")
 if echo "$DEP2" | grep -q "ok"; then ok "deposit mints again after the pend clears"; else nok "deposit should succeed now" "$(echo "$DEP2" | head -1)"; fi
 
-adm setTestPendingJump "(\"ICP\", null)" >/dev/null 2>&1 || true
+adm setTestPendingJump "(\"ICP\", null, null)" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(false)' >/dev/null 2>&1
 echo ""
 echo "═══════════════════════════════════════════════════════"

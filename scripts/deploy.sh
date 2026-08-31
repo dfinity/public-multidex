@@ -83,6 +83,11 @@ cd "$(dirname "$0")/.."
 # other children this script spawns land on the same paths.
 # shellcheck source=scripts/lib/runfiles.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/runfiles.sh"
+# Target table + the shared posture reader (mdx_posture_of). Sourced, not
+# copied: four hand-rolled DEPLOY_MODE greps with four different blind spots
+# is how a commented decoy could beat every deploy gate at once (W1-02).
+# shellcheck source=scripts/lib/targets.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/targets.sh"
 
 CONF="scripts/.cloud-engine.conf"
 # $CE_ENV — which icp ENVIRONMENT remote calls target. The two mainnet stacks
@@ -355,7 +360,8 @@ cloud_seed() {
 
   # 5) Insurance fund — genesis backstop for liquidation shortfalls. Mints
   #    pool ICPUSD and attributes the shares to the engine identity.
-  if icp canister call backend seedInsuranceFund "($(e8 "${INSURANCE_USD:-144000}"):nat)" -e "$CE_ENV" --identity "$CE_IDENTITY" >/dev/null 2>&1; then
+  seed_ins_out="$(icp canister call backend seedInsuranceFund "($(e8 "${INSURANCE_USD:-144000}"):nat)" -e "$CE_ENV" --identity "$CE_IDENTITY" 2>&1)"
+  if mdx_call_ok "$seed_ins_out"; then
     ok "Insurance fund seeded (\$50k ICPUSD, shares → $CE_IDENTITY)"
   else
     warn "Insurance fund seed failed"
@@ -428,6 +434,15 @@ command -v icp >/dev/null 2>&1 || die "icp CLI not found — install it (https:/
 # 2026-07-11 — silently, because a passthrough deploy still succeeds.
 # `cloud` stays accepted as an alias (docs, CI, muscle memory) but everything
 # downstream compares against the canonical name only.
+# W5-22: did a canister call RETURN #ok? A Candid #err is a successful call
+# (exit 0), so gates must parse the variant, not the exit status. Methods
+# audited as exit-status-safe stay as they are: getAmmPools (:216) pipes to
+# its own grep; setGoogleApiKey/setAnthropicApiKey (:633/:646) return () —
+# no #err arm to miss. seedInsuranceFund (:363) converted below too.
+mdx_call_ok() {  # $1 = full call output
+  printf '%s' "$1" | grep -qE 'variant[[:space:]]*\{[[:space:]]*ok'
+}
+
 canonical_target() {
   case "${1:-}" in
     local)        printf 'local' ;;
@@ -485,6 +500,21 @@ fi
 TARGET_GIVEN="$TARGET"
 TARGET="$(canonical_target "$TARGET_GIVEN")" || die "Unknown deploy target '$TARGET_GIVEN' — expected: local | engine | subnet ('cloud' is accepted as an alias for engine). Nothing was deployed."
 
+# ── Candid freshness: never ship a lying interface (W5-20) ───────────
+#
+# mops.toml embeds src/backend/backend.did as the canister's PUBLIC
+# candid:service metadata, and gen-did.sh is its only writer. A deploy after
+# an API edit without gen-did.sh ships the STALE interface: the CLI then
+# silently drops new fields from display and prints raw hash variants for
+# new methods (reproduced live during W1-03), and remote tooling reads an
+# interface that does not match the deployed code — on the subnet, a public
+# artefact of a transparency-doctrine venue telling lies. gen-did.sh is
+# idempotent and cheap relative to any deploy, so just run it; refuse only
+# if it cannot be run (its own failure text says why). The lint-ratchet
+# CANDID section stays the commit-time gate; this is the deploy-time one.
+info "Regenerating candid interface (gen-did.sh) so the deploy ships what the source says"
+bash scripts/gen-did.sh >/dev/null   || die "scripts/gen-did.sh failed — refusing to deploy a stale candid:service interface. Run it by hand to see why."
+
 # ── Posture gate: never ship #dev to a value-bearing target ──────────
 #
 # DEPLOY_MODE lives in src/backend/main.mo and is edited by hand — a local
@@ -502,14 +532,20 @@ TARGET="$(canonical_target "$TARGET_GIVEN")" || die "Unknown deploy target '$TAR
 # Checked against the WORKING TREE, because that is what gets compiled — HEAD
 # being clean is no comfort if the file on disk is not. Local deploys are
 # unaffected: #dev is the point of them.
-posture_of() { grep -oE 'DEPLOY_MODE : DeployMode = #[a-z]+' src/backend/main.mo 2>/dev/null | head -1 | grep -oE '#[a-z]+$'; }
+# Resolution is delegated to mdx_posture_of (lib/targets.sh): the ONE
+# comment-aware reader, which refuses to answer unless exactly one
+# uncommented declaration exists. `|| true`: its refusal (empty output,
+# non-zero) must fall through to the refuse-branch below for the full
+# remediation text — under set -e a bare failed substitution would exit
+# with only the helper's terse diagnostic.
+posture_of() { mdx_posture_of "src/backend/main.mo" || true; }
 case "$TARGET" in
   local) : ;;   # #dev is legitimate here
   *)
     POSTURE="$(posture_of)"
-    if [ "$POSTURE" != "#play" ] && [ "$POSTURE" != "#production" ]; then
+    if [ "$POSTURE" != "play" ] && [ "$POSTURE" != "production" ]; then
       echo ""
-      echo "  ✗ REFUSING to deploy to '$TARGET': src/backend/main.mo is ${POSTURE:-unreadable}, not #play."
+      echo "  ✗ REFUSING to deploy to '$TARGET': src/backend/main.mo posture is '${POSTURE:-unresolved — diagnostic above}', not #play."
       echo ""
       echo "    On a public venue #dev means:"
       echo "      · addTestTokens mints spendable balance to any caller (open faucet)"
@@ -522,7 +558,22 @@ case "$TARGET" in
       echo ""
       exit 1
     fi
-    ok "source posture is $POSTURE (safe for '$TARGET')"
+    ok "source posture is #$POSTURE (safe for '$TARGET')"
+    # W3-09: one-directional Bridge rule on the deploy path (not just in the
+    # test suite): a value-bearing DEX must never ship beside a Bridge whose
+    # posture still answers the unbacked-credit dev hooks.
+    if [ "$POSTURE" = "production" ]; then
+      BRIDGE_POSTURE="$(mdx_posture_of src/bridge/main.mo || true)"
+      if [ "$BRIDGE_POSTURE" != "production" ]; then
+        echo ""
+        echo "  ✗ REFUSING to deploy to '$TARGET': the DEX is #production but src/bridge/main.mo"
+        echo "    resolves to '#${BRIDGE_POSTURE:-unresolved}'. The stub Bridge's unbacked-credit hooks must"
+        echo "    not answer against a value-bearing DEX — deploy the real chain-key Bridge first."
+        echo ""
+        exit 1
+      fi
+      ok "bridge posture is #$BRIDGE_POSTURE (not more permissive than the DEX)"
+    fi
     ;;
 esac
 
@@ -747,10 +798,16 @@ remote_deploy() {
       # reads the ARB's balance, so it must run as CE_IDENTITY (it does).
       arb_bal="$(icp canister call backend getTestBalance "(principal \"$ARB_ID\", \"ICPUSD\")" --query -e "$CE_ENV" --identity "$CE_IDENTITY" 2>/dev/null | grep -oE "[0-9][0-9_]*" | head -1 | tr -d '_')"
       if [ -z "${arb_bal:-}" ] || [ "$arb_bal" = "0" ]; then
-        if icp canister call backend fundArbitrageur "($(e8 "${ARB_USD:-1281250}"):nat)" -e "$CE_ENV" --identity "$CE_IDENTITY" >/dev/null 2>&1; then
+        # W5-22: a Candid #err return is a SUCCESSFUL call (the CLI exits 0),
+        # so testing the exit status printed a FALSE "ok arb funded" on any
+        # posture where fundArbitrageur refuses (#production does, by
+        # design). Test the returned VARIANT via mdx_call_ok — never the
+        # exit status — for any method with an #err arm.
+        fund_out="$(icp canister call backend fundArbitrageur "($(e8 "${ARB_USD:-1281250}"):nat)" -e "$CE_ENV" --identity "$CE_IDENTITY" 2>&1)"
+        if mdx_call_ok "$fund_out"; then
           ok "arb funded: \$${ARB_USD:-1281250} ICPUSD working capital"
         else
-          warn "fundArbitrageur failed — fund it manually before enabling"
+          warn "fundArbitrageur did NOT fund — fund it manually before enabling: $(printf '%s' "$fund_out" | tr -d '\n' | head -c 160)"
         fi
       else
         ok "arb already funded ($(awk -v b="$arb_bal" 'BEGIN{printf "%.0f", b/1e8}') ICPUSD) — skipping fund"
@@ -807,17 +864,18 @@ if [ "$TARGET" = "plain" ]; then
   # (The old `-e ic` pattern matched NOTHING after the engine/subnet split, so
   # this check misfired on every remote plain deploy.)
   if ! printf '%s ' ${PASS[@]+"${PASS[@]}"} | grep -qE '(-e|--environment) *(subnet|engine)\b'; then
-    # `|| true`: with no replica running lsof exits non-zero, and under
-    # set -e the bare assignment would kill the script SILENTLY.
-    GATEWAY_PID=$(lsof -nP -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -1 || true)
-    for pid in $(pgrep -f "pocket-ic --ttl" 2>/dev/null); do
-      if [ "$pid" != "${GATEWAY_PID:-}" ]; then
-        warn "zombie pocket-ic master (pid $pid) — the local network is half-alive:"
-        warn "outcalls/inter-canister calls will fail even though deploys succeed."
-        warn "Run 'bash scripts/cold_start.sh' to restart the network cleanly first."
-        yesno "Deploy anyway onto the degraded network?" || die "Aborted — clean the network first."
-        break
-      fi
+    # Detection is mdx_stray_masters (lib/targets.sh, W1-06): repo-scoped by
+    # process cwd AND owner-scoped by the gateway `icp network status`
+    # records for this checkout. The old inline version compared every
+    # pocket-ic on the machine against the :8000 listener — no cwd filter at
+    # all — so with other projects' replicas running (a normal machine
+    # state) EVERY local deploy tripped this warning on a foreign master.
+    for pid in $(mdx_stray_masters || true); do
+      warn "zombie pocket-ic master (pid $pid) — the local network is half-alive:"
+      warn "outcalls/inter-canister calls will fail even though deploys succeed."
+      warn "Run 'bash scripts/cold_start.sh' to restart the network cleanly first."
+      yesno "Deploy anyway onto the degraded network?" || die "Aborted — clean the network first."
+      break
     done
   fi
   export VITE_CLOUD_ENGINE=false
@@ -911,6 +969,20 @@ if [ "$TARGET" = "subnet" ]; then
   # Anti-sybil canister env vars (runbook §3b) — re-asserted on every deploy
   # from the conf's remembered production origins; see apply_anti_sybil_settings.
   apply_anti_sybil_settings
+  # W6-09: read the env var BACK and diff it against II_PINNED_ORIGINS.
+  # apply_anti_sybil_settings warns-and-continues when its update fails, and
+  # a warn in a deploy scroll is how sign-in stayed down (2026-07-11).
+  bash "$(cd "$(dirname "$0")" && pwd)/check_origins.sh" --env "$CE_ENV" --identity "$CE_IDENTITY" \
+    || die "deployed frontend_origins do not match II_PINNED_ORIGINS (main.js) — Verify-with-Google fails closed; re-assert per runbook §3b"
+  # W4-20: verify the DEPLOYED asset canister actually serves the security
+  # headers the config promises — configuration is not a response header.
+  for origin in $(printf '%s' "${SN_FRONTEND_ORIGINS:-}" | tr ',' ' '); do
+    case "$origin" in
+      https://*) bash "$(cd "$(dirname "$0")" && pwd)/check_headers.sh" "$origin" \
+                   || die "security headers missing on $origin — the shipped CSP is not what the config promised" ;;
+    esac
+    break   # the first https origin is the canonical public one
+  done
 
   maybe_seed
 
@@ -983,6 +1055,22 @@ remote_deploy
 # 3b) Re-assert the production frontend_origins (a reinstall re-stamps the
 #     yaml's local-dev list — see apply_anti_sybil_settings).
 apply_anti_sybil_settings
+# W6-09: read-back gate, same as the subnet flow — but the engine's origins
+# live only in its conf (main.js pins the subnet's), so diff against those;
+# skip when none are recorded (apply_anti_sybil_settings already warned).
+if [ -n "${CE_FRONTEND_ORIGINS:-}" ]; then
+  bash "$(cd "$(dirname "$0")" && pwd)/check_origins.sh" --env "$CE_ENV" --identity "$CE_IDENTITY" --expect "$CE_FRONTEND_ORIGINS" \
+    || die "deployed frontend_origins do not match the conf's recorded origins — Verify-with-Google fails closed; re-assert per runbook §3b"
+fi
+# W4-20: same header verification as the subnet flow, when a public origin
+# is recorded for the engine.
+for origin in $(printf '%s' "${CE_FRONTEND_ORIGINS:-}" | tr ',' ' '); do
+  case "$origin" in
+    https://*) bash "$(cd "$(dirname "$0")" && pwd)/check_headers.sh" "$origin" \
+                 || die "security headers missing on $origin — the shipped CSP is not what the config promised" ;;
+  esac
+  break
+done
 
 # 4) Seed (default YES, idempotent — see maybe_seed).
 maybe_seed

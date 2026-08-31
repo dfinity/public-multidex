@@ -188,11 +188,23 @@ NCOLS=$(echo "$HH" | grep -oE 'computedNs = [0-9_]+' | wc -l | tr -d ' ')
 if [ "$NCOLS" -ge 1 ]; then _ok "§8 history holds $NCOLS column(s)"
 else _fail "§8 history empty — tick not appending? $(echo "$HH" | head -c 160)"; fi
 
-# newest column == the cached latest snapshot (same computedNs)
+# newest column == the cached latest snapshot (same computedNs). The tick can
+# legitimately recompute the snapshot between the two reads, so a mismatch is
+# retried with a fresh PAIR of reads — but a mismatch that survives the
+# retries is a real ring/snapshot desync and FAILS (#51.9: this used to _ok
+# both branches, so the equality could never go red).
 LASTNS=$(echo "$HH" | grep -oE 'computedNs = [0-9_]+' | tail -1 | grep -oE '[0-9_]+$' | tr -d '_')
 NOWNS=$(extract_nat "computedNs" "$(call getMarginHeatmap "(\"$MKT\")" --query)")
+for _try in 1 2 3; do
+  [ "$LASTNS" = "$NOWNS" ] && break
+  sleep 2
+  HH=$(call getMarginHeatmapHistory "(\"$MKT\", 0)" --query)
+  NCOLS=$(echo "$HH" | grep -oE 'computedNs = [0-9_]+' | wc -l | tr -d ' ')
+  LASTNS=$(echo "$HH" | grep -oE 'computedNs = [0-9_]+' | tail -1 | grep -oE '[0-9_]+$' | tr -d '_')
+  NOWNS=$(extract_nat "computedNs" "$(call getMarginHeatmap "(\"$MKT\")" --query)")
+done
 if [ "$LASTNS" = "$NOWNS" ]; then _ok "§8 newest column matches the published snapshot"
-else _ok "§8 newest column $LASTNS trails snapshot $NOWNS (tick raced the two reads — benign)"; fi
+else _fail "§8 newest column $LASTNS != snapshot $NOWNS after retries — the ring is not receiving the published snapshot"; fi
 
 # ordering: computedNs strictly increasing
 ORDERED=$(echo "$HH" | grep -oE 'computedNs = [0-9_]+' | grep -oE '[0-9_]+$' | tr -d '_' \

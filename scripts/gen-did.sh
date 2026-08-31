@@ -14,7 +14,11 @@
 # staged matching, integer money @1e8, poll-for-fill, the dead-man switch) call
 # the getApiDoc() query on the canister — the header below points there too.
 set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+# Repo root via git when available; a `git archive` extraction (the voter's
+# reproducible-build path, README "Getting started") has no .git — fall back
+# to this script's parent so the documented steps run noise-free there too.
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
 
 # Extraction goes through scripts/lib/candid.sh, the SAME helper
 # lint-ratchet.sh verifies this file with. That shared path is the point: a
@@ -51,3 +55,18 @@ mkdir -p candid
 } > candid/backend.did
 
 echo "gen-did: wrote candid/backend.did ($(wc -l < candid/backend.did | tr -d ' ') lines)"
+
+# The four sibling canisters' .did intermediates (task 1786991553): every
+# [canisters.*] block in mops.toml now declares candid= — deliberately, so
+# `mops generate candid` never rewrites mops.toml (the rewrite strips every
+# comment; hygiene §7e pins both halves) — and `mops build` treats each
+# declared path as a compat-check INPUT a build fails without. Emitting them
+# here keeps a fresh worktree's first deploy self-healing (deploy.sh runs
+# this script unconditionally before every build — W5-20). Gitignored
+# intermediates, no published copies; the backend's published contract above
+# stays the only committed interface.
+for C in bridge arb xrc-mock fuel-mock; do
+  mops generate candid "$C" >/dev/null 2>&1 \
+    || { echo "gen-did: could not generate the $C intermediate" >&2; exit 1; }
+done
+echo "gen-did: refreshed the bridge/arb/xrc-mock/fuel-mock .did intermediates"

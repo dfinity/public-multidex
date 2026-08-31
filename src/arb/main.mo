@@ -35,6 +35,8 @@ import Time "mo:core/Time";
 import Nat "mo:core/Nat";
 import Int "mo:core/Int";
 import Iter "mo:core/Iter";
+import Map "mo:core/Map";
+import Option "mo:core/Option";
 import Runtime "mo:core/Runtime";
 import Error "mo:core/Error";
 import Cycles "mo:core/Cycles";
@@ -50,9 +52,22 @@ persistent actor Arb {
   // Scaled with the vault: a $5.125M AMM is 5.125x the old $1M, so a 50bps
   // deviation is 5.125x the value to absorb. Holding the clip at $2k would
   // leave the arb permanently behind the mark on a production-scale venue.
-  transient let TRADE_CAP_USD : Nat = 1_025_000_000_000; // $10.25k per market per tick
+  // W4-08: MUST NOT exceed the DEX's ARB_MAX_SWAP_USD ($5k, main.mo) — the
+  // flatten step goes through extMarketSwap, which refuses anything above
+  // that cap, while the cheap-side buy goes through the ordinary limit path
+  // with no such cap. At the old $10.25k one fully-filled buy left the arb
+  // holding inventory its only exit refused, retrying every 5s until the
+  // mark happened to decline. test_deploy_hygiene §6h pins arb ≤ DEX.
+  transient let TRADE_CAP_USD : Nat = 500_000_000_000; // $5k per market per tick (= DEX per-call cap)
   transient let DUST_USD      : Nat = 500_000_000;     // ignore base positions under $5
-  transient let ORDER_TTL_SEC : Nat = 8;    // venue remnants self-expire
+  // W4-25: STRICTLY under TICK_NS (5s). At the old 8s a still-live hedge
+  // straddled the next tick's flatten: resting spot orders hold no
+  // reservation on the DEX, so the flatten exported the very base backing
+  // the live sell — the unfilled-hedge case became the NORMAL case, and a
+  // late fill hit an unfunded maker. At 4s the remnant is provably dead
+  // before the next flatten reads availBase. test_deploy_hygiene §6h′ pins
+  // TTL < tick.
+  transient let ORDER_TTL_SEC : Nat = 4;    // venue remnants self-expire before the next tick
 
   // ── Wiring & state ──────────────────────────────────────────────────
   var dexPrincipal : ?Principal = null;
@@ -97,6 +112,71 @@ persistent actor Arb {
       Iter.take(actions.vals(), keep)));
   };
 
+  // ── W4-25: per-market rich-side backoff ─────────────────────────────
+  // Every unwound import is a bounded round-trip loss (the DEX refunds the
+  // BUDGET on a zero-fill round-trip, but the ~20bps haircut is gone), and a
+  // spoofer can force one per tick at near-zero cost. Backing the RICH side
+  // of the affected market off geometrically bounds the sustained bleed to
+  // a few cycles per hold-cap (≈$100/hour across 4 markets at the 21-min
+  // cap) without touching spoof-free markets, the cheap side, or the
+  // flatten leg. The streak clears when a cycle's hedge mostly fills (the
+  // spoofer paid the tax — resets are PAID, not free) and escalates while
+  // round-trips repeat. Transient: an upgrade forgives the hold — the
+  // conservative direction for availability, and the streak rebuilds in one
+  // spoofed cycle anyway.
+  transient let BACKOFF_BASE_NS : Int = 10_000_000_000;   // 10s; ×2 per streak
+  transient let BACKOFF_MAX_EXP : Nat = 7;                // cap 10s·2⁷ = 1280s ≈ 21 min
+  transient let IMPORT_MEMO_NS  : Int = 25_000_000_000;   // covers the flatten a few ticks late
+  transient var _richStreak    : Map.Map<Text, Nat> = Map.empty();
+  transient var _richHoldUntil : Map.Map<Text, Int> = Map.empty();
+  transient var _lastImport    : Map.Map<Text, (Nat, Int)> = Map.empty();  // token → (qty, ns)
+
+  func richHeld(marketId : Text, now : Int) : Bool {
+    switch (Map.get(_richHoldUntil, Text.compare, marketId)) {
+      case (?h) { now < h };
+      case null { false };
+    };
+  };
+  func richBackoff(marketId : Text, now : Int) {
+    let s = Option.get(Map.get(_richStreak, Text.compare, marketId), 0) + 1;
+    Map.add(_richStreak, Text.compare, marketId, s);
+    let mult : Int = 2 ** Nat.min(s - 1 : Nat, BACKOFF_MAX_EXP);
+    let holdNs = BACKOFF_BASE_NS * mult;
+    Map.add(_richHoldUntil, Text.compare, marketId, now + holdNs);
+    note("rich backoff (" # marketId # "): streak " # Nat.toText(s)
+      # ", holding " # Int.toText(holdNs / 1_000_000_000) # "s");
+  };
+  func richClear(marketId : Text) {
+    ignore Map.delete(_richStreak, Text.compare, marketId);
+    ignore Map.delete(_richHoldUntil, Text.compare, marketId);
+  };
+  // Flatten-side verdict on the last import: did its hedge trade?
+  //   #roundTrip — >50% of the imported base is being exported back: the
+  //                cycle was spoof-dominated (bump the backoff).
+  //   #filled    — ≤50% remains: the hedge mostly filled; whoever pushed the
+  //                price paid the tax (clear the streak).
+  //   #none      — no recent import to judge.
+  func importVerdict(token : Text, availBase : Nat, now : Int) : { #roundTrip; #filled; #none } {
+    switch (Map.get(_lastImport, Text.compare, token)) {
+      case (?(qty, ns)) {
+        if (now - ns > IMPORT_MEMO_NS) { ignore Map.delete(_lastImport, Text.compare, token); return #none };
+        ignore Map.delete(_lastImport, Text.compare, token);   // single verdict per import
+        if (availBase * 2 > qty) { #roundTrip } else { #filled };
+      };
+      case null { #none };
+    };
+  };
+
+  // Break-glass: un-stick a market a false-positive backoff parked (ops),
+  // and the deterministic reset the integration suite runs between cases.
+  public shared (msg) func resetBackoff() : async () {
+    requireController(msg.caller);
+    Map.clear(_richStreak);
+    Map.clear(_richHoldUntil);
+    Map.clear(_lastImport);
+    note("backoff state reset");
+  };
+
   // Narrow views of the DEX's types: Candid decodes a wider record into these
   // (record subtyping), so the backend can evolve without breaking us.
   type PoolView = {
@@ -111,10 +191,15 @@ persistent actor Arb {
   type Dex = actor {
     getAmmPools : query () -> async [PoolView];
     getOrderBookDepth : query (Text, ?Nat) -> async Depth;
+    // W4-24: funded takeable depth — raw book depth is free to fake (resting
+    // orders hold no reservation), and sizing the import off it was the
+    // enabler for the R5(b) spoof. Sizes come from THIS now; the raw top-of-
+    // book price remains the deviation SIGNAL (genuine information).
+    getTakeableDepth : query (Text, { #buy; #sell }, Nat) -> async Nat;
     getBalance : query (Text) -> async Nat;
     getMyAvailableBalance : query (Text) -> async Nat;
     placeLimitOrderExp : (Text, { #buy; #sell }, Nat, Nat, ?Nat) -> async { #ok : {}; #err : Text };
-    extMarketSwap : (Text, { #importBase; #exportBase }, Nat) -> async { #ok : Nat; #err : Text };
+    extMarketSwap : (Text, { #importBase; #exportBase }, Nat, ?Nat) -> async { #ok : Nat; #err : Text };
   };
 
   func requireController(caller : Principal) {
@@ -184,12 +269,15 @@ persistent actor Arb {
   func runTick() : async Text {
     let dexP = switch (effectiveDex<system>()) { case (?p) { p }; case null { return "unwired" } };
     let dex : Dex = actor (Principal.toText(dexP));
-    let now = Time.now();
     var summary = "";
     let pools = await dex.getAmmPools();
     for (pool in pools.vals()) {
       if (pool.enabled and pool.refPrice > 0) {
         let mark = pool.refPrice;
+        // W4-17: clock read PER MARKET — one capture before the loop made the
+        // staleness guard loosest exactly where the data was oldest (each
+        // earlier market's awaits age the later markets' test).
+        let now = Time.now();
         let ageNs = now - pool.refPriceUpdatedNs;
         if (pool.refPriceUpdatedNs > 0 and ageNs <= FRESH_MAX_NS) {
           let token = pool.baseToken;
@@ -199,11 +287,22 @@ persistent actor Arb {
           // Realizing through the external market is where cheap-side profit
           // lands; leftovers cost the haircut, bounded by the per-tick cap.
           let availBase = await dex.getMyAvailableBalance(token);
+          // W4-25: judge the previous rich cycle by what the flatten sees —
+          // base mostly gone means the hedge filled (clear the backoff
+          // streak); base mostly back means a zero-fill round-trip (the
+          // cancel-after-rest spoof — bump it, after the export below).
+          let verdict = importVerdict(token, availBase, now);
+          if (verdict == #filled) { richClear(pool.marketId) };
           if (Fixed.mul(availBase, mark, false) > DUST_USD) {
             let capBase = Fixed.mulDiv(TRADE_CAP_USD, Fixed.SCALE, mark, false);
             let q = Nat.min(availBase, capBase);
-            switch (await dex.extMarketSwap(token, #exportBase, q)) {
-              case (#ok(proceeds)) { note("export " # Nat.toText(q) # " " # token # " → " # Nat.toText(proceeds) # " USD"); summary #= token # ":export "; };
+            // Bound: refuse if the DEX's mark fell >50bps below the one this
+            // sizing used (W4-17 — the mark is stale across the await).
+            switch (await dex.extMarketSwap(token, #exportBase, q, ?bpsDn(mark, 50))) {
+              case (#ok(proceeds)) {
+                note("export " # Nat.toText(q) # " " # token # " → " # Nat.toText(proceeds) # " USD"); summary #= token # ":export ";
+                if (verdict == #roundTrip) { richBackoff(pool.marketId, now) };
+              };
               case (#err(e)) { note("export " # token # " refused: " # e) };
             };
           };
@@ -219,16 +318,59 @@ persistent actor Arb {
             // pinned at mark + EDGE — beyond the mark (so it can never touch
             // the AMM's bid at mark − spread) but under the rich bids (so it
             // sweeps everything above it). Remnant self-expires.
-            let q = Nat.min(depth.bids[0].quantity, capBase);
-            if (q > 0) {
-              switch (await dex.extMarketSwap(token, #importBase, q)) {
-                case (#ok(_)) {
-                  switch (await dex.placeLimitOrderExp(pool.marketId, #sell, bpsUp(mark, EDGE_BPS), q, ?ORDER_TTL_SEC)) {
-                    case (#ok(_)) { note("rich: imported+selling " # Nat.toText(q) # " " # token # " (bid " # Nat.toText(depth.bids[0].price) # " > mark " # Nat.toText(mark) # ")"); summary #= token # ":rich "; };
-                    case (#err(e)) { note("rich sell refused (" # token # "): " # e) };
+            // W4-25: sit the backoff window out instead of feeding a spoofer
+            // another funded cycle (see the backoff block above). The flatten
+            // and cheap legs stay live; only this market's rich entry waits.
+            if (not richHeld(pool.marketId, now)) {
+              let sellPx = bpsUp(mark, EDGE_BPS);
+              let takeable = await dex.getTakeableDepth(pool.marketId, #sell, sellPx);
+              let q = Nat.min(takeable, capBase);
+              if (q > 0) {
+                // Bound: the import must not price above the mark this decision
+                // read (+50bps tolerance) — the DEX enforces it against its
+                // CURRENT mark (W4-17 items 3/4).
+                switch (await dex.extMarketSwap(token, #importBase, q, ?bpsUp(mark, 50))) {
+                  case (#ok(_)) {
+                    Map.add(_lastImport, Text.compare, token, (q, now));
+                    // W4-25 item 4: the import was justified by depth read
+                    // BEFORE it committed; a spoofer cancels in that gap.
+                    // Re-read — if the justifying depth is gone, export
+                    // straight back (the DEX refunds a zero-fill round-trip's
+                    // budget charge) instead of resting a hedge that cannot
+                    // fill and carrying the exposure for a tick.
+                    let takeable2 = await dex.getTakeableDepth(pool.marketId, #sell, sellPx);
+                    if (takeable2 == 0) {
+                      note("rich: takeable depth vanished after the import (" # token # ") — unwinding the import in-tick");
+                      switch (await dex.extMarketSwap(token, #exportBase, q, ?bpsDn(mark, 50))) {
+                        case (#ok(p2)) { note("unwound " # Nat.toText(q) # " " # token # " → " # Nat.toText(p2) # " USD") };
+                        case (#err(e2)) { note("UNWIND REFUSED (" # token # "): " # e2 # " — flatten leg picks it up next tick") };
+                      };
+                      ignore Map.delete(_lastImport, Text.compare, token);   // verdict rendered here
+                      richBackoff(pool.marketId, now);
+                      summary #= token # ":spoofed ";
+                    } else {
+                      switch (await dex.placeLimitOrderExp(pool.marketId, #sell, sellPx, q, ?ORDER_TTL_SEC)) {
+                        case (#ok(_)) { note("rich: imported+selling " # Nat.toText(q) # " " # token # " (bid " # Nat.toText(depth.bids[0].price) # " > mark " # Nat.toText(mark) # ")"); summary #= token # ":rich "; };
+                        case (#err(e)) {
+                          // W4-17 item 2: the import committed value; a refused
+                          // hedge used to fall through with NO compensating
+                          // action, leaving the position unhedged until (at
+                          // best) next tick's flatten. UNWIND: export straight
+                          // back. Costs the round-trip haircut — bounded, logged
+                          // — instead of open exposure on a moving mark.
+                          note("rich sell refused (" # token # "): " # e # " — unwinding the import");
+                          switch (await dex.extMarketSwap(token, #exportBase, q, ?bpsDn(mark, 50))) {
+                            case (#ok(p2)) { note("unwound " # Nat.toText(q) # " " # token # " → " # Nat.toText(p2) # " USD") };
+                            case (#err(e2)) { note("UNWIND REFUSED (" # token # "): " # e2 # " — flatten leg picks it up next tick") };
+                          };
+                          ignore Map.delete(_lastImport, Text.compare, token);   // verdict rendered here
+                          richBackoff(pool.marketId, now);
+                        };
+                      };
+                    };
                   };
+                  case (#err(e)) { note("import refused (" # token # "): " # e) };
                 };
-                case (#err(e)) { note("import refused (" # token # "): " # e) };
               };
             };
           } else if (depth.asks.size() > 0 and depth.asks[0].price <= cheapCeil) {
@@ -239,7 +381,8 @@ persistent actor Arb {
             let limitPx = bpsDn(mark, EDGE_BPS);
             // Reserve headroom: cost rounds up + taker fee ≤ 10 bp.
             let maxByCash = Fixed.mulDiv(bpsDn(affordable, 20), Fixed.SCALE, limitPx, false);
-            let q = Nat.min(Nat.min(depth.asks[0].quantity, capBase), maxByCash);
+            let takeable = await dex.getTakeableDepth(pool.marketId, #buy, limitPx);
+            let q = Nat.min(Nat.min(takeable, capBase), maxByCash);
             if (q > 0) {
               switch (await dex.placeLimitOrderExp(pool.marketId, #buy, limitPx, q, ?ORDER_TTL_SEC)) {
                 case (#ok(_)) { note("cheap: buying " # Nat.toText(q) # " " # token # " (ask " # Nat.toText(depth.asks[0].price) # " < mark " # Nat.toText(mark) # ")"); summary #= token # ":cheap "; };

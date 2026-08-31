@@ -284,7 +284,11 @@ persistent actor Bridge {
       let l = switch (Map.get(ledgers, Text.compare, key(msg.caller, a.asset))) {
         case (?x) { x }; case null { { var confirmed = 0; var pending = 0; var claimed = 0 } };
       };
-      let claimable = if (l.confirmed > l.claimed) { l.confirmed - l.claimed } else { 0 };
+      // The guard proves confirmed > claimed in this branch, so the
+      // subtraction cannot underflow — annotated `: Nat` rather than clamped
+      // (W5-18): a subOrZero here would silently absorb a future break of
+      // the confirmed ≥ claimed accounting invariant, and we want that loud.
+      let claimable = if (l.confirmed > l.claimed) { ((l.confirmed - l.claimed) : Nat) } else { 0 };
       { asset = a.asset; chain = a.chain; address = a.address;
         confirmed = l.confirmed; pending = l.pending; claimed = l.claimed; claimable };
     }));
@@ -315,7 +319,9 @@ persistent actor Bridge {
       case (?x) { x };
       case null { return #err("Nothing to claim for " # asset) };
     };
-    let claimable = if (l.confirmed > l.claimed) { l.confirmed - l.claimed } else { 0 };
+    // Guard-proven non-negative; annotated, not clamped — see the twin site
+    // in getMyDeposits (W5-18).
+    let claimable = if (l.confirmed > l.claimed) { ((l.confirmed - l.claimed) : Nat) } else { 0 };
     if (claimable == 0) { return #err("Nothing to claim for " # asset) };
 
     Map.add(claiming, Text.compare, k, true);
@@ -362,18 +368,45 @@ persistent actor Bridge {
         if (Map.get(admitting, Text.compare, k) != null) { return #err("A deposit for " # asset # " is already in progress") };
         let admitted = Option.get(Map.get(admittedUnits, Text.compare, k), 0);
         Map.add(admitting, Text.compare, k, true);
+        // WRITE-AHEAD (W3-04, #27.2): commit the counter AND the pending
+        // credit BEFORE the yield, and roll both back only on the DEX's
+        // explicit #err. Behind-the-yield writes were lost when an upgrade
+        // landed in the await window (the routine act of deploying):
+        // postupgrade cleared `admitting`, the user retried, the retry
+        // computed a DIFFERENT seq, and the DEX's replay gate — keyed on
+        // seq — debited the lifetime allowance a second time for units
+        // already admitted once. Write-ahead is safe on the ADMIT side
+        // specifically because the reserve is amount-based: a SKIPPED seq
+        // range costs nothing, while a repeated one double-reserves. On an
+        // ambiguous transport failure both writes are KEPT (the DEX may
+        // have committed; if it did not, the skipped range costs nothing
+        // and the deposit shows as pending without an allowance charge —
+        // the user-favorable direction, not reachable on demand from
+        // outside). Do NOT mirror any of this onto claim(): its counter is
+        // a slice base (`seq − prevSeq`), where advancing early loses funds.
+        Map.add(admittedUnits, Text.compare, k, admitted + amount);
+        let l = ledgerOf(msg.caller, asset);
+        l.pending += amount;
         let dex : DexActor = actor (Principal.toText(dexP));
         try {
           switch (await dex.playDepositReserve(msg.caller, asset, amount, admitted + amount)) {
-            case (#err(e)) { ignore Map.delete(admitting, Text.compare, k); return #err(e) };
+            case (#err(e)) {
+              // Explicit refusal: the DEX committed nothing — roll BOTH back.
+              // (devConfirmDeposits skips assets mid-admission, so the
+              // written-ahead pending cannot have been confirmed under us.)
+              Map.add(admittedUnits, Text.compare, k, admitted);
+              l.pending := if (l.pending >= amount) { l.pending - amount } else { 0 };
+              ignore Map.delete(admitting, Text.compare, k);
+              return #err(e);
+            };
             case (#ok) {};
           };
         } catch (e) {
           ignore Map.delete(admitting, Text.compare, k);
-          return #err("Deposit admission check failed: " # Error.message(e));
+          return #err("Deposit admission transport failed (state kept — the deposit shows as pending; if the DEX never saw it, the skipped range costs nothing): " # Error.message(e));
         };
         ignore Map.delete(admitting, Text.compare, k);
-        Map.add(admittedUnits, Text.compare, k, admitted + amount);
+        return #ok;
       };
       case null {};   // unwired stub → pure dev sandbox, no allowance to enforce
     };
@@ -390,9 +423,37 @@ persistent actor Bridge {
       Runtime.trap("devConfirmDeposits is disabled on #production: this Bridge is a STUB with no custody behind it. Deploy the real chain-key Bridge before flipping the posture.");
     };
     for (asset in ASSETS.vals()) {
+      // Skip an asset whose admission is mid-flight (W3-04): its pending was
+      // written AHEAD of the DEX's verdict, and confirming it here would
+      // strand the explicit-#err rollback (the refused amount would already
+      // have moved to `confirmed`). The next confirm call picks it up.
+      if (Map.get(admitting, Text.compare, key(msg.caller, asset)) != null) { continue };
       let l = ledgerOf(msg.caller, asset);
       if (l.pending > 0) { l.confirmed += l.pending; l.pending := 0 };
     };
+  };
+
+  // W4-12: the DEX-driven half of the season boundary. A reset wipes the
+  // DEX's reservation ledger; without this hook the Bridge kept every
+  // unclaimed claimable and its admission counters, and the surviving claim
+  // took a second allowance debit on the other side. Caller must be the
+  // wired DEX (or a controller, for ops repair). Refuses while any claim or
+  // admission is mid-flight — the reset aborts rather than wiping under an
+  // in-flight continuation.
+  public shared (msg) func adminSeasonWipe() : async { #ok; #err : Text } {
+    let dexOk = switch (effectiveDex<system>()) {
+      case (?p) { Principal.equal(msg.caller, p) };
+      case null { false };
+    };
+    if (not dexOk and not Principal.isController(msg.caller)) {
+      return #err("adminSeasonWipe: caller is neither the wired DEX nor a controller");
+    };
+    if (Map.size(claiming) > 0 or Map.size(admitting) > 0) {
+      return #err("adminSeasonWipe: a claim or admission is in flight — retry when it settles");
+    };
+    Map.clear(ledgers);
+    Map.clear(admittedUnits);
+    #ok;
   };
 
   // ── Admission control ───────────────────────────────────────

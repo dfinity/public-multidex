@@ -68,6 +68,27 @@ q={'start':'market','limit':1,'where':{'icontains':{'field':'id','value':'x'*410
 print(json.dumps(q))")
 assert_contains "§1 just-over-cap rejected" "$(oql "$OVER")" "query too large"
 
+# ── §1b the cap is counted in UTF-8 BYTES, not chars (GHSA-c6g7 / #52.5) ──
+# `Text.size` counts Unicode scalars; UTF-8 spends up to 4 bytes per scalar,
+# so a char-counted guard admits up to 4x the named byte ceiling — and mo:json
+# lexes the ENCODED input, so bytes are the unit the DoS bound must use.
+# '€' (U+20AC) is 1 char but 3 UTF-8 bytes: 1600 of them ≈ 4.9 KB in ~1.7 K
+# chars — a char-counted guard passed this query straight to the parser.
+MB_OVER=$(python3 -c "
+import json, sys
+q={'start':'market','limit':1,'where':{'icontains':{'field':'id','value':'€'*1600}}}
+sys.stdout.buffer.write(json.dumps(q, ensure_ascii=False).encode('utf-8'))")
+R=$(oql "$MB_OVER")
+assert_contains "§1b multibyte query over the BYTE cap rejected (char count would pass)" "$R" "query too large"
+assert_contains "§1b ...and the refusal reports bytes, not chars" "$R" "bytes"
+# The same shape under the byte cap is still served — multibyte text is
+# measured, not banned.
+MB_UNDER=$(python3 -c "
+import json, sys
+q={'start':'market','limit':1,'where':{'icontains':{'field':'id','value':'€'*1000}}}
+sys.stdout.buffer.write(json.dumps(q, ensure_ascii=False).encode('utf-8'))")
+assert_contains "§1b multibyte query under the byte cap still served" "$(oql "$MB_UNDER")" "rows = vec"
+
 # ── §2 lone surrogates are rejected, not trapped ──
 for esc in 'ud800' 'udbff' 'udc00' 'udfff'; do
   R=$(oql "{\"start\":\"market\",\"limit\":1,\"where\":{\"eq\":{\"field\":\"id\",\"value\":\"\\$esc\"}}}")

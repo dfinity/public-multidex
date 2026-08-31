@@ -91,7 +91,7 @@ adm fundArbitrageur "($(e8 3000) : nat)" >/dev/null 2>&1
 IMP=""
 for attempt in 1 2 3 4 5; do
   fresh
-  IMP=$(icp canister call --identity rp_arb backend extMarketSwap "(\"ICP\", variant { importBase }, $(e8 100) : nat)" 2>&1)
+  IMP=$(icp canister call --identity rp_arb backend extMarketSwap "(\"ICP\", variant { importBase }, $(e8 100) : nat, null)" 2>&1)
   echo "$IMP" | grep -q "ok = " && break
   sleep 1
 done

@@ -15,6 +15,7 @@
 import Principal "mo:core/Principal";
 import Text "mo:core/Text";
 import Map "mo:core/Map";
+import Runtime "mo:core/Runtime";
 import Types "../lib/Types";
 import Accounts "../lib/Accounts";
 
@@ -38,7 +39,7 @@ mixin (
     token  : Types.TokenId,
     amount : Nat,
   ) : async () {
-    if (isProduction) { return };
+    if (isProduction) { Runtime.trap("setTestBalance is not available on #production") };
     requireController(msg.caller);
     let old = Accounts.getBalance(accounts, user, token);
     Accounts.setBalance(accounts, user, token, amount);
@@ -52,7 +53,7 @@ mixin (
       balances  : [{ token : Types.TokenId; amount : Nat }];
     }]
   ) : async Nat {
-    if (isProduction) { return 0 };
+    if (isProduction) { Runtime.trap("bulkSetTestBalances is not available on #production") };
     requireController(msg.caller);
     var n : Nat = 0;
     for (entry in entries.vals()) {
@@ -82,7 +83,10 @@ mixin (
   // principals, so they must now call as the controller identity — both were
   // updated alongside this change.
   public query (msg) func getTestBalance(user : Principal, token : Types.TokenId) : async Nat {
-    if (isProduction) { return 0 };
+    // Loud on the POSTURE (the gate class the rule covers); the caller-auth
+    // return-0 below stays — that silence is a deliberate anti-oracle choice
+    // (see main.mo's getTestBalance note), not a posture gate.
+    if (isProduction) { Runtime.trap("getTestBalance is not available on #production") };
     if (not (Principal.equal(msg.caller, user) or Principal.isController(msg.caller))) { return 0 };
     Accounts.getBalance(accounts, user, token);
   };

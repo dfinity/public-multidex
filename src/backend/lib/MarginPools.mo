@@ -18,6 +18,7 @@ import Nat8 "mo:core/Nat8";
 import Array "mo:core/Array";
 import Types "Types";
 import Fixed "Fixed";
+import SafeMath "SafeMath";
 
 module {
 
@@ -121,22 +122,59 @@ module {
     Nat.min(Fixed.SCALE, Fixed.mulDiv(maintenance, debtUsd, collateralUsd, true))
   };
 
-  // Liquidation price for a LONG: P = (maint·debt − otherColl) / (size·ltv).
-  // Returns null when cash margin alone already covers the debt.
-  public func liqPriceLong(otherCollUsd : Nat, debtUsd : Nat, size : Int, ltv : Nat, maintenance : Nat) : ?Nat {
-    if (size <= 0 or ltv == 0) { return null };
-    let maintDebt = Fixed.mul(maintenance, debtUsd, true);
-    if (maintDebt <= otherCollUsd) { return null };
-    let num : Nat = maintDebt - otherCollUsd;
-    let sizeLtv = Fixed.mul(Int.abs(size), ltv, false);
-    if (sizeLtv == 0) { return null };
-    ?Fixed.div(num, sizeLtv, false)
-  };
-
-  // Liquidation price for a SHORT: P = otherColl / (maint·|size|).
-  public func liqPriceShort(otherCollUsd : Nat, sizeAbs : Nat, maintenance : Nat) : ?Nat {
-    if (sizeAbs == 0 or maintenance == 0) { return null };
-    ?Fixed.div(otherCollUsd, Fixed.mul(sizeAbs, maintenance, false), false)
+  // ── Liquidation price, debt-aware and per-leg (#15.4 + OhShii terms 2/3) ──
+  //
+  // DERIVATION. getHealth liquidates when coll/debt < maintenance (M). Split
+  // both sides into the leg that moves with THIS market's base price p and
+  // the legs that do not (they are valued at their own, unmoved, marks):
+  //
+  //   coll(p) = otherColl + heldBase·ltv·p     heldBase = balance + reserved,
+  //                                            the SAME balance definition
+  //                                            MarginEngine.valuations uses
+  //   debt(p) = otherDebt + debtBase·p         debtBase = base-token loan
+  //
+  // Setting coll(p) = M·debt(p) and solving for the crossing:
+  //
+  //   p · (heldBase·ltv − M·debtBase) = M·otherDebt − otherColl
+  //
+  // The scalars stay ON THEIR OWN LEG: netting heldBase − debtBase first and
+  // scaling the net by M alone (the pre-#15.4 short formula) mis-states the
+  // denominator by heldBase·(M − ltv) > 0 whenever residual base is held —
+  // the reporter's table: $289.86 shown where the true crossing is $180.18.
+  //
+  // The sign of A = heldBase·ltv − M·debtBase picks the liquidation
+  // DIRECTION — not the sign of the net size: ltv < M, so a pool can be net
+  // long in base yet still liquidate on a RISING mark.
+  //   A > 0 (long-like, health falls as p FALLS):
+  //       p = (M·otherDebt − otherColl) / A
+  //       null when otherColl ≥ M·otherDebt — the price-independent legs
+  //       alone keep health at/above M, no downward crossing exists.
+  //   A < 0 (short-like, health falls as p RISES):
+  //       p = (otherColl − M·otherDebt) / (−A)
+  //       numerator ≤ 0 → 0: liquidatable at EVERY price; a price at/below
+  //       the mark is the existing "you are already there" display signal.
+  //   A = 0: health is price-insensitive → null.
+  //
+  // W5-03 DIRECTION, kept: these prices are the DISPLAY surface (the
+  // liquidation decision itself is getHealth's ratio, rounded DOWN =
+  // protocol-safe). A displayed liquidation price must be CONSERVATIVE —
+  // shown as no farther than reality — so a long-like price (mark FALLS to
+  // it) rounds UP and a short-like price (mark RISES to it) rounds DOWN.
+  // Both are served by the same component roundings: held-base collateral
+  // DOWN, maintenance-scaled debt UP — each pushes p toward the mark.
+  public func liqPrice(otherCollUsd : Nat, otherDebtUsd : Nat, heldBase : Nat, debtBase : Nat, ltv : Nat, maintenance : Nat) : ?Nat {
+    let heldLtv        = Fixed.mul(heldBase, ltv, false);            // DOWN
+    let maintDebtBase  = Fixed.mul(maintenance, debtBase, true);     // UP
+    let maintOtherDebt = Fixed.mul(maintenance, otherDebtUsd, true); // UP
+    if (heldLtv > maintDebtBase) {
+      // Long-like: liquidates as the mark falls to P. Round UP.
+      if (maintOtherDebt <= otherCollUsd) { return null };
+      ?Fixed.div(maintOtherDebt - otherCollUsd, heldLtv - maintDebtBase, true)
+    } else if (maintDebtBase > heldLtv) {
+      // Short-like: liquidates as the mark rises to P. Round DOWN.
+      let num = SafeMath.subOrZero(otherCollUsd, maintOtherDebt);
+      ?Fixed.div(num, maintDebtBase - heldLtv, false)
+    } else { null };
   };
 
   // Distance from `mark` to a liquidation price, as a positive fraction (10^8).

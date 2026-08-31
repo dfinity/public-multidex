@@ -22,6 +22,24 @@
 //              the verifier says so on stderr.
 //   --last N   verify only the newest N events on the active archive
 //   --full     verify the ENTIRE history across every archive (default)
+//   --expect-start N
+//              pin the chain origin externally (default: the ACTIVE head's own
+//              chainStartSeq claim). History starting later than this fails
+//              unless a chain-declared gap explains it — the out-of-band
+//              anchor that makes "omit the early archives" refusable.
+//   --accept-gap FROM:TO   (repeatable)
+//              accept ONE discontinuity that has no #gap event in the chain —
+//              for operator-audited legacy gaps recorded before gaps were
+//              chain-declared. Anything else: a re-anchor is honored only if
+//              a #gap event with that exact range is hash-committed in the
+//              chain being verified. getLedgerGaps alone proves nothing — it
+//              is an uncertified self-report by the party under audit.
+//   --max-tail-skew N
+//              how many events below the certified head the ACTIVE tape may
+//              stop short (query replicas lag the certified state a little).
+//              Default 200 (one page). Beyond it the run FAILS: a host
+//              serving a genuine certificate while answering [] for the tape
+//              is hiding what it certifies (#37.1).
 //   --fold     additionally fold every #delta row into per-account balances
 //              and print per-token liability totals — the Proof-of-Reserves
 //              liabilities computation, from the public tape alone
@@ -46,6 +64,8 @@ const flag = (name) => {
 const HOST = flag("host") || "http://127.0.0.1:8000";
 const BACKEND = flag("backend");
 const LAST = flag("last") ? parseInt(flag("last"), 10) : null;
+// #37.1 — bound on the active-tail concession, in events (default one page).
+const MAX_TAIL_SKEW = flag("max-tail-skew") ? parseInt(flag("max-tail-skew"), 10) : 200;
 const FOLD = !!flag("fold");
 const INSECURE_ROOT_KEY = !!flag("insecure-root-key");
 if (!BACKEND) {
@@ -110,6 +130,8 @@ const archiveIdl = ({ IDL }) => {
     debtDelta: IDL.Record({ token: IDL.Text, amount: IDL.Int }),
     lpShareDelta: IDL.Record({ marketId: IDL.Text, amount: IDL.Int }),
     insShareDelta: IDL.Record({ amount: IDL.Int }),
+    gap: IDL.Record({ fromSeq: IDL.Nat, toSeq: IDL.Nat }),
+    config: IDL.Record({ setter: IDL.Text, value: IDL.Text }),
   });
   const UserEvent = IDL.Record({
     seq: IDL.Nat, ts: IDL.Int, user: IDL.Principal,
@@ -186,6 +208,10 @@ function canonical(e) {
     putT("lpShareDelta"); putT(k.lpShareDelta.marketId); putN(k.lpShareDelta.amount);
   } else if ("insShareDelta" in k) {
     putT("insShareDelta"); putN(k.insShareDelta.amount);
+  } else if ("gap" in k) {
+    putT("gap"); putN(k.gap.fromSeq); putN(k.gap.toSeq);
+  } else if ("config" in k) {
+    putT("config"); putT(k.config.setter); putT(k.config.value);
   } else {
     throw new Error(`seq ${e.seq}: unknown event kind — verifier older than the canister`);
   }
@@ -194,6 +220,38 @@ function canonical(e) {
 const hashEvent = (e) => createHash("sha256").update(canonical(e)).digest();
 const hex8 = (b) => Buffer.from(b).toString("hex").slice(0, 16) + "…";
 const eq = (a, b) => Buffer.from(a).equals(Buffer.from(b));
+
+// W2-04: one certificate check PER SEGMENT. Sealed archives set their own
+// certified_data at the sealing appendBatch, so each segment's head can be
+// subnet-vouched — comparing a sealed head against getCertifiedHead().headHash
+// alone was comparing a self-report to itself. Throws on a real network;
+// returns false (check unavailable) only on a development host.
+let certsValidated = 0;
+async function validateArchiveCert(certOpt, canisterIdText, headHashOpt, label) {
+  if (!headHashOpt.length) throw new Error(`${label}: no headHash to certify`);
+  if (!certOpt || !certOpt.length) {
+    if (LOCAL_HOST) { console.log(`  ~ ${label}: no certificate served (development host)`); return false; }
+    throw new Error(`${label}: host served NO certificate for this segment — an uncertified head proves nothing`);
+  }
+  try {
+    const cid = Principal.fromText(canisterIdText);
+    const cert = await Certificate.create({
+      certificate: new Uint8Array(certOpt[0]),
+      rootKey: agent.rootKey instanceof Uint8Array ? agent.rootKey : new Uint8Array(agent.rootKey),
+      principal: { canisterId: cid },
+      disableTimeVerification: LOCAL_HOST,
+    });
+    const res = cert.lookup_path([enc.encode("canister"), cid.toUint8Array(), enc.encode("certified_data")]);
+    if (!(res && res.status === "Found" && eq(res.value, Buffer.from(headHashOpt[0])))) {
+      throw new Error(`${label}: the subnet certificate does NOT commit to this segment's head`);
+    }
+    certsValidated++;
+    return true;
+  } catch (err) {
+    if (LOCAL_HOST) { console.log(`  ~ ${label}: certificate check unavailable on development host (${err.message})`); return false; }
+    throw new Error(`${label}: certificate check FAILED: ${err.message}`);
+  }
+}
 
 // ── Walk + verify ────────────────────────────────────────────────────
 const agent = await HttpAgent.create({ host: HOST });
@@ -236,6 +294,19 @@ try {
 let GAPS = [];
 try { GAPS = await backend.getLedgerGaps(); } catch { /* pre-failover backend — no gaps */ }
 const REANCHOR = new Set(GAPS.map(([, to]) => Number(to)));
+// W2-04: re-anchors claimed by getLedgerGaps are honored only TENTATIVELY —
+// after the walk, each structural discontinuity must be justified by a #gap
+// event hash-committed in the chain itself, or by an explicit --accept-gap.
+const ACCEPT_GAPS = [];
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "--accept-gap" && args[i + 1]) {
+    const m = String(args[i + 1]).match(/^(\d+):(\d+)$/);
+    if (!m) { console.error(`bad --accept-gap ${args[i + 1]} (want FROM:TO)`); process.exit(2); }
+    ACCEPT_GAPS.push([parseInt(m[1], 10), parseInt(m[2], 10)]);
+  }
+}
+const CHAIN_GAPS = [];        // [from, to) collected from #gap events on the walk
+const PENDING_JUSTIFY = [];   // structural discontinuities awaiting chain proof
 const gapEventsMissing = GAPS.reduce((n, [f, t]) => n + (Number(t) - Number(f)), 0);
 // Shed re-baselines (see the IDL note): seqs where the fold must reset.
 let BASELINES = [];
@@ -331,6 +402,7 @@ async function verifySlice(actor, from, to, seed, label) {
         if (!eq(got, expectPrev)) throw new Error(`${label}: chain BREAK at seq ${e.seq}`);
         links++;
       }
+      if ("gap" in e.kind) CHAIN_GAPS.push([Number(e.kind.gap.fromSeq), Number(e.kind.gap.toSeq)]);
       if (FOLD) foldEvent(e);
       lastHash = hashEvent(e);
       expectPrev = lastHash;
@@ -364,8 +436,22 @@ try {
     if (r.truncatedAt !== null) {
       // We never reached the certified head, so comparing against it would be
       // comparing different points on the tape. Every link we DID walk is
-      // verified; say exactly that rather than claiming a head match.
-      console.log(`~ tail not yet readable from seq ${r.truncatedAt} (live tape / replica skew)`);
+      // verified; say exactly that rather than claiming a head match — but
+      // BOUND the concession (#37.1): an honest replica lags by at most a
+      // little, while a host answering [] under a genuine certificate is
+      // hiding the tape it certifies. Unbounded, this branch let such a host
+      // exit 0 with zero links verified.
+      const skew = headSeq - r.truncatedAt + 1;
+      if (skew > MAX_TAIL_SKEW) {
+        throw new Error(`tail unreadable from seq ${r.truncatedAt} — ${skew} events short of the certified head at ${headSeq} (--max-tail-skew ${MAX_TAIL_SKEW}); the host is hiding tape it certifies`);
+      }
+      // Zero progress is not a concession: "verified 0 links, exit 0" is the
+      // exact lie #37.1 describes, and on a young tape the whole history can
+      // fit inside any absolute skew allowance.
+      if (r.links === 0) {
+        throw new Error(`nothing verifiable: the host certifies a head at seq ${headSeq} but served no readable tape at all`);
+      }
+      console.log(`~ tail not yet readable from seq ${r.truncatedAt} (live tape / replica skew, ${skew} ≤ ${MAX_TAIL_SKEW})`);
       console.log(`  verified up to seq ${r.truncatedAt - 1}; certified head is ${headSeq}`);
     } else if (!eq(r.lastHash, Buffer.from(head.headHash[0]))) {
       throw new Error("recomputed head ≠ archive head");
@@ -373,6 +459,17 @@ try {
       console.log(`head ok: ${hex8(r.lastHash)} == certified head at seq ${headSeq}`);
     }
   } else {
+    // W2-04: pin the origin. The active head's chainStartSeq is itself only a
+    // claim, so --expect-start is the true out-of-band anchor when given;
+    // either way, coverage starting LATER than the origin is a truncated
+    // archive list unless a justified gap explains exactly that range.
+    const claimedStart = head.chainStartSeq.length ? Number(head.chainStartSeq[0]) : 0;
+    const esFlag = flag("expect-start");
+    const ORIGIN = esFlag !== null && esFlag !== true ? parseInt(esFlag, 10) : claimedStart;
+    if (Number(archives[0].firstSeq) > ORIGIN) {
+      PENDING_JUSTIFY.push({ from: ORIGIN, to: Number(archives[0].firstSeq),
+        what: `history starts at seq ${archives[0].firstSeq} but the chain origin is ${ORIGIN} — early archives omitted?` });
+    }
     let carried = null;
     for (let i = 0; i < archives.length; i++) {
       const a = archives[i];
@@ -380,14 +477,36 @@ try {
       const aHead = i === archives.length - 1 ? head : await actor.getCertifiedHead();
       // Clip only the FIRST archive's start, and by ITS OWN chain start (not the
       // active archive's — which, after a re-anchor, is a later segment's start).
+      // W2-04: the clipped range is unverified tape — it too needs a justified gap.
       const aStart = aHead.chainStartSeq.length ? Number(aHead.chainStartSeq[0]) : Number(a.firstSeq);
       const from = i === 0 ? Math.max(Number(a.firstSeq), aStart) : Number(a.firstSeq);
+      if (i === 0 && aStart > Number(a.firstSeq)) {
+        PENDING_JUSTIFY.push({ from: Number(a.firstSeq), to: aStart,
+          what: `archive 1 re-anchors its own start at ${aStart}, skipping [${a.firstSeq}..${aStart})` });
+      }
       const to = a.lastSeq.length ? Number(a.lastSeq[0]) : headSeq;
+      // W2-04: coverage continuity — an omitted middle archive is a seq jump.
+      if (i > 0 && archives[i - 1].lastSeq.length) {
+        const prevLast = Number(archives[i - 1].lastSeq[0]);
+        if (Number(a.firstSeq) !== prevLast + 1) {
+          PENDING_JUSTIFY.push({ from: prevLast + 1, to: Number(a.firstSeq),
+            what: `coverage jumps ${prevLast + 1}→${a.firstSeq} between archives ${i}/${i + 1}` });
+        }
+      }
       // A recorded gap ends at this archive's firstSeq → it re-anchors a fresh
       // chain segment; its first event's prevHash intentionally does NOT link to
-      // the previous archive's head. Seed null so the walk accepts the documented
-      // discontinuity (and still verifies this archive's own chain internally).
+      // the previous archive's head. Seed null so the walk accepts the claimed
+      // discontinuity (and still verifies this archive's own chain internally) —
+      // TENTATIVELY: the claim must be proven by a chain-committed #gap event
+      // after the walk, or the run fails. A fabricated tuple whose only job is
+      // to suppress this link check demands a #gap event for an EMPTY range
+      // ([firstSeq..firstSeq), when coverage is continuous), which the honest
+      // shed path never emits — so the fabrication is refused.
       const reanchored = i > 0 && REANCHOR.has(Number(a.firstSeq));
+      if (reanchored && archives[i - 1].lastSeq.length) {
+        PENDING_JUSTIFY.push({ from: Number(archives[i - 1].lastSeq[0]) + 1, to: Number(a.firstSeq),
+          what: `re-anchor claimed at archive ${i + 1} firstSeq ${a.firstSeq}` });
+      }
       const seed = reanchored ? null : carried;
       const r = await verifySlice(actor, from, to, seed, `archive ${i + 1}/${archives.length} ${a.canisterId}`);
       totalLinks += r.links;
@@ -395,25 +514,55 @@ try {
         // Only the ACTIVE archive has a moving tail; a sealed one that stops
         // short is a genuine failure, so let the head comparison below catch it.
         if (!a.lastSeq.length) {
-          console.log(`  ~ tail not yet readable from seq ${r.truncatedAt} (live tape / replica skew)`);
+          // #37.1 — same bound as the --last path: the concession is for a
+          // replica lagging a certified head by a little, not for a host
+          // hiding the whole tape behind a genuine certificate.
+          const skew = headSeq - r.truncatedAt + 1;
+          if (skew > MAX_TAIL_SKEW) {
+            throw new Error(`${a.canisterId}: tail unreadable from seq ${r.truncatedAt} — ${skew} events short of the certified head at ${headSeq} (--max-tail-skew ${MAX_TAIL_SKEW}); the host is hiding tape it certifies`);
+          }
+          // Zero progress on the WHOLE RUN is not a concession (see the
+          // --last path): sealed archives before this one may have verified
+          // links, so gate on the run total, not this slice's count.
+          if (totalLinks === 0) {
+            throw new Error(`nothing verifiable: the host certifies a head at seq ${headSeq} but served no readable tape at all`);
+          }
+          console.log(`  ~ tail not yet readable from seq ${r.truncatedAt} (live tape / replica skew, ${skew} ≤ ${MAX_TAIL_SKEW})`);
           console.log(`    verified up to seq ${r.truncatedAt - 1} (active)`);
           carried = r.lastHash;
           continue;
         }
       }
       if (aHead.headHash.length && !eq(r.lastHash, Buffer.from(aHead.headHash[0]))) {
-        throw new Error(`${a.canisterId}: recomputed head ≠ its certified head`);
+        throw new Error(`${a.canisterId}: recomputed head ≠ its reported head`);
       }
-      console.log(`  head ok: ${hex8(r.lastHash)}${a.lastSeq.length ? " (sealed)" : " (active)"}${reanchored ? " [re-anchored after a recorded gap]" : ""}`);
+      // W2-04: certify THIS segment's head — sealed ones included. Before
+      // this, only the active archive's certificate was validated and every
+      // sealed head was trusted on its own say-so.
+      const certed = await validateArchiveCert(aHead.certificate, a.canisterId, aHead.headHash, a.canisterId);
+      console.log(`  head ok: ${hex8(r.lastHash)}${a.lastSeq.length ? " (sealed)" : " (active)"}${certed ? " [certified]" : ""}${reanchored ? " [re-anchor claimed]" : ""}`);
       carried = r.lastHash;
     }
+    // W2-04: every structural discontinuity honored above must now be proven
+    // by the chain itself (or an explicit operator flag). getLedgerGaps and
+    // getArchives are uncertified self-reports; the #gap events collected on
+    // the walk are hash-committed and certificate-covered.
+    for (const p of PENDING_JUSTIFY) {
+      const inChain = CHAIN_GAPS.some(([f, t]) => f === p.from && t === p.to);
+      const accepted = ACCEPT_GAPS.some(([f, t]) => f === p.from && t === p.to);
+      if (!inChain && !accepted) {
+        throw new Error(`unjustified discontinuity: ${p.what} — no #gap event [${p.from}..${p.to}) is hash-committed in the verified chain and no --accept-gap ${p.from}:${p.to} was given`);
+      }
+      if (!inChain) console.log(`  ⚠ discontinuity [${p.from}..${p.to}) accepted by FLAG (legacy, not chain-declared): ${p.what}`);
+    }
   }
+  const certSummary = certsValidated > 0 ? `; ${certsValidated} segment certificate(s) subnet-validated` : "";
   if (GAPS.length) {
-    console.log(`\n✓ ${totalLinks.toLocaleString()} chain links verified across ${GAPS.length} recorded gap(s) `
+    console.log(`\n✓ ${totalLinks.toLocaleString()} chain links verified across ${GAPS.length} gap(s), each chain-declared or operator-accepted `
       + `(${gapEventsMissing.toLocaleString()} events dropped by L2 failover — documented, not tampering`
-      + `${BASELINES.length ? `; ${BASELINES.length} re-baseline(s) keep the tape replayable` : ""})`);
+      + `${BASELINES.length ? `; ${BASELINES.length} re-baseline(s) keep the tape replayable` : ""})${certSummary}`);
   } else {
-    console.log(`\n✓ ${totalLinks.toLocaleString()} chain links verified`);
+    console.log(`\n✓ ${totalLinks.toLocaleString()} chain links verified${certSummary}`);
   }
 } catch (err) {
   console.error(`\n✗ ${err.message}`);
@@ -433,11 +582,23 @@ if (!failed && head.certificate.length) {
       // which the catch below reported as an environment limitation — so this
       // check, the one the root key exists to anchor, never actually ran.
       principal: { canisterId: cid },
-      disableTimeVerification: true,   // local replica time ≠ wall clock; BLS still checked
+      // #37.5 — the freshness window misfires on a LOCAL replica (its clock
+      // is not wall time); it must NOT be waived anywhere else. The browser
+      // verifier states the same rule for itself — an arbitrary --host is
+      // exactly where a stale-but-genuine certificate replay lives.
+      disableTimeVerification: LOCAL_HOST,
     });
     const res = cert.lookup_path([enc.encode("canister"), cid.toUint8Array(), enc.encode("certified_data")]);
     if (res && res.status === "Found" && eq(res.value, Buffer.from(head.headHash[0]))) {
-      console.log("✓ IC certificate VALID — the subnet vouches for this head");
+      // W2-04 verdict copy: say what was proven. This certificate covers the
+      // ACTIVE archive's head only; sealed segments are vouched by their own
+      // per-segment certificates in --full mode (and NOT AT ALL in --last
+      // mode, which never visits them). The guarantee also leans on sealed
+      // archives being immutable — absolute only once setBlackholeAtSeal is
+      // in force (pre-mainnet checklist); until then a reinstall by the
+      // controller could rewrite a sealed segment under a fresh certificate.
+      console.log(`✓ IC certificate VALID — the subnet vouches for the ACTIVE archive's head${certsValidated > 1 ? ` (+ ${certsValidated - 1} sealed segment(s) validated separately)` : ""}`);
+      if (LAST) console.log("  ⚠ --last mode: sealed history was not visited; run --full for per-segment certificates");
     } else {
       console.error("✗ IC certificate does NOT commit to this head");
       failed = true;
@@ -453,6 +614,17 @@ if (!failed && head.certificate.length) {
       console.error(`✗ certificate check FAILED: ${err.message}`);
       failed = true;
     }
+  }
+} else if (!failed) {
+  // #37.2 — ABSENCE must not be quieter than invalidity. The block above
+  // fails closed on a bad certificate; a host that simply omitted the field
+  // skipped the whole check and the run exited 0 with no certificate line
+  // at all — while :348 exits 1 when the SAME record's headHash is missing.
+  if (LOCAL_HOST) {
+    console.log("~ no certificate served (development host)");
+  } else {
+    console.error("✗ host served NO certificate for the head — a chain without the subnet's signature proves nothing; refusing to vouch");
+    failed = true;
   }
 }
 

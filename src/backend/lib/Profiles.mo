@@ -81,7 +81,17 @@ module {
   public func usernameFromDraws(d1 : Nat, d2 : Nat, d3 : Nat) : Text {
     let adj  = ADJECTIVES[d1 % N_WORDS];
     let noun = NOUNS[d2 % N_WORDS];
-    let num  = (d3 % 90) + 10;   // 10–99
+    // W6-11 (R7): 25 × 25 × 9,990 = 6,243,750 names — 50% chance of SOME
+    // accidental duplicate at ~2,940 profiles (birthday bound), up from 279
+    // at the old 2-digit space (25 × 25 × 90 = 56,250). Purely display
+    // ambiguity either way — nothing resolves by username in any live path,
+    // and the identicon is deliberately seeded from the NAME (a function of
+    // public data), so a collision yields an identical glyph rather than a
+    // false distinguisher. Deliberately NOT a principal-derived suffix: the
+    // tape publishes every principal, so any pure function of it would
+    // rebuild the whole name↔principal mapping offline — the exact attack
+    // the draws-based design above exists to close.
+    let num  = (d3 % 9_990) + 10;   // 10–9999
     adj # "-" # noun # "-" # Nat.toText(num)
   };
 

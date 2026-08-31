@@ -13,6 +13,10 @@
 #   C. Gates: a non-wired caller is refused; the per-call USD cap is enforced.
 #   D. Net: after both cycles the arb's total worth exceeds its funding —
 #      manipulation paid the arbitrageur, not the other way round.
+#   E. W4-25 spoof battery: a rich bid canceled before the arb's hedge can
+#      rest must not consume the rolling import budget (zero-fill round-trips
+#      refund it), must back the market's rich side off, and the in-tick
+#      cancel interleave (via the IS_DEV takeable latch) unwinds immediately.
 #
 # The AMM quotes with numLevels=0 here so off-mark USER orders can rest (with
 # a live ladder they'd fill against the AMM instead — that path is covered by
@@ -111,7 +115,7 @@ else nok "cheap ask should be gone" "top ask $TOPASK"; fi
 # ── C. Gates ────────────────────────────────────────────────────────
 echo ""
 echo "── C. gates: only the wired canister may reach the external market; caps bind ──"
-G1=$(u extMarketSwap "(\"ICP\", variant { importBase }, $(e8 10.0):nat)")
+G1=$(u extMarketSwap "(\"ICP\", variant { importBase }, $(e8 10.0):nat, null)")
 if echo "$G1" | grep -q "not the wired"; then ok "non-arb caller refused"; else nok "gate leak" "$G1"; fi
 # per-call cap: $5k at mark $10 = 500 ICP; 600 must refuse. (Direct-call check
 # — the DEX enforces this against the wired principal itself, so we assert on
@@ -135,6 +139,100 @@ WORTH=$(awk -v u="$ARB_USD1" -v i="$ARB_ICP1" 'BEGIN{printf "%.0f", u + i*10}')
 if awk -v w="$WORTH" -v f="$ARB_USD0" 'BEGIN{exit (w > f ? 0 : 1)}'; then
   ok "arb net worth \$$(from_e8 "$WORTH") > funding \$$(from_e8 "$ARB_USD0") (profit +\$$(awk -v w="$WORTH" -v f="$ARB_USD0" 'BEGIN{printf "%.2f", (w-f)/100000000}'))"
 else nok "arb should profit from off-mark flow" "worth=$WORTH funded=$ARB_USD0"; fi
+
+# ── E. W4-25 spoof battery ──────────────────────────────────────────
+# The venue-physics choreography (traps documented in test_po_sweep_fee.sh):
+# timers stay paused, so staged legs release only on freshrequote, whose
+# re-stamp postdates the stage (anti-snipe). The spoofed hedge's remnant has
+# ORDER_TTL_SEC=4s < the 5s sleep, so it is expired-dead (matcher honors
+# expiry strictly; the timer sweep is paused) before the flatten reads
+# availBase. Resetting the exchange gives E its own budget arithmetic.
+echo ""
+echo "── E. W4-25 spoof: cancel-after-import → refund, backoff, in-tick unwind ──"
+S=$(mkid arb_spoofer)
+sp() { icp canister call --identity arb_spoofer backend "$@" 2>&1; }
+hour() { adm getArbStats "()" | tr -d '_' | grep -oE "hourUsedUsd = [0-9]+" | grep -oE "[0-9]+"; }
+adm resetExchange "()" >/dev/null 2>&1
+arbc resetBackoff "()" >/dev/null
+adm setTestTimersPaused '(true)' >/dev/null 2>&1
+adm createAmmPool "(\"$MKT\")" >/dev/null 2>&1
+adm setAmmConfig "(\"$MKT\", 20:nat, $(e8 10.0):nat, 0:nat, 35:nat, 5:nat)" >/dev/null
+adm setAmmRefPrice "(\"$MKT\", $(e8 10.0):nat)" >/dev/null
+adm enableAmm "(\"$MKT\", true)" >/dev/null
+adm setArbitrageur "(principal \"$ARB_ID\")" >/dev/null
+adm fundArbitrageur "($(e8 250000.0):nat)" >/dev/null
+adm setTestBalance "(principal \"$S\", \"ICPUSD\", $(e8 100000.0):nat)" >/dev/null
+freshrequote
+
+# E1+E2. Spoofer rests a rich bid; the arb imports against it (charged) and
+# stages its hedge; the spoofer cancels before the hedge can rest. After the
+# remnant dies, a SECOND rich bid is already resting when the flatten tick
+# runs — so one tick proves both halves: the zero-fill round-trip refunds
+# the budget, and the freshly-bumped backoff keeps the rich side out of the
+# spoofer's next cycle (hold is evaluated in the same message that set it).
+sp placeLimitOrder "(\"$MKT\", variant { buy }, $(e8 10.20):nat, $(e8 400.0):nat)" >/dev/null
+freshrequote                        # bid rests
+T1=$(arbc tickOnce '()')
+H1=$(hour)
+if [ "${H1:-0}" -gt 0 ] && echo "$T1" | grep -q "rich"; then
+  ok "E1: import charged the rolling budget (\$$(from_e8 "${H1:-0}"))"
+else nok "E1 charge" "hourUsed=${H1:-?} ticks:$T1"; fi
+sp cancelAllMyOrders "(opt \"$MKT\")" >/dev/null    # the spoof
+freshrequote                        # hedge releases into an empty book, rests
+sleep 5                             # > ORDER_TTL_SEC=4 — remnant now expired-dead
+sp placeLimitOrder "(\"$MKT\", variant { buy }, $(e8 10.20):nat, $(e8 400.0):nat)" >/dev/null
+freshrequote                        # E2 bid rests (dead ask cannot match it)
+T2=$(arbc tickOnce '()')
+H2=$(hour)
+if [ "${H2:-999999999999999}" -le "$(e8 1)" ]; then
+  ok "E1: zero-fill round-trip refunded the budget (hourUsed \$$(from_e8 "${H2:-0}"))"
+else nok "E1 refund — the spoofed cycle kept its charge" "hourUsed=${H2:-?} (was ${H1:-?}) ticks:$T2"; fi
+ST=$(arbc getStatus '()')
+if echo "$ST" | grep -q "rich backoff"; then ok "E1: spoofed market backed off"; else nok "E1 backoff note" "$ST"; fi
+if ! echo "$T2" | grep -q "rich"; then
+  ok "E2: rich side held during backoff — resting rich bid drew no import"
+else nok "E2 hold — the spoofer got a free second cycle" "ticks:$T2"; fi
+H2B=$(hour)
+if [ "${H2B:-999999999999999}" -le "$(e8 1)" ]; then ok "E2: budget untouched through the held tick"; else nok "E2 budget" "hourUsed=$H2B"; fi
+# The bid must still REST after the held tick — this is what separates "the
+# hold skipped it" from the pre-fix accident where the TTL-8 zombie hedge
+# crossed and consumed it (the self-export-overlap bug in live form).
+BOOK2=$(adm getOrderBookDepth "(\"$MKT\", opt 3)" | tr -d '_')
+BID2=$(echo "$BOOK2" | awk '/bids = vec {/,/asks =/' | grep -oE "price = [0-9]+" | head -1 | grep -oE "[0-9]+")
+if [ "${BID2:-0}" = "$(e8 10.20)" ]; then
+  ok "E2: the rich bid still rests untouched — held, not consumed"
+else nok "E2 bid state — a zombie hedge consumed it?" "top bid ${BID2:-none}"; fi
+sp cancelAllMyOrders "(opt \"$MKT\")" >/dev/null
+arbc resetBackoff "()" >/dev/null
+
+# E3. The in-tick interleave — the cancel landing BETWEEN the import and the
+# arb's post-import re-read — driven deterministically by the IS_DEV latch
+# (armed here; flipped active by the import itself; read by the re-read;
+# cleared by the unwinding export). Everything else is real: the sizing read
+# sees the true funded bid, the import charges the real budget.
+sp placeLimitOrder "(\"$MKT\", variant { buy }, $(e8 10.20):nat, $(e8 400.0):nat)" >/dev/null
+freshrequote
+adm setTestArbTakeableSpoof "(\"$MKT\", true)" >/dev/null
+T3=$(arbc tickOnce '()')
+H3=$(hour)
+if echo "$T3" | grep -q "spoofed"; then ok "E3: in-tick unwind path taken"; else nok "E3 path" "ticks:$T3"; fi
+if [ "${H3:-999999999999999}" -le "$(e8 1)" ]; then
+  ok "E3: in-tick unwind refunded the budget (hourUsed \$$(from_e8 "${H3:-0}"))"
+else nok "E3 refund" "hourUsed=${H3:-?}"; fi
+ST3=$(arbc getStatus '()')
+if echo "$ST3" | grep -q "vanished after the import"; then ok "E3: unwind reason logged"; else nok "E3 note" "$ST3"; fi
+freshrequote   # release anything staged — a leaked hedge would rest LIVE now
+# Probe with TAKEABLE depth, not raw: raw asks legitimately show E1's
+# expired husk (timers paused ⇒ the sweep never removes dead orders), while
+# takeable excludes expired makers — so a nonzero here is exactly a LIVE
+# leaked hedge (and pre-fix, the placed hedge reds this where raw could not).
+TKA=$(adm getTakeableDepth "(\"$MKT\", variant { buy }, $(e8 10.02):nat)" | tr -d '_' | grep -oE "[0-9]+" | head -1)
+if [ "${TKA:-1}" = "0" ]; then ok "E3: no live hedge in the book (takeable asks 0)"; else nok "E3 hedge leaked into the book" "takeable=$TKA"; fi
+TK=$(adm getTakeableDepth "(\"$MKT\", variant { sell }, $(e8 10.02):nat)" | tr -d '_' | grep -oE "[0-9]+" | head -1)
+if [ "${TK:-0}" -gt 0 ]; then ok "E3: latch cleared by the unwind (takeable live again)"; else nok "E3 latch stuck" "takeable=${TK:-0}"; fi
+adm setTestArbTakeableSpoof "(\"$MKT\", false)" >/dev/null 2>&1
+sp cancelAllMyOrders "(opt \"$MKT\")" >/dev/null
+arbc resetBackoff "()" >/dev/null
 
 adm setTestTimersPaused '(false)' >/dev/null 2>&1
 echo ""

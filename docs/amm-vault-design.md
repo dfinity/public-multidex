@@ -74,7 +74,7 @@ bidSkew = min(lean, 0)                    // long → bids back away
 askSkew = max(lean, 0) + floorBarrier     // short → asks carry a premium
 bidMid  = min(ref, ref × (1 + bidSkew))   // hard clamp: bidMid ≤ ref
 askMid  = max(ref, ref × (1 + askSkew))   // hard clamp: askMid ≥ ref
-half    = spreadBps + 0.5 × (volRegime + 2×hostility + 2×staleness + 2×breakerGap)
+half    = spreadBps + 0.5 × (volRegime + 2×staleness + 2×breakerGap)
 bids    = bidMid × (1 − half − i×spacing),  i = 0…numLevels−1
 asks    = askMid × (1 + half + i×spacing)
 ```
@@ -95,6 +95,17 @@ asks    = askMid × (1 + half + i×spacing)
   option during real gap moves for the ~60 s until staleness widening engages
   (`ammBreakerWidenBps`; pends are cleared on `resetExchange` and by the
   dev-only direct price setter, and ignored past their confirm-TTL).
+* **Adverse-flow ("hostility") widening is UNIMPLEMENTED — retired 2026-08-20**
+  (#49.5, operator-ratified). The formula once advertised a per-counterparty
+  adverse-flow term, but its data source was provably never fed: the AMM is
+  non-takeable and never a pending-match party, so the term was identically
+  zero for its whole life and has been deleted (the empty stable map is
+  fossil-parked in `main.mo` for EOP compatibility). Wiring it was REJECTED
+  because per-counterparty hostility is an attacker-influenceable input to
+  public quotes (widen-by-griefing; Sybil laundering zeroes the score); any
+  future adverse-selection protection will be designed fresh against real
+  requirements — markout / vol / inventory-based (the AMM already tracks vol
+  and inventory) — not by resurrecting this mechanism.
 
 ## 4. Inventory recovery & the rebalancer
 
@@ -179,7 +190,10 @@ for it — nothing converges the price.
 
 **Safety rails** (all enforced backend-side, where they can't be bypassed):
 wired-principal-only; mark must be fresh (≤60 s) with no pending breaker jump;
-per-call cap $5k; rolling hourly cap $100k; every flow event-logged
+a per-leg price bound (`maxMarkE8`) the DEX checks against its current mark;
+per-call cap $5k; hourly import budget $512.5k — exports (the flatten/unwind
+leg) are exempt, so a tripped budget pauses imports but can never strand
+inventory, and the trip is logged (W4-17); every flow event-logged
 (`arb.flow`) and queryable (`getArbStats`). The arb pays normal taker fees, is
 not registered (never appears on the leaderboard), and its working capital is
 funded (`fundArbitrageur`) and skimmed (`skimArbitrageur`, → treasury) by the
@@ -188,14 +202,16 @@ controller as explicit, event-logged external flows.
 **War-gaming the arb itself:**
 
 * *Bait the import*: post a rich bid, let the arb import, cancel before its
-  sell releases. Cost to the arb: one round trip of the 10 bp haircut on ≤$2k
-  (~$4), bounded overall by the hourly cap (~$200/h) — while the baiter risks
-  their bid actually filling and pays fees on every dance. Not economical.
+  sell releases. Cost to the arb: one round trip of the 10 bp haircut on ≤$5k
+  (~$10), and every cycle starts with a budgeted import, so the $512.5k/h
+  import budget bounds the bleed to ~$1k/h — while the baiter risks their bid
+  actually filling and pays fees on every dance. Not economical.
 * *Farm a wrong mark*: if the oracle lags a real move, "off-mark" orders may
   be right. The arb stands down on stale marks and pending jumps — the same
-  trust bar as the AMM and LP minting — and its caps bound the residual to a
-  few $k per hour, versus the venue-wide exposure a wrong mark already
-  implies.
+  trust bar as the AMM and LP minting — and its caps bound the residual to
+  the low tens of $k per hour (sub-breaker mispricing on a $512.5k/h import
+  budget; the hourly-exempt export leg stays per-call- and per-tick-capped),
+  versus the venue-wide exposure a wrong mark already implies.
 * *Supply manipulation*: import/export changes synthetic supply, but only at
   the mark ± haircut and only within caps; it cannot move the mark (external
   medians) and cannot out-trade the invariant. `#production` deployments with
@@ -213,7 +229,7 @@ controller as explicit, event-logged external flows.
 | LP deposit/withdraw as an at-mid swap | 40 bp exit fee > trading route; 60 s mint freshness |
 | Wash-trade the LP fee share | Pays 1 to recover ≤ 0.5 × LP share |
 | Hold venue price off-mark | Arbitrageur imports/exports at the mark until it converges; deviation is taxed |
-| Bait/farm the arbitrageur | Bounded by haircut × caps (~$200/h max); baiter pays fees and fill risk |
+| Bait/farm the arbitrageur | Bounded by haircut × caps (~$1k/h max); baiter pays fees and fill risk |
 | Oracle stall / breaker freeze | Widen → pause (5 min) → panic cancel (10 min); users-only fallback ±2%; arb stands down |
 
 **Residual risks, accepted and stated:** vault inventory beta on genuine
@@ -236,8 +252,8 @@ deposit.
 | `LP_EXIT_FEE_BPS` | 40 | `withdrawLp` |
 | `LP_DEPOSIT_MAX_REF_AGE_NS` | 60 s | `vaultPricesStale` |
 | `DEFERRED_COMMIT_NS` | 3 s | cancel paths |
-| Arb band / edge / per-tick | 50 bp / 20 bp / $2k | `src/arb/main.mo` |
-| Arb haircut / per-call / hourly | 10 bp / $5k / $100k | `extMarketSwap` |
+| Arb band / edge / per-tick | 50 bp / 20 bp / $5k (= per-call) | `src/arb/main.mo` |
+| Arb haircut / per-call / hourly | 10 bp / $5k / $512.5k (imports only) | `extMarketSwap` |
 
 ## 10. Verification
 
@@ -255,7 +271,7 @@ deposit.
 ## 11. Ops runbook
 
 * Deploy: the arb ships with `play_start.sh` (reinstall → `setArbitrageur` /
-  `arb.setDex` → `fundArbitrageur` ($250k default, `ARB_USD` env) →
+  `arb.setDex` → `fundArbitrageur` ($1.28M default, `ARB_USD` env) →
   `setEnabled(true)`). `#production` must not wire it.
 * Watch: `getVaultValueHistory` (valuePerLP should drift up with fees),
   `getTreasury` (`lifetimeVaultFeesUsd`), `getArbStats`, event tags
@@ -263,3 +279,14 @@ deposit.
 * Levers: `setAmmRebalanceEnabled` (emergency only), `skimArbitrageur`
   (harvest arb profits to treasury), `setAmmSkewConfig` / `setAmmConfig`
   (per-market geometry), `ARB_USD` at seed time.
+
+## Deposit fee weight (W4-11, 2026-08-15)
+
+The concentration fee is priced at the **midpoint weight** of the deposit —
+`(cur + legAdd/2) / (T + totalAdd/2)` per leg — not the pre-deposit snapshot.
+The snapshot short-circuited to 1.0 whenever the current weight sat at/under
+target, so a single deposit from an under-weight state skewed the vault for
+free while chunking the same total cost more. The midpoint rule is the
+discrete integral: single-shot and chunked deposits price out the same (to
+second order), and every unit pays for the skew it causes. Rejection
+(`depositRejectsConcentration`) still uses the full post-deposit weight.

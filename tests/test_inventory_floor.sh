@@ -25,7 +25,7 @@
 #      floor and base never dips below it, no matter how many requotes fire.
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_inventory_floor.sh
 #
 # Floor math: target=100 ICP, FLOOR_FRACTION=0.15 → floor=15 ICP.
@@ -169,7 +169,7 @@ USD_NOW=$(awk -v a="$(bal "$W" ICPUSD)" -v b="$(bal "$AMM" ICPUSD)" 'BEGIN{print
 ICP_NOW=$(awk -v a="$(bal "$W" ICP)"    -v b="$(bal "$AMM" ICP)"    'BEGIN{printf "%.2f", a+b}')
 if awk -v a="$USD_NOW" -v b="$USD_BASE" 'BEGIN{exit ((a-b<0?b-a:a-b) < 1.0 ? 0 : 1)}' \
    && awk -v a="$ICP_NOW" -v b="$ICP_BASE" 'BEGIN{exit ((a-b<0?b-a:a-b) < 0.05 ? 0 : 1)}'; then
-  ok "ICPUSD conserved ($USD_NOW≈$USD_BASE), ICP conserved ($ICP_NOW≈$ICP_BASE)"
+  ok "ICPUSD conserved (${USD_NOW}≈$USD_BASE), ICP conserved (${ICP_NOW}≈$ICP_BASE)"
 else nok "value leak" "USD $USD_NOW vs $USD_BASE ; ICP $ICP_NOW vs $ICP_BASE"; fi
 
 adm setTestTimersPaused '(false)' >/dev/null 2>&1   # resume background timers

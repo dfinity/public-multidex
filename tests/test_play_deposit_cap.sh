@@ -92,7 +92,9 @@ XPRIN=$(principal_of "$X")
 SFX="${RANDOM}$$"
 for pair in "u:$UPRIN" "v:$VPRIN" "w:$WPRIN" "x:$XPRIN"; do
   BIND=$(call setTestEmailBinding "(principal \"${pair#*:}\", \"pdcap${pair%%:*}${SFX}@gmail.com\")" --identity anonymous)
-  assert_contains "email binding (${pair%%:*})" "$BIND" "ok"
+  # Needle anchored to the variant (#51.9): a bare "ok" was satisfied by the
+  # #play "dev-only hoOK" refusal text, so the binding pin could not go red.
+  assert_contains "email binding (${pair%%:*})" "$BIND" "variant { ok"
 done
 
 # §1 allowance visible, untouched; derive the cap + fraction amounts from it

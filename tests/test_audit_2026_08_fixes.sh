@@ -105,16 +105,30 @@ echo "── OhShii #5.1 — setUserPreferences validates before it persists ─
 # requireAuth rejects only the anonymous principal; this was the one write
 # endpoint reachable BEFORE any anti-Sybil control, storing an unbounded blob
 # per free identity with no eviction and no purge path.
+# #52.3: positive control FIRST — the two rejections below are negatives, and
+# a broken write path (nothing persists, hook renamed, auth refusing) would
+# green them both vacuously. Prove an in-bounds write persists, then re-assert
+# it after each rejection: a rejected write must neither persist nor clobber
+# the last good preferences. (Bounds: ≤8 markets of ≤32 chars.)
+PCTL="pctl-$$"
+asA setUserPreferences "(record { recentMarkets = vec { \"$PCTL\" }; lastMarket = null })" >/dev/null 2>&1
+OUT=$(asA getUserPreferences "()")
+if echo "$OUT" | grep -q "$PCTL"; then ok "positive control: in-bounds preferences persist"
+else nok "positive control: in-bounds preferences persist" "got: $(echo "$OUT" | head -1)"; fi
 BIG=$(head -c 100 < /dev/zero | tr '\0' 'y')
 asA setUserPreferences "(record { recentMarkets = vec { \"$BIG\" }; lastMarket = null })" >/dev/null 2>&1
 OUT=$(asA getUserPreferences "()")
 if echo "$OUT" | grep -q "$BIG"; then nok "over-long market string is rejected" "the blob persisted"
 else ok "over-long market string is rejected"; fi
+if echo "$OUT" | grep -q "$PCTL"; then ok "rejection preserved the last good preferences"
+else nok "rejection preserved the last good preferences" "positive-control value gone: $(echo "$OUT" | head -1)"; fi
 MANY='"a";"b";"c";"d";"e";"f";"g";"h";"i";"j";"k";"l"'
 asA setUserPreferences "(record { recentMarkets = vec { $MANY }; lastMarket = null })" >/dev/null 2>&1
 OUT=$(asA getUserPreferences "()")
 if echo "$OUT" | grep -q '"l"'; then nok "over-long recentMarkets array is rejected" "the array persisted"
 else ok "over-long recentMarkets array is rejected"; fi
+if echo "$OUT" | grep -q "$PCTL"; then ok "rejection preserved the last good preferences (again)"
+else nok "rejection preserved the last good preferences (again)" "positive-control value gone: $(echo "$OUT" | head -1)"; fi
 
 echo "── Menese #12.1 — the liquidation sweep is observable ──"
 # runLiquidationBatch was the only uncapped sweep on a fund-safety path. The
@@ -126,7 +140,11 @@ OUT=$(adm getLiquidationSweepHealth "()")
 if echo "$OUT" | grep -q "completions"; then ok "getLiquidationSweepHealth is exposed"
 else nok "getLiquidationSweepHealth is exposed" "got: $(echo "$OUT" | head -1)"; fi
 PENDING=$(fld pending "$OUT")
-if [ "${PENDING:-0}" -le 1 ]; then ok "no persistent dispatch/completion gap (pending=${PENDING:-0})"
+# #52.7: an ABSENT field must fail, not default to 0 — a renamed/removed
+# `pending` would otherwise green this forever (same -n discipline as the
+# spreadBps and round-trip-balance pins in this file).
+if [ -n "${PENDING:-}" ] && [ "$PENDING" -le 1 ]; then ok "no persistent dispatch/completion gap (pending=$PENDING)"
+elif [ -z "${PENDING:-}" ]; then nok "no persistent dispatch/completion gap" "pending field absent from getLiquidationSweepHealth — cannot observe the gap"
 else nok "no persistent dispatch/completion gap" "pending=$PENDING — the batch is failing"; fi
 
 # ...and the sweep is PACED, not merely observed. Counters alone left the
@@ -174,7 +192,13 @@ STAKE=$(e8 10000.0)
 OUT=$(asA stakeInsurance "($STAKE : nat)")
 SHARES=$(echo "$OUT" | tr -d '_' | grep -oE "ok = [0-9]+" | grep -oE "[0-9]+")
 if [ -n "${SHARES:-}" ]; then
-  asA unstakeInsurance "($SHARES : nat)" >/dev/null 2>&1
+  # #51.3: the redeem leg must REPORT success before the balance comparison
+  # means anything — a refused unstake leaves AFTER = BEFORE − STAKE, which
+  # trivially satisfies AFTER ≤ BEFORE and greened the round-trip pin with
+  # the round trip never completed.
+  UOUT=$(asA unstakeInsurance "($SHARES : nat)")
+  if echo "$UOUT" | grep -q "ok ="; then ok "unstakeInsurance redeemed the staked shares"
+  else nok "unstakeInsurance redeemed the staked shares" "got: $(echo "$UOUT" | head -1)"; fi
   AFTER=$(bal)
   if [ -n "${BEFORE:-}" ] && [ -n "${AFTER:-}" ]; then
     if [ "$AFTER" -le "$BEFORE" ]; then
@@ -184,7 +208,9 @@ if [ -n "${SHARES:-}" ]; then
     fi
   else nok "round-trip balances readable" "before=${BEFORE:-?} after=${AFTER:-?}"; fi
 else
-  echo "  (skipped: stakeInsurance did not mint — $(echo "$OUT" | head -1))"
+  # #51.3: this used to be a silent skip, so a stakeInsurance that stopped
+  # minting (renamed, refused, or broken) greened the whole finding forever.
+  nok "stake→unstake round trip does not mint value" "stakeInsurance did not mint — $(echo "$OUT" | head -1)"
 fi
 
 echo

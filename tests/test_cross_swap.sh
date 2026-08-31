@@ -4,7 +4,7 @@
 # only once BOTH legs' markets have re-quoted past the request (anti-snipe on both).
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_cross_swap.sh
 #
 # Verifies:
@@ -104,7 +104,9 @@ for pair in "ICP $icp_now $ICP_B" "BTC $btc_now $BTC_B" "ICPUSD $usd_now $USD_B"
   set -- $pair
   awk -v a="$2" -v b="$3" 'BEGIN{exit (((a-b<0?b-a:a-b)) < 0.02 ? 0 : 1)}' || { nok "leak in $1" "$2 vs $3"; okc=0; }
 done
-[ "$okc" = 1 ] && ok "ICP ($icp_now≈$ICP_B), BTC ($btc_now≈$BTC_B), ICPUSD ($usd_now≈$USD_B) all conserved"
+# NOTE: ${var}≈ needs the braces — macOS bash 3.2 swallows the multibyte ≈ into
+# the variable name and `set -u` kills the script with "icp_now≈: unbound".
+[ "$okc" = 1 ] && ok "ICP (${icp_now}≈$ICP_B), BTC (${btc_now}≈$BTC_B), ICPUSD (${usd_now}≈$USD_B) all conserved"
 
 echo ""
 # Fixture hygiene: every unit of vault LP minted above belongs to the ad-hoc

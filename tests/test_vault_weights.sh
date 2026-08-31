@@ -94,7 +94,9 @@ R=$(usr depositLp "(\"BTC-ICPUSD\", $(e8 0.5) : nat, 0 : nat)")   # $25k BTC →
 WB_AFTER=$(curw BTC)
 echo "   BTC weight: ${WB_BEFORE:-0} → ${WB_AFTER:-0}  (deposit: $(echo "$R" | grep -oE 'ok|err'))"
 if echo "$R" | grep -q "ok" && awk -v a="${WB_AFTER:-0}" -v b="${WB_BEFORE:-0}" 'BEGIN{exit (a > b ? 0 : 1)}'; then
-  ok "balancing BTC deposit accepted; BTC weight rose toward target"; else nok "balancing deposit should be accepted + converge" "$R wb=$WB_BEFORE→$WB_AFTER"; fi
+  ok "balancing BTC deposit accepted; BTC weight rose toward target"; else nok "balancing deposit should be accepted + converge" "$R wb=${WB_BEFORE}→$WB_AFTER"; fi
+# (${var}→ braces: macOS bash 3.2 under a UTF-8 locale swallows the multibyte
+# glyph into the variable name and `set -u` kills the script.)
 
 adm setTestTimersPaused '(false)' >/dev/null 2>&1 || true
 echo ""

@@ -87,8 +87,10 @@ degraded path deterministically.
 - A heartbeat task every `XRC_ANCHOR_PERIOD_NS = 120s` refreshes anchors for
   the enabled pools' base assets, one asset at a time, `await`ing XRC
   (`get_exchange_rate` with **no timestamp** — the canonical freshest
-  normalized minute; quote = USDT, matching the Kraken leg's convention and
-  avoiding the daily-granular forex path). All errors (`Pending`,
+  normalized minute; **quote = USD (fiat)** as of W3-05 — the anchor sits on
+  the MARK's denomination. It was USDT "matching the Kraken leg", which put
+  the depeg detector on the depegging side of the blend it was meant to
+  catch). All errors (`Pending`,
   `RateLimited`, decode failures, missing canister) are caught and simply
   leave the previous anchor in place — the fallback degrades to "no anchor",
   never to a wrong price.
@@ -162,3 +164,27 @@ later), sealed orders fall to the band-capped users-only path, LP mints refuse
 - GEPTOR/tick share `applyFreshAggregate`, so the same wiring is exercised.
 - The XRC binding is deliberately fail-safe: a decode/transport error just
   means "no anchor", which the tests above cover.
+
+## Quote bases (W3-05, 2026-08-15)
+
+The venue's mark is **USD-denominated**. The primary feed's sources are
+tagged with their quote asset (`PriceFeed.Source.quote`: coinbase/coingecko
+= USD; okx/kucoin/htx/cryptocom/binance/kraken = USDT), and
+`PriceFeed.aggregateByQuote` aggregates each group separately with the same
+trim/median machinery:
+
+- groups **agree** (≤ `USDT_DEPEG_ALARM_BPS` = 100bps apart) → the pooled
+  aggregate prices the mark (maximal sources; the groups corroborate each
+  other);
+- groups **diverge** → the divergence IS the depeg signal: a loud `warn`
+  event names the magnitude and both group sizes, and the mark follows the
+  **USD group** with its own dispersion and source count (which may drop it
+  below the source floor — then the XRC fallback applies, and that anchor is
+  USD-quoted too, so anchor and mark sit on the same side);
+- one group **empty** → the other prices alone; no cross-check, no false
+  signal.
+
+Pre-W3-05 all eight venues fed one median: a USDT depeg moved the blend, the
+USDT-quoted anchor moved with it, and the dispersion gate saw agreement —
+the exact scenario an anchor exists for was invisible. The pure combine
+logic is pinned by `tests/PriceFeedQuotes.test.mo`.

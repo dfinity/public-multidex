@@ -4,11 +4,21 @@
 # converted, NEVER ICPUSD left stranded as a side effect.
 #
 # Setup makes the BUY leg (BTC) THIN so it can absorb far less than a full sale of
-# the source (ICP) would raise. Expect: ICPUSD ≈ 0 residual, some BTC bought, and
-# most of the source ICP left unconverted.
+# the source (ICP) would raise. Expect: ICPUSD residual bounded by the slippage-band
+# fraction of leg 2's spend, some BTC bought, and most of the source ICP left
+# unconverted.
+#
+# Residual bound (task 1787204744, tightening the 1787189218 band-fraction
+# slack): the buy leg passes its sell proceeds to the engine as maxQuoteSpend
+# (a cost+takerFee budget) and sizes its quantity at the BEST ask — the engine
+# stops every fill walk exactly at the budget, so it can NEVER spend beyond
+# the proceeds into the owner's unrelated ICPUSD (see test_cross_swap_budget.sh)
+# AND fills landing below the cap no longer strand a band-fraction residual
+# (the old cap-sizing left up to spend×slip/(1+slip) ≈ $12 here; the engine
+# stop leaves sub-dollar conversion crumbs only).
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_cross_swap_sizing.sh
 
 set -u
@@ -81,8 +91,12 @@ sleep 2
 ICPUSD_UA=$(bal "$UA" ICPUSD); BTC_UA=$(bal "$UA" BTC); ICP_UA=$(bal "$UA" ICP)
 echo "   UA after: ICP=$ICP_UA  BTC=$BTC_UA  ICPUSD=$ICPUSD_UA"
 
-# 1) KEY: no stranded ICPUSD.
-if awk -v x="$ICPUSD_UA" 'BEGIN{exit (x<0.01?0:1)}'; then ok "no residual ICPUSD (≈0) — leg 1 sized to leg 2's capacity"; else nok "ICPUSD was stranded as a side effect" "ICPUSD=$ICPUSD_UA"; fi
+# 1) KEY: residual ICPUSD ≈ 0 — the engine's maxQuoteSpend stop converts the
+#    whole leg-2 budget (sub-dollar crumbs only: per-level floor rounding plus
+#    any sliver the walk can't fit at the last price). Pre-1787204744 the
+#    cap-sizing left ~$12 here (spend×slip/(1+slip)) and this assertion reads
+#    RED on that build.
+if awk -v x="$ICPUSD_UA" 'BEGIN{exit (x<1.0?0:1)}'; then ok "residual ICPUSD ($ICPUSD_UA) ≈ 0 (<\$1) — budget-stop converts the whole leg-2 spend"; else nok "ICPUSD residual beyond the engine-stop bound" "ICPUSD=$ICPUSD_UA"; fi
 # 2) Got some BTC (leg 2 executed).
 if awk -v x="$BTC_UA" 'BEGIN{exit (x>2.0?0:1)}'; then ok "bought BTC (~$BTC_UA, leg 2 executed up to the thin depth)"; else nok "leg 2 should have bought BTC" "BTC=$BTC_UA"; fi
 # 3) Source under-converted (most ICP kept) — the accepted worst case.

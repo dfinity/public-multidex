@@ -9,7 +9,7 @@
 # value, so the order fills the fresh AMM quotes but NEVER the stranded far ask.
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_slippage_anchor.sh
 #
 # Setup: mid=10, slippage=20% → mid-anchored cap=12.0. A stranded ask sits at

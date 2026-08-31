@@ -19,7 +19,7 @@
 # paused so the heartbeat can't refresh the mark or race the liquidation batch.
 #
 # RUN WITH THE TRADING BOT PAUSED, against a clean local replica:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_margin_staleness.sh
 # (calls resetExchange — do NOT run against a seeded/live sim.)
 

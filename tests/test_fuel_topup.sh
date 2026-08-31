@@ -13,6 +13,11 @@
 #   §3b unaffordable notify: a deposit past the mock's own balance → clean
 #       #Refunded (NOT a trap/wedge), pending cleared, block kept unconsumed
 #       (retry after topping the mock delivers), normal burn works after
+#   §3c stranded notify (#47.2): a #Processing notify keeps the latch; one
+#       auto-fuel tick on a HEALTHY balance retries and completes the saga
+#       unattended (pre-fix the health gate made the retry unreachable),
+#       the aged latch raises the FUEL age alarm, and getCanisterInfo
+#       mirrors the latch for the dashboard
 #   §4  archive fuel: adminFundArchive forwards cycles to the sidecar
 # Does NOT resetExchange (touches only treasury ICP + cycle balances).
 # Timers paused; sim killed (event-log grep needs a quiet log).
@@ -26,6 +31,7 @@ ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
 adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
+fm()  { icp canister call --identity anonymous fuel-mock "$@" 2>&1; }
 cycles() { adm getCanisterInfo '()' --query | tr -d '_' | grep -oE "cycles = [0-9]+" | head -1 | grep -oE "[0-9]+"; }
 
 # The sim must be dead (header: the event-log grep needs a quiet log).
@@ -150,6 +156,60 @@ else
   # fuel posture (cold_start sizes it to cover a 100-ICP auto-fuel tranche).
   icp canister top-up --amount 100t fuel-mock --identity anonymous >/dev/null 2>&1 || true
 fi
+
+echo "── §3c stranded notify auto-retries on a healthy balance (#47.2) ──"
+# The finding: tickAutoFuel's health gate preceded the pending-notify retry,
+# so once the cycle balance recovered (a local venue is ALWAYS healthy) the
+# tick returned before the retry — a landed-but-un-notified top-up waited on
+# a controller (adminRetryFuelNotify) forever while fuelStage2 refused every
+# further draw. Locks:
+#   (a) a #Processing notify KEEPS the pending record (saga latch armed),
+#   (b) a retry tick that still can't complete an AGED latch logs the FUEL
+#       age alarm (sinceNs is finally read),
+#   (c) one auto-fuel tick on a HEALTHY balance retries and completes the
+#       saga — latch cleared, cycles minted — with no admin call,
+#   (d) getCanisterInfo mirrors the latch for the dashboard (null once done).
+adm setAutoFuel '(true)' >/dev/null
+adm setTestBalance "(principal \"$TREAS\", \"ICP\", 200_000_000 : nat)" >/dev/null
+fm setProcessingNotifies '(true)' >/dev/null
+RS=$(adm burnTreasuryIcpToCycles '(80_000_000 : nat)')
+if echo "$RS" | grep -q "still processing"; then
+  ok "notify #Processing surfaced as a retryable error"
+else nok "unexpected burn result under #Processing" "$RS"; fi
+FS4=$(adm getFuelStatus '()' --query | tr -d '\n' | tr -s ' ')
+if echo "$FS4" | grep -q "pendingNotify = opt"; then
+  ok "pending notify KEPT on #Processing (latch armed)"
+else nok "latch not armed" "$(echo "$FS4" | head -c 200)"; fi
+# Backdate the latch 2h and tick while the mock still answers #Processing:
+# the retry must fire regardless of headroom, keep the latch, and log the
+# age alarm.
+adm setTestFuelPendingSince "($(( $(date +%s) * 1000000000 - 7200000000000 )) : int)" >/dev/null
+adm devTickAutoFuel '()' >/dev/null
+EV2=$(adm getRecentEvents '(30 : nat)' --query 2>/dev/null | grep -c "still awaiting notify")
+if [ "${EV2:-0}" -ge 1 ]; then
+  ok "age alarm logged for the stranded notify"
+else nok "no age alarm in the event log" "count=$EV2"; fi
+# Heal the mock; the NEXT unattended tick must complete the saga even though
+# the balance is healthy — pre-#47.2 this tick returned at the health gate.
+fm setProcessingNotifies '(false)' >/dev/null
+CS0=$(cycles)
+adm devTickAutoFuel '()' >/dev/null
+CS1=$(cycles)
+FS5=$(adm getFuelStatus '()' --query | tr -d '\n' | tr -s ' ')
+if echo "$FS5" | grep -q "pendingNotify = null"; then
+  ok "auto-retry cleared the latch on a healthy balance (the #47.2 fix)"
+else nok "latch survived the tick — retry unreachable behind the health gate" "$(echo "$FS5" | head -c 200)"; fi
+if [ $(( ${CS1:-0} - ${CS0:-0} )) -ge 700000000000 ]; then
+  ok "the stranded mint landed (Δ=$(( ${CS1:-0} - ${CS0:-0} )) cycles)"
+else nok "no deposit from the auto-retry" "Δ=$(( ${CS1:-0} - ${CS0:-0} ))"; fi
+CI=$(adm getCanisterInfo '()' --query | tr -d '\n' | tr -s ' ')
+if echo "$CI" | grep -q "fuelPendingNotify = null"; then
+  ok "getCanisterInfo surfaces fuelPendingNotify (null once cleared)"
+else nok "fuelPendingNotify missing from getCanisterInfo" "$(echo "$CI" | grep -o 'fuel[A-Za-z]* = [a-z0-9]*' | head -c 160)"; fi
+# Conservation physics: leave the venue with auto-fuel OFF (a seed burst
+# inflates the burn EMA and Stage-1 buys trader ICP into the treasury,
+# faking leaks in value-conservation frames).
+adm setAutoFuel '(false)' >/dev/null
 
 echo "── §4 archive fuel forwarding ──"
 RA=$(adm adminFundArchive '(100_000_000_000 : nat)')

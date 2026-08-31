@@ -68,7 +68,20 @@ assert_gt "level changes appear in the event log" "${EVT:-0}" "0"
 
 # (6) badges from lifetime counters: First Fill (any volume) + Player (≥$10k
 # lifetime — the two scorecard injections above sum past it)
-BDG=$(echo "$POL4" | tr -d '\n' | grep -oE "myBadges = vec \{.*" | head -1)
+# Anchored to the vec's own closing brace (#51.8): the old greedy `.*`
+# capture ran to the end of the flattened response, so the thresholds tail
+# supplied the "N : nat" needles and an EMPTY badge vec still passed. The
+# entries are nested records, so the anchor must be brace-BALANCED — a flat
+# [^}]* stops at the first record's brace and truncates the set.
+BDG=$(echo "$POL4" | tr -d '\n' | awk '{
+  i = index($0, "myBadges = vec {"); if (i == 0) exit
+  s = substr($0, i); d = 0
+  for (j = 1; j <= length(s); j++) {
+    c = substr(s, j, 1)
+    if (c == "{") d++
+    if (c == "}") { d--; if (d == 0) { print substr(s, 1, j); exit } }
+  }
+}')
 assert_contains "First Fill badge (id 2) earned"       "$BDG" "2 : nat"
 assert_contains "MULTI/DEX Player badge (id 3) earned" "$BDG" "3 : nat"
 
@@ -116,7 +129,25 @@ assert_contains "taker credited TAKER volume (\$1,200)" "$TPOL" "myTakerVolUsd =
 EXV=$(echo "$TPOL" | grep -oE "exchangeVolUsd = [0-9]+" | grep -oE "[0-9]+" | head -1)
 assert_gt "exchange window volume accrued" "${EXV:-0}" "0"
 
-# (8) staged-order cap: 32 staged orders fine, the 33rd refused
+# (8) staged-order cap: 32 staged orders fine, the 33rd refused.
+# Timers PAUSED across §8–§9: on a live-oracle venue the release machinery is
+# freshness-driven — a staged order releases the moment a requote lands a
+# price that postdates its entry (the GEPTOR re-stamps ~1-2s), so a count
+# read moments after a place/cancel can come up one short of what the action
+# accounts for (the 31-expected/30-read flake, 2026-08-20). Every release
+# path is a timer dispatch: processDeferred fires at the end of a requote
+# (tickAmm and the finaliser-dispatched processGeptorDue — its ONLY dispatch
+# site), and processDeferredExpiry/processDeferredSwaps (the oracle-stall
+# fallback — the likely releaser here, BTC-ICPUSD having no AMM pool in
+# matching mode) run directly in finaliseExpiredPending. tickAmm and the
+# finaliser both early-return under _timersPaused, and tickPriceRefresh only
+# stamps, never requotes — so under the pause a stamp, even one landing from
+# an already-in-flight fetch, releases nothing. Between pause and restore the
+# staged set therefore moves ONLY by this suite's own place/cancel calls.
+# No trap needed for the restore: assertions accumulate (_fail never exits),
+# so line-of-control always reaches the resume below, and run_all.sh's
+# inter-suite hygiene (2026-08-15) force-unpauses before every suite anyway.
+call setTestTimersPaused '(true)' > /dev/null
 for i in $(seq 1 32); do
   call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 $((60000 + i))) : nat, $(e8 0.001) : nat)" --identity lvlu > /dev/null
 done
@@ -132,5 +163,6 @@ POL6=$(call getAccessPolicy '()' --identity lvlu --query)
 assert_contains "cancel decremented the staged count" "$POL6" "myStagedCount = 31"
 AGAIN=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 60051) : nat, $(e8 0.001) : nat)" --identity lvlu)
 assert_contains "slot freed — placement accepted again" "$AGAIN" "ok"
+call setTestTimersPaused '(false)' > /dev/null   # resume venue dynamics
 
 finish_test "test_access_levels"

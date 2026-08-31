@@ -102,12 +102,18 @@ if [ "$TOTAL" -lt 8 ]; then
   echo ""; echo "═══════════════════════════════════════════════════════"
   echo "RESULT: passed=$pass failed=$fail"; exit 1
 fi
-# Audit a bounded window from the TAIL, opening strictly ABOVE the anchor so
-# every page — including the first — has a real inbound link to verify.
+# Audit a bounded window near the tail, opening strictly ABOVE the anchor so
+# every page — including the first — has a real inbound link to verify, and
+# closing strictly BELOW the tape end: a walk that reaches the end now makes
+# one extra comparison (the certified-head anchor, W2-01), which would turn
+# these fixed counts into a race against any concurrent append. The anchored
+# tail case is asserted deterministically on a SEALED archive by
+# test_archive_chain.sh instead.
 W=12
-FROM=$(( NEXT - W ))
-if [ "$FROM" -le "$ANCHOR" ]; then FROM=$(( ANCHOR + 1 )); W=$(( NEXT - FROM )); fi
+FROM=$(( NEXT - W - 1 ))
+if [ "$FROM" -le "$ANCHOR" ]; then FROM=$(( ANCHOR + 1 )); fi
 END=$(( FROM + W ))
+if [ "$END" -ge "$NEXT" ]; then END=$(( NEXT - 1 )); W=$(( END - FROM )); fi
 WANT_LINKS=$W                       # W−1 internal links + the seeded inbound one
 ok "window snapshotted: seqs $FROM..$((END-1)) ($W events, $WANT_LINKS links, anchor=$ANCHOR)"
 

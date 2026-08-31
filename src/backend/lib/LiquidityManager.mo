@@ -21,6 +21,42 @@ module {
   // and any pending-match reservations.
   public type AvailableBalance = (Principal, Types.TokenId) -> Nat;
 
+  // Human text for a 10^8-scaled multiplier, up to 2 dp with trailing zeros
+  // trimmed (250_000_000 → "2.5") — the raw base-unit constant is meaningless
+  // in a user-facing message (#50.3). Display only; enforcement stays fixed-point.
+  func factorText(f : Nat) : Text {
+    let whole = f / Fixed.SCALE;
+    let hundredths = (f % Fixed.SCALE) * 100 / Fixed.SCALE;
+    if (hundredths == 0) { Nat.toText(whole) }
+    else if (hundredths % 10 == 0) { Nat.toText(whole) # "." # Nat.toText(hundredths / 10) }
+    else { Nat.toText(whole) # "." # (if (hundredths < 10) "0" else "") # Nat.toText(hundredths) };
+  };
+
+  // Per-level congestion cap (see Types.MAX_ORDERS_PER_PRICE_LEVEL): a price
+  // already holding the max resting orders takes no more — REJECT-new, never
+  // evict. The counter is the AGGREGATE across ALL owners resting at this
+  // (marketId, side, price) level — it is NOT owner-scoped (per-owner budgets
+  // are the open-order cap, a different guard). It IS side-scoped: only the
+  // order's own side of the level counts, so a stacked opposite side never
+  // blocks an order that would cross it. `levelCap` is
+  // Types.MAX_ORDERS_PER_PRICE_LEVEL everywhere except main.mo's margin-path
+  // call sites, which may pass a dev-hook override (setTestLevelCap) so tests
+  // can fill a level without 512 placements. Internal placements (AMM ladder,
+  // deferred releases resting a remainder) do not route through this check
+  // and are exempt by construction.
+  public func levelCapCheck(
+    store    : OrderBook.OrderStore,
+    marketId : Types.MarketId,
+    side     : Types.Side,
+    price    : Nat,
+    levelCap : Nat,
+  ) : ?Text {
+    if (OrderBook.getLevelOrderCount(store, marketId, side, price) >= levelCap) {
+      ?("Price level full: " # Nat.toText(levelCap) #
+        " orders already rest at this exact price on this side. Choose a different price.")
+    } else { null };
+  };
+
   public func validateNewOrder(
     store : OrderBook.OrderStore,
     accounts : Accounts.AccountState,
@@ -34,18 +70,12 @@ module {
     price : Nat,
     quantity : Nat,
   ) : { #ok; #err : Text } {
-    // Per-level congestion cap (see Types.MAX_ORDERS_PER_PRICE_LEVEL): a
-    // price already holding the max resting orders takes no more. Checked
-    // FIRST — a full level rejects regardless of balances — and side-scoped:
-    // only the caller's own (side, price) level counts, so a stacked opposite
-    // side never blocks an order that would cross it. Internal placements
-    // (AMM ladder, deferred releases resting a remainder) do not route
-    // through this validation and are exempt by construction.
-    if (OrderBook.getLevelOrderCount(store, marketId, side, price) >= Types.MAX_ORDERS_PER_PRICE_LEVEL) {
-      return #err(
-        "Price level full: " # Nat.toText(Types.MAX_ORDERS_PER_PRICE_LEVEL) #
-        " orders already rest at this exact price on this side. Choose a different price."
-      );
+    // Per-level congestion cap — see levelCapCheck above for the semantics
+    // (aggregate across owners, side-scoped). Checked FIRST: a full level
+    // rejects regardless of balances.
+    switch (levelCapCheck(store, marketId, side, price, Types.MAX_ORDERS_PER_PRICE_LEVEL)) {
+      case (?e) { return #err(e) };
+      case null {};
     };
     switch (side) {
       case (#buy) {
@@ -79,7 +109,7 @@ module {
         let currentTotal = OrderBook.getUserMarketBuyTotal(store, user, marketId);
         let maxAllowed = Fixed.mul(icpusdBalance, Types.MARKET_ASSET_FACTOR, false);
         if (currentTotal + orderValue > maxAllowed) {
-          return #err("Total buy orders on this market would exceed " # Nat.toText(Types.MARKET_ASSET_FACTOR) # "x your ICPUSD balance");
+          return #err("Total buy orders on this market would exceed " # factorText(Types.MARKET_ASSET_FACTOR) # "x your ICPUSD balance");
         };
 
         // ── Cross-market soft cap on bids (Phase 0 soft-leverage limit) ──
@@ -131,7 +161,7 @@ module {
         let currentTotal = OrderBook.getUserMarketSellTotal(store, user, marketId);
         let maxAllowed = Fixed.mul(assetBalance, Types.MARKET_ASSET_FACTOR, false);
         if (currentTotal + quantity > maxAllowed) {
-          return #err("Total sell orders on this market would exceed " # Nat.toText(Types.MARKET_ASSET_FACTOR) # "x your " # baseToken # " balance");
+          return #err("Total sell orders on this market would exceed " # factorText(Types.MARKET_ASSET_FACTOR) # "x your " # baseToken # " balance");
         };
 
         #ok;
@@ -215,7 +245,7 @@ module {
             let orderValue = Fixed.mul(rem, live.price, true);
             if (orderValue <= excess) {
               // Cancel this order entirely
-              recordCancel(adjList, live, timestamp);
+              recordCancel(adjList, live, timestamp, #crossMarketCapExceeded);
               ignore OrderBook.cancelOrder(store, live.id);
               excess -= orderValue;
             } else {
@@ -224,13 +254,13 @@ module {
               let newQty : Nat = live.quantity - reduceQty;
               let newRem : Nat = newQty - live.filled;
               if (Fixed.mul(newRem, live.price, true) < Types.MIN_ORDER_ICPUSD) {
-                recordCancel(adjList, live, timestamp);
+                recordCancel(adjList, live, timestamp, #crossMarketCapExceeded);
                 ignore OrderBook.cancelOrder(store, live.id);
                 // orderValue > excess in this branch, so the cancel clears the
                 // whole overage (`-=` here is a guaranteed underflow trap).
                 excess := 0;
               } else {
-                recordAdjust(adjList, live, newQty, timestamp);
+                recordAdjust(adjList, live, newQty, timestamp, #crossMarketCapExceeded);
                 ignore OrderBook.adjustOrderQuantity(store, live.id, newQty);
                 excess := 0;
               };
@@ -252,7 +282,13 @@ module {
   };
 
   // ── Record helpers ──────────────────────────────────────────────
-  func recordCancel(adjList : List.List<Types.OrderAdjustment>, o : Types.Order, timestamp : Int) {
+  // `reason` names the WALK that touched the order (the trigger), threaded
+  // from every call site: #balanceShrank for the step-1 balance walks,
+  // #marketCapExceeded for the step-2 per-market cap walks,
+  // #crossMarketCapExceeded for enforceCrossMarketBidCap. A below-min
+  // escalation (shrink → whole cancel) keeps its walk's reason — `cancelled`
+  // records the escalation itself.
+  func recordCancel(adjList : List.List<Types.OrderAdjustment>, o : Types.Order, timestamp : Int, reason : Types.AdjustmentReason) {
     List.add(adjList, {
       orderId     = o.id;
       marketId    = o.marketId;
@@ -261,10 +297,11 @@ module {
       newQuantity = 0;
       cancelled   = true;
       timestamp;
+      reason      = ?reason;
     });
   };
 
-  func recordAdjust(adjList : List.List<Types.OrderAdjustment>, o : Types.Order, newQty : Nat, timestamp : Int) {
+  func recordAdjust(adjList : List.List<Types.OrderAdjustment>, o : Types.Order, newQty : Nat, timestamp : Int, reason : Types.AdjustmentReason) {
     let newRem = SafeMath.subOrZero(newQty, o.filled);
     List.add(adjList, {
       orderId     = o.id;
@@ -274,6 +311,7 @@ module {
       newQuantity = newRem;
       cancelled   = false;
       timestamp;
+      reason      = ?reason;
     });
   };
 
@@ -297,16 +335,16 @@ module {
             let orderValue = Fixed.mul(rem, o.price, true);
             if (orderValue > icpusdBalance) {
               if (icpusdBalance < Types.MIN_ORDER_ICPUSD) {
-                recordCancel(adjList, o, timestamp);
+                recordCancel(adjList, o, timestamp, #balanceShrank);
                 ignore OrderBook.cancelOrder(store, id);
               } else {
                 let newQty = o.filled + Fixed.div(icpusdBalance, o.price, false);
                 let newRem : Nat = newQty - o.filled;
                 if (Fixed.mul(newRem, o.price, true) < Types.MIN_ORDER_ICPUSD) {
-                  recordCancel(adjList, o, timestamp);
+                  recordCancel(adjList, o, timestamp, #balanceShrank);
                   ignore OrderBook.cancelOrder(store, id);
                 } else {
-                  recordAdjust(adjList, o, newQty, timestamp);
+                  recordAdjust(adjList, o, newQty, timestamp, #balanceShrank);
                   ignore OrderBook.adjustOrderQuantity(store, id, newQty);
                 };
               };
@@ -333,7 +371,7 @@ module {
               let rem = OrderBook.remaining(o);
               let orderValue = Fixed.mul(rem, o.price, true);
               if (orderValue <= excess) {
-                recordCancel(adjList, o, timestamp);
+                recordCancel(adjList, o, timestamp, #marketCapExceeded);
                 ignore OrderBook.cancelOrder(store, id);
                 excess -= orderValue;
               } else {
@@ -341,12 +379,12 @@ module {
                 let newQty : Nat = o.quantity - reduceQty;
                 let newRem : Nat = newQty - o.filled;
                 if (Fixed.mul(newRem, o.price, true) < Types.MIN_ORDER_ICPUSD) {
-                  recordCancel(adjList, o, timestamp);
+                  recordCancel(adjList, o, timestamp, #marketCapExceeded);
                   ignore OrderBook.cancelOrder(store, id);
                   // orderValue > excess in this branch — cancel clears the overage.
                   excess := 0;
                 } else {
-                  recordAdjust(adjList, o, newQty, timestamp);
+                  recordAdjust(adjList, o, newQty, timestamp, #marketCapExceeded);
                   ignore OrderBook.adjustOrderQuantity(store, id, newQty);
                   excess := 0;
                 };
@@ -382,11 +420,11 @@ module {
             if (rem > assetBalance) {
               let newRem = assetBalance;
               if (Fixed.mul(newRem, o.price, true) < Types.MIN_ORDER_ICPUSD) {
-                recordCancel(adjList, o, timestamp);
+                recordCancel(adjList, o, timestamp, #balanceShrank);
                 ignore OrderBook.cancelOrder(store, id);
               } else {
                 let newQty = o.filled + newRem;
-                recordAdjust(adjList, o, newQty, timestamp);
+                recordAdjust(adjList, o, newQty, timestamp, #balanceShrank);
                 ignore OrderBook.adjustOrderQuantity(store, id, newQty);
               };
             };
@@ -411,19 +449,19 @@ module {
             if (OrderBook.isOpen(o)) {
               let rem = OrderBook.remaining(o);
               if (rem <= excess) {
-                recordCancel(adjList, o, timestamp);
+                recordCancel(adjList, o, timestamp, #marketCapExceeded);
                 ignore OrderBook.cancelOrder(store, id);
                 excess -= rem;
               } else {
                 let newQty : Nat = o.quantity - excess;
                 let newRem : Nat = newQty - o.filled;
                 if (Fixed.mul(newRem, o.price, true) < Types.MIN_ORDER_ICPUSD) {
-                  recordCancel(adjList, o, timestamp);
+                  recordCancel(adjList, o, timestamp, #marketCapExceeded);
                   ignore OrderBook.cancelOrder(store, id);
                   // rem > excess in this branch — cancel clears the overage.
                   excess := 0;
                 } else {
-                  recordAdjust(adjList, o, newQty, timestamp);
+                  recordAdjust(adjList, o, newQty, timestamp, #marketCapExceeded);
                   ignore OrderBook.adjustOrderQuantity(store, id, newQty);
                   excess := 0;
                 };

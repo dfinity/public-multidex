@@ -40,12 +40,20 @@ sim behaviour while `DEPLOY_MODE = #dev`.
 - [ ] **Post-deploy verification that the flip actually landed** (catches any
       future stable-capture regression):
   - `getDeployMode()` → `"production"`.
-  - `addTestTokens("BTC", <amount>)` as a normal identity → returns silently,
-    balance **unchanged** (`getBalance("BTC")`).
-  - `setAmmRefPrice` → `#err("setAmmRefPrice is a dev-only override")`.
-  - `debugInspectByUsername("<any-username>")` as a controller →
-    `found = false`, empty record.
-  - `setTestBalance` no-ops; `getTestBalance` returns `0`.
+  - `addTestTokens("BTC", <amount>)` as a normal identity → **traps**
+    (`addTestTokens is a dev-only faucet (posture: play/production)`);
+    balance **unchanged** (`getBalance("BTC")`). (Was a silent no-op —
+    reconciled to the actor's own refuse-loudly rule, W6-02.)
+  - `setAmmRefPrice` → `#err("setAmmRefPrice is a dev-only hook (posture: play/production)")`.
+  - `debugInspectByUsername("<any-username>")` as a controller → **traps**
+    (`debugInspectByUsername is a dev-only hook (posture: play/production)`)
+    on #play and #production alike — a wrong `found=false` would claim the
+    user does not exist; the refusal is the honest answer.
+  - `setTestBalance` **traps** (`setTestBalance is not available on #production`);
+    `getTestBalance` **traps** (`getTestBalance is not available on #production`).
+    (Both were silent no-op/0 — same reconciliation. The caller-auth `0` for
+    non-controllers asking about OTHERS stays: that is the anti-oracle rule,
+    not a posture gate.)
   - `setTestEmailBinding` **traps** (`requireDevHook`, `#dev`-only — it used
     to be reachable on `#play`).
   - `injectHistoricalTrades` → `#err("injectHistoricalTrades is not available
@@ -84,8 +92,21 @@ sim behaviour while `DEPLOY_MODE = #dev`.
       archive that fills from now on becomes immutable at seal (controllers
       emptied; the fuel watermark still funds it). Irreversible per archive;
       this is the operator-proof-history half of Proof of Reserves.
-- [ ] Run `tests/test_authorization.sh` + `tests/test_fuel_topup.sh` +
-      `tests/test_archive_replay.sh` (the ledger-of-record reconciliation).
+- [ ] Auth + reconciliation, with eyes open about what runs WHERE (W6-02 —
+      the old form named three suites as if all three run against mainnet):
+      - `tests/test_authorization.sh` — runs against this target (it probes
+        with a NON-controller identity by design, never anonymous); its
+        admin-positive sections need `--identity <operator>`.
+      - `tests/test_fuel_topup.sh` — **local/#dev only**: it drives the
+        fuel-mock, which this page forbids deploying here. The mainnet fuel
+        verification is the wiring smoke above + the topup cron's first run
+        (cycles on Stats → Canister move).
+      - Ledger-of-record reconciliation on mainnet: `node
+        scripts/verify_ledger.mjs --backend <id> --host https://icp-api.io
+        --full` (the standalone verifier — gate-covered by
+        `tests/test_verify_ledger_gate.sh`). `tests/test_archive_replay.sh`
+        signs its admin plumbing as the LOCAL controller (anonymous) and is a
+        local-replica suite.
 - [ ] **Ledger page certificate check**: open Stats → Ledger, run "Verify in
       my browser", confirm the result says *IC certificate VALID*. (On the
       local replica this degrades to "certificate check unavailable" —
@@ -210,3 +231,23 @@ sim behaviour while `DEPLOY_MODE = #dev`.
       leaks plugged. No known open financial-accounting bugs remain from the
       June reviews — the open surface is oracle-integrity (M1 residual + M3
       above).
+
+## Security headers — VERIFIED LIVE 2026-08-15 (W4-20)
+
+`curl -sD- https://multidex.ai` returned the full strict set (recorded verbatim):
+
+    content-security-policy: default-src 'self';script-src 'self';connect-src 'self'
+      http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;
+      img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';
+      font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';
+      form-action 'self';upgrade-insecure-requests;
+    strict-transport-security: max-age=31536000; includeSubDomains
+    x-content-type-options: nosniff
+    x-frame-options: DENY
+    referrer-policy: same-origin
+    (+ permissions-policy denying every capability, x-xss-protection)
+
+Kept verified: `scripts/check_headers.sh <origin>` asserts CSP presence + the key directives
+(script-src 'self', object-src 'none', frame-ancestors 'none') + HSTS/nosniff/DENY/referrer, and
+`deploy.sh` runs it automatically after every subnet/engine deploy against the first recorded
+https origin — a recipe upgrade or config change that drops a header now fails the deploy, loudly.

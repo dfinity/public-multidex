@@ -61,14 +61,17 @@ module {
   };
 
   public func getUserBalances(state : AccountState, user : Principal) : [(Types.TokenId, Nat)] {
+    // W5-19 (F10): the balance map is ordered and keyed "principal#token", so
+    // one user's rows are a contiguous range — seek to the prefix and stop at
+    // the first key past it, instead of scanning every account on the venue.
+    // This is a QUERY-reachable path (the ~8×-lower instruction ceiling).
     let prefix = Principal.toText(user) # "#";
     let results = Map.empty<Text, Nat>();
-    for ((key, bal) in Map.entries(state.balances)) {
-      if (Text.startsWith(key, #text prefix)) {
-        let token = textAfter(key, Text.size(prefix));
-        if (bal > 0) {
-          Map.add(results, Text.compare, token, bal);
-        };
+    label walk for ((key, bal) in Map.entriesFrom(state.balances, Text.compare, prefix)) {
+      if (not Text.startsWith(key, #text prefix)) { break walk };
+      let token = textAfter(key, Text.size(prefix));
+      if (bal > 0) {
+        Map.add(results, Text.compare, token, bal);
       };
     };
     Iter.toArray(Map.entries(results));

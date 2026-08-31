@@ -52,6 +52,9 @@ cd "$(dirname "$0")/.."
 # price-snapshot path this script then reads back.
 # shellcheck source=scripts/lib/runfiles.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/runfiles.sh"
+# Target table + the shared posture reader (mdx_posture_of) — see W1-02.
+# shellcheck source=scripts/lib/targets.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/targets.sh"
 export PATH="$HOME/.local/bin:$PATH"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -77,29 +80,30 @@ adm() { icp canister call backend "$@" --identity anonymous 2>&1; }
 # ── 0. Preflight ──────────────────────────────────────────────────
 hdr "Preflight"
 
-grep -q 'DEPLOY_MODE : DeployMode = #play' src/backend/main.mo \
-  || die "src/backend/main.mo is not on #play — set: transient let DEPLOY_MODE : DeployMode = #play;"
+# mdx_posture_of (lib/targets.sh) — comment-aware, refuses ambiguity. The
+# old `grep -q` here matched the #play literal INSIDE a comment, so a
+# commented copy of the declaration passed the gate over a real #dev.
+SRC_POSTURE=$(mdx_posture_of src/backend/main.mo || true)
+[ "$SRC_POSTURE" = "play" ] \
+  || die "src/backend/main.mo must resolve to #play (got '${SRC_POSTURE:-unresolved — see above}') — set: transient let DEPLOY_MODE : DeployMode = #play;"
 ok "source posture is #play"
 
-curl -s --max-time 2 http://127.0.0.1:8000/api/v2/status > /dev/null 2>&1 \
-  || die "local network is not answering on :8000 — run scripts/cold_start.sh first"
+# Gateway resolved from the CLI's own record (mdx_local_gateway, W1-06) —
+# 8000 on the canonical checkout, a random port under the worktree-parallel
+# workflow. The old hardwired :8000 probe refused to run from a worktree.
+GW=$(mdx_local_gateway || true); GW_PORT=${GW##* }
+{ [ -n "$GW" ] && curl -s --max-time 2 "http://127.0.0.1:$GW_PORT/api/v2/status" > /dev/null 2>&1; } \
+  || die "local network is not answering — run scripts/cold_start.sh first"
 # Zombie-master check (same signature cold_start heals): a second pocket-ic
 # master leaves the gateway answering while inter-canister calls + outcalls
-# fail — and this script NEEDS outcalls (fetchAndSetRefPrice).
-#
-# Scoped to THIS repo by working directory. A pocket-ic master is NOT
-# machine-global: every project that runs `icp network start` gets its own,
-# rooted at its own checkout. Enumerating them all made any other project's
-# perfectly healthy replica look like our zombie and refused to seed
-# (observed against ~/Projects/open-saas, 2026-07-29).
-OWNER=$(lsof -nP -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -1)
-REPO_ROOT=$(pwd -P)
-for pid in $(pgrep -f "pocket-ic --ttl" 2>/dev/null); do
-  pcwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
-  [ "$pcwd" = "$REPO_ROOT" ] || continue        # another project's network — not ours to judge
-  [ "$pid" = "${OWNER:-}" ] || die "zombie pocket-ic master ($pid) for this repo — run scripts/cold_start.sh (it restarts the network cleanly), then rerun this"
+# fail — and this script NEEDS outcalls (fetchAndSetRefPrice). Detection is
+# mdx_stray_masters: repo-scoped by cwd (another project's healthy replica
+# is not our zombie — the 2026-07-29 open-saas lesson), owner-scoped by the
+# recorded gateway above.
+for pid in $(mdx_stray_masters || true); do
+  die "zombie pocket-ic master ($pid) for this repo — run scripts/cold_start.sh (it restarts the network cleanly), then rerun this"
 done
-ok "replica healthy (single master owns the gateway)"
+ok "replica healthy (single master owns the gateway on :$GW_PORT)"
 
 BACKEND_ID=$(icp canister status backend --identity anonymous 2>/dev/null | awk -F': ' '/^Canister Id/{print $2; exit}' | tr -d '[:space:]')
 BRIDGE_ID=$(icp canister status bridge  --identity anonymous 2>/dev/null | awk -F': ' '/^Canister Id/{print $2; exit}' | tr -d '[:space:]')
@@ -357,7 +361,7 @@ echo "  AMM              : $SEEDED markets × \$$TVL vault (live-feed prices)"
 echo "  Insurance fund   : \$$INS_USD ICPUSD"
 echo "  Arbitrageur      : \$${ARB_USD} working capital (pins venue ↔ mark)"
 echo "  Bots             : 20 sim traders + 2 makers, \$100k value each (player parity)"
-echo "  Frontend         : http://frontend.local.localhost:8000/"
+echo "  Frontend         : http://frontend.local.localhost:$GW_PORT/"
 echo ""
 echo "  NOTE: #play is the repo's DEFAULT posture (DEPLOY_MODE, src/backend/main.mo)."
 echo "        Dev fixtures (cold_start --mode full|matching|amm|pending|load) need a"

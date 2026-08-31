@@ -91,6 +91,10 @@ export function canonicalEvent(e) {
     putT(p, "lpShareDelta"); putT(p, k.lpShareDelta.marketId); putN(p, k.lpShareDelta.amount);
   } else if ("insShareDelta" in k) {
     putT(p, "insShareDelta"); putN(p, k.insShareDelta.amount);
+  } else if ("gap" in k) {
+    putT(p, "gap"); putN(p, k.gap.fromSeq); putN(p, k.gap.toSeq);
+  } else if ("config" in k) {
+    putT(p, "config"); putT(p, k.config.setter); putT(p, k.config.value);
   } else {
     throw new Error("unknown event kind (verifier older than the canister?)");
   }
@@ -174,7 +178,7 @@ async function validateCertifiedHead(certBytes, canisterIdText, expectedHash, ro
 // Walks [fromSeq..toSeq] on one archive, checking every link. `seedHash` is
 // the expected prevHash of the FIRST event (the predecessor's hash — null
 // skips that check, e.g. at the chain anchor). Returns the final hash.
-async function verifySlice(actor, fromSeq, toSeq, seedHash, onProgress) {
+async function verifySlice(actor, fromSeq, toSeq, seedHash, onProgress, gapSink) {
   let expectPrev = seedHash;
   let lastHash = null;
   let s = fromSeq;
@@ -191,6 +195,10 @@ async function verifySlice(actor, fromSeq, toSeq, seedHash, onProgress) {
         }
         links++;
       }
+      // W2-04: #gap events are the chain's OWN declaration of a shed — the
+      // only re-anchor justification this verifier accepts (getLedgerGaps is
+      // an uncertified self-report).
+      if (gapSink && "gap" in e.kind) gapSink.push([Number(e.kind.gap.fromSeq), Number(e.kind.gap.toSeq)]);
       lastHash = await hashEvent(e);
       expectPrev = lastHash;
       s = Number(e.seq) + 1;
@@ -224,6 +232,13 @@ export async function verifyChainClient(deps, opts, onStatus) {
   try { gaps = getLedgerGaps ? await getLedgerGaps() : []; } catch { /* pre-failover backend */ }
   const reanchorSeqs = new Set(gaps.map((g) => Number(g[1])));
   const gapEventsMissing = gaps.reduce((n, g) => n + (Number(g[1]) - Number(g[0])), 0);
+  // W2-04: the tuples above are only CLAIMS. Each structural discontinuity
+  // honored below must be justified after the walk by a #gap event that is
+  // hash-committed in the chain itself, or by an operator-audited legacy gap
+  // passed in opts.acceptGaps ([[from,to], …]).
+  const acceptGaps = (opts && opts.acceptGaps) || [];
+  const chainGaps = [];
+  const pendingJustify = [];
   // Shed re-baselines: after each shed the canister re-attests EVERY balance
   // with absolute rows, so a replayer that resets at the baseline reconstructs
   // balances from the tape alone — the gap costs history, not replayability.
@@ -233,6 +248,7 @@ export async function verifyChainClient(deps, opts, onStatus) {
   let totalLinks = 0;
   let carried = null;   // hash carried across archive boundaries
   let heads = 0;
+  let segCertsOk = 0;   // W2-04: per-segment certificates that validated
 
   if (lastN) {
     // Newest N on the active archive only. Seed the first link from the
@@ -252,27 +268,71 @@ export async function verifyChainClient(deps, opts, onStatus) {
     }
   } else {
     // Full history: every archive in routing order, links carried across
-    // canister boundaries, each sealed head checked too.
+    // canister boundaries, each sealed head checked AND certified too.
+    // W2-04: pin the origin — coverage starting later than the chain's
+    // declared start (or opts.expectStart, the out-of-band anchor) is a
+    // truncated archive list unless a justified gap explains that range.
+    const origin = opts && Number.isInteger(opts.expectStart) ? opts.expectStart : chainStart;
+    if (Number(archives[0].firstSeq) > origin) {
+      pendingJustify.push({ from: origin, to: Number(archives[0].firstSeq),
+        what: `history starts at seq ${archives[0].firstSeq} but the chain origin is ${origin} — early archives omitted?` });
+    }
     for (let i = 0; i < archives.length; i++) {
       const a = archives[i];
       const actor = i === archives.length - 1 ? activeActor : await makeRawArchiveActor(a.canisterId);
       const aHead = i === archives.length - 1 ? head : await actor.getCertifiedHead();
       const from = Number(a.firstSeq);
       const to = a.lastSeq.length ? Number(a.lastSeq[0]) : headSeq;
-      // Re-anchor after a recorded gap: seed null so the walk accepts the
-      // documented cross-archive discontinuity (still verifies this archive's
-      // own chain internally + its certified head).
+      // W2-04: a clipped first-archive start and any coverage jump between
+      // archives are unverified tape — both demand a chain-visible gap.
+      const clipTo = i === 0 ? chainStartOf(aHead, from) : from;
+      if (i === 0 && clipTo > from) {
+        pendingJustify.push({ from, to: clipTo, what: `archive 1 re-anchors its own start at ${clipTo}` });
+      }
+      if (i > 0 && archives[i - 1].lastSeq.length) {
+        const prevLast = Number(archives[i - 1].lastSeq[0]);
+        if (from !== prevLast + 1) {
+          pendingJustify.push({ from: prevLast + 1, to: from,
+            what: `coverage jumps ${prevLast + 1}→${from} between archives ${i}/${i + 1}` });
+        }
+      }
+      // Re-anchor after a CLAIMED gap: seed null so the walk accepts the
+      // discontinuity — tentatively. The claim is proven after the walk by a
+      // #gap event committed in the chain, or the whole run fails: a
+      // fabricated tuple at a continuous boundary would need a #gap event
+      // for an empty range, which the honest shed path never emits.
       const reanchored = i > 0 && reanchorSeqs.has(from);
+      if (reanchored && archives[i - 1].lastSeq.length) {
+        pendingJustify.push({ from: Number(archives[i - 1].lastSeq[0]) + 1, to: from,
+          what: `re-anchor claimed at archive ${i + 1} firstSeq ${from}` });
+      }
       const seed = reanchored ? null : carried;
-      onStatus(`archive ${i + 1}/${archives.length}: verifying seqs ${from}…${to}…${reanchored ? " (re-anchored after a gap)" : ""}`);
-      const r = await verifySlice(actor, Math.max(from, i === 0 ? chainStartOf(aHead, from) : from), to, seed,
-        (done, total) => onStatus(`archive ${i + 1}/${archives.length}: ${done}/${total} events`));
+      onStatus(`archive ${i + 1}/${archives.length}: verifying seqs ${from}…${to}…${reanchored ? " (re-anchor claimed)" : ""}`);
+      const r = await verifySlice(actor, Math.max(from, clipTo), to, seed,
+        (done, total) => onStatus(`archive ${i + 1}/${archives.length}: ${done}/${total} events`), chainGaps);
       totalLinks += r.links;
       if (aHead.headHash.length && !bytesEq(r.lastHash, new Uint8Array(aHead.headHash[0]))) {
-        throw new Error(`archive ${a.canisterId}: recomputed head ≠ its certified head`);
+        throw new Error(`archive ${a.canisterId}: recomputed head ≠ its reported head`);
+      }
+      // W2-04: certify THIS segment's head — before this, sealed heads were
+      // only compared against their own uncertified self-report.
+      if (!aHead.certificate.length) {
+        if (!isLocalReplicaOrigin()) throw new Error(`archive ${a.canisterId}: no certificate for this segment — an uncertified head proves nothing`);
+      } else {
+        const c = await validateCertifiedHead(aHead.certificate[0], a.canisterId, new Uint8Array(aHead.headHash[0]), rootKey);
+        if (c.ok === false) throw new Error(`archive ${a.canisterId}: segment certificate FAILED: ` + c.why);
+        if (c.ok === true) segCertsOk++;
       }
       heads++;
       carried = r.lastHash;
+    }
+    // W2-04: demand chain proof for every discontinuity honored above.
+    for (const p of pendingJustify) {
+      const inChain = chainGaps.some(([f, t]) => f === p.from && t === p.to);
+      const accepted = acceptGaps.some(([f, t]) => Number(f) === p.from && Number(t) === p.to);
+      if (!inChain && !accepted) {
+        throw new Error(`unjustified discontinuity: ${p.what} — no #gap event [${p.from}..${p.to}) is hash-committed in the verified chain`);
+      }
     }
   }
 
@@ -287,12 +347,22 @@ export async function verifyChainClient(deps, opts, onStatus) {
   const certCheck = head.certificate.length
     ? await validateCertifiedHead(head.certificate[0], active.canisterId, new Uint8Array(head.headHash[0]), rootKey)
     : { ok: null, why: "no certificate in the query response" };
-  if (certCheck.ok === true) certNote = "IC certificate VALID — the subnet vouches for this head";
+  // W2-04 verdict copy: say what was proven. The active certificate vouches
+  // for the ACTIVE archive's head; sealed segments are vouched only by their
+  // own per-segment certificates (counted in segCertsOk; lastN mode never
+  // visits them). Sealed-segment immutability is absolute only with
+  // blackhole-at-seal in force — see docs/archive-design.md.
+  if (certCheck.ok === true) {
+    certNote = lastN
+      ? "IC certificate VALID — the subnet vouches for the ACTIVE archive's head (sealed history not visited in a window check)"
+      : `IC certificate VALID — the subnet vouches for the active head${segCertsOk > 1 ? `; ${segCertsOk - 1} sealed segment(s) certificate-validated` : ""}`;
+  }
   else if (certCheck.ok === false) throw new Error("IC certificate check FAILED: " + certCheck.why);
   else certNote = "certificate check DID NOT RUN (" + certCheck.why + ") — the head is only the canister's own claim";
 
   return { links: totalLinks, headSeq, headHex: hex(new Uint8Array(head.headHash[0]), 8), certNote, heads,
-    certOk: certCheck.ok === true, certLocal: isLocalReplicaOrigin(),
+    certOk: certCheck.ok === true, certLocal: isLocalReplicaOrigin(), segCertsOk,
+    chainGapCount: chainGaps.length,
     gapCount: gaps.length, gapEventsMissing, baselineCount: baselines.length,
     baselineResumeSeq: baselines.length ? Number(baselines[baselines.length - 1][1]) : null };
 }
@@ -314,6 +384,7 @@ function kindCell(e) {
   if ("debtDelta" in k) return ["debt Δ", `${fmtAmt(k.debtDelta.amount)} ${escH(k.debtDelta.token)} owed to vault`];
   if ("lpShareDelta" in k) return ["LP Δ", `${fmtAmt(k.lpShareDelta.amount)} vault shares`];
   if ("insShareDelta" in k) return ["insurance Δ", `${fmtAmt(k.insShareDelta.amount)} shares`];
+  if ("gap" in k) return ["ledger gap", `seqs ${k.gap.fromSeq}…${k.gap.toSeq} dropped by L2 failover (chain-declared)`];
   if ("fill" in k) { const f = k.fill; return ["fill", `${sideTag(f.side)} ${Number(f.qty) / 1e8} ${escH(f.marketId)} @ ${Number(f.price) / 1e8}`]; }
   if ("deposit" in k) { const d = k.deposit; return ["withdrawal" in d.kind ? "withdrawal" : "deposit", `${Number(d.amount) / 1e8} ${escH(d.token)}`]; }
   if ("orderClosed" in k) return ["order", "closed"];
@@ -486,10 +557,15 @@ export function setupLedger(deps) {
       // tape with `certificate = []` is internally consistent by construction,
       // so painting that green is exactly the reassurance an attacker wants.
       out.className = res.certOk ? "lg-verify-out lg-ok" : "lg-verify-out lg-warn";
+      // W2-04: a full walk THROWS on any gap that is not justified by a #gap
+      // event hash-committed in the chain — so gaps surviving to this render
+      // are chain-declared, and the copy may say so. (A window check never
+      // walks them; it keeps the weaker "recorded" wording.)
+      const gapWord = res.chainGapCount ? "chain-declared" : "recorded";
       const gapNote = res.gapCount
         ? (res.baselineCount
-          ? ` <br><span class="lg-gap-note">⚠ across ${res.gapCount} recorded ledger gap${res.gapCount > 1 ? "s" : ""}
-              (${res.gapEventsMissing.toLocaleString()} events dropped by archive-failover — documented, not tampering).
+          ? ` <br><span class="lg-gap-note">⚠ across ${res.gapCount} ${gapWord} ledger gap${res.gapCount > 1 ? "s" : ""}
+              (${res.gapEventsMissing.toLocaleString()} events dropped by archive-failover — ${res.chainGapCount ? "declared on the chain itself, hash-committed — " : "documented, "}not tampering).
               The tape re-baselined itself after the shed${res.baselineCount > 1 ? "s" : ""}: every balance was re-attested
               with absolute rows, so replay reconstructs balances exactly from seq ${res.baselineResumeSeq.toLocaleString()}
               onward — only the dropped history itself is gone.</span>`

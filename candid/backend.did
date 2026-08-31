@@ -91,6 +91,10 @@ type UserEventKind =
              amount: nat;
              token: TokenId;
            };
+   config: record {
+             setter: text;
+             value: text;
+           };
    debtDelta: record {
                 amount: int;
                 token: TokenId;
@@ -109,6 +113,10 @@ type UserEventKind =
       side: Side;
       tradeId: nat;
     };
+   gap: record {
+          fromSeq: nat;
+          toSeq: nat;
+        };
    insShareDelta: record {amount: int;};
    insuranceStake: record {
                      amountUsd: nat;
@@ -448,6 +456,7 @@ type OrderAdjustment =
    newQuantity: nat;
    oldQuantity: nat;
    orderId: nat;
+   reason: opt AdjustmentReason;
    side: Side;
    timestamp: int;
  };
@@ -482,6 +491,7 @@ type MatchResult =
    affectedUsers: vec principal;
    avgPrice: nat;
    pendingMatches: vec PendingMatch;
+   quoteSpent: nat;
    remainingQty: nat;
    totalFilled: nat;
    trades: vec Trade;
@@ -686,14 +696,6 @@ type DebtEntry =
    "principal": nat;
    token: TokenId;
  };
-type CounterpartyStats = 
- record {
-   adverseRate: float64;
-   lastFillNs: int;
-   "principal": principal;
-   totalFillValue: float64;
-   totalFills: nat;
- };
 type CollateralValuation = 
  record {
    balance: nat;
@@ -767,10 +769,17 @@ type BadgeCriteria =
    uptimeSamplePassed;
  };
 type Asset = text;
+type ArchiveOqlResult = 
+ record {
+   degraded: vec text;
+   hasMore: bool;
+   rows: vec vec Cell;
+ };
 type ArchiveChainEntry = 
  record {
    canisterId: text;
    cycles: opt nat;
+   degraded: opt bool;
    firstSeq: opt nat;
    freezeLimitCycles: opt nat;
    frozen: opt bool;
@@ -823,6 +832,12 @@ type Aggregate =
    stddevBps: float64;
    timestamp: int;
  };
+type AdjustmentReason = 
+ variant {
+   balanceShrank;
+   crossMarketCapExceeded;
+   marketCapExceeded;
+ };
 type AccountSummary = 
  record {
    freeWalletValueUsd: nat;
@@ -841,6 +856,10 @@ service : {
                                                  ok: text;
                                                });
   adminClearAiBan: (user: principal) -> ();
+  adminClearFuelAmbiguous: () -> (variant {
+                                    err: text;
+                                    ok: text;
+                                  });
   adminForceShipTick: () -> (nat);
   adminFundArchive: (amount: nat) -> (variant {
                                         err: text;
@@ -850,6 +869,11 @@ service : {
                                        err: text;
                                        ok: nat;
                                      });
+  adminFundCanister: (cid: principal, amount: nat) ->
+   (variant {
+      err: text;
+      ok: nat;
+    });
   adminRebuildIndexes: () -> (variant {
                                 err: text;
                                 ok: text;
@@ -901,6 +925,7 @@ service : {
                                                err: text;
                                                ok: nat;
                                              });
+  adminRunArchiveFuelPass: () -> ();
   adminRunDeferredExpiry: () -> ();
   adminRunDeferredSwaps: () -> ();
   adminRunLiquidationBatch: () -> ();
@@ -922,7 +947,7 @@ service : {
                                  });
   aiConfigured: () -> (bool) query;
   aiProvider: () -> (text) query;
-  archiveExecute: (qJson: text) -> (Result) composite_query;
+  archiveExecute: (qJson: text) -> (ArchiveOqlResult) composite_query;
   archiveSchema: () -> (text) query;
   bulkSetTestBalances: (entries:
    vec
@@ -993,6 +1018,25 @@ service : {
       err: text;
       ok: nat;
     });
+  devDriveLiqCycle: (trap: bool) -> ();
+  devGetGeptorInFlight: (marketId: MarketId) -> (opt int) query;
+  devPoisonGeptorInFlight: (marketId: MarketId, ageNs: int) -> ();
+  devSweepCostProbe: () ->
+   (record {
+      crossSection: nat64;
+      myPositionsPools: nat64;
+      repointLinksAtProbe: nat;
+      repointSaturated: nat64;
+      sampledPrincipal: text;
+      stagedGlobal: nat;
+      stagedMyIds: nat64;
+      stagedMyOrders: nat64;
+      stagedOwn: nat;
+      stagedPoolElsewhere: nat64;
+      stagedPoolOrders: nat64;
+      userBalances: nat64;
+    }) query;
+  devTickAutoFuel: () -> ();
   donateToVault: (amount: nat, fromTreasury: bool) ->
    (variant {
       err: text;
@@ -1003,11 +1047,11 @@ service : {
                                                        ok;
                                                      });
   execute: (qJson: text) -> (Result) query;
-  extMarketSwap: (token: TokenId, side: ArbSide, baseAmount: nat) ->
-   (variant {
-      err: text;
-      ok: nat;
-    });
+  extMarketSwap: (token: TokenId, side: ArbSide, baseAmount: nat, maxMarkE8:
+   opt nat) -> (variant {
+                  err: text;
+                  ok: nat;
+                });
   fetchAndSetRefPrice: (marketId: MarketId) -> (variant {
                                                   err: text;
                                                   ok: nat;
@@ -1051,6 +1095,7 @@ service : {
       openOrderCap: nat;
       scaleBps: nat;
       shedFloor: nat;
+      shipQueueDepth: nat;
       stpPolicy: text;
       thresholds:
        record {
@@ -1066,12 +1111,15 @@ service : {
          mmMinUptimePct: nat;
          refExchangeVolUsd: nat;
          scaleMinBps: nat;
+         shedHardShip: nat;
          shedHardStaged: nat;
+         shedSoftShip: nat;
          shedSoftStaged: nat;
+         shipShearCap: nat;
          stagedCapPerOwner: nat;
        };
+      timersPaused: bool;
     }) query;
-  getAllCounterpartyStats: () -> (vec CounterpartyStats) query;
   getAllTrades: (marketId: MarketId) -> (vec PublicTrade) query;
   getAmmAutoInventory: () -> (bool) query;
   getAmmBookShare: (marketId: MarketId) -> (opt AmmBookShare) query;
@@ -1115,6 +1163,7 @@ service : {
    (CandleResponse) query;
   getCanisterInfo: () ->
    (record {
+      ackDivergences: nat;
       appVersion: text;
       arbCycles: nat;
       arbLifetimeTopUp: nat;
@@ -1133,6 +1182,12 @@ service : {
       emergencyRolls: nat;
       freezingLimitCycles: nat;
       fuelLifetimeCycles: nat;
+      fuelPendingNotify:
+       opt record {
+             blockIndex: nat;
+             icpE8s: nat;
+             sinceNs: int;
+           };
       fuelRouteWired: bool;
       heapLiveBytes: nat;
       idleBurnPerDay: nat;
@@ -1158,13 +1213,18 @@ service : {
       usersRegistered: nat;
       wasmMemoryLimitBytes: nat;
     }) query;
-  getCounterpartyStatsQuery: (p: principal) -> (CounterpartyStats) query;
   getDeployMode: () -> (text) query;
   getDepositAddress: (token: TokenId) -> (text) query;
   getFuelStatus: () ->
    (record {
+      ambiguous: opt record {
+                       atNs: int;
+                       icpE8s: nat;
+                       msg: text;
+                     };
       autoEnabled: bool;
       cmc: opt principal;
+      dailyMaxE8s: nat;
       ledger: opt principal;
       lifetimeCycles: nat;
       lifetimeIcpE8s: nat;
@@ -1173,8 +1233,18 @@ service : {
                            icpE8s: nat;
                            sinceNs: int;
                          };
+      spentTodayE8s: nat;
       treasuryIcpE8s: nat;
     }) query;
+  getHbHealth: () ->
+   (vec record {
+          text;
+          record {
+            completions: nat;
+            dispatches: nat;
+            streak: nat;
+          };
+        }) query;
   getInsuranceFund: () -> (InsuranceFundInfo) query;
   getLastAggregate: (asset: text) -> (opt Aggregate) query;
   getLeaderboard: () ->
@@ -1247,6 +1317,7 @@ service : {
   getMyCancelAllAfter: () ->
    (opt record {
           deadlineNs: int;
+          timersPaused: bool;
           windowNs: int;
         }) query;
   getMyClosedOrders: () -> (vec ClosedOrderRecord) query;
@@ -1256,7 +1327,6 @@ service : {
   getMyLiquidationHistory: () -> (vec LiquidationEvent) query;
   getMyLpBalance: (marketId: MarketId) -> (nat) query;
   getMyLpPosition: (marketId: MarketId) -> (opt LpPosition) query;
-  getMyMarginAccount: () -> (opt MarginAccount) query;
   getMyMarginHealth: () -> (MarginHealth) query;
   getMyMarginPools: () -> (vec MarginPoolView) query;
   getMyOrderStatus: (orderId: nat) ->
@@ -1336,6 +1406,21 @@ service : {
                                  nat;
                                  nat;
                                }) query;
+  getStagedIndexAudit: () ->
+   (record {
+      accEntries: nat;
+      consistent: bool;
+      detail: text;
+      execLive: nat;
+      indexedReadInstructions: nat64;
+      pmLive: nat;
+      recomputedReadInstructions: nat64;
+      releasedFromEntries: nat;
+      releasedLinks: nat;
+      swapLive: nat;
+    }) query;
+  getTakeableDepth: (marketId: MarketId, takerSide: Side, capPrice: nat) ->
+   (nat) query;
   getTestBalance: (user: principal, token: TokenId) -> (nat) query;
   getTradesSince: (marketId: MarketId, sinceTimestamp: int) ->
    (vec PublicTrade) query;
@@ -1522,19 +1607,33 @@ service : {
   setBridge: (p: principal) -> ();
   setFuelRoute: (ledger: opt principal, cmc: opt principal) -> ();
   setGoogleApiKey: (key: text) -> ();
+  setTestArbTakeableSpoof: (marketId: MarketId, armed: bool) ->
+   (variant {
+      err: text;
+      ok;
+    });
   setTestArchiveCap: (cap: opt nat) -> ();
+  setTestArchiveStopped: (cid: principal, stopped: bool) ->
+   (variant {
+      err: text;
+      ok;
+    });
   setTestBalance: (user: principal, token: TokenId, amount: nat) -> ();
   setTestDeferredExpiry: (orderId: nat, expiresAtNs: int) -> ();
+  setTestDeferredFok: (orderId: nat) -> ();
   setTestEmailBinding: (user: principal, rawEmail: text) ->
    (variant {
       err: text;
       ok;
     });
+  setTestFuelPendingSince: (ns: int) -> ();
+  setTestHbTrap: (name: opt text) -> ();
+  setTestLevelCap: (cap: opt nat) -> ();
   setTestMinSources: (n: opt nat) -> ();
   setTestOrderCap: (cap: opt nat) -> ();
   setTestOrderExpiry: (orderId: nat, expiryNs: int) -> ();
   setTestOrderTtl: (ttlSecs: opt nat) -> ();
-  setTestPendingJump: (asset: text, price: opt nat) -> ();
+  setTestPendingJump: (asset: text, price: opt nat, ageSecs: opt nat) -> ();
   setTestPlayDepositCap: (cap: opt nat) -> ();
   setTestRefPriceUpdatedNs: (marketId: MarketId, ns: int) -> ();
   setTestScorecard: (user: principal, makerVol: nat, takerVol: nat, samples:
@@ -1544,12 +1643,18 @@ service : {
                          });
   setTestShedFloor: (floor: opt nat) -> ();
   setTestShipFailover: (fail: bool, rollThreshold: opt nat, hardCap: 
-   opt nat, shedTo: opt nat) -> (variant {
-                                   err: text;
-                                   ok;
-                                 });
+   opt nat, shedTo: opt nat, shearCap: opt nat) -> (variant {
+                                                      err: text;
+                                                      ok;
+                                                    });
+  setTestShipShedBands: (bands: opt record {
+                                      nat;
+                                      nat;
+                                      nat;
+                                      nat;
+                                    }) -> ();
   setTestTimersPaused: (paused: bool) -> ();
-  setTestXrcRate: (asset: text, rateE8: opt nat) -> ();
+  setTestXrcRate: (asset: text, rateE8: opt nat, ageSecs: opt nat) -> ();
   setUserPreferences: (prefs: UserPreferences) -> ();
   setXrcCanister: (p: opt principal) -> ();
   skimArbitrageur: (amount: nat) -> (variant {
@@ -1581,6 +1686,7 @@ service : {
       shedFloor: nat;
       stagedCap: nat;
       stagedCount: nat;
+      timersPaused: bool;
     }) query;
   withdraw: (token: TokenId, amount: nat, destination: text) ->
    (variant {

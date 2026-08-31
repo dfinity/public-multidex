@@ -4,7 +4,7 @@
 # the book visibly empties when the oracle can't price an asset.
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_order_expiry.sh
 
 set -u

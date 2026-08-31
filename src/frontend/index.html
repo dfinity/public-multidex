@@ -1639,6 +1639,7 @@
                   <th>Old Size</th>
                   <th>New Size</th>
                   <th>Status</th>
+                  <th>Reason</th>
                 </tr>
               </thead>
               <tbody id="account-adj-body">
@@ -1722,6 +1723,11 @@
                 <div class="margin-stat"><div class="margin-stat-label">Pool share</div><div class="margin-stat-value" id="earn-vault-share">—</div></div>
                 <div class="margin-stat"><div class="margin-stat-label">Value / LP</div><div class="margin-stat-value" id="earn-vault-vplp">—</div></div>
               </div>
+              <!-- Loan-book haircut (#50.1): "Value" above is f × NAV and NAV
+                   counts the vault's loan book, but withdrawals pay in kind
+                   from physical holdings — the utilisation-adjusted figure is
+                   the honest one. Populated by renderVaultHaircut. -->
+              <div id="earn-vault-haircut" class="margin-risk-note" style="display:none"></div>
               <!-- Target-weight table: shows what the vault needs + the live
                    deposit bonus/fee per asset. Populated by renderEarnCard. -->
               <div id="earn-vault-weights"></div>
@@ -2121,10 +2127,8 @@
           <button class="chart-interval-btn" data-interval="900000">15m</button>
           <button class="chart-interval-btn active" data-interval="3600000">1h</button>
           <button class="chart-interval-btn" data-interval="14400000">4h</button>
-          <button class="chart-interval-btn" data-interval="43200000">12h</button>
           <button class="chart-interval-btn" data-interval="86400000">1D</button>
           <button class="chart-interval-btn" data-interval="604800000">1W</button>
-          <button class="chart-interval-btn" data-interval="2592000000">1M</button>
         </div>
         <button id="chart-close-btn" class="chart-close-btn" title="Close">&times;</button>
       </div>

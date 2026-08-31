@@ -3,7 +3,7 @@
 # post-posting GEPTOR, matching crossing users + the fresh AMM; remainder rests.
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_sealed_model.sh
 #
 # Verifies:
@@ -139,7 +139,7 @@ USD_NOW=$(awk -v a="$(bal "$UA" ICPUSD)" -v b="$(bal "$AMM" ICPUSD)" -v c="$(bal
 ICP_NOW=$(awk -v a="$(bal "$UA" ICP)" -v b="$(bal "$AMM" ICP)" -v c="$(bal "$UB" ICP)" -v s="$(bal "$S" ICP)" 'BEGIN{printf "%.4f", a+b+c+s}')
 if awk -v a="$USD_NOW" -v b="$USD_BASE" 'BEGIN{exit (((a-b<0?b-a:a-b)) < 0.02 ? 0 : 1)}' \
    && awk -v a="$ICP_NOW" -v b="$ICP_BASE" 'BEGIN{exit (((a-b<0?b-a:a-b)) < 0.02 ? 0 : 1)}'; then
-  ok "ICPUSD conserved ($USD_NOW≈$USD_BASE), ICP conserved ($ICP_NOW≈$ICP_BASE)"
+  ok "ICPUSD conserved (${USD_NOW}≈$USD_BASE), ICP conserved (${ICP_NOW}≈$ICP_BASE)"
 else nok "value leak" "USD $USD_NOW vs $USD_BASE ; ICP $ICP_NOW vs $ICP_BASE"; fi
 
 echo ""

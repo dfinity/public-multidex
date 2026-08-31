@@ -73,6 +73,46 @@ if awk -v a="${V1:-0}" -v b="${V0:-0}" 'BEGIN{exit (a>b?0:1)}'; then
   ok "yield: stake value rose ($(from_e8 "$V0") → $(from_e8 "$V1"))"
 else nok "solvent liquidation should lift stake value (penalty → stakers)" "before=$V0 after=$V1"; fi
 
+# #48.1: the quote must use the redeem expression, not the plain V/S share
+# value. Here V>S (the penalty accrued value without minting shares), so the
+# naive s×shareValue — the OLD valueUsd formula — must STRICTLY exceed the
+# symmetric-offset redeem value the query now reports. (~1e12-scale values fit
+# a double with room to spare; the gap here is ~1e6 base units.)
+SHY=$(fld shares "$(asS getMyInsuranceStake '()')")
+SVY=$(fld shareValueUsd "$(adm getInsuranceFund '()')")
+if awk -v s="${SHY:-0}" -v sv="${SVY:-0}" -v q="${V1:-0}" 'BEGIN{exit (s*sv/100000000 > q ? 0 : 1)}'; then
+  ok "quote is the redeem expression: naive s×V/S exceeds valueUsd at V>S (#48.1)"
+else nok "valueUsd should sit BELOW the naive s×shareValue at V>S (#48.1)" "s=${SHY:-} sv=${SVY:-} quote=${V1:-}"; fi
+
+# #48.1 sibling (1787200508): the account summary must fold the SAME redeem
+# quote into netAccountValueUsd. The staker holds only wallet ICPUSD plus the
+# stake (no pools, no debt, no vault LP), so net − freeWallet isolates the
+# insurance term — at V>S the old s×V/S mark strictly exceeded the redeem value.
+QI=$(stakeval)
+SUM=$(asS getMyAccountSummary '()')
+NAVQ=$(fld netAccountValueUsd "$SUM"); FREEW=$(fld freeWalletValueUsd "$SUM")
+INSTERM=$(( ${NAVQ:-0} - ${FREEW:-0} ))
+if [ -n "${QI:-}" ] && [ "$INSTERM" = "$QI" ]; then
+  ok "account summary's insurance term == redeem quote at V>S (#48.1 sibling)"
+else nok "netAccountValueUsd must fold in insuranceRedeemValue, not s×V/S" "term=$INSTERM quote=${QI:-}"; fi
+
+echo "── 2b. #48.1: at V>S the quote equals an immediate full unstake, exactly ──"
+# The money case: value above supply, clamp inactive, payout NONZERO. Quote the
+# full holding, unstake it all, and demand base-unit equality — then re-stake
+# the payout so sections 3-4 still run against a live stake.
+QY=$(stakeval)
+BA=$(adm getTestBalance "(principal \"$S\", \"ICPUSD\")" | tr -d '_' | grep -oE "[0-9]+" | head -1)
+SHA=$(fld shares "$(asS getMyInsuranceStake '()')")
+UNY=$(asS unstakeInsurance "(${SHA:-0} : nat)")
+BB=$(adm getTestBalance "(principal \"$S\", \"ICPUSD\")" | tr -d '_' | grep -oE "[0-9]+" | head -1)
+GY=$(( ${BB:-0} - ${BA:-0} ))
+if echo "$UNY" | grep -q "ok" && [ -n "${QY:-}" ] && [ "$GY" != "0" ] && [ "$GY" = "$QY" ]; then
+  ok "quote == immediate unstake payout, nonzero (\$$(from_e8 "$GY")) (#48.1)"
+else nok "valueUsd must equal the actual unstake payout at V>S (#48.1)" "quote=${QY:-} paid=$GY ($UNY)"; fi
+RS=$(asS stakeInsurance "($GY : nat)")
+if echo "$RS" | grep -q "ok"; then ok "re-staked the payout"; else nok "re-stake after the round trip" "$RS"; fi
+V1=$(stakeval)   # re-baseline for section 3 (entry value differs by rounding dust)
+
 echo "── 3. INSOLVENT liquidation → pool absorbs → stake value FALLS ──"
 release   # restore 50k so the next pool can open
 open_pool as2
@@ -87,6 +127,7 @@ echo "── 4. unstake all → pro-rata remainder returns ──"
 SH=$(fld shares "$(asS getMyInsuranceStake '()')")
 BAL0=$(fld '' "$(adm getTestBalance "(principal \"$S\", \"ICPUSD\")")")
 BAL0=$(adm getTestBalance "(principal \"$S\", \"ICPUSD\")" | tr -d '_' | grep -oE "[0-9]+" | head -1)
+QUOTE=$(stakeval)   # #48.1: quote taken immediately before the unstake
 UN=$(asS unstakeInsurance "(${SH:-0} : nat)")
 if echo "$UN" | grep -q "ok"; then ok "unstaked ${SH:-0} shares"; else nok "unstakeInsurance" "$UN"; fi
 BAL1=$(adm getTestBalance "(principal \"$S\", \"ICPUSD\")" | tr -d '_' | grep -oE "[0-9]+" | head -1)
@@ -95,6 +136,12 @@ GOT=$(( ${BAL1:-0} - ${BAL0:-0} ))
 if awk -v g="$GOT" -v v="${V2:-0}" 'BEGIN{d=g-v; if(d<0)d=-d; exit (d <= 100000 ? 0 : 1)}'; then
   ok "pro-rata redemption ≈ stake value (\$$(from_e8 "$GOT"))"
 else nok "redemption mismatch" "got=$GOT expected≈$V2"; fi
+# #48.1: the quote IS the payout — valueUsd read just before the unstake must
+# EXACTLY equal what unstakeInsurance credited (same insuranceRedeemValue path,
+# timers paused, nothing moved the pool in between).
+if [ -n "${QUOTE:-}" ] && [ "${GOT:-x}" = "$QUOTE" ]; then
+  ok "quote == payout exactly (\$$(from_e8 "$GOT")) (#48.1)"
+else nok "getMyInsuranceStake().valueUsd must equal the unstake payout (#48.1)" "quote=${QUOTE:-} paid=${GOT:-}"; fi
 SH2=$(fld shares "$(asS getMyInsuranceStake '()')")
 if [ "${SH2:-x}" = "0" ]; then ok "no shares left"; else nok "shares should be zero" "left=$SH2"; fi
 

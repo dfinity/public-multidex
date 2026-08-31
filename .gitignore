@@ -14,13 +14,30 @@ dist/
 # they survive a sync. Keep this list explicit — a blanket un-ignore would
 # start committing the mirror.
 !.claude/skills/mdex-process-safety/
+!.claude/skills/mdex-software-factory/
 # Per-developer Claude Code local overrides (machine paths, personal allowlist).
 .claude/settings.local.json
+
+# The software factory's runtime queue (queue/claimed/archive/factory/handoff/
+# signal under tasks/) — machine coordination state operated ONLY by
+# scripts/factory.sh; the TRACKED task corpus stays in docs/tasks/. See
+# .claude/skills/mdex-software-factory/SKILL.md. Anchored to the repo root:
+# unanchored `tasks/` also swallowed docs/tasks/, silently ignoring NEW briefs.
+/tasks/
+# The seat identity pin (factory.sh worker-pin): one line naming the worker
+# that owns THIS worktree, so a drifted cwd can never mint another seat's
+# name. Per-worktree runtime state, never committed.
+.factory-worker
+# Factory seat worktrees and each seat's isolated icp identity/network store
+# (ICP_HOME=<worktree>/.icp-home per the seat bring-up recipe).
+.claude/worktrees/
+.icp-home/
 
 # Installed Motoko packages, the moc build cache, and the per-machine
 # moc-resolution marker — none of it is source. `mops install` reproduces the
 # whole tree from mops.toml + mops.lock, and the lockfile carries a SHA-256 per
-# file, so integrity is verified rather than vendored.
+# file — enforced by scripts/lint-ratchet.sh ("toolchain" gate, `mops install
+# --lock check`), so integrity is verified rather than vendored.
 .mops/
 
 # icp-cli machine/deploy state (canister-id mappings, local network data).
@@ -64,4 +81,8 @@ id_rsa*
 docs/*.private.md
 .run/
 src/backend/backend.did
+src/bridge/bridge.did
+src/arb/arb.did
+src/xrc-mock/xrc-mock.did
+src/fuel-mock/fuel-mock.did
 ops/phase1/

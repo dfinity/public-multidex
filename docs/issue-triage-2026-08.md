@@ -31,6 +31,15 @@ A **second wave of reports (#13–#21) landed on 2026-08-02**, after this triage
 from a third reviewer (`andreij6`). They are triaged in §7, not above — several are explicit
 corrections to conclusions recorded here.
 
+> **REFRESH (2026-08-15) — read §8 first if you are deduplicating.** Rounds 2–6
+> (#22–#28, #36–#41) were triaged into a 54-task queue and worked to completion;
+> §8 below carries the per-issue status table (fixed / open / decision, with what
+> changed). Corrections to THIS document's own stale claims are edited in place
+> and marked "(corrected 2026-08-15)": §1.7 (heartbeat isolation was half-done,
+> now done), §2's `settleNettedPair` clearance (wrong — fixed as #15.2), the six
+> §3 items 1.60 fixed, and §6's deferred list (all four closed). Reporters' own
+> retractions are recorded in §8.4.
+
 ---
 
 ## 0. Fix this first: there is no private disclosure channel
@@ -157,12 +166,18 @@ locally and watch whether `_lastHeartbeatNs` advances.
 Credit: Menese #12.1.
 
 ### 1.7 A trap in any synchronous heartbeat subtask stops maintenance permanently
+**(corrected 2026-08-15: FIXED — and the earlier "implemented" claim was half-true.)** The
+1.60 fix isolated only the `ignore tickX()` async dispatches; the nine inline subtasks named
+below still ran unisolated, which round 3 called out. As of 2026-08-15 every heartbeat
+subtask runs through `hbRun` (an async self-send isolating each task's trap) behind `hbReady`
+(a per-subtask dispatch/completion breaker with geometric backoff, capped 32×) — pinned by
+`tests/test_heartbeat_isolation.sh`. Original finding, kept for the record:
 Confirmed unisolated: `reapClosedOrders`, `drainLedgerJournal` (unthrottled, every beat),
 `tickTier`, `tickHeatmaps`, `tickLeaderboardShard`, `settleInsuranceArrears` (unthrottled),
 `tickCandleFill`, `tickDeadman` (unthrottled), `sweepStaleUserOrders`. All four aggravating
 properties verified, including the self-reinforcing journal (`Accounts.mo:45` is the sole write
 funnel; `List.clear` is only reachable after the full loop) and cadence alignment (every `HB_*`
-constant divides 300s evenly). No consecutive-failure breaker exists anywhere.
+constant divides 300s evenly). No consecutive-failure breaker existed anywhere at that time.
 
 Good catch worth noting: `sweepStaleUserOrders` is declared `: Nat`, not `async`, so its
 textual `ignore` defers nothing — the reporters classified it correctly *despite* the
@@ -214,17 +229,17 @@ Credit: OhShii #5.1, #5.3, #5.5.
 Docs asserting protections the code does not deliver — fix the text, or the code, but not
 neither:
 
-- `getApiDoc()` and `docs.js` both claim other users' rows are filtered server-side / "never
+- **(fixed in 1.60)** `getApiDoc()` and `docs.js` both claim other users' rows are filtered server-side / "never
   leave the canister". `archiveExecute` deliberately serves every other user's deposits and
   withdrawals. Under the transparency doctrine the *publicness* is defensible; the claims are
   not. `main.mo` already contradicts itself on this ~600 lines below, and
   `tests/test_archive_replay.sh` depends on the behaviour the docs deny. (OhShii #8.1)
-- The owner gate on `getEventsForPrincipals` says it "closes the targeted vector", but
+- **(fixed in 1.60)** The owner gate on `getEventsForPrincipals` says it "closes the targeted vector", but
   `getEventsRange`/`getDepositWithdrawals` are public and every row carries `user` **and**
   `counterparty`. Doc-only would concede the gate is decorative. (OhShii #8.2)
-- `bridge-and-cks-design.md` §11 states NNS sole-controllership in the **present tense**;
+- **(fixed — §11 now opens "TARGET STATE, NOT CURRENT STATE")** `bridge-and-cks-design.md` §11 stated NNS sole-controllership in the **present tense**;
   the live posture is a single operator principal. (OhShii #10.6d)
-- The kill matrix references `claimPlayFunds` and `tests/test_play_claim.sh`. The method is
+- **(fixed 2026-08-15, W6-02)** The kill matrix referenced `claimPlayFunds` and `tests/test_play_claim.sh`. The method is
   retired, `PLAY_BASKET` is gone, and **the test file does not exist** — yet
   `pre-mainnet-checklist.md:49` lists it as a required verification step. (OhShii #10.6c)
 
@@ -233,20 +248,25 @@ Code-side privacy gaps that don't conflict with the doctrine: the `capitalUsd` j
 `_nameEntropySeeded` latch with no `postupgrade` — a shape `src/bridge/main.mo` already
 documents and fixes (#8.4b).
 
-Production-readiness: three unbacked-credit endpoints lack the `IS_PRODUCTION` interlock every
+Production-readiness **(all four below fixed: interlocks + arb gate verified live 2026-08-15;
+clean-checkout build fixed by W5-06; module-hash/reproducible-build verification remains open)**:
+three unbacked-credit endpoints lacked the `IS_PRODUCTION` interlock every
 sibling has, and `extMarketSwap` is reachable by a **non-controller** (OhShii #7.4);
-`setTestEmailBinding` is gated on `IS_PRODUCTION` instead of `IS_DEV`, and the rebind escape
+`setTestEmailBinding` was gated on `IS_PRODUCTION` instead of `IS_DEV` (now requireController +
+dev-gated), and the rebind escape
 hatch its comment promises **does not exist as a method** (#10.6a); `injectHistoricalTrades`
-has no posture gate (#10.6b); no build verification, module-hash check, or reproducible build,
+had no posture gate (#10.6b — now controller + genesis-window gated, decision 2026-08-06); no build verification, module-hash check, or reproducible build,
 and `npm install` rather than `npm ci` (#10.4).
 
 Operator-machine-only, but real: the `awk` program-text injection on the mainnet deploy path —
 and because `/tmp` is sticky, a file planted by another local user **cannot** be removed or
 overwritten by our own `rm -f`, so this is a persistent plant rather than a race (#10.1);
-`cold_start.sh` still pattern-kills (`play_start.sh`'s own comment records a **fourth** fleet
-kill on 2026-08-01) (#10.2); the keychain helper pre-authorises unsigned binaries against the
-controller identity (#10.3); `deploy_to_engine.sh` passes a target `deploy.sh` doesn't
-recognise, silently skipping `apply_anti_sybil_settings` and `apply_memory_settings` (#10.5).
+`cold_start.sh` pattern-killed (**fixed** — the deploy-path scripts now carry zero live
+pkill/pgrep-by-pattern, enforced by `test_deploy_hygiene.sh` §3; the fourth-fleet-kill comment
+survives as history) (#10.2); the keychain helper pre-authorises unsigned binaries against the
+controller identity (#10.3); `deploy_to_engine.sh` passed a target `deploy.sh` didn't
+recognise (**fixed** — unknown targets now hard-error and `cloud`/`engine` is a canonical
+alias) (#10.5).
 
 ---
 
@@ -342,7 +362,8 @@ verification could not close those either. That restraint is worth more than the
 
 Recorded so the gaps are visible rather than assumed closed.
 
-- **The `order.id` ↔ `fill.orderId` join is only half-closed.** `id` cannot be dropped from the
+- **(DECISION RECORDED 2026-08-15, W4-21: the transparency doctrine wins — the verifier
+  forces the join to stay; see §8)** **The `order.id` ↔ `fill.orderId` join is only half-closed.** `id` cannot be dropped from the
   `order` projection: it is that entity's declared primary key and `Executor.mo:649` traps on a
   hidden pk. The OQL half is already shut (the public `userEvent` projection carries no
   `orderId`), but the archive's raw `getEventsRange` still returns the whole `#fill` variant, so
@@ -356,7 +377,9 @@ Recorded so the gaps are visible rather than assumed closed.
   survives. Menese's *silent*-failure signature was the right one, and the two verification
   agents who read it as an inline computation were wrong. This is also why the failure had to be
   paced rather than merely counted — see §7.1.
-- **Volume-credit consolidation (§2.5) is not implemented.** The four bypassing paths are
+- **(FIXED 2026-08-15, W4-18 — single-writer credit inside `updateStatsAfterTrades`, the
+  hook every settling path already calls; `tests/test_volume_credit.sh` proves the swept-maker
+  case; see §8)** **Volume-credit consolidation (§2.5) was not implemented.** The four bypassing paths are
   confirmed, but routing them all through one `creditTradeVolume` helper touches the settlement
   path in four places and deserves its own change with its own fee-conservation tests, rather
   than riding along with a security pass.
@@ -365,11 +388,14 @@ Recorded so the gaps are visible rather than assumed closed.
   it, and the play allowance flows through it), so a `#dev` gate would have deleted the only
   on-ramp the committed posture has. The genuine hole was the uncapped `#production` posture,
   where `playDepositCap()` returns null — that is what is now gated.
-- **CSP is verified by configuration, not by response headers.** `security_policy: "standard"`
+- **(FIXED 2026-08-15, W4-20 — live headers `curl -sD-`'d and recorded in
+  `pre-mainnet-checklist.md`; `scripts/check_headers.sh` is now a post-deploy gate wired into
+  deploy.sh; see §8)** **CSP was verified by configuration, not by response headers.** `security_policy: "standard"`
   is set on the shipping asset config and the build was audited for what `standard` would break
   (no `eval`, no WASM, no cross-origin fetches, no external fonts), but nothing has been
   `curl -sD-`'d against a deployed asset canister yet. Do that on the next remote deploy.
-- **`_minSourcesOverride` can still pin the source floor *below* the robustness floor.** It is
+- **(FIXED 2026-08-15, W4-19 — the setter refuses below the floor; see §8)**
+  **`_minSourcesOverride` could pin the source floor *below* the robustness floor.** It is
   dev-gated and today's only caller raises it, so nothing is broken — but the hook can defeat
   the n≥3 guarantee and should probably clamp.
 - **The four red integration tests were baselined and are NOT caused by this change set.**
@@ -494,19 +520,22 @@ order, most consequential first:
   returns. The caller is told the swap failed while holding the proceeds (a client that
   retries on `#err` double-sells), and because `refreshRolling24h` is the sole call site of
   `emitFillEvents`, the settled fills are permanently absent from the hash-chained archive.
-- **#18 finding 50** — `verifyChain` never anchors its recomputed tail to the certified
+- **(FIXED 2026-08-15 — outbound anchor + §3 pins, see §8 W2-01)** **#18 finding 50** — `verifyChain` never anchored its recomputed tail to the certified
   `chainHead`, so corruption of the newest event, or any consistent rewrite of a tail suffix,
   verifies clean. This is the endpoint the sealed-season record points auditors at.
-- **#15 item 2** — `settleNettedPair`'s dust path: `cash` floors to zero, `writeOffLoan`
+- **(FIXED 2026-08-15 — the cash==0 guard mirrors the qty guard, see §8 W4-03; this also
+  formally retracts §2-era clearance of the function)** **#15 item 2** — `settleNettedPair`'s dust path: `cash` floors to zero, `writeOffLoan`
   rejects it and the result is `ignore`d, while the buyer's base debt is still forgiven.
   Corrects §2's clearance of that function.
-- **#16 finding 27** — `performLpDeposit` gates on the raw balance instead of available, so a
+- **(FIXED 2026-08-15 — available-gated, see §8 W4-02)** **#16 finding 27** — `performLpDeposit` gated on the raw balance instead of available, so a
   deposit can spend what a staged order reserved.
-- **#14 findings 4/16/17** — order identity and time-in-force do not survive the sealed
+- **(FIXED 2026-08-15 — staging-id resolver, release-time expiry kill, sweep repoint; see §8
+  W4-05/06/07)** **#14 findings 4/16/17** — order identity and time-in-force did not survive the sealed
   release path: `ammSweepResting` re-rests under a fresh id without `linkStagedRelease` or
   the user's `orderExpiry`, `cancelMyOrder` never consults `stagedReleasedAs`, and a staged
   order whose expiry lapsed still executes as a taker.
-- **#17 items 2 and 3** — the jump-breaker confirmation livelock, and USD/USDT venues pooled
+- **(FIXED 2026-08-15 — sample-time bases + direction-aware replacement; per-quote aggregation
+  with a USDT depeg alarm; see §8 W3-06/W3-05)** **#17 items 2 and 3** — the jump-breaker confirmation livelock, and USD/USDT venues pooled
   into one median and one dispersion with the XRC anchor on the USDT side.
 - **#16 finding 3** — the vault deposit fee is evaluated at the pre-deposit weight.
 - **#13 item 3** — `swap()`/`quoteSwap()` never range-check `maxSlippage`, so an
@@ -526,3 +555,135 @@ independently in `6f63107` after a live incident, before the report arrived.
 
 Neither wave has been acknowledged on the tracker, and `andreij6` is not yet scored in
 [CONTRIBUTORS.md](../CONTRIBUTORS.md).
+
+---
+
+## 8. Rounds 2–6 — issues #22–#28 and #36–#41, triaged and worked (2026-08-14 → 15)
+
+Rounds 2–6 arrived from the same three teams between 2026-08-05 and 2026-08-13. Every item
+was re-verified against the tree at `01d2b23` by symbol lookup (same standard as §1–§7),
+decomposed into a worked queue, and **the engineering waves (W1–W5, 46 work items) were run
+to completion on 2026-08-15**; the process wave (W6) is in flight with its remainder listed
+in §8.3. The
+table below is the dedup surface: one row per work item, with the issue items it covers.
+"Fixed" means implemented AND pinned by a test that fails on the pre-fix shape (the
+mutation-verification discipline of §4.1 applied throughout); "decision" means the finding
+was answered in writing rather than by code, with the reasoning recorded.
+
+### 8.1 Per-issue status
+
+| Issue | Work item | Finding | Status |
+|---|---|---|---|
+| #4 item 2 | W4-20 | CSP is verified by configuration, never by response headers | fixed |
+| #6 item 5 | W4-18 | Volume credit reaches the scorecard on exactly one settlement path | fixed |
+| #8 item 4a | W4-21 | The `order.id` ↔ `fill.orderId` join is only half-closed | decision — the join STAYS: the standalone verifier needs it, and the transparency doctrine outranks the privacy nicety; recorded in the design docs |
+| #13 item 1 | W2-03 | `executeSwapCross` settles the sell leg, returns `#err`, and skips the fill-capture hooks | fixed |
+| #13 item 3 | W4-04 | `swap()` / `quoteSwap()` never range-check `maxSlippage` | fixed |
+| #14 | W4-05 | `cancelMyOrder` never consults `stagedReleasedAs` | fixed |
+| #14 | W4-06 | A staged order whose expiry lapsed still executes as a taker | fixed |
+| #14 | W4-07 | `ammSweepResting` re-rests under a fresh id, dropping the release link and the user's expiry | fixed |
+| #15 item 2 | W4-03 | `settleNettedPair`'s dust path forgives debt against a rejected write-off | fixed |
+| #16 | W4-02 | `performLpDeposit` gates on the raw balance, so it spends what a staged order reserved | fixed |
+| #16 | W4-11 | The vault deposit fee is priced at the pre-deposit weight | fixed |
+| #17 item 3 | W3-05 | USD and USDT venues are pooled into one median and one dispersion | fixed |
+| #18 | W2-01 | `verifyChain` never anchors the recomputed tail to the certified `chainHead` | fixed |
+| #19 | W3-01 | `softLockedReserved` scans all staged state per (owner, token) | fixed |
+| #19 | W5-19 | The remaining uncapped sweeps and full scans | fixed |
+| #22 item 3 | W1-04 | `cancelAllUserOrders` is a second uncapped O(staged) term on the liquidation batch | fixed |
+| #23 item 1 | W3-02 | The self-funding loop re-enters after an ambiguous ledger reject | fixed |
+| #23 item 2 | W3-03 | The auto-fuel trigger extrapolates burn with no clamp and no absolute ICP budget | fixed |
+| #24 item 1 | W4-08 | The arb's per-tick clip is 2.05× the DEX's per-call cap, so its inventory is unflattenable | fixed |
+| #24 item 2 | W4-17 | Arbitrageur design cluster: unhedged commits, no price bound, stale marks, a 65-second budget | fixed |
+| #25 item 3 | W4-01 | The unshipped-history gate ignores `accounts.journal`, which the same message discards | fixed |
+| #25 item 2 | W4-12 | The reset clears `playReservedUnits` while the Bridge's claimables survive | fixed |
+| #25 item 4 | W4-13 | `performWorldWipe` clears a single-flight flag it does not own | fixed |
+| #25 item 5 | W4-14 | After a season reset the prior season's history answers `{events = []; total = 0}` — a success | fixed |
+| #26 item 26 | W1-03 | One unreachable archive segment fails every History and OQL read, for every caller | fixed |
+| #26 item 5 | W4-09 | `adminReplayStep` has no single-flight guard, so a double-click fakes a reserve alarm | fixed |
+| #26 item 3 | W4-10 | Blackholed archive segments are never re-observed, so the chain table shows a stale `ok` | fixed |
+| #26 item 1 | W4-15 | The season detach drops sealed archives out of every funding path | fixed |
+| #26 item 4 | W4-16 | An archive spawn is unrecorded across its own await, and the cleanup swallows the principal | fixed |
+| #27 item 1 | W1-05 | Load shedding is caller-scoped, so it refuses shed users' exits | fixed |
+| #27 item 2 | W3-04 | The Bridge advances its admission counter behind the DEX commit | fixed |
+| #27 item 4 | W3-07 | The XRC anchor is aged from arrival and re-stamped as instantaneous | fixed |
+| #28 item 1 | W5-01 | `tests/test_market_walks_locked.sh` can never fail | fixed |
+| #28 item 2 | W5-02 | `run_all.sh` computes the failing-assertion count and then discards it | fixed |
+| #28 item 3 and 4 | W5-12 | Two Motoko hygiene fixes: unretunable constants, and a clamp that should fail closed | fixed |
+| #36 item 36 | W1-01 | Retire `stop_local_bots.sh`: its pattern now selects the LIVE subnet fleet | fixed |
+| #36 item 6 | W5-04 | The root-key pin fails on absence, not on reintroduction | fixed |
+| #36 item 3, 4, 7 | W5-10 | Three defects in the harness that judges the deploy gates | fixed |
+| #36 item 8 | W5-17 | The display-integrity suite catches three properties by their spelling | fixed |
+| #36 item 2 | W5-18 | The repaired `M0155` ratchet is still inert outside `src/backend` | fixed |
+| #36 item 1 | W6-04 | A README sentence no gate maintains | fixed |
+| #37 item 37 | W1-02 | Four `DEPLOY_MODE` gates read the posture by text, none comment-aware | fixed |
+| #37 item 37 | W2-02 | The standalone verifier exits 0 against a hostile gateway | fixed |
+| #37 item 6 | W5-07 | The Candid breaking-change hatch opens from the working tree, and downward | fixed |
+| #37 item 7 | W5-09 | One `.mjs` in `scripts/` is run by a gate and the other is not | fixed |
+| #38 item 1 | W5-03 | The solvency rounding rule is pinned at the primitive and at none of its call sites | fixed |
+| #38 item 3 | W5-11 | A nested template literal drives the shared JS stripper out of phase | fixed |
+| #38 item 4 | W5-13 | The Nat-underflow fix exists at three sites and is pinned at one | fixed |
+| #38 item 2 | W5-14 | The fleet's only global invariant reports green when its queries stop answering | fixed |
+| #38 item 5 | W5-15 | The only bridge-upgrade test has no oracle for either property its header names | fixed |
+| #38 item 6 | W5-16 | The zero-collateral guard on `marginUsage` is unpinned, on a synchronous heartbeat path | fixed |
+| #39 | W6-07 | Pull and triage the two private advisories | open |
+| #40 item 1 | W5-08 | The integrity claim the de-vendoring rests on is never checked | fixed |
+| #40 item 4 | W6-03 | A sign-in invariant stated as MUST, with no instrument | fixed |
+| #40 | W6-01 | Refresh the public triage document | open |
+| #40 | W6-09 | `frontend_origins` omits the app's canonical origin (anti-sybil fails closed there) | open |
+| #41 item 3 | W5-05 | The property that closes the reentrancy/double-spend class is pinned by nothing | fixed |
+| #41 item 1 | W5-06 | Neither published build path works on a clean checkout | fixed |
+| #41 item 2 | W6-02 | The production gate does not match the code it gates | fixed |
+| found internally | W1-06 | Pocket-ic reaper trio: owner-resolution assumes port 8000, misfires under worktree parallelism | fixed |
+| found internally | W3-06 | The jump breaker judges independence on arrival clocks, and its candidate never ages | fixed |
+| found internally | W3-08 | Nine heartbeat subtasks run inline, so a trap in any one stops maintenance permanently | fixed |
+| found internally | W3-09 | The deploy path never reads the Bridge's posture literal | fixed |
+| found internally | W4-19 | `_minSourcesOverride` can pin the source floor below the robustness floor | fixed |
+| found internally | W5-20 | The deploy path ships whatever candid is lying around | fixed |
+| found internally | W6-05 | Acknowledge rounds 2–6, and publish the scoring basis | open |
+| found internally | W6-06 | Answer the disclosure-channel question | open |
+| found internally | W6-08 | Latent OQL defects: a watch item, not work | open |
+
+### 8.2 Corrections to this document made in this refresh
+
+Edited in place above, marked "(corrected 2026-08-15)": the §1.7 heartbeat-isolation claim
+(half-true → now fully isolated behind `hbRun`/`hbReady`); §2-era clearance of
+`settleNettedPair` (withdrawn — #15.2 was right, fixed as W4-03); six §3 production-readiness
+items that 1.60 fixed but the list still showed open (interlocks, posture gates,
+pattern-kills, deploy-target hard-error, bridge §11 target-state note, kill matrix); §6's four
+deferred items (volume credit, `_minSourcesOverride`, CSP headers, `order.id` join) all
+resolved or decided.
+
+### 8.3 Still open after this pass
+
+- W6-05 — acknowledge rounds 2–6 on the issue threads and publish the scoring basis
+  (outward-facing; queued for explicit operator go-ahead).
+- W6-06 — the disclosure-channel decision (§0's original ask — still the top process gap).
+- ~~W6-07~~ — DONE 2026-08-15: both round-4 advisories pulled, verified, FIXED (archiveExecute
+  hop budget; depositLp(0,0) loud refusal), pinned by `tests/test_ghsa_round4.sh`; the
+  reporter reply + public mirror ride the outward batch.
+- ~~W6-08~~ — DONE 2026-08-15: unreachability chain recorded in the OQL source + README watch
+  section gating any served/secondary-index adoption on the four latent fixes.
+- W6-09 — live `frontend_origins` env-var check on the subnet (operator action; template fixed).
+- Module-hash / reproducible-build **verification** (#10.4's second half; the clean-checkout
+  build itself is fixed).
+
+### 8.4 Reporters' own corrections and retractions (recorded, rounds 2–6)
+
+Recorded because the document promised to hold everyone to the same standard, including them:
+
+- **#37.4 (OhShii, retracted in part):** the claim that a signed delegation reaches
+  `attacker.example.com` was withdrawn after measurement — `new Request("http://127.0.0.1:1@attacker.example.com/callback", …)`
+  throws on credentials in the URL before anything is sent. The authority injection itself is
+  real (`new URL(…).hostname` IS the attacker host). So §1.2's final step, credited as #11.4,
+  is **not established**: the defect and the fix stand; the exploit chain as written does not.
+- **#41.2 step 4 (OhShii, they were right, our first pass was wrong):** `claimPlayFunds` IS
+  genuinely retired; the fix reached the checklist and not the kill matrix. Both now agree
+  (W6-02).
+- **#40.4 (both sides sharpened):** the "third statement of the II origin list" is the
+  anti-sybil verifier's `frontend_origins` — a different mechanism. The II half now has a gate
+  (W6-03); the anti-sybil half was a REAL, separate gap (the canonical origin missing from the
+  template) and is filed as its own item (W6-09).
+- **PRICE_MIN_SOURCES 2→3 (OhShii, withdrawn):** retracted after andreij6's #17 demonstrated
+  the change moves the failure rather than fixing it. Kept visible in §7.1; the eventual fix
+  was the per-quote aggregation + depeg alarm (W3-05) and the floor-refusing override clamp
+  (W4-19).

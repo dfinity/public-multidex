@@ -20,6 +20,12 @@
 #   E  the point of it all: adminReplay folds the tape ACROSS the gap (hop the
 #          dropped range, reset at the baseline) and must reproduce every live
 #          balance with ZERO mismatches on all four ledgers.
+#   F  L3 shear (#52.2) — the SIZE-ONLY absolute ceiling above L2: internal
+#          emitters are not admission-throttled, so a queue can pass the L2 cap
+#          while the shipper reads healthy and the both-conditions gate stays
+#          cold. Above shipShearCap the shed fires on size ALONE (failStreak 0),
+#          with the same gap-ledger + re-anchor semantics; at hardCap alone with
+#          a healthy shipper L2 still does NOT fire (both-conditions unchanged).
 #
 # Timers stay PAUSED; shipping is stepped by hand so the sequence is exact.
 # ⚠️ Calls resetExchange. Needs a #dev backend.
@@ -53,7 +59,7 @@ else
 fi
 adm setTestTimersPaused '(true)' >/dev/null 2>&1     # step shipping by hand
 adm resetExchange "()" >/dev/null 2>&1 || true
-adm setTestShipFailover "(false, null, null, null)" >/dev/null 2>&1  # clean slate
+adm setTestShipFailover "(false, null, null, null, null)" >/dev/null 2>&1  # clean slate
 adm setTestBalance "(principal \"$WD\", \"ICPUSD\", 100_000_000_000 : nat)" >/dev/null
 
 # Emit N withdrawal events (each → 1 semantic UserEvent straight into the ship
@@ -77,15 +83,17 @@ else nok "baseline ship failed" "queued0=$UNSHIP0 queued1=$UNSHIP1 archived=$ARC
 echo ""
 echo "── B. L1: N ship failures → seal wedged archive + roll to fresh ──"
 # fail=true, roll after 2 failures, hard cap high (no L2 interference).
-adm setTestShipFailover "(true, opt (2 : nat), opt (100000 : nat), opt (90000 : nat))" >/dev/null
+adm setTestShipFailover "(true, opt (2 : nat), opt (100000 : nat), opt (90000 : nat), null)" >/dev/null
 emit 4 wedge
 SEALED0=$(field "$(info)" archivesSealed)
 ship; ship; ship   # fail,fail,then streak≥2 → roll
 I=$(info)
 ROLLS=$(field "$I" emergencyRolls); SEALED1=$(field "$I" archivesSealed); STREAK=$(field "$I" shipFailStreak)
-echo "   emergencyRolls=$ROLLS archivesSealed=$SEALED0→$SEALED1 streak=$STREAK"
+# NOTE: ${var}→ needs the braces — macOS bash 3.2 under a UTF-8 locale swallows the
+# multibyte glyph into the variable name and `set -u` kills the script ("unbound").
+echo "   emergencyRolls=$ROLLS archivesSealed=${SEALED0}→$SEALED1 streak=$STREAK"
 if [ "${ROLLS:-0}" -ge 1 ]; then ok "L1 emergency roll fired (emergencyRolls=$ROLLS)"; else nok "L1 should roll after the fail streak" "rolls=$ROLLS"; fi
-if [ "${SEALED1:-0}" -gt "${SEALED0:-0}" ]; then ok "wedged archive sealed at its acked prefix (sealed $SEALED0→$SEALED1)"; else nok "roll should seal the wedged archive" "$SEALED0→$SEALED1"; fi
+if [ "${SEALED1:-0}" -gt "${SEALED0:-0}" ]; then ok "wedged archive sealed at its acked prefix (sealed ${SEALED0}→$SEALED1)"; else nok "roll should seal the wedged archive" "${SEALED0}→$SEALED1"; fi
 SHED_B=$(field "$I" shedEvents)
 if [ "${SHED_B:-0}" = "0" ]; then ok "no data dropped by L1 (shedEvents=0)"; else nok "L1 must not drop data" "shedEvents=$SHED_B"; fi
 
@@ -93,7 +101,7 @@ if [ "${SHED_B:-0}" = "0" ]; then ok "no data dropped by L1 (shedEvents=0)"; els
 echo ""
 echo "── C. L2: sustained failure past the hard cap → drop oldest, record gap ──"
 # Shrink the cap so ~55 events trip it. Still failing.
-adm setTestShipFailover "(true, opt (2 : nat), opt (50 : nat), opt (30 : nat))" >/dev/null
+adm setTestShipFailover "(true, opt (2 : nat), opt (50 : nat), opt (30 : nat), null)" >/dev/null
 emit 55 flood
 QBEFORE=$(field "$(info)" journalUnshipped)
 # TWO ticks, not one. The L2 shed now requires BOTH conditions — queue ≥ cap
@@ -108,7 +116,7 @@ ship   # streak 1 → 2; queue ≥ 50 but streak not yet at threshold, so no she
 ship   # streak at threshold + queue ≥ 50 → shed to 30 + re-baseline
 I=$(info)
 QAFTER=$(field "$I" journalUnshipped); SHED=$(field "$I" shedEvents); GAPS=$(field "$I" ledgerGaps)
-echo "   journalUnshipped=$QBEFORE→$QAFTER shedEvents=$SHED ledgerGaps=$GAPS"
+echo "   journalUnshipped=${QBEFORE}→$QAFTER shedEvents=$SHED ledgerGaps=$GAPS"
 if [ "${SHED:-0}" -ge 1 ]; then ok "L2 dropped events to bound the heap (shedEvents=$SHED)"; else nok "L2 should shed above the cap" "shedEvents=$SHED"; fi
 if [ "${GAPS:-0}" -ge 1 ]; then ok "a ledger gap is recorded (ledgerGaps=$GAPS)"; else nok "L2 must record a gap" "ledgerGaps=$GAPS"; fi
 # The shed immediately re-baselines the tape: one absolute row per live ledger
@@ -127,14 +135,16 @@ echo "   baseline: [$BF..$BT) = $BWIDTH re-attestation rows (recorded=$NBASE)"
 if [ "${NBASE:-0}" -ge 1 ] && [ "$BWIDTH" -ge 1 ]; then
   ok "shed emitted a balance re-baseline ($BWIDTH absolute rows, seq [$BF..$BT))"
 else nok "no re-baseline after the shed" "n=$NBASE width=$BWIDTH"; fi
-if [ "${QAFTER:-9999}" = "$(( 30 + BWIDTH ))" ]; then
-  ok "queue bounded at shedTo + baseline (journalUnshipped=$QAFTER = 30+$BWIDTH)"
-else nok "queue not at shedTo+baseline" "journalUnshipped=$QAFTER want $(( 30 + BWIDTH ))"; fi
+# +1: the shed declares its gap ON the chain (W2-04 #gap event) before the
+# baseline rows — the queue lands at shedTo + gapEvent + baselineWidth.
+if [ "${QAFTER:-9999}" = "$(( 30 + 1 + BWIDTH ))" ]; then
+  ok "queue bounded at shedTo + #gap + baseline (journalUnshipped=$QAFTER = 30+1+$BWIDTH)"
+else nok "queue not at shedTo + #gap + baseline" "journalUnshipped=$QAFTER want $(( 30 + 1 + BWIDTH ))"; fi
 
 # ── D. Recovery: drain + re-anchor + gap queryable ─────────────────
 echo ""
 echo "── D. recovery: clear the failure → drain onto a fresh archive, gap closed ──"
-adm setTestShipFailover "(false, opt (2 : nat), opt (50 : nat), opt (30 : nat))" >/dev/null  # keep test cooldown=0
+adm setTestShipFailover "(false, opt (2 : nat), opt (50 : nat), opt (30 : nat), null)" >/dev/null  # keep test cooldown=0
 ship; sleep 1; ship; sleep 1; ship   # re-anchor roll, then ship the post-gap tail
 I=$(info)
 QREC=$(field "$I" journalUnshipped)
@@ -213,8 +223,46 @@ for L in debt lp ins; do
   else nok "${L} ledger mismatch across the gap" "$(echo "$R" | grep -oE "${L}Mismatches = vec \{[^}]*" | head -c 200)"; fi
 done
 
+# ── F. Layer 3 shear: SIZE-ONLY shed on a HEALTHY shipper (#52.2) ──
+echo ""
+echo "── F. L3 shear: size alone sheds above the shear cap; L2 stays both-conditions ──"
+# Healthy shipper (fail=false); D/E's successful ships reset the streak to 0.
+# hardCap=40 < shearCap=60, shedTo=30; rollThreshold stays the default (3) so
+# the streak condition genuinely gates L2 here.
+adm setTestShipFailover "(false, null, opt (40 : nat), opt (30 : nat), opt (60 : nat))" >/dev/null
+I=$(info); SHED_F0=$(field "$I" shedEvents); GAPS_F0=$(field "$I" ledgerGaps); STREAK_F0=$(field "$I" shipFailStreak)
+if [ "${STREAK_F0:-x}" = "0" ]; then ok "precondition: shipper healthy (shipFailStreak=0)"
+else nok "expected a healthy shipper entering §F" "streak=$STREAK_F0"; fi
+# Negative half: queue ≥ hardCap (45 ≥ 40) but under the shear cap, streak 0 →
+# NO shed. The L2 both-conditions contract is unchanged; the healthy shipper
+# just drains the backlog.
+emit 45 nofire
+ship; sleep 1; ship
+I=$(info); SHED_F1=$(field "$I" shedEvents); GAPS_F1=$(field "$I" ledgerGaps); Q_F1=$(field "$I" journalUnshipped)
+if [ "${SHED_F1:-x}" = "${SHED_F0:-y}" ] && [ "${GAPS_F1:-x}" = "${GAPS_F0:-y}" ]; then
+  ok "no shed at hardCap alone with streak 0 (shedEvents=$SHED_F1 unchanged; queue drained to $Q_F1)"
+else nok "L2 fired without a fail streak (both-conditions regression)" "shed ${SHED_F0}→$SHED_F1 gaps ${GAPS_F0}→$GAPS_F1"; fi
+# Positive half: queue past the SHEAR cap (65 ≥ 60), streak still 0 → the
+# size-only shear sheds to shedTo (+ #gap + re-baseline) and records a gap.
+emit 65 shear
+QF=$(field "$(info)" journalUnshipped)
+ship
+I=$(info); SHED_F2=$(field "$I" shedEvents); GAPS_F2=$(field "$I" ledgerGaps)
+if [ "${SHED_F2:-0}" -gt "${SHED_F1:-0}" ]; then
+  ok "L3 shear fired on size alone (shedEvents ${SHED_F1}→$SHED_F2 at queue $QF ≥ 60, streak 0)"
+else nok "shear should shed above the shear cap on a healthy shipper" "shed ${SHED_F1}→$SHED_F2 queue=$QF"; fi
+if [ "${GAPS_F2:-0}" -gt "${GAPS_F1:-0}" ]; then
+  ok "the shear recorded a ledger gap (ledgerGaps ${GAPS_F1}→$GAPS_F2)"
+else nok "shear must record a gap" "gaps ${GAPS_F1}→$GAPS_F2"; fi
+# Same semantics as L2: the shear sealed the active archive, so the healthy
+# shipper re-anchors a fresh one and drains the tail (gap + baseline included).
+ship; sleep 1; ship; sleep 1; ship
+QREC_F=$(field "$(info)" journalUnshipped)
+if [ "${QREC_F:-99}" = "0" ]; then ok "post-shear tail drained onto a fresh archive (journalUnshipped=0)"
+else nok "post-shear queue should drain" "journalUnshipped=$QREC_F"; fi
+
 # Cleanup: clear overrides + resume timers.
-adm setTestShipFailover "(false, null, null, null)" >/dev/null 2>&1
+adm setTestShipFailover "(false, null, null, null, null)" >/dev/null 2>&1
 adm setTestTimersPaused '(false)' >/dev/null 2>&1
 echo ""
 echo "═══════════════════════════════════════════════════════"

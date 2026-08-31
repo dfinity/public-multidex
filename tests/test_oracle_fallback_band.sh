@@ -7,7 +7,7 @@
 # still fills but distant stranded orders are out of reach.
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_oracle_fallback_band.sh
 #
 # Setup: mid 10. A near-band user bid @ 9.85 (-1.5%, inside the 2% clamp) and a

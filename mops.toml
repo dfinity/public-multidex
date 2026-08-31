@@ -25,18 +25,27 @@ candid = "src/backend/backend.did"
 # with margin; the archive additionally seals early on #full (checked grow).
 args = [ "--default-persistent-actors", "--implicit-package=core", "--public-metadata", "candid:service", "--max-stable-pages", "131072" ]
 
+# candid= on EVERY canister block, deliberately (W5-23-era footgun, factory
+# task 1786991553): `mops generate candid <name>` REWRITES this whole file —
+# comments stripped — whenever it must ADD a missing candid= key. With the
+# key present it leaves the file alone. All five .did outputs are gitignored
+# intermediates; candid/backend.did stays the only PUBLISHED copy.
 [canisters.bridge]
 main = "src/bridge/main.mo"
+candid = "src/bridge/bridge.did"
 args = [ "--default-persistent-actors", "--implicit-package=core" ]
 
 [canisters.arb]
 main = "src/arb/main.mo"
+candid = "src/arb/arb.did"
 args = [ "--default-persistent-actors", "--implicit-package=core" ]
 
 [canisters.xrc-mock]
 main = "src/xrc-mock/main.mo"
+candid = "src/xrc-mock/xrc-mock.did"
 args = [ "--default-persistent-actors", "--implicit-package=core" ]
 
 [canisters.fuel-mock]
 main = "src/fuel-mock/main.mo"
+candid = "src/fuel-mock/fuel-mock.did"
 args = [ "--default-persistent-actors", "--implicit-package=core" ]

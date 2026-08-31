@@ -105,7 +105,31 @@ function readSites(src, field) {
     .map((text, i) => ({ ln: i + 1, text: text.trim() }))
     .filter((l) => l.text.includes(field) && !l.text.includes("IDL."));
 }
+// STATEMENT-scoped sites (W5-17): a line-wrapped `field\n  / 1e8` defeats
+// per-line matching in both directions — the field line has no divide and
+// the divide line no field. Statements are approximated by splitting on
+// `;` and collapsing internal whitespace.
+function readSiteStatements(src, field) {
+  return src.split(";")
+    .map((text) => text.replace(/\s+/g, " ").trim())
+    .filter((t) => t.includes(field) && !t.includes("IDL."));
+}
 const DIVIDES_BY_E8 = /\/\s*(1e8|100_000_000|100000000)\b/;
+// Downscale in EITHER spelling: divide by 1e8 or multiply by its inverse.
+const DOWNSCALES_E8 = /(\/\s*(1e8|100_000_000|100000000)\b|\*\s*(1e-8|0\.00000001)\b)/;
+// Module helpers that downscale (the fifth reintroduction variant: a
+// one-line `const down = (x) => x / 1e8` applied at the render site). Best
+// effort by regex — this is a STRUCTURE pin, not a behaviour pin; main.js
+// cannot be imported outside a browser.
+function e8HelperNames(src) {
+  const names = new Set();
+  const defs = src.split(";").map((t) => t.replace(/\s+/g, " ").trim());
+  for (const d of defs) {
+    const m = d.match(/(?:const|let|var)\s+(\w+)\s*=\s*(?:\([^)]*\)|\w+)\s*=>/) || d.match(/function\s+(\w+)\s*\(/);
+    if (m && DOWNSCALES_E8.test(d)) names.add(m[1]);
+  }
+  return names;
+}
 
 console.log(`frontend display-integrity guards — ${ROOT}\n`);
 
@@ -228,14 +252,21 @@ console.log("\nB. main.js — no second divide on boundary-normalised money");
     // A divide here is not a rounding difference, it is eight orders of
     // magnitude, and it renders green: the guard above each card tests the
     // undivided value, so the alert still fires and only the figure lies.
+    const helperNames = e8HelperNames(src);
     for (const field of ["pendingYieldUsd", "uncoveredBadDebtUsd"]) {
-      const sites = readSites(src, field);
-      check(`${field} has render sites at all`, sites.length > 0,
+      const stmts = readSiteStatements(src, field);
+      check(`${field} has render sites at all`, stmts.length > 0,
         "field renamed? this section is then asserting nothing");
-      const divided = sites.filter((l) => DIVIDES_BY_E8.test(l.text));
-      check(`no ${field} render site divides by 1e8`,
-        divided.length === 0,
-        divided.map((l) => `main.js:${l.ln}  ${l.text}`).join("\n"));
+      const scaled = stmts.filter((t) => DOWNSCALES_E8.test(t));
+      check(`no ${field} render statement downscales by e8 [structure pin: / and * spellings, statement-scoped]`,
+        scaled.length === 0,
+        scaled.map((t) => t.slice(0, 120)).join("\n"));
+      // the helper variant: any module downscale-helper APPLIED to the field
+      const helped = stmts.filter((t) =>
+        [...helperNames].some((h) => new RegExp(`\\b${h}\\s*\\(`).test(t)));
+      check(`no ${field} render statement routes through a downscale helper [structure pin: cannot execute main.js outside a browser]`,
+        helped.length === 0,
+        helped.map((t) => t.slice(0, 120)).join("\n"));
     }
 
     // Whole-function guard on the Stats alert cards. Every figure that pane
@@ -247,10 +278,14 @@ console.log("\nB. main.js — no second divide on boundary-normalised money");
     const issues = funcBody(src, "async function renderStatsIssues(");
     check("renderStatsIssues is extractable", issues !== null);
     if (issues) {
-      const divides = issues.split("\n").filter((l) => DIVIDES_BY_E8.test(l));
-      check("no alert card divides an already-normalised figure by 1e8",
+      const divides = issues.split("\n").filter((l) => DOWNSCALES_E8.test(l));
+      check("no alert card downscales an already-normalised figure [structure pin]",
         divides.length === 0,
         divides.map((l) => l.trim()).join("\n"));
+      const issueHelpers = [...helperNames].filter((h) => new RegExp(`\\b${h}\\s*\\(`).test(issues));
+      check("no alert card routes through a downscale helper [structure pin]",
+        issueHelpers.length === 0,
+        `helper(s) applied inside renderStatsIssues: ${issueHelpers.join(", ")}`);
     }
   }
 }
@@ -399,9 +434,15 @@ console.log("\nE. main.js — poll + chart cursor integrity");
     if (poll) {
       check("an in-flight flag is declared at module scope",
         /let\s+_pollInFlight\s*=\s*false/.test(src));
+      // The guard is a compound condition (`if (!src || _pollInFlight) return`),
+      // so the needle admits other disjuncts — but a NEGATED flag is asserted
+      // ABSENT separately, which is what the old permissive needle could not
+      // do: `if (!_pollInFlight) return` satisfied it (the inversion, #36.8).
       check("pollChanges returns early while one is already in flight",
-        /if\s*\([^)]*_pollInFlight[^)]*\)\s*return/.test(poll),
-        "the file already does this for checkReleaseRejections (_rejCheckInFlight)");
+        /if\s*\([^)]*\b_pollInFlight\b[^)]*\)\s*(?:\{\s*)?return/.test(poll)
+          && !/if\s*\([^)]*!\s*_pollInFlight[^)]*\)\s*(?:\{\s*)?return/.test(poll),
+        "the file already does this for checkReleaseRejections (_rejCheckInFlight); "
+        + "a NEGATED _pollInFlight in the early-return is the inversion and fails this");
       const setAt = poll.indexOf("_pollInFlight = true");
       const awaitAt = poll.indexOf("await");
       check("the flag is set before the first await",
@@ -420,9 +461,12 @@ console.log("\nE. main.js — poll + chart cursor integrity");
       check("the market-trade merge is not a bare concatenation",
         !/\[\s*\.\.\.existing\s*,\s*\.\.\.resp\.newTrades\s*\]/.test(merge),
         "identical newTrades from two polls would both be appended");
-      check("the market-trade merge dedups by trade id",
-        /\bid\b/.test(merge) && /has\(|some\(|Set\(/.test(merge),
-        "the user-trade merge below it already does this by String(t.id)");
+      check("the market-trade merge builds a seen-set keyed by trade id [structure pin]",
+        /new\s+Set\(\s*existing\.map\([\s\S]{0,60}?\bid\b/.test(merge),
+        "expected `new Set(existing.map((t) => String(t.id)))` — the key half of the dedup");
+      check("the market-trade merge SKIPS trades already seen [structure pin: the check the tape's duplicate-tick bug rode in on]",
+        /if\s*\(\s*seen\.has\([\s\S]{0,60}?\)\s*continue/.test(merge),
+        "a seen-set that is built but never consulted dedups nothing");
     }
 
     // E3 — refreshChartData refetches page 0 and replaces the series, so the
@@ -448,6 +492,292 @@ console.log("\nE. main.js — poll + chart cursor integrity");
       interval !== null && /chartCurrentPage\s*=\s*0/.test(interval),
       "both page-0 refetch paths have to reset, not one");
   }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// F. assistant.js — action outcomes name the payload; candle-interval
+//    honesty (#46.2 §1/§3, #46.4)
+// ════════════════════════════════════════════════════════════════════
+console.log("\nF. assistant.js — action outcome reporting + interval honesty");
+{
+  const rawAsst = must("src/frontend/src/assistant.js");
+  const asst = rawAsst === null ? null : stripJsComments(rawAsst);
+  const rawMain = must("src/frontend/src/main.js");
+  const mainSrc = rawMain === null ? null : stripJsComments(rawMain);
+  const rawOb = must("src/backend/lib/OrderBook.mo");
+  const html = must("src/frontend/index.html");
+
+  // F1 — BEHAVIOURAL. assistant.js is import-clean under node (its module
+  // scope touches only state.js/oql.js/money.js, all pure), so the outcome
+  // formatter is exercised directly. #46.2 §1: `res.ok` used to collapse to
+  // the two chars "OK" for every record payload, so a STAGED swap and a
+  // fill-nothing market order were indistinguishable from a completed one —
+  // for the user (the chat note) AND for the model (the ACTION RESULT turn).
+  let outcomeFn = null;
+  try {
+    const mod = await import(pathToFileURL(path("src/frontend/src/assistant.js")).href);
+    outcomeFn = typeof mod.asstActionOutcome === "function" ? mod.asstActionOutcome : null;
+  } catch (e) { bad("assistant.js imports under node", e.message || String(e)); }
+  check("asstActionOutcome is exported for this battery", outcomeFn !== null,
+    "the action-result formatter must be an exported pure function, not inlined");
+  if (outcomeFn) {
+    // Payload shapes mirror the wrapActor-normalized results the actor returns
+    // (human-unit floats; opt Nat decodes to a 0/1-element array of BigInt).
+    const staged = outcomeFn("swap", { fromAmount: 0, toAmount: 0, fullyFilled: false, swapOrderId: [123n] });
+    check("a staged swap reports STAGED + its order id, not bare OK",
+      /STAGED/i.test(staged) && staged.includes("123"), staged);
+    const filledSwap = outcomeFn("swap", { fromAmount: 0.5, toAmount: 1500, fullyFilled: true, swapOrderId: [] });
+    check("a filled swap reports the swapped amounts",
+      filledSwap.includes("0.5") && filledSwap.includes("1500") && !/STAGED/i.test(filledSwap), filledSwap);
+    const partialSwap = outcomeFn("swap", { fromAmount: 0.25, toAmount: 700, fullyFilled: false, swapOrderId: [] });
+    check("a partial swap says partial", /partial/i.test(partialSwap), partialSwap);
+    const mktStaged = outcomeFn("placeMarketOrder", { trades: [], pendingMatches: [], remainingQty: 1, totalFilled: 0, avgPrice: 0 });
+    check("a fill-nothing market order reports STAGED, not bare OK", /STAGED/i.test(mktStaged), mktStaged);
+    const mktFilled = outcomeFn("placeMarketOrder", { trades: [], pendingMatches: [], remainingQty: 0, totalFilled: 2, avgPrice: 65000 });
+    check("a filled market order reports fill quantity + avg price",
+      /filled 2\b/.test(mktFilled) && mktFilled.includes("65000"), mktFilled);
+    const lim = outcomeFn("placeLimitOrder", { order: { id: 42n }, pendingMatches: [] });
+    check("a placed limit order reports its order id", lim.includes("#42"), lim);
+    check("a null ok still reads OK", outcomeFn("cancelMyOrder", null) === "OK");
+    check("an unrecognized record ok surfaces its payload instead of swallowing it",
+      outcomeFn("someFutureAction", { alpha: 7 }).includes("7"),
+      "new actions must never regress to a bare OK");
+  }
+
+  if (asst) {
+    check("the action dispatch routes res.ok through asstActionOutcome",
+      /asstActionOutcome\(\s*obj\.method/.test(asst),
+      "an exported formatter the dispatch does not call guards nothing");
+
+    // #46.2 §3 — the post-action account refresh. The old guard read
+    // `typeof refreshAccountData === "function"` on an identifier that was
+    // never in this module's scope: typeof on an undeclared name is
+    // "undefined", so the guard was ALWAYS false and the refresh dead code.
+    check("the dead bare-identifier refreshAccountData guard is gone",
+      !/typeof\s+refreshAccountData/.test(asst),
+      "typeof on an out-of-scope identifier is 'undefined' — the guard can never pass");
+    check("the post-action refresh runs through an injected dep",
+      /if\s*\(\s*_refreshAccount\s*\)\s*_refreshAccount\(\)/.test(asst),
+      "the refresh must come through setupAssistant(deps), the module's one injection point");
+    check("setupAssistant accepts the refreshAccountData dep",
+      /deps\.refreshAccountData/.test(asst));
+  }
+  if (mainSrc) {
+    const at = mainSrc.indexOf("setupAssistant({");
+    check("main.js injects refreshAccountData into setupAssistant",
+      at >= 0 && mainSrc.slice(at, at + 400).includes("refreshAccountData"),
+      "without the injection the fixed guard is false forever, same as the bug");
+  }
+
+  // F2 — interval honesty (#46.4). The backend materialises candles ONLY for
+  // OrderBook.mo's CANDLE_INTERVALS and exposes no query for the set, so
+  // every client-side interval list is a hand-copy; one that offers an
+  // unmaterialised bucket (the old 12h, the chart's old 1M) gets an EMPTY
+  // response that reads as "no price history". Parse the backend set and hold
+  // every hand-copy to it.
+  const ob = rawOb === null ? null : stripJsComments(rawOb);
+  let backendIvs = null;
+  if (ob) {
+    const at = ob.indexOf("CANDLE_INTERVALS");
+    const blk = at < 0 ? "" : ob.slice(at, ob.indexOf("];", at));
+    backendIvs = [...blk.matchAll(/\(\s*([\d_]+)\s*,/g)].map((m) => Number(m[1].replace(/_/g, "")));
+    check("the backend CANDLE_INTERVALS set is extractable and plausible",
+      backendIvs.length >= 5 && backendIvs.includes(60000),
+      `parsed: ${backendIvs.join(", ")}`);
+  }
+  const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+  if (asst && backendIvs && backendIvs.length) {
+    const ivsM = /const\s+ALLOWED_IVS\s*=\s*\[([^\]]*)\]/.exec(asst);
+    const allowed = ivsM ? ivsM[1].split(",").map((s) => Number(s.trim())).filter((n) => n > 0) : [];
+    check("the candles tool's ALLOWED_IVS equals the backend's materialised set",
+      sameSet(allowed, backendIvs),
+      `assistant: ${allowed.join(", ")}\nbackend:   ${backendIvs.join(", ")}`);
+
+    const promptLine = asst.split("\n").find((l) => l.includes("intervalMs must be one of")) || "";
+    const offered = [...promptLine.matchAll(/(\d{5,})\s*\(/g)].map((m) => Number(m[1]));
+    check("the prompt's interval list is extractable", offered.length > 0,
+      "the 'intervalMs must be one of' line moved or lost its N (label) form");
+    check("the prompt offers exactly the backend's materialised intervals",
+      sameSet(offered, backendIvs),
+      `prompt:  ${offered.join(", ")}\nbackend: ${backendIvs.join(", ")}`);
+  }
+  if (html && backendIvs && backendIvs.length) {
+    const btns = [...html.matchAll(/data-interval="(\d+)"/g)].map((m) => Number(m[1]));
+    const phantom = btns.filter((n) => !backendIvs.includes(n));
+    check("every chart interval button maps to a materialised backend interval",
+      btns.length > 0 && phantom.length === 0,
+      `phantom buttons: ${phantom.join(", ")} — getCandles returns empty for these`);
+  }
+
+  // F3 — the depth-walk instruction (#46.4). `quantity` is the PLACED size;
+  // a partially-filled resting row's remaining depth is quantity - filled,
+  // so walking `quantity` alone overstates book depth exactly on the rows
+  // where it matters.
+  if (asst) {
+    check("the depth-walk teaches resting size = quantity - filled",
+      asst.includes("quantity - filled"),
+      "the slippage walk must subtract filled from quantity per row");
+    check("the depth-walk accumulates (quantity - filled)×price",
+      asst.includes("(quantity - filled)×price"));
+    check("the depth-walk tells the model to select the filled field",
+      /Select[^\n]*filled/.test(asst),
+      "a walk that never selects `filled` cannot subtract it");
+    check("the old quantity-as-resting-size claim is gone",
+      !asst.includes("as the resting size per row"));
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// G. Earn card — pool share percent + the LP loan-book disclosure (#50)
+// ════════════════════════════════════════════════════════════════════
+console.log("\nG. Earn card — pool share percent + LP value disclosure");
+{
+  // G1 (behavioural) — sharePercent crosses the money boundary as a 0..1
+  // FRACTION of the pool: money.js divides the e8 fixed-point by 1e8 and
+  // nothing more, so whoever renders it as a percent owns the ×100.
+  if (money) {
+    const { MONEY_KEYS, normMoney } = money;
+    check("sharePercent is in MONEY_KEYS", MONEY_KEYS.has("sharePercent"),
+      "normMoney would hand the render a raw e8 bigint");
+    const pos = normMoney({ sharePercent: 5_000_000n }); // 5% of the pool at e8
+    check("a 5% pool share normalises to the fraction 0.05, not 5",
+      pos.sharePercent === 0.05,
+      `got ${pos.sharePercent} — the render site's ×100 assumption just changed`);
+  }
+
+  const rawMain = must("src/frontend/src/main.js");
+  const src = rawMain === null ? null : stripJsComments(rawMain);
+  if (src) {
+    // G2 — the "Pool share" tile multiplies the fraction by 100 before
+    // printing "%". Without it a 5% holder reads "0.05%" (#50.2) while the
+    // three sibling weights on the same card multiply correctly — the worst
+    // kind of wrong: plausible, green, and 100× out. main.js cannot run
+    // outside a browser, so this is a structure pin on the render statement.
+    const stmts = readSiteStatements(src, "earn-vault-share");
+    check("the Pool share tile has a render site at all", stmts.length > 0,
+      "element id renamed? this section is then asserting nothing");
+    const bare = stmts.filter((t) => !/\*\s*100\b/.test(t));
+    check("the Pool share render multiplies the fraction by 100 [structure pin]",
+      bare.length === 0,
+      bare.map((t) => t.slice(0, 120)).join("\n"));
+
+    // G3 — the loan-book haircut disclosure (#50.1): the Earn card surfaces
+    // a utilisation-adjusted figure beside the NAV-based "Value", because
+    // withdrawLp pays in kind from physical holdings while the tile marks
+    // f × NAV (loan book included) — up to ~2× apart at the 0.50 borrow cap.
+    const body = funcBody(src, "function renderVaultHaircut(");
+    check("renderVaultHaircut exists", body !== null,
+      "the #50.1 disclosure renderer was removed or renamed");
+    if (body) {
+      check("the haircut note derives the adjusted figure from debt/NAV",
+        /totalDebtUsd/.test(body) && /vaultValueUsd/.test(body),
+        "the utilisation-adjusted figure must come from getMarginRiskSummary");
+      check("the haircut note surfaces utilisation",
+        /vaultUtilisationBps/.test(body));
+      // The bps field is NOT in MONEY_KEYS; a stray e8 downscale here would
+      // print utilisation as 0.0% forever.
+      check("the haircut note does not e8-downscale the pre-normalised fields",
+        !DOWNSCALES_E8.test(body));
+    }
+    const earnBody = funcBody(src, "async function renderEarnCard(") || "";
+    check("renderEarnCard invokes the haircut disclosure",
+      /renderVaultHaircut\s*\(/.test(earnBody),
+      "the disclosure renderer is defined but never called from the Earn card");
+  }
+
+  // G4 — the LP docs carry the matching upper-bound sentence (#50.1): the
+  // Earn docs must say the displayed value is an upper bound while the vault
+  // is lending, and that withdrawals are paid in kind.
+  const docs = must("src/frontend/src/docs.js");
+  check("docs.js Earn section discloses the loan-book upper bound",
+    docs !== null && /upper bound while the vault is lending/.test(docs)
+      && /paid in kind/.test(docs),
+    "the Earn docs upper-bound sentence is gone — #50.1's docs half");
+
+  // G5 — the per-market order-cap error prints the human multiplier, never
+  // the raw e8 constant (#50.3). Enforcement is fixed-point and unchanged;
+  // only the message speaks human. (Behavioural pin lives in
+  // tests/LiquidityManager.test.mo; this catches the lazy revert.)
+  const lm = must("src/backend/lib/LiquidityManager.mo");
+  check("the order-cap error no longer prints the raw fixed-point constant",
+    lm !== null && !lm.includes("Nat.toText(Types.MARKET_ASSET_FACTOR)"),
+    '"exceed 250000000x your ICPUSD balance" — meaningless to the person it addresses');
+}
+
+// ════════════════════════════════════════════════════════════════════
+// H. Adjustment reasons — the WHY column stays wired end to end
+//    (#50 follow-up, task 1787199451)
+// ════════════════════════════════════════════════════════════════════
+console.log("\nH. adjustment reasons — backend tags vs IDL, labels, and the pane");
+{
+  // The backend's AdjustmentReason variant is the source of truth. Every
+  // hand-copy — the frontend IDL variant, the humanising label map — is held
+  // to it, the same way the candle-interval lists are held to CANDLE_INTERVALS:
+  // a tag added on one side without the other otherwise decodes to a raw key
+  // (or throws in the IDL) with nothing but this suite to notice.
+  const rawTypes = must("src/backend/lib/Types.mo");
+  let backendTags = null;
+  if (rawTypes) {
+    const at = rawTypes.indexOf("public type AdjustmentReason");
+    const blk = at < 0 ? "" : rawTypes.slice(at, rawTypes.indexOf("};", at));
+    backendTags = [...blk.matchAll(/#(\w+)/g)].map((m) => m[1]);
+    check("the backend AdjustmentReason tag set is extractable and plausible",
+      backendTags.length >= 3 && backendTags.includes("balanceShrank"),
+      `parsed: ${backendTags.join(", ")}`);
+  }
+
+  const rawMain = must("src/frontend/src/main.js");
+  const src = rawMain === null ? null : stripJsComments(rawMain);
+  if (src && backendTags && backendTags.length) {
+    // H1 — the IDL half: getMyAdjustments decodes reason as an opt variant
+    // carrying exactly the backend's tags. A missing field here throws on
+    // every decode; a missing TAG throws only when that walk first fires.
+    const idlM = /const\s+AdjustmentReason\s*=\s*IDL\.Variant\(\{([^}]*)\}/.exec(src);
+    const idlTags = idlM ? [...idlM[1].matchAll(/(\w+)\s*:\s*IDL\.Null/g)].map((m) => m[1]) : [];
+    check("main.js declares the AdjustmentReason IDL variant with the backend's tags",
+      idlTags.length === backendTags.length && backendTags.every((t) => idlTags.includes(t)),
+      `IDL: ${idlTags.join(", ")}\nbackend: ${backendTags.join(", ")}`);
+    check("OrderAdjustment's IDL record carries reason as Opt(AdjustmentReason)",
+      /reason\s*:\s*IDL\.Opt\(AdjustmentReason\)/.test(src),
+      "fossil rows arrive as null — a non-opt field fails to decode them");
+
+    // H2 — the label half: every backend tag humanises; no orphan labels.
+    const lblM = /const\s+ADJ_REASON_LABELS\s*=\s*\{([^}]*)\}/.exec(src);
+    const lblTags = lblM ? [...lblM[1].matchAll(/(\w+)\s*:\s*"/g)].map((m) => m[1]) : [];
+    check("ADJ_REASON_LABELS covers exactly the backend's tags",
+      lblTags.length === backendTags.length && backendTags.every((t) => lblTags.includes(t)),
+      `labels: ${lblTags.join(", ")}\nbackend: ${backendTags.join(", ")}`);
+
+    // H3 — the render half: the pane prints the humanised reason per row and
+    // survives the fossil rows (reason = [] from the opt decode). main.js
+    // cannot run outside a browser, so these are structure pins.
+    const pane = funcBody(src, "async function renderAccountAdjustments(");
+    check("renderAccountAdjustments is extractable", pane !== null);
+    if (pane) {
+      check("each adjustment row renders through adjReasonLabel [structure pin]",
+        /adjReasonLabel\(\s*a\.reason\s*\)/.test(pane),
+        "a Reason <th> with no <td> shifts every row one column left");
+      check("the empty state spans the widened table (8 columns)",
+        /colspan="8"/.test(pane),
+        "the Reason column widened the table; a colspan 7 empty row misaligns it");
+    }
+    const helper = funcBody(src, "function adjReasonLabel(");
+    check("adjReasonLabel handles the fossil (empty opt) rows",
+      helper !== null && /!\s*reason\s*\|\|\s*!\s*reason\.length/.test(helper),
+      "pre-reason rows decode as [] — rendering them must not throw");
+
+    const html = must("src/frontend/index.html");
+    check("the adjustments table header carries the Reason column",
+      html !== null && /<th>Status<\/th>\s*<th>Reason<\/th>/.test(html),
+      "the render appends a Reason <td>; a missing <th> shears the header");
+  }
+
+  // H4 — the published contract: candid/backend.did must carry the field as
+  // opt, or bots and tooling decode yesterday's record shape.
+  const did = must("candid/backend.did");
+  check("candid/backend.did publishes reason: opt AdjustmentReason",
+    did !== null && /reason\s*:\s*opt AdjustmentReason/.test(did),
+    "gen-did.sh was not re-run after the backend change");
 }
 
 // ── Summary ─────────────────────────────────────────────────────────

@@ -28,7 +28,14 @@
 #   §6 flat close:       derived size 0 → row gone; an episode is recorded
 #
 # Runs on a warm venue (cold_start play/full: AMM book + live oracle) OR
-# self-provisions on a cold one — §0 seeds an alice-held ICP-ICPUSD pool and
+# self-provisions whenever the venue cannot COVER THE §6 CLOSE — empty book
+# (cold) or one-sweep bid capacity below the close size (a SUITE-RESIDUE
+# venue: earlier suite fixtures reconfigure ICP-ICPUSD to thin 3-level
+# ladders — test_breaker_widening/test_slippage_anchor set 3×15bps — and a
+# post-suite venue passes a bare "book non-empty" check while §6's ~600-base
+# market close can only fill the ladder's ~dozen base units in its one
+# sweep; the 2026-08-20 pre-rollout red was exactly this shape). §0 seeds an
+# alice-held ICP-ICPUSD pool and
 # runs a 2s refPrice+requote keeper standing in for the GEPTOR (the venue's
 # release/sweep machinery is freshness-driven and stops dead without one).
 # Creates its own identities and margin pool; trades tiny sizes on
@@ -94,14 +101,35 @@ calm_book() {
   awk -v b="$b" -v a="$a" 'BEGIN{ m=(a+b)/2; exit ((a-b)*10000/m <= 60) ? 0 : 1 }'
 }
 
+# One-sweep bid capacity (e8): Σ resting bid size over the top 25 levels —
+# an upper bound on what §6's full-size market SELL close can fill in one
+# sweep. Candid field order inside the depth record is not guaranteed, so
+# cut the bids vec out explicitly before summing (either side may print
+# first; the sed only fires when asks trail bids).
+bid_capacity() {
+  call getOrderBookDepth "(\"$MKT\", opt (25 : nat))" --query | tr -d '_\n' \
+    | awk -F'bids = vec ' 'NF > 1 { print $2 }' | sed 's/asks = vec.*//' \
+    | grep -oE 'quantity = [0-9]+' | grep -oE '[0-9]+' \
+    | awk '{ s += $1 } END { printf "%.0f", s + 0 }'
+}
+# §6 flat-closes the position with ONE slippage-bounded market order (a
+# market close never rests: it fills what the sweep reaches). Worst case
+# the position is still the full §1 entry (1000) if neither reduce filled,
+# so demand bids for ~1200 in one sweep; a genuinely seeded warm venue
+# (cold_start full/play) quotes thousands per side, so this never trips
+# there — only cold and residue venues self-provision.
+CLOSE_NEED=$(e8 1200)
+
 # The sections below trade against a live two-sided $MKT book. A warm venue
 # (cold_start --mode play/full) provides one via the AMM; in full-suite runs
-# the destructive tests reset the venue at exit (fixture hygiene), so raise
-# our own quoting pool here. The LP is deliberately held by `alice` — one of
+# the destructive tests reset the venue at exit (fixture hygiene) or leave
+# thin single-purpose ladders behind, so raise our own quoting pool here.
+# The LP is deliberately held by `alice` — one of
 # the five identities _lib.sh's I1 sums — so the vault stays fully
 # attributable during AND after this test (I1's contract for seeders).
-if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ]; then
-  echo "  (cold venue — seeding an AMM-quoted $MKT book, LP held by alice)"
+if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ] \
+   || [ "$(bid_capacity)" -lt "$CLOSE_NEED" ]; then
+  echo "  (venue cannot cover the §6 close — seeding an AMM-quoted $MKT book, LP held by alice)"
   call setTestTimersPaused '(false)' $CTL >/dev/null 2>&1   # releases need live timers
   ALICE_PRIN=$(principal_of alice)
   call createAmmPool "(\"$MKT\")" $CTL >/dev/null 2>&1
@@ -115,7 +143,18 @@ if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ]; then
   # inside-spread prices then land miles off-market and settlement becomes a
   # race against the ladder's return (the §2 flake).
   call setAmmConfig "(\"$MKT\", 20:nat, $(e8 200) : nat, 10:nat, 25:nat, 0:nat)" $CTL >/dev/null
-  call setAmmRefPrice "(\"$MKT\", $(e8 10) : nat)" $CTL >/dev/null
+  # Anchor price. A RESIDUE venue (thin suite-fixture ladder, live book near
+  # the real market price) re-anchors AT ITS CURRENT refPrice — freshness
+  # re-stamp only, no movement — because quoting the cold default $10 into a
+  # ~$2 book would cross every stray resting order and §0's calm gate would
+  # stare at a blown-out spread forever. A virgin pool anchors at $10.
+  CUR_REF=$(call getAmmPool "(\"$MKT\")" 2>/dev/null | tr -d '_' | grep -oE 'refPrice = [0-9]+' | grep -oE '[0-9]+' | head -1)
+  if [ -n "${CUR_REF}" ] && [ "${CUR_REF}" != "0" ]; then
+    ANCHOR_PX=$(awk -v p="${CUR_REF}" 'BEGIN{ printf "%.8f", p / 100000000 }')
+  else
+    ANCHOR_PX="10.00"
+  fi
+  call setAmmRefPrice "(\"$MKT\", $(e8 "${ANCHOR_PX}") : nat)" $CTL >/dev/null
   call setTestBalance "(principal \"$ALICE_PRIN\", \"ICP\",    $(e8 20000)  : nat)" $CTL >/dev/null
   call setTestBalance "(principal \"$ALICE_PRIN\", \"ICPUSD\", $(e8 200000) : nat)" $CTL >/dev/null
   # Mid-suite the vault can hold legs whose refPrice went stale when their
@@ -125,7 +164,7 @@ if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ]; then
   # refPrice (freshness only, no movement — no breaker interaction), and
   # pin manual quoting in case an earlier test left auto-inventory on.
   call setAmmAutoInventory '(false)' $CTL >/dev/null 2>&1
-  call setTestPendingJump '("ICP", null)' $CTL >/dev/null 2>&1
+  call setTestPendingJump '("ICP", null, null)' $CTL >/dev/null 2>&1
   for m in BTC-ICPUSD ETH-ICPUSD SOL-ICPUSD ICP-ICPUSD; do
     cur=$(call getAmmPool "(\"$m\")" 2>/dev/null | tr -d '_' | grep -oE 'refPrice = [0-9]+' | grep -oE '[0-9]+' | head -1)
     [ -n "$cur" ] && [ "$cur" != "0" ] && call setAmmRefPrice "(\"$m\", $cur : nat)" $CTL >/dev/null 2>&1
@@ -150,7 +189,7 @@ if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ]; then
   # keeper loop.
   COLD_FIXTURE=1
   ANCHOR_FILE=$(mktemp /tmp/uplands-posacct-anchor-XXXXXX)
-  echo "10.00" > "$ANCHOR_FILE"
+  echo "${ANCHOR_PX}" > "$ANCHOR_FILE"
   # setAmmRefPrice AND requoteAmm, as release()/freshrequote() do elsewhere
   # in the suite: the heartbeat's own requoter is drift/cooldown gated, so a
   # flat anchor alone means requotes — and ammSweepResting, which only runs
@@ -186,7 +225,7 @@ lift_resting_reduce() { # $1 = resting price (e8); returns once size < $2
   call requoteAmm "(\"$MKT\")" $CTL >/dev/null 2>&1   # force the requote → the sweep runs now
   wait_for '[ "$(pos_field "$(pos_read)" size)" -lt '"$below"' ]' 20 2
   local rc=$?
-  echo "10.00" > "$ANCHOR_FILE"
+  echo "${ANCHOR_PX}" > "$ANCHOR_FILE"
   # Let the restore transient pass before the caller reads edges again —
   # returning straight into §3 off a -0.5% anchor snap was measured to
   # destabilise its cross.

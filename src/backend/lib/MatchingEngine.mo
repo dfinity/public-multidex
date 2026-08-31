@@ -39,6 +39,22 @@ module {
     // makers so the taker rests instead; the AMM fills resting orders itself
     // on its next requote, at its fresh price. Defaults false (legacy).
     isNonTakeable : (makerOrderId : Nat, makerOwner : Principal) -> Bool;
+    // W4-22 (R2): the AMM sweep re-submits a USER's resting order as the
+    // AGGRESSOR so it fills at the AMM's equal-or-better price — a price
+    // mechanic, not a role change. With this true the aggressor is fee-rated
+    // AND volume-attributed as MAKER (their order was resting; the venue
+    // chose to re-home it): the fee role maps taker→maker on the aggressor
+    // leg only, and the engine pre-reserves the aggressor's order id so its
+    // trades carry it (attribution keys off a non-zero id). Resting sides
+    // keep their own roles. Safe by construction: reservations are sized at
+    // the taker worst case, so maker-rating never under-reserves. Only the
+    // sweep sets this; every other caller passes false.
+    aggressorIsMaker : Bool;
+    // W4-24 (R5(c)): the graceful unfunded-maker cancel used to be SILENT —
+    // inconsistent with cancelPoolRestingOrder and cancelSelfMaker, both
+    // documented "NEVER silent". The engine reports each such cancel here;
+    // main records a release-rejection notice for the owner.
+    onUnfundedMaker : (marketId : Types.MarketId, owner : Principal, side : Types.Side, price : Nat, qty : Nat) -> ();
     // True when a maker order has passed its orderExpiresDate. Expired orders
     // are skipped by the matcher (never filled) and swept off the book by the
     // maintenance heartbeat. Used to tie AMM quotes to oracle freshness: when
@@ -108,6 +124,8 @@ module {
     getMakerPending  = func(_) { 0 };
     availableBalance = func(p, t) { Accounts.getBalance(accounts, p, t) };
     isNonTakeable    = func(_, _) { false };
+    aggressorIsMaker = false;
+    onUnfundedMaker  = func(_, _, _, _, _) {};
     isExpired        = func(_) { false };
     onPendingFill    = func(_, _, _, _, _, _, _) { null };
     quoteFee         = func(_, _, _) { 0 };   // legacy/test: no fee
@@ -156,6 +174,14 @@ module {
     totalFilled : Nat;
     avgPrice : Nat;
     affectedUsers : [Principal]; // users whose orders may need adjustment
+    // QUOTE the #buy taker committed this call: tradeCost + its taker fee,
+    // summed over immediate settlements AND deferred (pending) slices — i.e.
+    // exactly what draws down a maxQuoteSpend budget. 0 for #sell takers
+    // (their quote leg is a credit). Lets budget-passing callers judge
+    // "budget spent" truthfully instead of reconstructing it from
+    // totalFilled×avgPrice (floored) — remainingQty > 0 with the budget
+    // exhausted is a COMPLETE conversion, not a partial fill.
+    quoteSpent : Nat;
   };
 
   // Execute a market order against resting orders on the book
@@ -176,7 +202,7 @@ module {
   ) : MatchResult {
     executeMarketOrderProtected(
       store, accounts, marketId, baseToken, taker, side, quantity,
-      maxSlippage, noPartialFill, timestamp, unprotected(accounts),
+      maxSlippage, noPartialFill, timestamp, unprotected(accounts), null,
     );
   };
 
@@ -192,6 +218,19 @@ module {
   // time. A staged/deferred release that passed its park-time here was
   // minting trades born 15s old: the Trades feed read permanently stale on
   // users-only markets, and fills landed in already-closed candle buckets.
+  //
+  // `maxQuoteSpend` (#buy takers only; ignored for #sell): a QUOTE budget —
+  // tradeCost PLUS the taker's fee, exactly the debit shape settlement
+  // charges — that the fill walk must never exceed. The fill loop already
+  // haircuts fillQty by the taker's whole available balance; the budget
+  // applies the SAME shrink against min(balance, remainingBudget), so a
+  // caller can size its quantity at the BEST price (full conversion on a
+  // flat book) while the walk stops exactly at the budget on a walking
+  // book — no residual, no overspend. null keeps the legacy semantics
+  // (bounded only by the taker's whole available balance). Composes with
+  // noPartialFill: the FOK pre-check simulates with the same budget clamp,
+  // so a budget the full quantity cannot fit in kills rather than
+  // partial-fills.
   public func executeMarketOrderProtected(
     store : OrderBook.OrderStore,
     accounts : Accounts.AccountState,
@@ -204,9 +243,10 @@ module {
     noPartialFill : Bool,
     settleTs : Int,
     ctx : ProtectionCtx,
+    maxQuoteSpend : ?Nat,
   ) : MatchResult {
     let refPrice = switch (OrderBook.findBestMatch(store, marketId, side)) {
-      case null { return { trades = []; pendingMatches = []; remainingQty = quantity; totalFilled = 0; avgPrice = 0; affectedUsers = [] } };
+      case null { return { trades = []; pendingMatches = []; remainingQty = quantity; totalFilled = 0; avgPrice = 0; affectedUsers = []; quoteSpent = 0 } };
       case (?best) { best.price };
     };
 
@@ -219,15 +259,21 @@ module {
     // Pending locks are counted against availability — a locked slice can't
     // serve another taker even though the maker looks "open" in the book.
     if (noPartialFill) {
-      let availableQty = simulateAvailableFill(store, accounts, marketId, baseToken, taker, side, quantity, maxPrice, minPrice, ctx);
+      let availableQty = simulateAvailableFill(store, accounts, marketId, baseToken, taker, side, quantity, maxPrice, minPrice, ctx, maxQuoteSpend);
       if (availableQty < quantity) {
-        return { trades = []; pendingMatches = []; remainingQty = quantity; totalFilled = 0; avgPrice = 0; affectedUsers = [] };
+        return { trades = []; pendingMatches = []; remainingQty = quantity; totalFilled = 0; avgPrice = 0; affectedUsers = []; quoteSpent = 0 };
       };
     };
 
     var remainingQty = quantity;
     var totalFilled : Nat = 0;
     var totalCost : Nat = 0;
+    // #buy quote budget (see maxQuoteSpend above). Drawn down by
+    // tradeCost + takerFee on every slice the taker commits — immediate
+    // settlements and deferred (pending) reservations alike, since a
+    // pending slice reserves exactly that inflated debit.
+    var remainingBudget : ?Nat = switch (side) { case (#buy) { maxQuoteSpend }; case (#sell) { null } };
+    var quoteSpent : Nat = 0;
     let tradeList = List.empty<Types.Trade>();
     let pendingList = List.empty<Types.PendingMatch>();
     let affectedSet = Map.empty<Text, Principal>();
@@ -258,9 +304,10 @@ module {
       if (not withinSlippage) { break matchLoop };
 
       // Indicative (AMM) makers are not takeable by market orders either: skip
-      // so the taker walks past them. main.mo rests the unfilled remainder at
-      // the slippage cap; the AMM sweeps it on its next requote (fresh price),
-      // exactly like a crossing limit order.
+      // so the taker walks past them. A market taker is IOC — it never rests;
+      // main.mo re-defers an unfilled spot remainder to the next requote (it
+      // walks the reskewed AMM curve, MAX_REDEFER-capped, then drops). Only a
+      // crossing LIMIT taker rests for the AMM to sweep at its fresh price.
       if (ctx.isNonTakeable(best.id, best.owner)) {
         Map.add(exhausted, Nat.compare, best.id, true);
         continue matchLoop;
@@ -315,6 +362,7 @@ module {
       };
 
       if (makerBal < makerNeeds) {
+        ctx.onUnfundedMaker(marketId, best.owner, best.side, best.price, OrderBook.remaining(best));
         ignore OrderBook.cancelOrder(store, best.id);
         continue matchLoop;
       };
@@ -330,19 +378,27 @@ module {
         case (#sell) { fillQty };
       };
 
-      if (takerBal < takerNeeds) {
+      // The taker's effective spendable quote this slice: its whole available
+      // balance, further clamped by the remaining maxQuoteSpend budget (#buy
+      // with a budget only — spendCap == takerBal everywhere else).
+      let spendCap = switch (side, remainingBudget) {
+        case (#buy, ?b) { Nat.min(takerBal, b) };
+        case _ { takerBal };
+      };
+      if (spendCap < takerNeeds) {
         let affordableQty = switch (side) {
           case (#buy) {
             if (best.price > 0) {
-              // Shrink so qty·price + takerFee(qty·price) <= takerBal. Probe the
+              // Shrink so qty·price + takerFee(qty·price) <= spendCap. Probe the
               // taker's effective bps (TAKER, or 0 if internal) and divide the
               // affordable quote by (1 + bps/10_000) before converting to qty —
-              // provably keeps cost+fee within balance, so the fill never strands.
+              // provably keeps cost+fee within the cap, so the fill never strands
+              // (and never dips past the budget on a walking book).
               let eff = ctx.quoteFee(taker, 10_000, #takerDebit);
-              Fixed.div(Fixed.mulDiv(takerBal, 10_000, 10_000 + eff, false), best.price, false)
+              Fixed.div(Fixed.mulDiv(spendCap, 10_000, 10_000 + eff, false), best.price, false)
             } else { 0 }
           };
-          case (#sell) { takerBal };
+          case (#sell) { spendCap };
         };
         if (affordableQty == 0) { break matchLoop };
         fillQty := Nat.min(fillQty, affordableQty);
@@ -426,6 +482,17 @@ module {
         };
       };
 
+      // This slice is committed (settled, or reserved as a pending debit):
+      // on a #buy the taker's quote outlay is tradeCost + its taker fee
+      // (buyer == taker here) — record it and draw down the budget. Every
+      // rollback/refusal path above breaks or continues before this point.
+      if (side == #buy) {
+        quoteSpent += tradeCost + buyerFee;
+        switch (remainingBudget) {
+          case (?b) { remainingBudget := ?SafeMath.subOrZero(b, tradeCost + buyerFee) };
+          case null {};
+        };
+      };
       remainingQty -= fillQty;
     };
 
@@ -442,6 +509,7 @@ module {
       totalFilled;
       avgPrice;
       affectedUsers = affected;
+      quoteSpent;
     };
   };
 
@@ -461,11 +529,20 @@ module {
     maxPrice : Nat,
     minPrice : Nat,
     ctx : ProtectionCtx,
+    maxQuoteSpend : ?Nat,
   ) : Nat {
     var available : Nat = 0;
     var takerBal = switch (side) {
       case (#buy) { ctx.availableBalance(taker, Types.QUOTE_TOKEN) };
       case (#sell) { ctx.availableBalance(taker, baseToken) };
+    };
+    // The sim already models the taker's balance draw (cost + taker fee per
+    // slice), so a maxQuoteSpend budget is just a tighter starting balance:
+    // clamp it here and the FOK pre-check becomes budget-aware for free — a
+    // full quantity the budget cannot cover kills instead of partial-filling.
+    switch (side, maxQuoteSpend) {
+      case (#buy, ?b) { takerBal := Nat.min(takerBal, b) };
+      case _ {};
     };
     // Per-OWNER maker drawdown, so a maker's affordability accounts for depth
     // this same walk already committed against its shared balance (one owner
@@ -586,10 +663,11 @@ module {
     quantity : Nat,
     timestamp : Int,
   ) : (Types.Order, [Types.Trade], [Types.PendingMatch], [Principal]) {
-    executeLimitOrderProtected(
+    let (o, t, p, a, _) = executeLimitOrderProtected(
       store, accounts, marketId, baseToken, owner, side, #limit, price, quantity, timestamp, timestamp,
-      unprotected(accounts)
+      unprotected(accounts), null,
     );
+    (o, t, p, a);
   };
 
   // Protection-aware limit-order execution. For each candidate fill, asks
@@ -616,6 +694,22 @@ module {
   // submission time made the Trades feed read permanently stale and wrote
   // fills into already-closed candle buckets. Synchronous callers pass the
   // same value for both.
+  //
+  // `maxQuoteSpend` (#buy takers only; ignored for #sell): the market
+  // variant's cost+takerFee quote budget, threaded here for the STAGED
+  // direct-swap path (releaseDeferred, orderType = #market/IOC). With a
+  // budget, each slice is shrunk to fit min(available balance, remaining
+  // budget) — the market variant's spendCap shape — so a caller can size its
+  // quantity at the BEST price while the walk stops exactly at the budget on
+  // a walking book. With null the legacy semantics are UNCHANGED, including
+  // the break/cancel handling of an unaffordable buyer (no shrink) — the
+  // resting-#limit flow must not silently down-size fills. Pass a budget only
+  // from #market releases.
+  //
+  // The 5th result element is quoteSpent — the #buy taker's committed quote
+  // (tradeCost + its fee, immediate AND deferred slices), 0 for #sell — so a
+  // budget-passing caller can re-defer its remainder with the REMAINING
+  // budget and judge "budget exhausted = complete conversion" truthfully.
   public func executeLimitOrderProtected(
     store : OrderBook.OrderStore,
     accounts : Accounts.AccountState,
@@ -629,9 +723,24 @@ module {
     timestamp : Int,
     settleTs : Int,
     ctx : ProtectionCtx,
-  ) : (Types.Order, [Types.Trade], [Types.PendingMatch], [Principal]) {
+    maxQuoteSpend : ?Nat,
+  ) : (Types.Order, [Types.Trade], [Types.PendingMatch], [Principal], Nat) {
     var remainingQty = quantity;
     var totalFilled : Nat = 0;  // only IMMEDIATE fills count here
+    // Quote notional of the immediate fills (Σ tradeCost, fee-exclusive) —
+    // feeds the #market record's VWAP price stamp after the loop.
+    var totalCost : Nat = 0;
+    // #buy quote budget (see maxQuoteSpend above). Drawn down by
+    // tradeCost + buyerFee on every slice the taker commits.
+    var remainingBudget : ?Nat = switch (side) { case (#buy) { maxQuoteSpend }; case (#sell) { null } };
+    var quoteSpent : Nat = 0;
+    // W4-22: pre-reserve the aggressor's order id when the sweep re-homes a
+    // resting order, so trades recorded mid-loop carry it (0 = the classic
+    // "aggressor has no id yet" sentinel, unchanged for every other caller).
+    // The order record is created with this id after the loop; a reserved id
+    // burned by a no-fill cancel is a harmless gap (ids are already sparse
+    // via the staging queue's allocateId).
+    let aggressorId : Nat = if (ctx.aggressorIsMaker) { OrderBook.allocateId(store) } else { 0 };
     let tradeList = List.empty<Types.Trade>();
     let pendingList = List.empty<Types.PendingMatch>();
     let affectedSet = Map.empty<Text, Principal>();
@@ -697,7 +806,37 @@ module {
         continue matchLoop;
       };
 
-      let fillQty = Nat.min(remainingQty, availableForFill);
+      var fillQty = Nat.min(remainingQty, availableForFill);
+
+      // maxQuoteSpend shrink — ONLY when a budget is present (#buy taker), so
+      // the null path stays byte-identical (the legacy break/cancel semantics
+      // below are load-bearing for resting #limit flow). Mirrors the market
+      // variant's spendCap: clamp this slice so qty·price + buyerFee stays
+      // within min(available balance, remaining budget); the fee role matches
+      // the buyerFee computed below (aggDebit — #takerDebit for every budget
+      // caller today, since only #market releases pass a budget).
+      switch (remainingBudget) {
+        case (?bud) {
+          let takerBal = ctx.availableBalance(owner, Types.QUOTE_TOKEN);
+          let spendCap = Nat.min(takerBal, bud);
+          let feeRole = if (ctx.aggressorIsMaker) { #makerDebit } else { #takerDebit };
+          let needs = do { let c = Fixed.mul(fillQty, best.price, true); c + ctx.quoteFee(owner, c, feeRole) };
+          if (spendCap < needs) {
+            let affordableQty = if (best.price > 0) {
+              // Shrink so qty·price + fee(qty·price) <= spendCap: probe the
+              // taker's effective bps and carve it out of the affordable quote
+              // before converting to qty (floor) — provably keeps cost+fee
+              // within the cap (same derivation as the market variant).
+              let eff = ctx.quoteFee(owner, 10_000, feeRole);
+              Fixed.div(Fixed.mulDiv(spendCap, 10_000, 10_000 + eff, false), best.price, false)
+            } else { 0 };
+            if (affordableQty == 0) { break matchLoop };
+            fillQty := Nat.min(fillQty, affordableQty);
+          };
+        };
+        case null {};
+      };
+
       let (buyer, seller) = switch (side) {
         case (#buy) { (owner, best.owner) };
         case (#sell) { (best.owner, owner) };
@@ -708,9 +847,14 @@ module {
       // Symmetric maker/taker fee, both legs in QUOTE. Incoming taker is `owner`,
       // resting maker is best.owner; buyer is the taker iff this is a #buy. Each
       // fee is 0 for internal principals (ctx.quoteFee exempts both sides).
+      // W4-22: under aggressorIsMaker the AGGRESSOR leg is fee-rated maker —
+      // the sweep's price mechanic must not decide the fee role. The resting
+      // leg keeps its own role either way.
       let buyerIsTaker = (side == #buy);
-      let buyerFee  = ctx.quoteFee(buyer,  tradeCost, if (buyerIsTaker) #takerDebit  else #makerDebit);
-      let sellerFee = ctx.quoteFee(seller, tradeCost, if (buyerIsTaker) #makerCredit else #takerCredit);
+      let aggDebit  = if (ctx.aggressorIsMaker) { #makerDebit }  else { #takerDebit };
+      let aggCredit = if (ctx.aggressorIsMaker) { #makerCredit } else { #takerCredit };
+      let buyerFee  = ctx.quoteFee(buyer,  tradeCost, if (buyerIsTaker) aggDebit  else #makerDebit);
+      let sellerFee = ctx.quoteFee(seller, tradeCost, if (buyerIsTaker) #makerCredit else aggCredit);
 
       let window = ctx.getMakerWindow(best.id);
 
@@ -723,6 +867,7 @@ module {
         // was inflated to cover the fee, so this gate holds.
         if (ctx.availableBalance(buyer, Types.QUOTE_TOKEN) < tradeCost + buyerFee) {
           if (Principal.equal(buyer, best.owner)) {
+            ctx.onUnfundedMaker(marketId, best.owner, best.side, best.price, OrderBook.remaining(best));
             ignore OrderBook.cancelOrder(store, best.id);
             continue matchLoop;
           } else {
@@ -731,6 +876,7 @@ module {
         };
         if (ctx.availableBalance(seller, baseToken) < fillQty) {
           if (Principal.equal(seller, best.owner)) {
+            ctx.onUnfundedMaker(marketId, best.owner, best.side, best.price, OrderBook.remaining(best));
             ignore OrderBook.cancelOrder(store, best.id);
             continue matchLoop;
           } else {
@@ -751,9 +897,11 @@ module {
         ctx.creditTreasury(buyerFee + sellerFee);
         Accounts.addBalance(accounts, seller, Types.QUOTE_TOKEN, tradeCost - sellerFee);
         ignore OrderBook.fillOrder(store, best.id, fillQty);
+        // W4-22: the aggressor side carries its pre-reserved id under the
+        // sweep (0 for every other caller — the historical sentinel).
         let (buyOrderId, sellOrderId) = switch (side) {
-          case (#buy) { (0 : Nat, best.id) };
-          case (#sell) { (best.id, 0 : Nat) };
+          case (#buy) { (aggressorId, best.id) };
+          case (#sell) { (best.id, aggressorId) };
         };
         let trade = OrderBook.recordTrade(
           store, marketId, buyOrderId, sellOrderId, buyer, seller, tradePrice, fillQty, settleTs, ?orderType
@@ -763,6 +911,7 @@ module {
         Map.add(affectedSet, Text.compare, Principal.toText(buyer), buyer);
         Map.add(affectedSet, Text.compare, Principal.toText(seller), seller);
         totalFilled += fillQty;
+        totalCost += tradeCost;
       } else {
         // ── Deferred-settlement path ─────────────────────────────────
         // Validate that the taker (and maker) have enough AVAILABLE
@@ -790,6 +939,17 @@ module {
         };
       };
 
+      // This slice is committed (settled, or reserved as a pending debit): on
+      // a #buy the taker's quote outlay is tradeCost + its buyer fee — record
+      // it and draw down the budget (the market variant's shape). Every
+      // rollback/refusal path above breaks or continues before this point.
+      if (side == #buy) {
+        quoteSpent += tradeCost + buyerFee;
+        switch (remainingBudget) {
+          case (?b) { remainingBudget := ?SafeMath.subOrZero(b, tradeCost + buyerFee) };
+          case null {};
+        };
+      };
       remainingQty -= fillQty;
     };
 
@@ -820,7 +980,16 @@ module {
       // (the Calm-Bear-91 bug). The caller reads the remainder as
       // quantity_requested − finalOrder.filled.
       if (totalFilled > 0) {
-        let order = OrderBook.createOrder(store, marketId, owner, side, #market, price, totalFilled, timestamp);
+        // Task 1787182538 (2026-08-20): stamp the record — and thus the
+        // ClosedOrderRecord the reaper later seals from it — with the
+        // VOLUME-WEIGHTED execution price of the immediate fills (floored,
+        // the MatchResult.avgPrice rounding), NOT the caller's mid-clamped
+        // slippage cap. The cap (`price`) still bounds the walk above; it
+        // just no longer masquerades as a traded price on the tape. Rows
+        // sealed before this change carry the cap — see Types.mo's
+        // ClosedOrderRecord.price doc comment for the dated boundary.
+        let vwap = Fixed.div(totalCost, totalFilled, false);
+        let order = OrderBook.createOrder(store, marketId, owner, side, #market, vwap, totalFilled, timestamp);
         ignore OrderBook.fillOrder(store, order.id, totalFilled);
         switch (OrderBook.getOrder(store, order.id)) {
           case (?o) { o };
@@ -837,9 +1006,24 @@ module {
         };
       };
     } else if (remainingQty > 0 or totalFilled > 0) {
-      let order = OrderBook.createOrder(store, marketId, owner, side, orderType, price, remainingQty, timestamp);
+      // Create at the FULL requested size (resting remainder + immediate
+      // fills), not the remainder: createOrder pins originalQuantity at
+      // creation, and the closed-order reaper reports that field as the
+      // "original requested quantity" (Types.ClosedOrderRecord.quantity).
+      // Creating at remainingQty and up-adjusting afterwards preserved
+      // originalQuantity = R, so a partially-filled-at-release limit order
+      // closed with quantity = R < filled (issue #42). The level-aggregate
+      // math is unchanged: create adds R+F, the partial fill below subtracts
+      // F — net R resting, exactly as before.
+      let requestedQty = remainingQty + totalFilled;
+      let order = if (aggressorId != 0) {
+        // W4-22: materialize the pre-reserved aggressor id the trades above
+        // already reference.
+        OrderBook.createOrderWithId(store, aggressorId, marketId, owner, side, orderType, price, requestedQty, timestamp);
+      } else {
+        OrderBook.createOrder(store, marketId, owner, side, orderType, price, requestedQty, timestamp);
+      };
       if (totalFilled > 0) {
-        ignore OrderBook.adjustOrderQuantity(store, order.id, remainingQty + totalFilled);
         ignore OrderBook.fillOrder(store, order.id, totalFilled);
       };
       switch (OrderBook.getOrder(store, order.id)) {
@@ -876,6 +1060,7 @@ module {
       Iter.toArray(List.values(tradeList)),
       Iter.toArray(List.values(pendingList)),
       affected,
+      quoteSpent,
     );
   };
 };

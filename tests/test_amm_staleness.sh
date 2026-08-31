@@ -8,7 +8,7 @@
 #      sweep does not remove them (wall-clock GC expiry, not born-expired)
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_amm_staleness.sh
 #
 # Staleness is simulated by backdating refPriceUpdatedNs (setTestRefPriceUpdatedNs)

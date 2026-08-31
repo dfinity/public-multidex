@@ -5,7 +5,7 @@
 # so the frontend can tell the user what happened.
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_swap_outcome.sh
 #
 #   A. tiny slippage (0.1%) < AMM half-spread → buy leg unreachable → outcome
@@ -61,8 +61,17 @@ adm setTestBalance "(principal \"$U\", \"BTC\", $(e8 0.0) : nat)"    >/dev/null
 
 # ── A. Unfillable swap (slippage below the spread) reports, doesn't vanish ──
 echo ""
-echo "── A. Swap 50 ICP → BTC @ 0.1% slippage (below the 0.2% spread → unreachable) ──"
-RA=$(u swap "(record { fromToken=\"ICP\"; toToken=\"BTC\"; amount=$(e8 50.0) : nat; mode=variant { marketOrder=record { maxSlippage=$(e8 0.001) : nat } }; noPartialFill=false })")
+echo "── A. Swap 50 ICP → BTC @ 1% slippage vs a 3% BUY-leg spread (→ unreachable) ──"
+# W4-04 floors maxSlippage at 1%, so "slippage below the venue's 0.2% spread"
+# is no longer expressible. Same property, new mechanism — and the leg
+# matters: the cross-swap sizes its fill against the BUY market's asks
+# capped at THAT pool's refPrice × (1+slippage) (main.mo buyCap). Widening
+# the SELL leg does nothing. Widen BTC-ICPUSD to 3% (restored below): asks
+# rest ≈1.5% over ref, the 1% cap can't reach them, absorb=0 → the swap
+# records filled=false and refunds.
+adm setAmmConfig "(\"BTC-ICPUSD\", 300:nat, $(e8 1.0):nat, 15:nat, 35:nat, 8:nat)" >/dev/null
+adm requoteAmm '("BTC-ICPUSD")' >/dev/null
+RA=$(u swap "(record { fromToken=\"ICP\"; toToken=\"BTC\"; amount=$(e8 50.0) : nat; mode=variant { marketOrder=record { maxSlippage=$(e8 0.01) : nat } }; noPartialFill=false })")
 if echo "$RA" | grep -q "swapOrderId = opt"; then ok "swap staged (swapOrderId returned)"; else nok "swap should stage" "$(echo "$RA" | head -c 120)"; fi
 release
 FA=$(swap_filled); BTCA=$(bal "$U" BTC)
@@ -74,6 +83,9 @@ if awk -v b="$BTCA" 'BEGIN{exit (b<0.0000001?0:1)}' && awk -v i="$ICPA" 'BEGIN{e
 else nok "funds should be returned on an unfilled swap" "btc=$BTCA icpAvail=$ICPA"; fi
 
 # ── B. Fillable swap reports filled=true with a real toAmount ──
+# restore the seeded spread first (values = scripts/play_start.sh:223)
+adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, $(e8 1.0):nat, 15:nat, 35:nat, 8:nat)" >/dev/null
+adm requoteAmm '("BTC-ICPUSD")' >/dev/null
 echo ""
 echo "── B. Swap 50 ICP → BTC @ 5% slippage → fills ──"
 RB=$(u swap "(record { fromToken=\"ICP\"; toToken=\"BTC\"; amount=$(e8 50.0) : nat; mode=variant { marketOrder=record { maxSlippage=$(e8 0.05) : nat } }; noPartialFill=false })")

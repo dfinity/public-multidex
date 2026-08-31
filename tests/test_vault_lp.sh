@@ -97,7 +97,118 @@ if near "$(echo "$V" | fieldh costBasis)" 0.0 0.01; then ok "costBasis returns t
 TQV=$(echo "$V" | fieldh totalQuoteValue)
 if near "$TQV" 331 0.15; then ok "exit-fee residue retained (~\$331)"; else nok "fee residue missing" "$TQV"; fi
 
+echo ""
+echo "── 5. Round trip while insurance arrears are outstanding nets ≤ 0 ──"
+# GHSA-3j44 / #48.3 / #50.1-root. currentVaultValue haircuts NAV by
+# insuranceOwedUsd (arrears the vault owes the fund), so depositLp MINTS against
+# a reduced figure — more LP per dollar. Before this fix, withdrawLp paid GROSS
+# holdings (the arrears deduction was confined to the CASH leg, which is ≈ 0 in
+# the reachable persistent-arrears state — settleInsuranceArrears pays
+# min(W, cash) so W > 0 ⟹ cash ≈ 0 — and was double-prorated by the exiter's
+# fraction f besides). A deposit→immediate-withdraw round trip then came out
+# net-POSITIVE, funded by the LPs who stayed. The fix spreads the FULL arrears W
+# across the whole HELD basket, so mint (NAV) and redeem (holdings) agree on the
+# arrears axis and the round trip is ≤ 0 by construction (payout ≤ f·NAV) — here
+# it costs exactly the 40bp exit fee, regardless of W. Tested at φ = f < 1 (a
+# sole LP makes shipped and intended coincide by arithmetic).
+LIQ_ID=vlp_liq; icp identity new $LIQ_ID --storage plaintext >/dev/null 2>&1 || true
+BOB_ID=vlp_bob; icp identity new $BOB_ID --storage plaintext >/dev/null 2>&1 || true
+LIQ_P=$(icp identity principal --identity $LIQ_ID 2>/dev/null | tail -1)
+BOB_P=$(icp identity principal --identity $BOB_ID 2>/dev/null | tail -1)
+asL()   { icp canister call --identity $LIQ_ID  backend "$@" 2>&1; }
+asBob() { icp canister call --identity $BOB_ID backend "$@" 2>&1; }
+pyf()   { adm getInsuranceFund '()' | tr -d '_' | grep -oE 'pendingYieldUsd = [0-9]+' | grep -oE '[0-9]+'; }
+# bob's whole wallet, valued in USD base units at 50k/BTC (he only ever holds BTC + cash)
+bobUsd() {
+  local b u
+  b=$(adm getTestBalance "(principal \"$BOB_P\", \"BTC\")"    | tr -d '_' | grep -oE '[0-9]+' | head -1)
+  u=$(adm getTestBalance "(principal \"$BOB_P\", \"ICPUSD\")" | tr -d '_' | grep -oE '[0-9]+' | head -1)
+  awk -v b="${b:-0}" -v u="${u:-0}" 'BEGIN{ printf "%.0f", b*50000 + u }'
+}
+
+adm setTestTimersPaused '(true)' >/dev/null 2>&1 || true
+adm resetExchange '()' >/dev/null 2>&1
+adm createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1
+adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat, 0:nat)" >/dev/null 2>&1
+adm enableAmm '("BTC-ICPUSD", true)' >/dev/null 2>&1
+adm setAutoFuel '(false)' >/dev/null 2>&1   # else Stage-1 auto-fuel buys trader ICP into treasury and fakes a leak
+AMM=$(adm getAmmPrincipal '()' | grep -oE 'principal "[^"]+"' | head -1 | sed -E 's/principal "(.+)"/\1/')
+adm setTestBalance "(principal \"$LIQ_P\", \"ICPUSD\", $(e8 2000000.0) : nat)" >/dev/null
+adm seedInsuranceFund "($(e8 3000.0) : nat)" >/dev/null   # mints shares (caller = staker), so penalties can accrue
+
+# Drive persistent arrears via the liquidation-penalty path (#48.2: both arms
+# accrue). Each pass: fund a leveraged long, DRAIN the vault cash so the accrued
+# penalty cannot settle (models cash ≈ 0), crash into insolvency, liquidate.
+# insuranceOwedUsd survives resetExchange, so four passes bank ≈ $5.1k of arrears.
+bank_arrears() {
+  adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
+  adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", $(e8 2000000.0) : nat)" >/dev/null
+  adm setTestBalance "(principal \"$AMM\", \"BTC\",    $(e8 20.0) : nat)"      >/dev/null
+  local R PID
+  R=$(asL createMarginPool '("vlp arrears", false)')
+  PID=$(echo "$R" | tr -d '_' | grep -oE 'ok = [0-9]+' | grep -oE '[0-9]+' | tail -1)
+  asL fundMarginPool "($PID, $(e8 100000.0) : nat)" >/dev/null
+  asL openPosition "($PID, \"BTC-ICPUSD\", variant { buy }, $(e8 5.0) : nat, $(e8 0.25) : nat, null)" >/dev/null
+  adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null; adm requoteAmm '("BTC-ICPUSD")' >/dev/null
+  adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", 0 : nat)" >/dev/null      # cash ≈ 0: penalty can't settle
+  adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 10000.0) : nat)" >/dev/null           # collateral < debt → insolvent
+  adm adminRunLiquidationBatch '()' >/dev/null 2>&1
+}
+for _ in 1 2 3 4; do bank_arrears; done
+adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
+W5=$(pyf); W5_H=$(from_e8 "${W5:-0}")
+if [ -n "${W5:-}" ] && awk -v w="${W5:-0}" 'BEGIN{exit (w>0?0:1)}'; then
+  ok "liquidation-penalty path drove insuranceOwedUsd > 0 (\$${W5_H} arrears)"
+else nok "arrears not driven (pendingYieldUsd)" "W=${W5:-0}"; fi
+
+# Rebuild a CLEAN vault on top of the preserved arrears: resetExchange wipes the
+# LP/pool/margin state but NOT insuranceOwedUsd or the staker shares. Vault =
+# 4 BTC + \$40k cash genesis (alice stays, so the exiter's φ < 1), then drain the
+# cash so the vault is BTC-heavy with cash ≈ 0 — the reachable state where a
+# cash-leg-only deduction would vanish.
+adm resetExchange '()' >/dev/null 2>&1
+adm createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1
+adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
+adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat, 0:nat)" >/dev/null 2>&1
+adm enableAmm '("BTC-ICPUSD", true)' >/dev/null 2>&1
+adm setAutoFuel '(false)' >/dev/null 2>&1
+for t in BTC ETH SOL ICP ICPUSD; do
+  adm setTestBalance "(principal \"$A\",     \"$t\", 0 : nat)" >/dev/null
+  adm setTestBalance "(principal \"$BOB_P\", \"$t\", 0 : nat)" >/dev/null
+  adm setTestBalance "(principal \"$AMM\",   \"$t\", 0 : nat)" >/dev/null
+done
+adm setTestBalance "(principal \"$A\",     \"BTC\",    $(e8 4.0) : nat)"     >/dev/null
+adm setTestBalance "(principal \"$A\",     \"ICPUSD\", $(e8 40000.0) : nat)" >/dev/null
+adm setTestBalance "(principal \"$BOB_P\", \"ICPUSD\", $(e8 40000.0) : nat)" >/dev/null
+asA depositLp "(\"BTC-ICPUSD\", $(e8 4.0) : nat, $(e8 40000.0) : nat)" >/dev/null
+adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", 0 : nat)" >/dev/null       # cash ≈ 0
+adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null            # fresh stamp for the mint gate
+
+# bob (the exiter) deposits the under-weight cash leg and immediately withdraws
+# ALL of it. Under the shipped (cash-leg) accounting this netted ≈ +\$558; the
+# fix makes it cost exactly the exit fee.
+BOB_BEFORE=$(bobUsd)
+BOB_MINT=$(asBob depositLp "(\"BTC-ICPUSD\", 0 : nat, $(e8 40000.0) : nat)" | tr -d '_' | grep -oE 'ok = [0-9]+' | grep -oE '[0-9]+' | head -1)
+if [ -z "${BOB_MINT:-}" ] || [ "${BOB_MINT:-0}" = "0" ]; then nok "bob's LP deposit minted nothing" "$(asBob depositLp "(\"BTC-ICPUSD\", 0 : nat, $(e8 40000.0) : nat)")"; fi
+asBob withdrawLp "(${BOB_MINT:-0} : nat)" >/dev/null 2>&1
+BOB_AFTER=$(bobUsd)
+NET5=$(awk -v a="${BOB_AFTER:-0}" -v b="${BOB_BEFORE:-0}" 'BEGIN{ printf "%.0f", a-b }')
+NET5_H=$(from_e8 "${NET5:-0}")
+# ≤ 0 by construction; allow \$1 of base-unit rounding slack. Pre-fix this was
+# ≈ +\$558, far above the slack.
+if awk -v n="${NET5:-0}" 'BEGIN{exit (n <= 100000000 ? 0 : 1)}'; then
+  ok "deposit→immediate-withdraw with \$${W5_H} arrears nets ≤ 0 (net \$${NET5_H})"
+else nok "round trip extracted value while arrears outstanding (LP mint/redeem basis misaligned)" "net=\$${NET5_H} (arrears \$${W5_H})"; fi
+
+# HYGIENE: settle the banked arrears back to 0 so this suite strands no global
+# state (insuranceOwedUsd survives resetExchange). The arrears heartbeat
+# (settleInsuranceArrears, interval 0) pays min(W, vault cash) every tick; give
+# the vault cash ≥ W, UNPAUSE timers, and tick with a couple of update calls.
+adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", $(e8 5000000.0) : nat)" >/dev/null
 adm setTestTimersPaused '(false)' >/dev/null 2>&1 || true
+for _ in 1 2 3; do adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null; done
+if [ "$(pyf)" = "0" ]; then ok "arrears settled back to 0 (no stranded global state)"; else nok "section 5 stranded arrears" "W=\$$(from_e8 "$(pyf)")"; fi
+adm resetExchange '()' >/dev/null 2>&1
 echo ""
 echo "═══════════════════════════════════════════════════════"
 echo "RESULT: passed=$pass failed=$fail"

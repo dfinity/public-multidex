@@ -76,6 +76,51 @@ release
 POS2=$(usr getMyPositions "()")
 if ! echo "$POS2" | grep -q "BTC-ICPUSD"; then ok "position flattened"; else nok "close did not flatten" "$POS2"; fi
 
+echo "── E. #49.1: an opposite-side SHORT must NOT disable the initial-margin clamp ──"
+# Regression for public issue #49 finding 1. clampToInitialMargin's de-lever
+# escape was a BARE SIGN TEST: for a #buy it returned #full whenever poolNetSize
+# < 0 — i.e. whenever the pool held ANY opposite-side (short) exposure — BEFORE
+# reaching the headroom/#partial math. So a market-buy of any size skipped the
+# initial-margin bound: the pool could re-lever straight through flat into a
+# fresh long with no clamp. Fixed: only the quantity up to Int.abs(net) flattens
+# exposure and passes free; the re-levering EXCESS faces the normal headroom
+# clamp. Discriminator is the CLAMP'S OWN DECISION, read back via
+# getMyReleaseRejections (immune to partial-fill/settlement noise): a genuine
+# clamp records a rejection whose reason cites the initial-margin requirement and
+# whose clampedTo is set. Pre-fix that record is ABSENT (the escape returned
+# #full); post-fix it is PRESENT. Setup: a leveraged SOL short (net<0), then a
+# buy far past flat that re-levers into a long.
+SID=imgs; icp identity new $SID --storage plaintext 2>/dev/null || true
+SPP=$(icp identity principal --identity $SID 2>/dev/null | tail -1)
+susr() { icp canister call --identity $SID backend "$@" 2>&1; }
+srel() { for _ in 1 2 3 4 5 6 7 8; do adm setAmmRefPrice "(\"SOL-ICPUSD\", $(e8 150.0) : nat)" >/dev/null; adm requoteAmm '("SOL-ICPUSD")' >/dev/null; done; }
+adm createAmmPool '("SOL-ICPUSD")' >/dev/null 2>&1 || true
+adm setAmmRefPrice "(\"SOL-ICPUSD\", $(e8 150.0) : nat)" >/dev/null
+adm setAmmConfig "(\"SOL-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat, 0:nat)" >/dev/null 2>&1 || true
+adm enableAmm '("SOL-ICPUSD", true)' >/dev/null 2>&1 || true
+adm setTestBalance "(principal \"$AMM\", \"SOL\",    $(e8 1000000.0) : nat)"    >/dev/null
+adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", $(e8 100000000.0) : nat)"  >/dev/null
+adm setTestBalance "(principal \"$SPP\", \"ICPUSD\", $(e8 100000.0) : nat)"     >/dev/null
+SR=$(susr createMarginPool '("dust-escape pool", false)')
+SPID=$(echo "$SR" | tr -d '_' | grep -oE 'ok = [0-9]+' | grep -oE '[0-9]+' | head -1)
+susr fundMarginPool "($SPID, $(e8 10000.0) : nat)" >/dev/null
+SO=$(susr openPosition "($SPID, \"SOL-ICPUSD\", variant { sell }, $(e8 150.0) : nat, $(e8 0.05) : nat, null)")
+if echo "$SO" | grep -q "ok"; then ok "leveraged SOL short staged"; else nok "short should stage" "$SO"; fi
+srel
+SNET=$(susr getMyPositions '()' | tr -d '_' | grep -oE 'size = -?[0-9]+' | head -1 | grep -oE '\-?[0-9]+')
+if [ -n "${SNET:-}" ] && [ "${SNET:-0}" -lt 0 ]; then ok "pool is net SHORT (size $(from_e8 "$SNET") SOL)"; else nok "pool should be net short after release" "size=$SNET"; fi
+# Buy far past flat: 250 > 150, so ~150 de-levers (free) and ~100 re-levers long —
+# the excess MUST hit the initial-margin clamp.
+SB=$(susr openPosition "($SPID, \"SOL-ICPUSD\", variant { buy }, $(e8 250.0) : nat, $(e8 0.05) : nat, null)")
+if echo "$SB" | grep -q "ok"; then ok "re-levering buy staged (250 SOL, past the 150 short)"; else nok "buy should stage" "$SB"; fi
+srel
+RJ=$(susr getMyReleaseRejections "()")
+if echo "$RJ" | grep -q "breach the initial-margin requirement" && echo "$RJ" | grep -q "clampedTo = opt"; then
+  ok "de-lever escape did NOT bypass the clamp — excess was reduced at the initial-margin bound"
+else
+  nok "the re-levering buy was NOT clamped (escape returned #full — #49.1 regression)" "$(echo "$RJ" | tr '\n' ' ' | head -c 400)"
+fi
+
 adm setTestTimersPaused '(false)' >/dev/null 2>&1 || true
 echo ""
 echo "═══════════════════════════════════════════════════════"

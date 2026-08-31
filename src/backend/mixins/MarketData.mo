@@ -23,6 +23,12 @@ mixin (orderStore : OrderBook.OrderStore) {
   // book). A SEPARATE method rather than a trailing opt arg on getOrderBook
   // because the icp CLI serializes strictly against the declared arity —
   // same precedent as placeLimitOrder/placeLimitOrderExp.
+  // W4-24 DECISION: this serves the RAW book, deliberately — the orders are
+  // genuine information. But resting orders carry no reservation (documented
+  // design), so raw depth is NOT what a taker can rely on: phantom depth is
+  // free to create. Anyone SIZING flow against the book must use the
+  // backend's getTakeableDepth, which nets out maker funding via the same
+  // walk the FOK gate trusts.
   public query func getOrderBookDepth(marketId : Types.MarketId, depth : ?Nat) : async Types.OrderBookSnapshot {
     OrderBook.getSnapshot(orderStore, marketId, depth);
   };

@@ -92,9 +92,14 @@ else nok "expected internal netting (seller A × buyer B on BTC)" "before=$NV0 a
 
 DA1=$(fld debtUsd "$(asA getMyMarginPools '()')")
 DB1=$(fld debtUsd "$(asB getMyMarginPools '()')")
-if awk -v a="${DA1:-0}" -v b="$DA0" 'BEGIN{exit (a<b?0:1)}' && awk -v a="${DB1:-0}" -v b="$DB0" 'BEGIN{exit (a<b?0:1)}'; then
+# #45.1: a `<` comparison is fail-OPEN under the `:-0` default (an empty read
+# passes as 0 < debt) — require the reads to be non-empty, like the `>` sibling
+# above is fail-closed by construction.
+if [ -n "${DA1:-}" ] && [ -n "${DB1:-}" ] && awk -v a="${DA1:-0}" -v b="$DA0" 'BEGIN{exit (a<b?0:1)}' && awk -v a="${DB1:-0}" -v b="$DB0" 'BEGIN{exit (a<b?0:1)}'; then
   ok "both debts reduced (A \$$(from_e8 "$DA0")→\$$(from_e8 "${DA1:-0}") · B \$$(from_e8 "$DB0")→\$$(from_e8 "${DB1:-0}"))"
-else nok "both sides should deleverage through the net" "A:$DA0→$DA1 B:$DB0→$DB1"; fi
+else nok "both sides should deleverage through the net" "A:${DA0}→$DA1 B:${DB0}→$DB1"; fi
+# (${var}→ braces: macOS bash 3.2 under a UTF-8 locale swallows the multibyte
+# glyph into the variable name and `set -u` kills the script.)
 
 echo "── netted slices are BOOKED: realized PnL attributed, not a silent size shrink ──"
 # The netted flatten now flows through bookPoolSide at the oracle mid, so each

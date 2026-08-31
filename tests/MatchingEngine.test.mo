@@ -180,6 +180,8 @@ func mkFeeCtx(acc : Accounts.AccountState, store : OB.OrderStore, onCancel : (Na
   getMakerPending  = func(_) { 0 };
   availableBalance = func(p, t) { Accounts.getBalance(acc, p, t) };
   isNonTakeable    = func(_, _) { false };
+  aggressorIsMaker = false;
+  onUnfundedMaker  = func(_, _, _, _, _) {};
   isExpired        = func(_) { false };
   onPendingFill    = func(_, _, _, _, _, _, _) { null };
   quoteFee         = func(_p, gross, role) {
@@ -201,7 +203,7 @@ Accounts.setBalance(sb_a, alice, base, 100_000_000);            // 1 BTC maker (
 Accounts.setBalance(sb_a, bob, QUOTE, 10_010_000_000);          // C + takerFee, ZERO headroom
 ignore OB.createOrder(sb_s, mkt, alice, #sell, #limit, 10_000_000_000, 100_000_000, 1);
 let sb_before = Accounts.getBalance(sb_a, alice, QUOTE) + Accounts.getBalance(sb_a, bob, QUOTE) + Accounts.getBalance(sb_a, treas, QUOTE);
-let sb_r = MX.executeMarketOrderProtected(sb_s, sb_a, mkt, base, bob, #buy, 100_000_000, 10_000_000, false, 2, mkFeeCtx(sb_a, sb_s, func(_) {}));
+let sb_r = MX.executeMarketOrderProtected(sb_s, sb_a, mkt, base, bob, #buy, 100_000_000, 10_000_000, false, 2, mkFeeCtx(sb_a, sb_s, func(_) {}), null);
 eqN("buyfee: filled 1 BTC at zero headroom (gate holds)", sb_r.totalFilled, 100_000_000);
 eqN("buyfee: buyer paid C+takerFee → 0", Accounts.getBalance(sb_a, bob, QUOTE), 0);
 eqN("buyfee: buyer got 1 BTC", Accounts.getBalance(sb_a, bob, base), 100_000_000);
@@ -217,7 +219,7 @@ Accounts.setBalance(fs_a, alice, QUOTE, 10_005_000_000);        // maker buyer: 
 Accounts.setBalance(fs_a, bob, base, 100_000_000);             // taker seller: 1 BTC
 ignore OB.createOrder(fs_s, mkt, alice, #buy, #limit, 10_000_000_000, 100_000_000, 1);
 let fs_before = Accounts.getBalance(fs_a, alice, QUOTE) + Accounts.getBalance(fs_a, bob, QUOTE) + Accounts.getBalance(fs_a, treas, QUOTE);
-let fs_r = MX.executeMarketOrderProtected(fs_s, fs_a, mkt, base, bob, #sell, 100_000_000, 10_000_000, false, 3, mkFeeCtx(fs_a, fs_s, func(_) {}));
+let fs_r = MX.executeMarketOrderProtected(fs_s, fs_a, mkt, base, bob, #sell, 100_000_000, 10_000_000, false, 3, mkFeeCtx(fs_a, fs_s, func(_) {}), null);
 eqN("sellfee: filled 1 BTC", fs_r.totalFilled, 100_000_000);
 eqN("sellfee: maker-buyer paid C+makerFee → 0", Accounts.getBalance(fs_a, alice, QUOTE), 0);
 eqN("sellfee: maker-buyer got 1 BTC", Accounts.getBalance(fs_a, alice, base), 100_000_000);
@@ -233,7 +235,7 @@ Accounts.setBalance(st_a, alice, QUOTE, 10_005_000_000);        // funds her res
 Accounts.setBalance(st_a, alice, base, 100_000_000);           // and the base she'd sell
 let st_bid = OB.createOrder(st_s, mkt, alice, #buy, #limit, 10_000_000_000, 100_000_000, 1);
 var st_cancelled : Nat = 0;
-let st_r = MX.executeMarketOrderProtected(st_s, st_a, mkt, base, alice, #sell, 100_000_000, 10_000_000, false, 4, mkFeeCtx(st_a, st_s, func(id) { st_cancelled := id }));
+let st_r = MX.executeMarketOrderProtected(st_s, st_a, mkt, base, alice, #sell, 100_000_000, 10_000_000, false, 4, mkFeeCtx(st_a, st_s, func(id) { st_cancelled := id }), null);
 eqN("stp: no self-fill (totalFilled 0)", st_r.totalFilled, 0);
 truth("stp: no trade recorded", st_r.trades.size() == 0);
 eqN("stp: onSelfTrade cancelled the resting bid", st_cancelled, st_bid.id);
@@ -253,7 +255,7 @@ Accounts.setBalance(bp_a, poolC1, QUOTE, 10_005_000_000);      // funds C1's res
 Accounts.setBalance(bp_a, poolC2, base, 100_000_000);          // C2's base to sell
 let bp_bid = OB.createOrder(bp_s, mkt, poolC1, #buy, #limit, 10_000_000_000, 100_000_000, 1);
 var bp_cancelled : Nat = 0;
-let bp_r = MX.executeMarketOrderProtected(bp_s, bp_a, mkt, base, poolC2, #sell, 100_000_000, 10_000_000, false, 2, mkFeeCtx(bp_a, bp_s, func(id) { bp_cancelled := id }));
+let bp_r = MX.executeMarketOrderProtected(bp_s, bp_a, mkt, base, poolC2, #sell, 100_000_000, 10_000_000, false, 2, mkFeeCtx(bp_a, bp_s, func(id) { bp_cancelled := id }), null);
 truth("stp beneficial: the two sides really ARE different principals", not Principal.equal(poolC1, poolC2));
 truth("stp beneficial: ...resolving to the SAME beneficiary", Principal.equal(beneficial(poolC1), beneficial(poolC2)));
 eqN("stp beneficial: sibling-pool cross does not fill", bp_r.totalFilled, 0);
@@ -273,7 +275,7 @@ Accounts.setBalance(bx_a, poolC1, QUOTE, 10_005_000_000);      // maker-buyer: C
 Accounts.setBalance(bx_a, poolD1, base, 100_000_000);          // taker-seller: 1 BTC
 ignore OB.createOrder(bx_s, mkt, poolC1, #buy, #limit, 10_000_000_000, 100_000_000, 1);
 var bx_cancelled : Nat = 0;
-let bx_r = MX.executeMarketOrderProtected(bx_s, bx_a, mkt, base, poolD1, #sell, 100_000_000, 10_000_000, false, 2, mkFeeCtx(bx_a, bx_s, func(id) { bx_cancelled := id }));
+let bx_r = MX.executeMarketOrderProtected(bx_s, bx_a, mkt, base, poolD1, #sell, 100_000_000, 10_000_000, false, 2, mkFeeCtx(bx_a, bx_s, func(id) { bx_cancelled := id }), null);
 truth("stp control: different owners → different beneficiaries", not Principal.equal(beneficial(poolC1), beneficial(poolD1)));
 eqN("stp control: pools of DIFFERENT owners do cross", bx_r.totalFilled, 100_000_000);
 eqN("stp control: onSelfTrade never fired", bx_cancelled, 0);
@@ -291,7 +293,7 @@ let bk_a = Accounts.emptyState();
 Accounts.setBalance(bk_a, poolC1, QUOTE, 100_000_000_000);
 Accounts.setBalance(bk_a, poolC2, base, 100_000_000);
 let bk_bid = OB.createOrder(bk_s, mkt, poolC1, #buy, #limit, 10_000_000_000, 100_000_000, 1);
-let bk_r = MX.executeMarketOrderProtected(bk_s, bk_a, mkt, base, poolC2, #sell, 100_000_000, 10_000_000, true, 2, mkFeeCtx(bk_a, bk_s, func(_) {}));
+let bk_r = MX.executeMarketOrderProtected(bk_s, bk_a, mkt, base, poolC2, #sell, 100_000_000, 10_000_000, true, 2, mkFeeCtx(bk_a, bk_s, func(_) {}), null);
 eqN("stp FOK: sibling-pool depth is not fillable → kill", bk_r.totalFilled, 0);
 truth("stp FOK: no trades", bk_r.trades.size() == 0);
 eqN("stp FOK: taker base untouched", Accounts.getBalance(bk_a, poolC2, base), 100_000_000);
@@ -315,6 +317,8 @@ let ex_ctx : MX.ProtectionCtx = {
   getMakerPending  = func(_) { 0 };
   availableBalance = func(p, t) { Accounts.getBalance(ex_a, p, t) };
   isNonTakeable    = func(_, _) { false };
+  aggressorIsMaker = false;
+  onUnfundedMaker  = func(_, _, _, _, _) {};
   isExpired        = func(_) { false };
   onPendingFill    = func(_, _, _, _, _, _, _) { null };
   quoteFee         = func(p, gross, role) {
@@ -328,7 +332,7 @@ let ex_ctx : MX.ProtectionCtx = {
   onTradeFees      = func(_, _, _) {};
 };
 let ex_before = Accounts.getBalance(ex_a, ammP, QUOTE) + Accounts.getBalance(ex_a, bob, QUOTE) + Accounts.getBalance(ex_a, treas, QUOTE);
-let ex_r = MX.executeMarketOrderProtected(ex_s, ex_a, mkt, base, bob, #buy, 100_000_000, 10_000_000, false, 5, ex_ctx);
+let ex_r = MX.executeMarketOrderProtected(ex_s, ex_a, mkt, base, bob, #buy, 100_000_000, 10_000_000, false, 5, ex_ctx, null);
 eqN("exempt-cpty: filled 1 BTC", ex_r.totalFilled, 100_000_000);
 eqN("exempt-cpty: taker paid C+takerFee → 0", Accounts.getBalance(ex_a, bob, QUOTE), 0);
 eqN("exempt-cpty: AMM seller kept FULL tradeCost (no maker fee)", Accounts.getBalance(ex_a, ammP, QUOTE), 10_000_000_000);
@@ -346,9 +350,9 @@ let io_a = Accounts.emptyState();
 Accounts.setBalance(io_a, alice, base, 50_000_000);              // maker: 0.5 BTC
 Accounts.setBalance(io_a, bob, QUOTE, 100_000_000_000);          // taker: 1000 ICPUSD
 ignore OB.createOrder(io_s, mkt, alice, #sell, #limit, 10_000_000_000, 50_000_000, 1); // 0.5 @ 100
-let (io_o, io_t, _, _) = MX.executeLimitOrderProtected(
+let (io_o, io_t, _, _, _) = MX.executeLimitOrderProtected(
   io_s, io_a, mkt, base, bob, #buy, #market, 11_000_000_000, 200_000_000, 2, 2, // MARKET buy 2, cap 110
-  mkFeeCtx(io_a, io_s, func(_) {})
+  mkFeeCtx(io_a, io_s, func(_) {}), null
 );
 truth("IOC: trade stamped takerOrderType = #market", io_t.size() == 1 and io_t[0].takerOrderType == ?#market);
 truth("IOC: returned order is #market", io_o.orderType == #market);
@@ -357,24 +361,112 @@ eqN("IOC: order.filled = filled portion (caller derives remainder)", io_o.filled
 truth("IOC: order is CLOSED (#filled), never resting", io_o.status == #filled);
 truth("IOC: NO remainder resting on the book (no bid appeared)",
   OB.findBestMatch(io_s, mkt, #sell) == null);   // a seller would match the best BID — none
+eqN("IOC: single-fill price = the fill's price (VWAP), NOT the 110 cap", io_o.price, 10_000_000_000);
 
 // Dry market cycle: nothing filled → synthetic id-0 record, store untouched.
-let (dry_o, dry_t, _, _) = MX.executeLimitOrderProtected(
+let (dry_o, dry_t, _, _, _) = MX.executeLimitOrderProtected(
   io_s, io_a, mkt, base, bob, #buy, #market, 11_000_000_000, 100_000_000, 3, 3,
-  mkFeeCtx(io_a, io_s, func(_) {})
+  mkFeeCtx(io_a, io_s, func(_) {}), null
 );
 truth("IOC dry: no trades", dry_t.size() == 0);
 eqN("IOC dry: synthetic id 0 (never enters the store)", dry_o.id, 0);
 truth("IOC dry: nothing recorded in the store", OB.getOrder(io_s, 0) == null);
+// Zero-fill sentinel pinned EXACTLY (task 1787182538 rider 2): the synthetic
+// keeps the cap as its price and #cancelled as its status, and — because it
+// never enters the store — the reaper never seals a ClosedOrderRecord from it.
+eqN("IOC dry: sentinel keeps the cap price (unchanged)", dry_o.price, 11_000_000_000);
+truth("IOC dry: sentinel status #cancelled (unchanged)", dry_o.status == #cancelled);
+
+// ── #market record price = VWAP of its fills, not the slippage cap
+//    (task 1787182538, 2026-08-20). The record executeLimitOrderProtected's
+//    #market branch creates is what the closed-order reaper later seals as
+//    ClosedOrderRecord.price — stamp it with the volume-weighted execution
+//    price of the immediate fills. Two-level walk, exact e8 arithmetic:
+//    2 @ 100 + 0.5 @ 101, cap 110 → VWAP = (2×100 + 0.5×101)/2.5 = 100.2. ──
+Debug.print("── #market record price = VWAP of fills, not the slippage cap ──");
+let vw_s = OB.emptyStore();
+let vw_a = Accounts.emptyState();
+Accounts.setBalance(vw_a, alice, base, 250_000_000);             // maker: 2.5 BTC
+Accounts.setBalance(vw_a, bob, QUOTE, 100_000_000_000);          // taker: 1000 ICPUSD
+ignore OB.createOrder(vw_s, mkt, alice, #sell, #limit, 10_000_000_000, 200_000_000, 1); // 2 @ 100
+ignore OB.createOrder(vw_s, mkt, alice, #sell, #limit, 10_100_000_000,  50_000_000, 2); // 0.5 @ 101
+let (vw_o, vw_t, _, _, _) = MX.executeLimitOrderProtected(
+  vw_s, vw_a, mkt, base, bob, #buy, #market, 11_000_000_000, 250_000_000, 3, 3, // MARKET buy 2.5, cap 110
+  mkFeeCtx(vw_a, vw_s, func(_) {}), null
+);
+truth("VWAP: two fills across two levels", vw_t.size() == 2);
+eqN("VWAP: filled the full 2.5", vw_o.filled, 250_000_000);
+eqN("VWAP: price = (2×100 + 0.5×101)/2.5 = 100.2, NOT the 110 cap", vw_o.price, 10_020_000_000);
+truth("VWAP: the STORED record carries it too (the reaper seals o.price)",
+  (switch (OB.getOrder(vw_s, vw_o.id)) { case (?o) { o.price == 10_020_000_000 }; case null { false } }));
 
 // Control: a #limit execution with a remainder still RESTS (unchanged semantics).
-let (lm_o, _, _, _) = MX.executeLimitOrderProtected(
+let (lm_o, _, _, _, _) = MX.executeLimitOrderProtected(
   io_s, io_a, mkt, base, bob, #buy, #limit, 9_000_000_000, 100_000_000, 4, 4,  // passive bid @ 90
-  mkFeeCtx(io_a, io_s, func(_) {})
+  mkFeeCtx(io_a, io_s, func(_) {}), null
 );
 truth("limit control: remainder rests open", lm_o.status == #open and lm_o.orderType == #limit);
 truth("limit control: resting bid IS on the book",
   OB.findBestMatch(io_s, mkt, #sell) != null);
+
+// ── Issue #42: a limit order that PARTIALLY fills on execution must record
+//    its PLACED size, not the resting remainder. originalQuantity is pinned
+//    at createOrder time and the closed-order reaper reports it as
+//    ClosedOrderRecord.quantity ("original requested quantity", Types.mo) —
+//    creating the record at remainingQty and up-adjusting afterwards left
+//    originalQuantity = R, so the tape showed quantity = R with filled = F > R. ──
+Debug.print("── partial fill records the placed size, not the remainder (#42) ──");
+// Book: alice rests 0.5 BTC @ 100. bob limit-buys 2 @ 100 → F = 0.5 fills, R = 1.5 rests.
+let pf_s = OB.emptyStore();
+let pf_a = Accounts.emptyState();
+Accounts.setBalance(pf_a, alice, base, 50_000_000);              // maker: 0.5 BTC
+Accounts.setBalance(pf_a, bob, QUOTE, 100_000_000_000);          // taker: 1000 ICPUSD
+ignore OB.createOrder(pf_s, mkt, alice, #sell, #limit, 10_000_000_000, 50_000_000, 1);
+let (pf_o, pf_t, _, _, _) = MX.executeLimitOrderProtected(
+  pf_s, pf_a, mkt, base, bob, #buy, #limit, 10_000_000_000, 200_000_000, 2, 2, // limit buy 2 @ 100
+  mkFeeCtx(pf_a, pf_s, func(_) {}), null
+);
+truth("partial #42: one immediate fill", pf_t.size() == 1);
+eqN("partial #42: filled = F (0.5)", pf_o.filled, 50_000_000);
+eqN("partial #42: quantity = R+F (2.0)", pf_o.quantity, 200_000_000);
+eqN("partial #42: originalQuantity = PLACED size (R+F), not the remainder", pf_o.originalQuantity, 200_000_000);
+truth("partial #42: filled <= originalQuantity (reaper reports it as quantity)", pf_o.filled <= pf_o.originalQuantity);
+eqN("partial #42: remainder rests (R = 1.5)", OB.remaining(pf_o), 150_000_000);
+// The reaper's pick — qty = originalQuantity when > 0, else quantity
+// (main.mo reapClosedOrders) — must equal the placed size.
+eqN("partial #42: reaper qty pick = placed size",
+  (if (pf_o.originalQuantity > 0) pf_o.originalQuantity else pf_o.quantity), 200_000_000);
+
+// W4-22 leg: the sweep's pre-reserved aggressor id (createOrderWithId) carried
+// the same defect — same scenario under aggressorIsMaker = true.
+let pw_s = OB.emptyStore();
+let pw_a = Accounts.emptyState();
+Accounts.setBalance(pw_a, alice, base, 50_000_000);
+Accounts.setBalance(pw_a, bob, QUOTE, 100_000_000_000);
+ignore OB.createOrder(pw_s, mkt, alice, #sell, #limit, 10_000_000_000, 50_000_000, 1);
+let pw_ctx : MX.ProtectionCtx = { mkFeeCtx(pw_a, pw_s, func(_) {}) with aggressorIsMaker = true };
+let (pw_o, pw_t, _, _, _) = MX.executeLimitOrderProtected(
+  pw_s, pw_a, mkt, base, bob, #buy, #limit, 10_000_000_000, 200_000_000, 2, 2, pw_ctx, null
+);
+truth("partial #42 (W4-22 leg): pre-reserved id materialized", pw_o.id != 0 and pw_t.size() == 1);
+eqN("partial #42 (W4-22 leg): originalQuantity = placed size", pw_o.originalQuantity, 200_000_000);
+eqN("partial #42 (W4-22 leg): filled = F", pw_o.filled, 50_000_000);
+eqN("partial #42 (W4-22 leg): remainder rests (R)", OB.remaining(pw_o), 150_000_000);
+
+// Fully-filled-at-execution control (case b): quantity == originalQuantity == filled.
+let pz_s = OB.emptyStore();
+let pz_a = Accounts.emptyState();
+Accounts.setBalance(pz_a, alice, base, 50_000_000);
+Accounts.setBalance(pz_a, bob, QUOTE, 100_000_000_000);
+ignore OB.createOrder(pz_s, mkt, alice, #sell, #limit, 10_000_000_000, 50_000_000, 1);
+let (pz_o, _, _, _, _) = MX.executeLimitOrderProtected(
+  pz_s, pz_a, mkt, base, bob, #buy, #limit, 10_000_000_000, 50_000_000, 2, 2, // exact-size buy
+  mkFeeCtx(pz_a, pz_s, func(_) {}), null
+);
+truth("full-fill control: closed #filled", pz_o.status == #filled);
+eqN("full-fill control: originalQuantity = placed size", pz_o.originalQuantity, 50_000_000);
+eqN("full-fill control: quantity = placed size", pz_o.quantity, 50_000_000);
+eqN("full-fill control: filled = placed size", pz_o.filled, 50_000_000);
 
 // ── Two clocks: the order record keeps the SUBMISSION timestamp, the trades
 //    it produces stamp at SETTLEMENT. This is the deferred-release contract —
@@ -386,10 +478,10 @@ let tc_a = Accounts.emptyState();
 Accounts.setBalance(tc_a, alice, base, 50_000_000);
 Accounts.setBalance(tc_a, bob, QUOTE, 100_000_000_000);
 ignore OB.createOrder(tc_s, mkt, alice, #sell, #limit, 10_000_000_000, 50_000_000, 100);
-let (tc_o, tc_t, _, _) = MX.executeLimitOrderProtected(
+let (tc_o, tc_t, _, _, _) = MX.executeLimitOrderProtected(
   tc_s, tc_a, mkt, base, bob, #buy, #limit, 10_000_000_000, 50_000_000,
   1_000, 16_000, // submitted at t=1000, SETTLES at t=16000 (a 15s users-only walk)
-  mkFeeCtx(tc_a, tc_s, func(_) {})
+  mkFeeCtx(tc_a, tc_s, func(_) {}), null
 );
 truth("two clocks: trade stamped at SETTLEMENT time", tc_t.size() == 1 and tc_t[0].timestamp == 16_000);
 truth("two clocks: order record keeps the SUBMISSION time", tc_o.timestamp == 1_000);
@@ -404,6 +496,189 @@ let (lw_o, lw_t, _, _) = MX.executeLimitOrder(
 );
 truth("legacy wrapper: one clock stamps both order and trade",
   lw_o.timestamp == 7_777 and lw_t.size() == 1 and lw_t[0].timestamp == 7_777);
+
+// ════════════════════════════════════════════════════════════════════
+// maxQuoteSpend — the #buy quote budget (task 1787204744). The caller sizes
+// its quantity at the BEST price (max conversion on a flat book) and passes
+// its whole proceeds as a cost+takerFee budget; the engine shrinks each
+// slice to min(balance, remaining budget), so a walking book stops EXACTLY
+// at the budget — no overspend past it, no band-fraction residual under it.
+// Fee ctx: TAKER = 10 bps (mkFeeCtx). Book (unless noted): 2 BTC @ $100 +
+// 2 BTC @ $110, 10% slippage (cap = $110, both levels in band).
+// ════════════════════════════════════════════════════════════════════
+Debug.print("── maxQuoteSpend budget ──");
+
+func mkTwoLevelBook() : (OB.OrderStore, Accounts.AccountState) {
+  let s = OB.emptyStore();
+  let a = Accounts.emptyState();
+  Accounts.setBalance(a, alice, base, 400_000_000);            // 4 BTC maker
+  Accounts.setBalance(a, bob, QUOTE, 100_000_000_000);         // 1000 ICPUSD taker
+  ignore OB.createOrder(s, mkt, alice, #sell, #limit, 10_000_000_000, 200_000_000, 1); // 2 @ 100
+  ignore OB.createOrder(s, mkt, alice, #sell, #limit, 11_000_000_000, 200_000_000, 2); // 2 @ 110
+  (s, a);
+};
+
+// ── (B1) Budget BETWEEN the level costs: level 1 (2@100 = $200.20 with fee)
+//        fits, level 2 does not — the walk fills level 1 whole, then shrinks
+//        the level-2 slice so the TOTAL spend lands within a rounding crumb
+//        of the $300 budget, and stops. The taker's balance ($1000) must not
+//        be touched past the budget. ──
+let qb_budget : Nat = 30_000_000_000;                          // $300
+let (qb_s, qb_a) = mkTwoLevelBook();
+let qb_r = MX.executeMarketOrderProtected(qb_s, qb_a, mkt, base, bob, #buy, 300_000_000, 10_000_000, false, 2, mkFeeCtx(qb_a, qb_s, func(_) {}), ?qb_budget);
+let qb_spent = 100_000_000_000 - Accounts.getBalance(qb_a, bob, QUOTE) : Nat;
+truth("budget between levels: spend ≤ budget", qb_spent <= qb_budget);
+truth("budget between levels: spend within a crumb of the budget (≥ budget−100)", qb_budget - qb_spent < 100);
+eqN("budget between levels: quoteSpent reports the debit exactly", qb_r.quoteSpent, qb_spent);
+truth("budget between levels: level 1 swept + level 2 entered (2 trades)", qb_r.trades.size() == 2);
+truth("budget between levels: filled past level 1, short of the sized qty",
+  qb_r.totalFilled > 200_000_000 and qb_r.totalFilled < 300_000_000);
+truth("budget between levels: remainder returned (budget stop, not book exhaustion)", qb_r.remainingQty > 0);
+eqN("budget between levels: taker got exactly what it paid for",
+  Accounts.getBalance(qb_a, bob, base), qb_r.totalFilled);
+
+// ── (B2) Budget LARGER than the whole book cost: full fill, spend = book
+//        cost + fee, budget never binds. ──
+let (qf_s, qf_a) = mkTwoLevelBook();
+let qf_r = MX.executeMarketOrderProtected(qf_s, qf_a, mkt, base, bob, #buy, 400_000_000, 10_000_000, false, 2, mkFeeCtx(qf_a, qf_s, func(_) {}), ?90_000_000_000);
+eqN("budget above book: full fill (4 BTC)", qf_r.totalFilled, 400_000_000);
+eqN("budget above book: nothing left", qf_r.remainingQty, 0);
+// cost = 2×100 + 2×110 = 420; taker fee 10 bps = 0.42 → spend 420.42
+eqN("budget above book: spent book cost + taker fee", qf_r.quoteSpent, 42_042_000_000);
+eqN("budget above book: balance debit agrees", Accounts.getBalance(qf_a, bob, QUOTE), 100_000_000_000 - 42_042_000_000);
+
+// ── (B3) Budget smaller than one full fill: the slice shrinks to the
+//        affordable FLOOR quantity (cost+fee ≤ budget), fills it, stops. ──
+let (qs_s, qs_a) = mkTwoLevelBook();
+let qs_budget : Nat = 5_000_000_000;                           // $50 ≪ level-1's $200
+let qs_r = MX.executeMarketOrderProtected(qs_s, qs_a, mkt, base, bob, #buy, 300_000_000, 10_000_000, false, 2, mkFeeCtx(qs_a, qs_s, func(_) {}), ?qs_budget);
+truth("budget below one fill: partial floor fill (0 < qty < level size)",
+  qs_r.totalFilled > 0 and qs_r.totalFilled < 200_000_000);
+truth("budget below one fill: spend ≤ budget", qs_r.quoteSpent <= qs_budget);
+truth("budget below one fill: spend within a crumb of the budget", qs_budget - qs_r.quoteSpent < 200);
+truth("budget below one fill: single trade", qs_r.trades.size() == 1);
+
+// Sub-unit budget: can't afford even ONE base unit at the best price →
+// nothing fills, nothing moves.
+let (qz_s, qz_a) = mkTwoLevelBook();
+let qz_r = MX.executeMarketOrderProtected(qz_s, qz_a, mkt, base, bob, #buy, 300_000_000, 10_000_000, false, 2, mkFeeCtx(qz_a, qz_s, func(_) {}), ?50);
+eqN("sub-unit budget: nothing filled", qz_r.totalFilled, 0);
+eqN("sub-unit budget: quoteSpent 0", qz_r.quoteSpent, 0);
+eqN("sub-unit budget: taker balance untouched", Accounts.getBalance(qz_a, bob, QUOTE), 100_000_000_000);
+
+// ── (B4) null budget: legacy semantics unchanged — the same walk is bounded
+//        only by the taker's whole available balance, so it walks the book
+//        past where the $300 budget stopped. ──
+let (qn_s, qn_a) = mkTwoLevelBook();
+let qn_r = MX.executeMarketOrderProtected(qn_s, qn_a, mkt, base, bob, #buy, 300_000_000, 10_000_000, false, 2, mkFeeCtx(qn_a, qn_s, func(_) {}), null);
+eqN("null budget: fills the full sized qty (3 BTC)", qn_r.totalFilled, 300_000_000);
+// cost = 2×100 + 1×110 = 310; fee 10 bps = 0.31 → 310.31 — past the B1 budget.
+eqN("null budget: spends past the B1 budget (whole balance is the only bound)", qn_r.quoteSpent, 31_031_000_000);
+
+// ── (B5) FOK composes with the budget: the pre-check simulates with the
+//        SAME budget clamp, so an all-or-nothing quantity the budget cannot
+//        cover KILLS (never partial-fills at the budget stop)... ──
+let (qk_s, qk_a) = mkTwoLevelBook();
+let qk_r = MX.executeMarketOrderProtected(qk_s, qk_a, mkt, base, bob, #buy, 300_000_000, 10_000_000, true, 2, mkFeeCtx(qk_a, qk_s, func(_) {}), ?30_000_000_000);
+eqN("FOK + short budget: killed, nothing filled", qk_r.totalFilled, 0);
+truth("FOK + short budget: no trades", qk_r.trades.size() == 0);
+eqN("FOK + short budget: taker balance untouched", Accounts.getBalance(qk_a, bob, QUOTE), 100_000_000_000);
+
+// ...while a budget that covers the full quantity passes and settles whole.
+let (qp_s, qp_a) = mkTwoLevelBook();
+let qp_r = MX.executeMarketOrderProtected(qp_s, qp_a, mkt, base, bob, #buy, 300_000_000, 10_000_000, true, 2, mkFeeCtx(qp_a, qp_s, func(_) {}), ?35_000_000_000);
+eqN("FOK + ample budget: fills in full", qp_r.totalFilled, 300_000_000);
+eqN("FOK + ample budget: spent cost+fee (310.31)", qp_r.quoteSpent, 31_031_000_000);
+
+// ════════════════════════════════════════════════════════════════════
+// maxQuoteSpend on the LIMIT engine (task 1787209266) — the budget threaded
+// through executeLimitOrderProtected for the STAGED direct-swap path
+// (releaseDeferred, orderType = #market/IOC). Same contract as the market
+// variant above; additionally the NULL path must stay byte-identical —
+// including the legacy "unaffordable buyer BREAKS" semantics (no shrink) —
+// and #limit callers (always null) are unaffected.
+// ════════════════════════════════════════════════════════════════════
+Debug.print("── maxQuoteSpend budget (limit engine / IOC release path) ──");
+
+// ── (L1) Budget BETWEEN the level costs, IOC #market release: level 1
+//        (2@100 = $200.20 with fee) fits, level 2 does not — level 1 sweeps
+//        whole, the level-2 slice shrinks so the TOTAL spend lands within a
+//        crumb of the $300 budget, and the walk stops. IOC: the remainder
+//        never rests. ──
+let lb_budget : Nat = 30_000_000_000;                          // $300
+let (lb_s, lb_a) = mkTwoLevelBook();
+let (lb_o, lb_t, _, _, lb_spent) = MX.executeLimitOrderProtected(
+  lb_s, lb_a, mkt, base, bob, #buy, #market, 11_000_000_000, 300_000_000, 2, 2, // IOC buy 3, cap $110
+  mkFeeCtx(lb_a, lb_s, func(_) {}), ?lb_budget
+);
+let lb_debit = 100_000_000_000 - Accounts.getBalance(lb_a, bob, QUOTE) : Nat;
+truth("limit budget between levels: spend ≤ budget", lb_debit <= lb_budget);
+truth("limit budget between levels: spend within a crumb of the budget", lb_budget - lb_debit < 100);
+eqN("limit budget between levels: quoteSpent reports the debit exactly", lb_spent, lb_debit);
+truth("limit budget between levels: level 1 swept + level 2 entered (2 trades)", lb_t.size() == 2);
+truth("limit budget between levels: filled past level 1, short of the sized qty",
+  lb_o.filled > 200_000_000 and lb_o.filled < 300_000_000);
+eqN("limit budget between levels: taker got exactly what it paid for",
+  Accounts.getBalance(lb_a, bob, base), lb_o.filled);
+truth("limit budget between levels: IOC — remainder never rests",
+  OB.findBestMatch(lb_s, mkt, #sell) == null);   // a seller would match a resting bid — none
+
+// ── (L2) null budget, SAME call: legacy semantics — bounded only by the
+//        taker's whole balance, walks the book past where $300 stopped. ──
+let (ln_s, ln_a) = mkTwoLevelBook();
+let (ln_o, _, _, _, ln_spent) = MX.executeLimitOrderProtected(
+  ln_s, ln_a, mkt, base, bob, #buy, #market, 11_000_000_000, 300_000_000, 2, 2,
+  mkFeeCtx(ln_a, ln_s, func(_) {}), null
+);
+eqN("limit null budget: fills the full sized qty (3 BTC)", ln_o.filled, 300_000_000);
+// cost = 2×100 + 1×110 = 310; taker fee 10 bps = 0.31 → 310.31 — past the L1 budget.
+eqN("limit null budget: quoteSpent = cost+fee (310.31)", ln_spent, 31_031_000_000);
+
+// ── (L3) The shrink fires ONLY with a budget. An unaffordable buyer on the
+//        null path keeps the legacy BREAK (fills nothing — the resting-#limit
+//        flow's semantics); the same balance passed AS a budget shrinks the
+//        slice and converts what fits. ──
+let lu_s = OB.emptyStore();
+let lu_a = Accounts.emptyState();
+Accounts.setBalance(lu_a, alice, base, 400_000_000);
+Accounts.setBalance(lu_a, bob, QUOTE, 15_000_000_000);          // $150 < level-1's $200.20
+ignore OB.createOrder(lu_s, mkt, alice, #sell, #limit, 10_000_000_000, 200_000_000, 1); // 2 @ 100
+let (lu_o, lu_t, _, _, lu_spent) = MX.executeLimitOrderProtected(
+  lu_s, lu_a, mkt, base, bob, #buy, #market, 11_000_000_000, 300_000_000, 2, 2,
+  mkFeeCtx(lu_a, lu_s, func(_) {}), null
+);
+eqN("limit null unaffordable: legacy break — nothing fills", lu_o.filled, 0);
+truth("limit null unaffordable: no trades", lu_t.size() == 0);
+eqN("limit null unaffordable: quoteSpent 0", lu_spent, 0);
+eqN("limit null unaffordable: balance untouched", Accounts.getBalance(lu_a, bob, QUOTE), 15_000_000_000);
+let lv_s = OB.emptyStore();
+let lv_a = Accounts.emptyState();
+Accounts.setBalance(lv_a, alice, base, 400_000_000);
+Accounts.setBalance(lv_a, bob, QUOTE, 15_000_000_000);
+ignore OB.createOrder(lv_s, mkt, alice, #sell, #limit, 10_000_000_000, 200_000_000, 1);
+let (lv_o, lv_t, _, _, lv_spent) = MX.executeLimitOrderProtected(
+  lv_s, lv_a, mkt, base, bob, #buy, #market, 11_000_000_000, 300_000_000, 2, 2,
+  mkFeeCtx(lv_a, lv_s, func(_) {}), ?15_000_000_000
+);
+truth("limit budget=balance: shrinks and converts (0 < filled < level)",
+  lv_o.filled > 0 and lv_o.filled < 200_000_000);
+truth("limit budget=balance: one trade", lv_t.size() == 1);
+truth("limit budget=balance: spend ≤ budget", lv_spent <= 15_000_000_000);
+truth("limit budget=balance: spend within a crumb of the budget", 15_000_000_000 - lv_spent < 200);
+
+// ── (L4) #limit caller control: a crossing #limit (null budget — every
+//        #limit caller passes null) keeps its resting semantics untouched:
+//        fills what balance affords... and here, fully funded, it fills level
+//        1 and RESTS the remainder at its limit price. ──
+let (ll_s, ll_a) = mkTwoLevelBook();
+let (ll_o, ll_t, _, _, _) = MX.executeLimitOrderProtected(
+  ll_s, ll_a, mkt, base, bob, #buy, #limit, 10_500_000_000, 300_000_000, 2, 2, // limit $105: crosses level 1 only
+  mkFeeCtx(ll_a, ll_s, func(_) {}), null
+);
+truth("limit control: level-1 fill", ll_t.size() == 1);
+eqN("limit control: filled level 1 (2 BTC)", ll_o.filled, 200_000_000);
+truth("limit control: remainder RESTS open (unchanged semantics)", OB.isOpen(ll_o));
+eqN("limit control: rested remainder (1 BTC)", OB.remaining(ll_o), 100_000_000);
 
 // ════════════════════════════════════════════════════════════════════
 // PER-CALL ITERATION CAP. One matcher invocation spends at most

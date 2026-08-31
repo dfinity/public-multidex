@@ -68,8 +68,39 @@ assert_contains() {
 }
 
 assert_not_contains() {
-  if echo "$2" | grep -q -- "$3"; then _fail "$1: unexpected '$3' in:\n$2"
+  # Same underscore-strip as assert_contains (#51.9): Candid prints nats both
+  # as "75_000" and "75000", and a digit needle written plain could NEVER
+  # match an underscored haystack — so the ban it expressed was vacuous
+  # (test_play_deposit_cap's "pending = $B" pins were exactly that shape).
+  # Call-site audit at the change (2026-08-20): no needle contains an
+  # underscore, and no text needle can be manufactured by deleting
+  # underscores from these haystacks — the strip only arms the digit pins.
+  local stripped
+  stripped=$(echo "$2" | tr -d '_')
+  if echo "$stripped" | grep -q -- "$3"; then _fail "$1: unexpected '$3' in:\n$2"
   else _ok "$1 lacks '$3'"; fi
+}
+
+# Absolute-tolerance comparison — for BASE-UNIT (integer) money, where a
+# RELATIVE tolerance scales the allowed error with the balance sheet itself
+# (#51.5: 1% of a seeded vault's lpSupply was ~300 whole tokens of invisible
+# drift). `tol` is in the same units as the operands.
+assert_abs_close() {
+  local name="$1" expected="$2" actual="$3" tol="$4"
+  if [ -z "$actual" ]; then
+    _fail "$name: actual is empty"
+    return
+  fi
+  local verdict
+  verdict=$(python3 -c "
+e=$expected; a=$actual; t=$tol
+print('PASS' if abs(e - a) <= t else f'FAIL diff={abs(e-a)}')
+")
+  if [ "$verdict" = "PASS" ]; then
+    _ok "$name ≈ $expected (got $actual, abs tol $tol)"
+  else
+    _fail "$name: expected ≈$expected (abs tol $tol), got $actual ($verdict)"
+  fi
 }
 
 # Tolerance comparison — for any quantity that can drift due to live
@@ -246,13 +277,33 @@ assert_invariants() {
   local marker="${1:-default}"
   echo -e "  ${DIM}── invariants ($marker) ──${NC}"
 
+  # Every invariant below must PROVE IT OBSERVED something before it may
+  # pass (#38.2 / W5-14): each one's failure shape used to be identical to
+  # its pass shape — a trapped, renamed, or stopped query produced the same
+  # green tick as a coherent venue, because grep over an error message
+  # counts zero. A vacuous pass is now a FAIL; "observed empty" is labeled
+  # as such and passes only when the response was well-formed.
+
+  # I0: liveness positive control. If the surface cannot answer this, the
+  # three invariants below cannot observe anything — refuse them all rather
+  # than letting three vacuous ticks into the count.
+  local info
+  info=$(call getCanisterInfo '()' --query)
+  if ! echo "$info" | grep -q "journalUnshipped"; then
+    _fail "I0: backend not answering (getCanisterInfo) — invariants cannot pass unobserved: $(echo "$info" | tr -d '\n' | head -c 140)"
+    return
+  fi
+  _ok "I0: surface alive (positive control observed)"
+
   # I1: LP balance sheet.
   local vault
   vault=$(call getVaultValue '()')
   local lpSupply
   lpSupply=$(extract_float "lpSupply" "$vault")
-  if [ -z "$lpSupply" ] || [ "$lpSupply" = "0.0" ] || [ "$lpSupply" = "0" ]; then
-    _ok "I1: vault empty (skipped)"
+  if ! echo "$vault" | grep -q "lpSupply"; then
+    _fail "I1: getVaultValue malformed/unanswered — refusing the vacuous pass: $(echo "$vault" | tr -d '\n' | head -c 140)"
+  elif [ -z "$lpSupply" ] || [ "$lpSupply" = "0.0" ] || [ "$lpSupply" = "0" ]; then
+    _ok "I1: vault OBSERVED empty (lpSupply=0, well-formed response)"
   else
     # Sum LP across the identities we can actually ask. There is NO backend
     # query that enumerates LP holders — only getMyVaultLp, which is per-caller
@@ -273,32 +324,54 @@ assert_invariants() {
       [ -z "$bal" ] && bal=0
       sum=$(python3 -c "print($sum + $bal)")
     done
+    # Both sides are integer base-unit Nats (10^8/token), so the equality is
+    # exact in principle; the tolerance exists only for float-printing edge
+    # cases in the extractors. 100 base units = 1e-6 of one token: dust that
+    # cannot mask a real leak, where the old RELATIVE 0.01 allowed 1% of the
+    # whole supply (#51.5).
+    local i1_tol_e8=100
     if [ -n "${MDX_LP_IDENTITIES:-}" ]; then
-      assert_float_close "I1: Σ LP over the declared holder set == vaultLPSupply" "$lpSupply" "$sum" 0.01
+      assert_abs_close "I1: Σ LP over the declared holder set == vaultLPSupply" "$lpSupply" "$sum" "$i1_tol_e8"
     else
-      assert_float_close "I1: Σ LP balances == vaultLPSupply" "$lpSupply" "$sum" 0.01
+      assert_abs_close "I1: Σ LP balances == vaultLPSupply" "$lpSupply" "$sum" "$i1_tol_e8"
     fi
   fi
 
-  # I2: No zombie orders.
+  # I2: No zombie orders — and each book must actually ANSWER: an error
+  # string contains no "quantity = 0 :" either, which used to read as clean.
   local zombies=0
+  local dead_books=""
   for m in BTC-ICPUSD ETH-ICPUSD SOL-ICPUSD ICP-ICPUSD; do
     local book
     book=$(call getOrderBook "(\"$m\")" 2>&1)
+    if ! echo "$book" | grep -q "bids = vec"; then
+      dead_books="$dead_books $m"
+      continue
+    fi
     local n
     n=$(echo "$book" | grep -c "quantity = 0 :" || true)   # Nat zero prints as `0`, not `0.0`
     zombies=$(( zombies + n ))
   done
-  assert_eq "I2: no 0-qty zombie orders across markets" "0" "$zombies"
+  if [ -n "$dead_books" ]; then
+    _fail "I2: getOrderBook unanswered/malformed for:$dead_books — refusing the vacuous pass"
+  else
+    assert_eq "I2: no 0-qty zombie orders across markets (4 books observed)" "0" "$zombies"
+  fi
 
-  # I3: Enabled pools have non-zero refPrice.
+  # I3: Enabled pools have non-zero refPrice — on a WELL-FORMED pool listing.
   local pools
   pools=$(call getAmmPools '()' 2>&1)
-  local zero_ref
-  zero_ref=$(echo "$pools" | tr ';' '\n' \
-             | awk '/enabled = true/{e=1} /refPrice = 0 :/{r=1} /marketId/{if (e && r) print "1"; e=0; r=0}' \
-             | wc -l | tr -d ' ')
-  assert_eq "I3: no enabled pool with refPrice=0" "0" "$zero_ref"
+  if ! echo "$pools" | grep -q "vec"; then
+    _fail "I3: getAmmPools malformed/unanswered — refusing the vacuous pass: $(echo "$pools" | tr -d '\n' | head -c 140)"
+  elif echo "$pools" | tr -d ' \n' | grep -q "^(vec{})"; then
+    _ok "I3: OBSERVED no pools (well-formed empty listing)"
+  else
+    local zero_ref
+    zero_ref=$(echo "$pools" | tr ';' '\n' \
+               | awk '/enabled = true/{e=1} /refPrice = 0 :/{r=1} /marketId/{if (e && r) print "1"; e=0; r=0}' \
+               | wc -l | tr -d ' ')
+    assert_eq "I3: no enabled pool with refPrice=0" "0" "$zero_ref"
+  fi
 }
 
 # ── Lifecycle ────────────────────────────────────────────────────

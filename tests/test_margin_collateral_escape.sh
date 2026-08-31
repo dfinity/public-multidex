@@ -106,7 +106,9 @@ if [ "$LIQ0" -ge 1 ]; then ok "pool liquidatable after the squeeze"; else nok "e
 adm adminRunLiquidationBatch "()" >/dev/null 2>&1
 D2=$(fld debtUsd "$(usr getMyMarginPools '()')")
 NORD1=$(usr getPoolOrders "($PID)" | grep -c "id =")
-if awk -v a="${D2:-0}" -v b="$D0" 'BEGIN{exit (a<b?0:1)}'; then
+# #45.1: a `<` comparison is fail-OPEN under the `:-0` default (an empty read
+# passes as 0 < debt) — require the read to be non-empty.
+if [ -n "${D2:-}" ] && awk -v a="${D2:-0}" -v b="$D0" 'BEGIN{exit (a<b?0:1)}'; then
   ok "seize proceeded (debt \$$(awk -v d="$D0" 'BEGIN{printf "%.0f", d/100000000}') → \$$(awk -v d="${D2:-0}" 'BEGIN{printf "%.0f", d/100000000}'))"
 else nok "liquidation blocked" "debt $D0 → $D2"; fi
 if [ "${NORD1:-0}" -eq 0 ]; then
@@ -114,19 +116,19 @@ if [ "${NORD1:-0}" -eq 0 ]; then
 else nok "resting order survived a liquidation" "orders=$NORD1"; fi
 
 echo "── §3 M1: LP mint gated during an ACTIVE circuit-breaker pend ──"
-adm setTestPendingJump '("BTC", opt (5500000000000 : nat))' >/dev/null   # BTC pend: 50k → 55k held for confirmation
+adm setTestPendingJump '("BTC", opt (5500000000000 : nat), null)' >/dev/null   # BTC pend: 50k → 55k held for confirmation
 DL1=$(usr depositLp "(\"BTC-ICPUSD\", 0 : nat, $(e8 100.0) : nat)")
 if echo "$DL1" | grep -q "circuit-breaker confirmation"; then
   ok "mint REFUSED while a HELD leg's price is pending confirmation"
 else nok "mint accepted against a frozen refPrice (M1)" "$DL1"; fi
 # Precision: a pend on an asset the vault does NOT hold must not block.
-adm setTestPendingJump '("BTC", null)' >/dev/null
-adm setTestPendingJump '("ETH", opt (300000000000 : nat))' >/dev/null    # vault holds no ETH
+adm setTestPendingJump '("BTC", null, null)' >/dev/null
+adm setTestPendingJump '("ETH", opt (300000000000 : nat), null)' >/dev/null    # vault holds no ETH
 DL2=$(usr depositLp "(\"BTC-ICPUSD\", 0 : nat, $(e8 100.0) : nat)")
 if echo "$DL2" | grep -q "ok"; then
   ok "pend on an UNHELD asset doesn't block (held-legs-only gate)"
 else nok "over-broad gate: unheld asset pend blocked the mint" "$DL2"; fi
-adm setTestPendingJump '("ETH", null)' >/dev/null
+adm setTestPendingJump '("ETH", null, null)' >/dev/null
 
 echo "── §4 debt-free humans unaffected: depositLp / withdrawLp round-trip ──"
 LP=$(usr getMyVaultLp "()" | tr -d '_' | grep -oE "[0-9]+" | head -1)

@@ -738,7 +738,12 @@ async function dxRun(reset) {
   _dxRows = reset ? objs : _dxRows.concat(objs);
   _dxOffset += objs.length;
   dxRenderTable(_dxRows);
-  dxStatus(`${_dxRows.length} row${_dxRows.length === 1 ? "" : "s"} · ${ms} ms${res.hasMore ? " · more available" : ""}`);
+  // History only: name any archive segment the fan-out could not read, so a
+  // partial read never renders as complete history (W1-03).
+  const degraded = res.degraded && res.degraded.length
+    ? ` · ⚠ archive segment${res.degraded.length === 1 ? "" : "s"} unavailable (${res.degraded.join(", ")}) — history may be incomplete`
+    : "";
+  dxStatus(`${_dxRows.length} row${_dxRows.length === 1 ? "" : "s"} · ${ms} ms${res.hasMore ? " · more available" : ""}${degraded}`);
   const more = document.getElementById("dx-more");
   if (more) more.style.display = res.hasMore ? "" : "none";
 }

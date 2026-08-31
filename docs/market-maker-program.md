@@ -326,3 +326,18 @@ capital-normalized P&L (+40% in 48h) as a **beat-the-house benchmark** rather th
 The single highest-leverage sequence: **docs + dead-man + cancel-all + the bash template** — an
 outsider can then run a safe two-sided bot in an afternoon against machinery that already rewards
 them (2× W, fees→0, shield). Everything else compounds from there.
+
+## Volume-credit consolidation (W4-18, 2026-08-15)
+
+Volume credit is written by exactly one place — the credit loop inside
+`updateStatsAfterTrades` — so EVERY settlement path (direct fills, AMM-sweep
+fills, both cross-swap legs, pending-finalize) credits both parties, and a
+new settlement path cannot be added without crediting (it has to book stats
+to exist). Historical injection books stats via `updateStatsCore` and
+credits nobody: backdrop trades must scale no one's level.
+
+Backfill decision, recorded: **start clean from this deploy.** Historical
+under-credit is not reconstructed — the affected quantities are play-money
+scorecard rows, the level scale recalibrates automatically as newly-counted
+volume flows, and a mid-season retroactive rewrite would move everyone's
+level without an action of theirs.

@@ -55,12 +55,22 @@ with a kill-matrix for test hooks — see `docs/deployment-modes.md`.
 ## Getting started (local)
 
 Prerequisites: [Node.js](https://nodejs.org) 18+, [mops](https://mops.one)
-(Motoko package manager, pins the `moc` toolchain), and the
-[`icp` CLI](https://github.com/dfinity/icp-cli).
+CLI 2.19.2 (Motoko package manager — it pins the `moc` toolchain, and
+`scripts/lint-ratchet.sh` pins *it*, since its defaults decide whether
+lockfile integrity is checked), the
+[`icp` CLI](https://github.com/dfinity/icp-cli), and
+[`ic-wasm`](https://github.com/dfinity/ic-wasm) 0.11.0 on `PATH` (the
+`@dfinity/motoko` build recipe in `icp.yaml` shells out to it for the
+metadata passes — the installed wasm is its output, not `moc`'s).
 
 ```bash
 npm install
 mops install
+
+# generate the backend candid interface — mops.toml declares it as a
+# compat-check INPUT (src/backend/backend.did), it is gitignored, and
+# nothing builds without it on a fresh checkout
+bash scripts/gen-did.sh
 
 # start a local network and stand the whole exchange up in the repo's
 # default posture, #play: deploys all canisters, wires bridge + fuel,
@@ -94,8 +104,15 @@ bash tests/<suite>.sh          # integration suites against a local network
 bash scripts/lint-ratchet.sh   # moc type-check + lintoko + M0155 hard-zero gate
 ```
 
-The lint gate runs as a pre-push hook (`.githooks/pre-push`); the backend is kept
-free of compiler warnings, and unguarded `Nat` subtractions are a hard error.
+The lint gate runs as a pre-push hook (`.githooks/pre-push`). What it actually
+enforces, so this sentence stays checkable (W6-04): all four program roots
+(backend, ArchiveCanister, bridge, arb) must **type-check** with the real build
+flags; `lintoko` style lints are **zero** on hand-written code; the `M0155`
+(unguarded `Nat` subtraction) count is **ratcheted at a hard zero** across
+`src/backend`, `src/bridge` and `src/arb`; the `.mops/` tree must match
+`mops.lock`'s per-file SHA-256s; and the published candid must be fresh and
+backward-compatible. Remaining non-`M0155` compiler warnings are surfaced as
+information, not errors — the gate prints their count on every run.
 
 ## Repository layout
 

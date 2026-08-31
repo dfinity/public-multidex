@@ -138,10 +138,46 @@ assert_eq "§4 ...and minted nothing" "0" "$(balof "$U4" dlg_u4)"
 # ── §5 the Bridge survives an upgrade with its ledger intact ──
 # postupgrade clears ONLY the in-flight latches. Deposit bookkeeping is stable
 # and must come through untouched.
-BEFORE=$(icp canister call bridge getSupportedAssets '()' --query --identity anonymous 2>&1)
+#
+# REAL STATE across the boundary (W5-15 / #38.5): the old §5 read a
+# compile-time constant (getSupportedAssets) and an unset latch key — neither
+# could fail if every ledger map was wiped. Now the section SETS state the
+# upgrade must carry: a pending deposit row (the W3-04 write-ahead — the
+# parked mid-flow shape a lost continuation leaves) and the DEX-side
+# allowance charge; upgrades; and asserts both survive byte-for-byte, the
+# ledger keeps working (a post-upgrade deposit charges exactly its mark
+# value), and the confirm path then finishes exactly-once.
+newid dlg_u5; U5P=$(principal_of dlg_u5)   # FRESH principal — the bridge ledger is cumulative per identity
+call createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1
+call setAmmRefPrice '("BTC-ICPUSD", 10_000_000_000 : nat)' >/dev/null 2>&1   # $100 mark
+call requoteAmm '("BTC-ICPUSD")' >/dev/null 2>&1
+BIND5=$(call setTestEmailBinding "(principal \"$U5P\", \"dlgu5${RANDOM}$$@gmail.com\")" --identity anonymous)
+assert_contains "§5 fresh principal bound (anti-sybil hook)" "$BIND5" "ok"
+u5_used() { call getPlayDepositAllowance '()' --identity dlg_u5 | tr -d '_\n' | tr -s ' ' | grep -oE "usedUsd = [0-9]+" | awk '{print $3}'; }
+u5_pend() { icp canister call bridge getMyDeposits '()' --query --identity dlg_u5 2>&1 | tr -d '_\n' | tr -s ' ' | grep -oE "asset = \"BTC\"[^}]*" | grep -oE "pending = [0-9]+" | awk '{print $3}'; }
+u5_conf() { icp canister call bridge getMyDeposits '()' --query --identity dlg_u5 2>&1 | tr -d '_\n' | tr -s ' ' | grep -oE "asset = \"BTC\"[^}]*" | grep -oE "confirmed = [0-9]+" | awk '{print $3}'; }
+R=$(icp canister call bridge devSimulateDeposit '("BTC", 100_000_000 : nat)' --identity dlg_u5 2>&1)
+assert_contains "§5 pre-upgrade deposit admitted" "$R" "ok"
+PEND0=$(u5_pend); USED0=$(u5_used)
+assert_eq "§5 write-ahead pending row SET before the upgrade (1.0 BTC)" "100000000" "${PEND0:-0}"
 icp deploy bridge --identity anonymous >/dev/null 2>&1
-AFTER=$(icp canister call bridge getSupportedAssets '()' --query --identity anonymous 2>&1)
-assert_eq "§5 bridge serves identically after an upgrade" "$BEFORE" "$AFTER"
+PEND1=$(u5_pend); USED1=$(u5_used)
+assert_eq "§5 pending row SURVIVES the upgrade (stable ledger intact)" "${PEND0:-x}" "${PEND1:-y}"
+assert_eq "§5 allowance charge survives, charged exactly once" "${USED0:-x}" "${USED1:-y}"
+# ledger continuity: the surface is not just readable, it still BOOKS —
+# 0.5 BTC at the $100 mark must move usedUsd by exactly $50.
+R=$(icp canister call bridge devSimulateDeposit '("BTC", 50_000_000 : nat)' --identity dlg_u5 2>&1)
+assert_contains "§5 post-upgrade deposit admitted (ledger still books)" "$R" "ok"
+USED2=$(u5_used)
+assert_eq "§5 post-upgrade charge is exactly the mark value (+\$50)" "$(( ${USED1:-0} + 5000000000 ))" "${USED2:-0}"
+# the parked rows then FINISH exactly-once through the confirm path — the
+# W3-04 lost-continuation recovery: nothing doubled, nothing stranded.
+# devConfirmDeposits confirms the CALLER's own parked rows (it iterates
+# ASSETS under msg.caller's key) — so the depositor drives it.
+call_bridge_confirm=$(icp canister call bridge devConfirmDeposits '()' --identity dlg_u5 2>&1)
+CONF=$(u5_conf); PEND2=$(u5_pend)
+assert_eq "§5 confirm finishes BOTH parked rows exactly-once (1.5 BTC)" "150000000" "${CONF:-0}"
+assert_eq "§5 nothing left parked after confirm" "0" "${PEND2:-x}"
 # A claim path that was never in flight behaves normally afterwards (the guard
 # is clear, so this is the "nothing to claim" answer, not "already in progress").
 R=$(icp canister call bridge claim '("ICP")' --identity dlg_u1 2>&1)

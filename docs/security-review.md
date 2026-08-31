@@ -163,4 +163,11 @@ The production gate and post-deploy verification are in
 `docs/pre-mainnet-checklist.md`; the deployment-posture kill-matrix in
 `docs/deployment-modes.md`.
 
+**Closing any security fix** follows the three W6-12 adjacency rules in
+`docs/tasks/README.md` ("Closing a task"): enumerate the adjacent cases (the
+one-unit neighbour, the sibling's boundary, the re-run mechanism grep);
+assert the specific series the fix moves, never an aggregating proxy; and
+cost any new helper on a hot path. Round 2 exists because five honest fixes
+skipped one of these.
+
 *Cross-refs: `[[amm-vault-deposit-economics]]`, `docs/price-deviation-explained.md`.*

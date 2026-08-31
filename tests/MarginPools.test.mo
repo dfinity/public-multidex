@@ -5,6 +5,7 @@
 // integers (no tolerance). Runs in moc's interpreter via `mops test`.
 
 import MP "../src/backend/lib/MarginPools";
+import Fixed "../src/backend/lib/Fixed";
 import Debug "mo:core/Debug";
 import Runtime "mo:core/Runtime";
 import Principal "mo:core/Principal";
@@ -89,22 +90,109 @@ eqN("notional abs", MP.notional(-300_000_000, 5_000_000_000), 15_000_000_000);
 eqN("usage: no debt = 0", MP.marginUsage(100_000_000_000, 0, 115_000_000), 0);
 // coll 1150, debt 1000, maint 1.15 → usage = 1.0 (at the line)
 eqN("usage at line", MP.marginUsage(115_000_000_000, 100_000_000_000, 115_000_000), 100_000_000);
+// W5-16 (#38.6): zero collateral with live debt = fully liquidatable (1.0),
+// via the EXPLICIT guard. Without it this is a divide-by-zero TRAP — and
+// marginUsage is reached from the heartbeat's synchronous leaderboard/margin
+// pass, where a trap is not one bad response but PERMANENT maintenance halt
+// until an upgrade (the W3-08 class). This fixture is what holds it in place.
+eqN("usage: zero collateral + debt = 1.0 (guard, not a heartbeat-halting trap)",
+  MP.marginUsage(0, 100_000_000_000, 115_000_000), 100_000_000);
 // coll 2300, debt 1000 → usage = 0.5 → 50% to liq
 eqN("usage half", MP.marginUsage(230_000_000_000, 100_000_000_000, 115_000_000), 50_000_000);
 
-// ── liquidation price ──
-// LONG: 2 BTC, ltv 0.85, debt $120k, no other coll, maint 1.15 →
-// P = (1.15*120000)/(2*0.85) = 138000/1.7 = 81176.47
-switch (MP.liqPriceLong(0, 12_000_000_000_000, 200_000_000, 85_000_000, 115_000_000)) {
-  case (?p) { nearN("liqPriceLong 81176.47", p, 8_117_647_058_824, 4) };
-  case null { Runtime.trap("FAIL: liqPriceLong returned null") };
+// ── liquidation price (debt-aware, per-leg — #15.4 + OhShii terms 2/3) ──
+// liqPrice(otherColl, otherDebt, heldBase, debtBase, ltv, maint); the health
+// identity these fixtures assert: evaluating getHealth's OWN equation at the
+// returned price lands exactly on the maintenance ratio (1.15).
+func healthAt(otherColl : Nat, otherDebt : Nat, held : Nat, borrowed : Nat, ltv : Nat, p : Nat) : Nat {
+  // Exactly getHealth's arithmetic: valuations' per-token contribUsd
+  // (bal×px DOWN, ×ltv DOWN), debtUsdTotal (principal×px UP), ratio DOWN.
+  let coll = otherColl + Fixed.mul(Fixed.mul(held, p, false), ltv, false);
+  let debt = otherDebt + Fixed.mul(borrowed, p, true);
+  if (debt == 0) { Runtime.trap("healthAt: no debt") };
+  Fixed.div(coll, debt, false);
 };
-// LONG already safe: cash margin $200k covers maint*debt → null
-truth("liqPriceLong null when safe", MP.liqPriceLong(20_000_000_000_000, 12_000_000_000_000, 200_000_000, 85_000_000, 115_000_000) == null);
-// SHORT: cash $100k, |size| 1 BTC, maint 1.15 → P = 100000/1.15 = 86956.52
-switch (MP.liqPriceShort(10_000_000_000_000, 100_000_000, 115_000_000)) {
-  case (?p) { nearN("liqPriceShort 86956.52", p, 8_695_652_173_913, 4) };
-  case null { Runtime.trap("FAIL: liqPriceShort returned null") };
+
+// Pure LONG (no base debt): 2 BTC held, ltv 0.85, quote debt $120k, no other
+// coll → P = (1.15·120000)/(2·0.85) = 81176.47 — unchanged from the
+// pre-#15.4 liqPriceLong (the debt-aware form reduces to it when debtBase=0).
+switch (MP.liqPrice(0, 12_000_000_000_000, 200_000_000, 0, 85_000_000, 115_000_000)) {
+  case (?p) {
+    nearN("liqPrice long 81176.47", p, 8_117_647_058_824, 4);
+    eqN("long identity: health at P == 1.15", healthAt(0, 12_000_000_000_000, 200_000_000, 0, 85_000_000, p), 115_000_000);
+  };
+  case null { Runtime.trap("FAIL: liqPrice long returned null") };
+};
+// LONG already safe: cash margin $200k covers maint·debt → null
+truth("liqPrice long null when safe", MP.liqPrice(20_000_000_000_000, 12_000_000_000_000, 200_000_000, 0, 85_000_000, 115_000_000) == null);
+// Pure SHORT (no residual base): cash $100k, 1 BTC borrowed →
+// P = 100000/1.15 = 86956.52 — unchanged from the pre-#15.4 liqPriceShort.
+switch (MP.liqPrice(10_000_000_000_000, 0, 0, 100_000_000, 85_000_000, 115_000_000)) {
+  case (?p) {
+    nearN("liqPrice short 86956.52", p, 8_695_652_173_913, 4);
+    eqN("short identity: health at P == 1.15", healthAt(10_000_000_000_000, 0, 0, 100_000_000, 85_000_000, p), 115_000_000);
+  };
+  case null { Runtime.trap("FAIL: liqPrice short returned null") };
+};
+
+// ── OhShii term 2: the reporter's table (#15 comment), verbatim ──
+// SOL ltv 0.85, maint 1.15, otherColl $1,000, otherDebt held at 0. The
+// pre-fix formula netted first — P = otherColl/(M·|borrowed−held|) — and
+// reported $124.2236 / $289.855 for rows 2/3, prices at which the pool's
+// health is 1.06 / 0.94 (row 3: INSOLVENT at the price the UI called its
+// liquidation price). The true crossings, pinned here exactly:
+//   row 1 (control, held 0): $86.9565 — old and new agree;
+//   row 2 (held 3, borrowed 10): $111.7318, not $124.2236;
+//   row 3 (held 7, borrowed 10): $180.180,  not $289.855.
+do {
+  let oc = 100_000_000_000; // $1,000
+  switch (MP.liqPrice(oc, 0, 0, 1_000_000_000, 85_000_000, 115_000_000)) {
+    case (?p) {
+      eqN("table row 1 (control): 86.9565", p, 8_695_652_173);
+      eqN("row 1 identity: health at P == 1.15", healthAt(oc, 0, 0, 1_000_000_000, 85_000_000, p), 115_000_000);
+    };
+    case null { Runtime.trap("FAIL: table row 1 null") };
+  };
+  switch (MP.liqPrice(oc, 0, 300_000_000, 1_000_000_000, 85_000_000, 115_000_000)) {
+    case (?p) {
+      eqN("table row 2: 111.7318 (old code said 124.2236)", p, 11_173_184_357);
+      eqN("row 2 identity: health at P == 1.15", healthAt(oc, 0, 300_000_000, 1_000_000_000, 85_000_000, p), 115_000_000);
+    };
+    case null { Runtime.trap("FAIL: table row 2 null") };
+  };
+  switch (MP.liqPrice(oc, 0, 700_000_000, 1_000_000_000, 85_000_000, 115_000_000)) {
+    case (?p) {
+      eqN("table row 3: 180.180 (old code said 289.855)", p, 18_018_018_018);
+      truth("row 3: the pre-fix number is gone", p != 28_985_507_246);
+      eqN("row 3 identity: health at P == 1.15", healthAt(oc, 0, 700_000_000, 1_000_000_000, 85_000_000, p), 115_000_000);
+    };
+    case null { Runtime.trap("FAIL: table row 3 null") };
+  };
+  // Term 1 (#15.4 proper): pool-wide OTHER debt now enters the short branch.
+  // Row-2 legs + otherDebt $200 → P = (1000 − 1.15·200)/(1.15·10 − 0.85·3)
+  // = 770/8.95 = $86.0335 (the debt-blind row-2 answer was $111.73).
+  switch (MP.liqPrice(oc, 20_000_000_000, 300_000_000, 1_000_000_000, 85_000_000, 115_000_000)) {
+    case (?p) {
+      eqN("term 1: other-market debt pulls the short crossing in (86.0335)", p, 8_603_351_955);
+      eqN("term 1 identity: health at P == 1.15", healthAt(oc, 20_000_000_000, 300_000_000, 1_000_000_000, 85_000_000, p), 115_000_000);
+    };
+    case null { Runtime.trap("FAIL: term 1 case null") };
+  };
+  // Direction follows the HEALTH SLOPE, not the net-size sign: net long
+  // (held 10 > borrowed 9) but held·ltv (8.5) < M·debtBase (10.35) → the
+  // crossing is ABOVE the entry region (short-like), P = 100/1.85 = $54.05.
+  switch (MP.liqPrice(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, 115_000_000)) {
+    case (?p) {
+      eqN("direction by slope: net-long pool liquidating on a RISING mark", p, 5_405_405_405);
+      eqN("slope-case identity: health at P == 1.15", healthAt(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, p), 115_000_000);
+    };
+    case null { Runtime.trap("FAIL: slope case null") };
+  };
+  // A = 0 (held·ltv == M·debtBase: 23·0.85 == 17·1.15): price-insensitive → null.
+  truth("liqPrice null when price-insensitive", MP.liqPrice(oc, 0, 2_300_000_000, 1_700_000_000, 85_000_000, 115_000_000) == null);
+  // Short-like with nothing price-independent left (otherColl ≤ M·otherDebt):
+  // liquidatable at EVERY price → 0, the at-or-below-mark display signal.
+  truth("liqPrice 0 when liquidatable at every price", MP.liqPrice(0, 10_000_000_000, 0, 300_000_000, 85_000_000, 115_000_000) == ?0);
 };
 
 // pctToLiq: mark 100000, liq 80000 → 20%
@@ -120,3 +208,30 @@ truth("poolPrincipal distinct ids", not Principal.equal(MP.poolPrincipal(1), MP.
 truth("poolPrincipal distinct large", not Principal.equal(MP.poolPrincipal(1), MP.poolPrincipal(4294967297)));
 
 Debug.print("── MarginPools.test: all passed ──");
+
+// ── W5-03: liquidation-price display direction, decided and pinned ──
+// LONG-like rounds UP (the mark FALLS toward its liq price — a displayed
+// price may never look farther away than reality); SHORT-like rounds DOWN
+// (the mark RISES toward it). Operands chosen so the final division does
+// NOT come out even: flipping the rounding flag at the call site flips the
+// exact value and turns this red. The liquidation DECISION is getHealth's
+// DOWN-rounded ratio, pinned in BorrowEngine.test.mo — these are display.
+// (Pinned across the #15.4 debt-aware rewrite: the same operand shapes,
+// expressed as liqPrice's per-leg inputs, produce the same pinned values.)
+Debug.print("── W5-03 liq-price direction ──");
+do {
+  // maintOtherDebt = ceil(1.15 × $100) = 11_500_000_000; num = 10_000_000_000;
+  // heldLtv = 3.0 × 1.0 = 300_000_000 → P = 10e9/3 = 3_333_333_333.33…
+  let long = MP.liqPrice(1_500_000_000, 10_000_000_000, 3_00_000_000, 0, 100_000_000, 115_000_000);
+  switch (long) {
+    case (?p) { eqN("liqPrice long-like rounds UP (3_333_333_334, conservative for a falling mark)", p, 3_333_333_334) };
+    case null { truth("liqPrice long-like returned a price", false) };
+  };
+  // maintDebtBase = ceil(3.0 × 1.15) = 345_000_000 → P = 10e9/3.45 = 2_898_550_724.63…
+  let shortP = MP.liqPrice(10_000_000_000, 0, 0, 3_00_000_000, 85_000_000, 115_000_000);
+  switch (shortP) {
+    case (?p) { eqN("liqPrice short-like rounds DOWN (2_898_550_724, conservative for a rising mark)", p, 2_898_550_724) };
+    case null { truth("liqPrice short-like returned a price", false) };
+  };
+};
+Debug.print("W5-03 direction pinned");

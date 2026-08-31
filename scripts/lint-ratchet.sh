@@ -41,9 +41,10 @@
 #                    (a changed surface without scripts/gen-did.sh = silent API
 #                    drift), and (b) when `didc` is installed, a SUBTYPE of the
 #                    origin/main merge-base's — the additive-only stability promise,
-#                    mechanically enforced instead of reviewed by eye. Without didc
-#                    the subtype half skips (install: `cargo install didc`, or a
-#                    release binary from github.com/dfinity/candid).
+#                    mechanically enforced instead of reviewed by eye. The check
+#                    runs via mops (already a hard requirement), didc as fallback;
+#                    with NEITHER available it FAILS — "could not check" is not
+#                    treated as "compatible".
 #   5. BADGE SYNC  — the backend badge catalog (getBadgeCatalog — the source of
 #                    truth) vs the frontend's BADGE_META shelf table and the docs
 #                    page: ids, icons, names, prose, and thresholds-quoted-in-prose
@@ -75,10 +76,53 @@ fi
 # Our hand-written backend — exclude vendored OQL. Glob the filesystem (NOT
 # `git ls-files`) so brand-new, not-yet-tracked files are gated too — that is
 # exactly the code most likely to introduce a regression.
-OUR_FILES=$(find src/backend -name '*.mo' -not -path 'src/backend/oql/*' | sort)
+# src/bridge and src/arb are OURS too (W5-18, #36.2): the ratchet's input set
+# and its path filter both said src/backend, so a bridge/arb regression was a
+# verified no-op — moc reported the sites and the filter dropped them.
+OUR_FILES=$(find src/backend src/bridge src/arb -name '*.mo' -not -path 'src/backend/oql/*' | sort)
 # Every tests/*.mo — the `mops test` suite. Same reason to glob the filesystem.
 TEST_FILES=$(find tests -name '*.mo' 2>/dev/null | sort)
 fail=0
+
+# ── 0. TOOLCHAIN INTEGRITY ─────────────────────────────────────────────
+# .gitignore de-vendored .mops/ (286 tracked files) on the claim that
+# mops.lock's per-file SHA-256s make integrity "verified rather than
+# vendored" — but every build path (mops sources/test/build, the recipe)
+# resolves with the check disabled, so THIS is the one place the hashes
+# are actually enforced (OhShii #40.1). `--lock check` re-hashes the
+# installed .mops/ tree against the lockfile.
+if mops install --lock check >/dev/null 2>&1; then
+  echo "✓ toolchain: .mops/ tree matches mops.lock (per-file SHA-256)"
+else
+  echo "✗ toolchain: mops.lock integrity check FAILED — a file under .mops/ does not" >&2
+  echo "  match its pinned SHA-256 (or the lock is stale). The .gitignore de-vendoring" >&2
+  echo "  rests on this check. Diagnose with: mops install --lock check" >&2
+  fail=1
+fi
+# The two build tools the lockfile structurally CANNOT pin: the mops CLI
+# itself (whose defaults decide whether integrity is checked anywhere
+# else) and ic-wasm (the @dfinity/motoko recipe runs two metadata passes
+# over mops build's output — the installed wasm is ic-wasm's output, not
+# moc's). Pinned here; README prerequisites name the same versions.
+MOPS_CLI_PIN="2.19.2"
+IC_WASM_PIN="0.11.0"
+MOPS_CLI_V=$(mops --version 2>/dev/null | grep -oE 'CLI [0-9.]+' | grep -oE '[0-9.]+')
+if [ "${MOPS_CLI_V:-}" = "$MOPS_CLI_PIN" ]; then
+  echo "✓ toolchain: mops CLI $MOPS_CLI_PIN"
+else
+  echo "✗ toolchain: mops CLI is '${MOPS_CLI_V:-absent}', pinned $MOPS_CLI_PIN — update the" >&2
+  echo "  pin here and in README prerequisites together, reviewing its resolver defaults." >&2
+  fail=1
+fi
+IC_WASM_V=$(ic-wasm --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [ "${IC_WASM_V:-}" = "$IC_WASM_PIN" ]; then
+  echo "✓ toolchain: ic-wasm $IC_WASM_PIN"
+else
+  echo "✗ toolchain: ic-wasm is '${IC_WASM_V:-absent}', pinned $IC_WASM_PIN — it REWRITES the" >&2
+  echo "  built wasm (metadata passes), so its version is part of the build. Update the pin" >&2
+  echo "  here and in README prerequisites together." >&2
+  fail=1
+fi
 
 # The project's REAL build flags — keep in sync with mops.toml
 # [canisters.backend].args. (The candid step below already passed these; the
@@ -94,17 +138,22 @@ MOC_FLAGS=(--default-persistent-actors --implicit-package=core)
 # GATE ON THE EXIT CODE, never on a text pattern: moc --check exits 0 when
 # there are only warnings and non-zero when there is any error, which is
 # precisely the question being asked. Warnings are surfaced as info.
-TYPE_OUT=$("$MOC" $SRCS "${MOC_FLAGS[@]}" --check src/backend/main.mo 2>&1)
-TYPE_RC=$?
-if [ "$TYPE_RC" -ne 0 ]; then
-  echo "✗ type-check FAILED — src/backend/main.mo (moc --check exit $TYPE_RC):" >&2
-  printf '%s\n' "$TYPE_OUT" | grep -E 'error \[M' | head -20 >&2
-  fail=1
-else
-  WARN_N=$(printf '%s\n' "$TYPE_OUT" | grep -E ': warning \[M' | grep -v 'M0155' \
-           | grep -oE 'src/backend/[^:]+:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
-  echo "✓ type-check: src/backend ok (${WARN_N} non-M0155 moc warning(s) — run 'mops check' to see them)"
-fi
+# All four program ROOTS (W5-18): src/arb and src/bridge were never compiled
+# by this hook — a syntax error there pushed green while the deploy path
+# failed on it. Each root pulls in its own import closure.
+for ROOT_MO in src/backend/main.mo src/backend/ArchiveCanister.mo src/bridge/main.mo src/arb/main.mo; do
+  TYPE_OUT=$("$MOC" $SRCS "${MOC_FLAGS[@]}" --check "$ROOT_MO" 2>&1)
+  TYPE_RC=$?
+  if [ "$TYPE_RC" -ne 0 ]; then
+    echo "✗ type-check FAILED — $ROOT_MO (moc --check exit $TYPE_RC):" >&2
+    printf '%s\n' "$TYPE_OUT" | grep -E 'error \[M' | head -20 >&2
+    fail=1
+  else
+    WARN_N=$(printf '%s\n' "$TYPE_OUT" | grep -E ': warning \[M' | grep -v 'M0155' \
+             | grep -oE 'src/[^:]+:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
+    echo "✓ type-check: $ROOT_MO ok (${WARN_N} non-M0155 moc warning(s))"
+  fi
+done
 
 # 1b) Type-check every tests/*.mo, ONE FILE AT A TIME.
 #
@@ -157,7 +206,7 @@ fi
 # analysis, so this "hard zero gate" was reporting 0 because it was analysing
 # nothing. Adding the flags is what makes the count real.
 M0155_N=$(for f in $OUR_FILES; do "$MOC" $SRCS "${MOC_FLAGS[@]}" --check "$f" 2>&1 | grep 'M0155'; done \
-          | grep -oE 'src/backend/[^:]+\.mo:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
+          | grep -oE 'src/(backend|bridge|arb)/[^:]+\.mo:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
 if [ "$M0155_N" -gt "$M0155_BASELINE" ]; then
   echo "✗ M0155 (Nat-subtraction may-trap): $M0155_N > baseline $M0155_BASELINE — a new" >&2
   echo "  unguarded subtraction was added. Use SafeMath.subOrZero(a, b) for a defensive" >&2
@@ -205,12 +254,32 @@ if [ "$fail" -eq 0 ]; then
       fi | head -1 | grep -oE '[0-9]+$'
     }
     BASE_REF=$(git merge-base HEAD origin/main 2>/dev/null || true)
-    NEW_MAJOR=$(api_major_of "")
+    # The NEW side reads HEAD, not the working tree: the design above says the
+    # hatch is "a visible, reviewable, COMMITTED act", and a working-tree read
+    # let it open from an unstaged edit — what reached origin/main was the
+    # breaking change with no declaration anywhere in history (OhShii #37.6).
+    NEW_MAJOR=$(api_major_of "HEAD")
+    WT_MAJOR=$(api_major_of "")
     BASE_MAJOR=$(api_major_of "$BASE_REF")
-    if [ -n "$NEW_MAJOR" ] && [ -n "$BASE_MAJOR" ] && [ "$NEW_MAJOR" != "$BASE_MAJOR" ]; then
+    if [ -n "$WT_MAJOR" ] && [ "$WT_MAJOR" != "${NEW_MAJOR:-}" ]; then
+      echo "  note: working tree sets MM_API_VERSION major to $WT_MAJOR but HEAD has '${NEW_MAJOR:-none}'."
+      echo "  The hatch reads the COMMITTED value — commit the bump to take it."
+    fi
+    if [ -n "$BASE_REF" ] && { [ -z "$NEW_MAJOR" ] || [ -z "$BASE_MAJOR" ]; }; then
+      # Digits-or-empty by construction (the grep), so empty here means the
+      # constant is missing/malformed at that ref. The policy hinges on this
+      # value — refuse loudly instead of falling through to look compatible.
+      echo "✗ candid: MM_API_VERSION major unreadable (HEAD=${NEW_MAJOR:-none} base=${BASE_MAJOR:-none}) —" >&2
+      echo "  expected MM_API_VERSION : Text = \"N.…\" in src/backend/main.mo at both refs." >&2
+      fail=1
+    elif [ -n "$NEW_MAJOR" ] && [ -n "$BASE_MAJOR" ] && [ "$NEW_MAJOR" -gt "$BASE_MAJOR" ]; then
       echo "✓ candid: apiVersion major $BASE_MAJOR → $NEW_MAJOR — breaking changes ALLOWED;"
       echo "  subtype gate skipped by declaration. Record it under 'Major bumps so far'"
       echo "  in candid/README.md if you have not already."
+    elif [ -n "$NEW_MAJOR" ] && [ -n "$BASE_MAJOR" ] && [ "$NEW_MAJOR" -lt "$BASE_MAJOR" ]; then
+      echo "✗ candid: apiVersion major DOWNGRADED $BASE_MAJOR → $NEW_MAJOR — a downgrade does" >&2
+      echo "  not open the hatch, and is itself an anomaly (majors are monotonic)." >&2
+      fail=1
     elif [ -n "$BASE_REF" ] \
        && git show "$BASE_REF:candid/backend.did" 2>/dev/null \
           | tail -n +$((MDX_CANDID_HEADER_LINES + 1)) > "$DID_TMP/base.did" \

@@ -132,15 +132,61 @@ MDX_IDENTITY=""
 #             restart (launchd KeepAlive) would be refused and production bots
 #             would stay down until someone noticed the file. That is
 #             mdx_assert_runtime_posture_for_target.
+# The ONE reader of the source literal. Everything that wants the working
+# tree's posture — this file's deploy gate, deploy.sh, cold_start.sh,
+# play_start.sh, test_deploy_hygiene.sh — resolves it HERE. Four sites used
+# to hand-roll this grep in three spellings, and none stripped comments: a
+# commented decoy above the real declaration defeated all four at once
+# (W1-02), and the spelling without head -1 turned TWO matches into a
+# two-line string that equals neither "dev" nor "play" — ambiguity silently
+# read as safety.
+#
+# So: // comments are stripped first, and any match count other than
+# EXACTLY 1 is refused — never "take the first". Block-comment decoys are
+# deliberately NOT stripped: they leave the count above 1 and land in the
+# same refusal (fail-closed beats a cleverer parser here).
+#
+# Prints the bare posture word to stdout. On refusal: diagnostic to stderr,
+# NOTHING to stdout, return 1 — it never exits, so it is safe inside $()
+# (see NOTE ON SHAPE above); the CALLER must treat empty output as fatal in
+# its own shell.
+mdx_posture_of() {
+  local file="$1" matches n
+  matches=$(sed 's|//.*||' "$file" 2>/dev/null \
+    | grep -oE 'transient let DEPLOY_MODE : DeployMode = #[a-z]+' \
+    | grep -oE '#[a-z]+$' | tr -d '#' || true)
+  n=$(printf '%s' "$matches" | grep -c . || true)
+  if [ "$n" -ne 1 ]; then
+    printf '\033[0;31m✗\033[0m DEPLOY_MODE in %s: need exactly 1 uncommented declaration, found %s%s\n' \
+      "$file" "$n" "${matches:+ (matches: $(echo $matches))}" >&2
+    return 1
+  fi
+  printf '%s\n' "$matches"
+}
+
 mdx_assert_posture_for_target() {
   local target="$1"
-  MDX_POSTURE=$(grep -oE 'transient let DEPLOY_MODE : DeployMode = #[a-z]+' "$MDX_ROOT/src/backend/main.mo" \
-         | grep -oE '#[a-z]+$' | tr -d '#')
-  [ -n "$MDX_POSTURE" ] || mdx_die "could not read DEPLOY_MODE from src/backend/main.mo"
+  MDX_POSTURE=$(mdx_posture_of "$MDX_ROOT/src/backend/main.mo" || true)
+  [ -n "$MDX_POSTURE" ] || mdx_die "could not resolve DEPLOY_MODE from src/backend/main.mo (diagnostic above)"
   if mdx_is_remote "$target" && [ "$MDX_POSTURE" = "dev" ]; then
     mdx_die "refusing to touch '$target' with a #dev build — DEPLOY_MODE = #dev in src/backend/main.mo.
    #dev arms the open faucet and the price/scorecard hooks; on a public venue that is a
    leaderboard-rigging surface. Set it back to #play and rebuild."
+  fi
+  # W3-09: the Bridge carries its OWN posture literal, and the deploy path
+  # never read it — only the test suite asserted the one-directional rule
+  # (test_deploy_hygiene §7): the Bridge must never be MORE PERMISSIVE than
+  # the DEX it credits. A #production DEX beside a #play/#dev Bridge leaves
+  # the stub's unbacked-credit dev hooks answering against a value-bearing
+  # venue, and nothing on the deploy path would have said a word.
+  if mdx_is_remote "$target" && [ "$MDX_POSTURE" = "production" ]; then
+    local bridge_posture
+    bridge_posture=$(mdx_posture_of "$MDX_ROOT/src/bridge/main.mo" || true)
+    if [ "$bridge_posture" != "production" ]; then
+      mdx_die "refusing '$target': the DEX is #production but the Bridge resolves to '#${bridge_posture:-unresolved}'.
+   The stub Bridge's unbacked-credit hooks (devSimulateDeposit/devConfirmDeposits) must not answer
+   against a value-bearing DEX — deploy the real chain-key Bridge on #production first."
+    fi
   fi
 }
 
@@ -181,5 +227,50 @@ mdx_kill_tree() {
   sleep 2
   for p in $(mdx_descendants "$root") "$root"; do
     kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+  done
+}
+
+# ── Local gateway / stray-master resolution (W1-06) ────────────────
+# The local network's "legitimate owner" used to be WHOEVER LISTENS ON TCP
+# 8000, hand-rolled in three scripts. That is only true for the canonical
+# checkout: the worktree-parallel workflow (fresh ICP_HOME, random gateway
+# port) gives each checkout its own port, so the 8000 test made cold_start
+# kill a worktree's own healthy master and play_start/deploy misclassify
+# it. Resolve the owner from the CLI's OWN record instead: `icp network
+# status` honours the ambient ICP_HOME and the project rooted at the cwd —
+# the SAME resolution `icp network stop`/`start` use, which is what makes
+# the reap and the stop provably the same scope.
+#
+# Prints "PID PORT" for this checkout's gateway owner; prints nothing when
+# no running network is recorded or nothing listens on the recorded port —
+# and a live master with a dead gateway is exactly the zombie the callers
+# are hunting. (`|| true` on both probes: lsof/status exit non-zero when
+# they find nothing, and pipefail + a caller's -e would turn that into a
+# silent abort mid-function.)
+mdx_local_gateway() {
+  local url port pid
+  url=$(icp network status 2>/dev/null | sed -n 's/^Api Url: //p' | head -1 || true)
+  port=$(printf '%s' "$url" | sed -n 's|.*:\([0-9][0-9]*\)/*$|\1|p' || true)
+  [ -n "$port" ] || return 0
+  pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+  [ -n "$pid" ] || return 0
+  printf '%s %s\n' "$pid" "$port"
+}
+
+# Every pocket-ic master ROOTED AT THIS CHECKOUT that is not the gateway
+# owner — the callers' definition of a zombie. Detection only; never kills.
+# The pgrep here is ENUMERATION (the one tolerated spelling, exempted for
+# THIS FILE alone in test_deploy_hygiene §3); selection is the cwd filter —
+# another project's healthy replica is not our zombie (the 2026-07-29
+# open-saas lesson; a dozen foreign masters is a NORMAL machine state) —
+# plus the owner test above.
+mdx_stray_masters() {
+  local owner repo pid pcwd
+  owner=$(mdx_local_gateway || true); owner=${owner%% *}
+  repo=$(pwd -P)
+  for pid in $(pgrep -f "pocket-ic --ttl" 2>/dev/null || true); do
+    pcwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)
+    [ "$pcwd" = "$repo" ] || continue
+    [ "$pid" = "${owner:-}" ] || echo "$pid"
   done
 }

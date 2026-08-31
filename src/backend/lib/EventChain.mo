@@ -102,6 +102,8 @@ module {
       case (#debtDelta(d)) { putT(buf, "debtDelta"); putT(buf, d.token); putI(buf, d.amount) };
       case (#lpShareDelta(d)) { putT(buf, "lpShareDelta"); putT(buf, d.marketId); putI(buf, d.amount) };
       case (#insShareDelta(d)) { putT(buf, "insShareDelta"); putI(buf, d.amount) };
+      case (#gap(g)) { putT(buf, "gap"); putN(buf, g.fromSeq); putN(buf, g.toSeq) };
+      case (#config(c)) { putT(buf, "config"); putT(buf, c.setter); putT(buf, c.value) };
     };
     Blob.fromArray(List.toArray(buf));
   };

@@ -118,9 +118,18 @@ install, state preserved, seeding self-skips because the pools exist. The skelet
 manual reference for what the script does; the domain (§3.5), the topup cron (§1) and the bots
 (§3.6) remain manual steps.
 
+**After any update that WIDENS the tape's event kinds** (e.g. W2-04's `#gap`): run
+`adminUpgradeArchives` (controller) right after the backend leg, so the ACTIVE archive's
+`appendBatch` accepts the new variant before the first such event ships. Skipping it is
+self-healing but noisy — the ship fails candid decode, the failure streak trips, and the L1 roll
+seals the old archive and spawns a fresh one (new wasm) on its own. Sealed archives never receive
+new events and can be upgraded at leisure.
+
 ```sh
-# 1. Build
-mops install && icp build
+# 1. Build. gen-did.sh first: mops.toml declares src/backend/backend.did
+#    as a compat-check INPUT and it is gitignored — a clean checkout does
+#    not build without generating it.
+mops install && bash scripts/gen-did.sh && icp build
 
 # 2. Create + install on the dedicated subnet from the funded wallet.
 #    (Create with a big cycle endowment; --subnet pins placement.)
@@ -138,8 +147,12 @@ icp canister call bridge  setDex    "(principal \"<backend-id>\")" ...
 #     apply to an existing canister on redeploy — use settings update):
 icp canister settings update backend -e subnet --identity <wallet> \
   --add-environment-variable "trusted_attribute_signers=rdmx6-jaaaa-aaaaa-aaadq-cai" \
-  --add-environment-variable "frontend_origins=https://<frontend-id>.icp0.io,https://<PLACEHOLDER-domain>"
+  --add-environment-variable "frontend_origins=https://<frontend-id>.icp.net,https://<frontend-id>.icp0.io,https://<PLACEHOLDER-domain>"
 #   EVERY origin the app is served from must be listed, or Verify-with-Google
+#   fails closed there. Keep this list in lockstep with II_PINNED_ORIGINS in
+#   src/frontend/src/main.js (the II derivation list) — the canonical icp.net
+#   origin was missing from this template while being the app's PRIMARY origin
+#   (W6-03 question B: verification would fail closed exactly there).
 #   fails closed with #FrontendOriginMismatch (the error names the expected list).
 
 # 3c. AI key (can be done or ROTATED post-launch, any time — see scripts/set_ai_key.sh):

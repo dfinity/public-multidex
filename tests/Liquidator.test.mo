@@ -106,6 +106,34 @@ switch (LQ.tryLiquidate(ist, img, iacc, noReserved, alice, vault, 1, px)) {
 // 1-base-unit interest accrued between the borrow and the liquidation instant).
 truth("insolvent: debt not repaid (left standing for the insurance fund)", BE.loanOf(ist, alice, QUOTE) >= debtBeforeIns);
 
+// ── #insolvent with a SEIZING pass: the penalty is REAL on the insolvent path ──
+// classifySeizingPass returns #insolvent when the pass DID seize but the user is
+// still liquidatable with nothing seizable left — and every seize keeps the 5%
+// penalty in the vault, so penaltyUsd = proceedsUsd − debtRepaidUsd > 0. main.mo
+// answers this event with accrueInsurancePenalty + absorbBadDebt (issue #48.2:
+// the accrual used to be skipped, so the fund paid the shortfall while its
+// earned penalty stayed with LPs). This pins the Liquidator half: a non-zero,
+// exactly-derived penaltyUsd rides the #insolvent event.
+let (pst, pmg, pacc) = liquidatableAlice();
+Accounts.setBalance(pacc, alice, QUOTE, 0); // only the 1 BTC remains seizable
+let hPen = BE.getHealth(pst, pmg, pacc, noReserved, alice, pxCrash);
+truth("seizing-insolvent setup: liquidatable at BTC=5k", hPen.isLiquidatable);
+truth("seizing-insolvent setup: collateral value < debt", hPen.collateralUsd < hPen.debtUsd);
+switch (LQ.tryLiquidate(pst, pmg, pacc, noReserved, alice, vault, 1, pxCrash)) {
+  case (#insolvent(ev)) {
+    truth("seizing-insolvent: the pass DID seize (debt repaid > 0)", ev.debtRepaidUsd > 0);
+    truth("seizing-insolvent: penaltyUsd is non-zero", ev.penaltyUsd > 0);
+    eqN("seizing-insolvent: penaltyUsd = proceedsUsd − debtRepaidUsd",
+        ev.penaltyUsd, ev.proceedsUsd - ev.debtRepaidUsd);
+    Debug.print("  ✓ seizing pass → #insolvent with a real penalty (penaltyUsd = " # debug_show ev.penaltyUsd # ")");
+  };
+  case (#liquidated(_)) { Runtime.trap("FAIL: 1 BTC @5k cannot cover 40k debt — expected #insolvent") };
+  case (#healthy) { Runtime.trap("FAIL: reported healthy despite 40k debt against 5k collateral") };
+  case (#err(e)) { Runtime.trap("FAIL: seizing-insolvent errored: " # e) };
+};
+// The seized BTC (repaid + penalty worth) is retained by the vault.
+eqN("seizing-insolvent: all BTC seized from alice", Accounts.getBalance(pacc, alice, "BTC"), 0);
+
 // ── Internal netting: long (holds BTC, owes ICPUSD) ↔ short (holds ICPUSD, owes BTC) ──
 let nst = BE.emptyState(); let nmg = ME.emptyState(); let nacc = Accounts.emptyState();
 Accounts.setBalance(nacc, vault, QUOTE, 100_000_000_000_000);
