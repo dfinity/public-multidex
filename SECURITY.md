@@ -2,23 +2,29 @@
 
 ## Reporting a vulnerability
 
-Please report vulnerabilities **privately** via GitHub's private vulnerability
-reporting on the public repository: **Security → Report a vulnerability**
-(https://github.com/dfinity/public-multidex/security/advisories/new).
+Default to a **public issue** on this repository. Use the private channel ONLY
+for findings easily exploitable against end users before a fix exists (working
+exploits on sign-in/delegation/custody flows, or de-anonymisation of a specific
+person) — file those via GitHub's private vulnerability reporting: **Security →
+Report a vulnerability**
+(https://github.com/dfinity/public-multidex/security/advisories/new). We mirror
+advisories into the public tracker once the fix ships, keeping the GHSA id so
+the cross-reference graph survives. This is the `#play`-era policy; it will be
+revised before the venue transitions to `#production`.
 
-If that is unavailable to you for any reason, email **multidex@dfinity.org**
-instead. Either channel is private; use whichever you can reach.
+If the private channel is unavailable to you for any reason, email
+**multidex@dfinity.org** instead.
 
-> This link previously pointed at `dfinity/multidex`, which is a **private**
-> repository — so it 404'd for every external reporter, and there was no working
-> private channel at all. Two independent review teams hit that wall in August
-> 2026 and published in the open rather than sit on their findings; one withheld
-> a user-targeting exploit for want of somewhere to send it. If a link here ever
-> 404s for you, that is a bug in this file — mail the address above and say so.
+> The private-reporting link previously pointed at `dfinity/multidex`, which is
+> a **private** repository — so it 404'd for every external reporter, and there
+> was no working private channel at all. Two independent review teams hit that
+> wall in August 2026 and published in the open rather than sit on their
+> findings; one withheld a user-targeting exploit for want of somewhere to send
+> it. If a link here ever 404s for you, that is a bug in this file — mail the
+> address above and say so.
 
-Please do **not** open public issues or pull requests for security problems, and
-do not test against deployments you do not operate beyond what is needed to
-demonstrate the issue.
+Please do not test against deployments you do not operate beyond what is needed
+to demonstrate the issue.
 
 A useful report includes: the affected surface (canister method, page, script),
 steps to reproduce, the impact you believe it has (funds, privacy, availability),
