@@ -1527,16 +1527,37 @@ persistent actor Uplands {
       bumpUserVersion(pm.makerPrincipal);
       return;
     };
+    // Fees first, so a fee >= debit can fail closed BEFORE any credit: both
+    // reservations were consumed above, so refunding both legs in full is the
+    // only conservation-exact outcome (crediting 0 would destroy the reserved
+    // value). Same drop-and-log handling as the desync path below.
+    let makerFee = if (pm.takerDebitToken == Types.QUOTE_TOKEN) {
+      quoteFeeFor(pm.makerPrincipal, pm.takerDebitAmount, #makerCredit)
+    } else { 0 };
+    let takerFee = if (pm.makerDebitToken == Types.QUOTE_TOKEN) {
+      quoteFeeFor(pm.takerPrincipal, pm.makerDebitAmount, #takerCredit)
+    } else { 0 };
+    if (makerFee > pm.takerDebitAmount or takerFee > pm.makerDebitAmount) {
+      Accounts.addBalance(accounts, pm.takerPrincipal, pm.takerDebitToken, pm.takerDebitAmount);
+      Accounts.addBalance(accounts, pm.makerPrincipal, pm.makerDebitToken, pm.makerDebitAmount);
+      subPendingQty(pm.makerOrderId, pm.quantity);
+      removePendingIndex(pm);
+      logEventF("warn", "settle", ?"pendingMatch", ?Principal.toText(pm.takerPrincipal),
+        "fee exceeded debit on finalise — pending match " # Nat.toText(pm.id)
+        # " dropped fail-closed (makerFee=" # Nat.toText(makerFee)
+        # ", takerFee=" # Nat.toText(takerFee) # ")", null);
+      bumpUserVersion(pm.takerPrincipal);
+      bumpUserVersion(pm.makerPrincipal);
+      return;
+    };
     let makerCredit : Nat = if (pm.takerDebitToken == Types.QUOTE_TOKEN) {
-      let fee = quoteFeeFor(pm.makerPrincipal, pm.takerDebitAmount, #makerCredit);
-      creditTreasury(fee);
-      pm.takerDebitAmount - fee
+      creditTreasury(makerFee);
+      pm.takerDebitAmount - makerFee
     } else { pm.takerDebitAmount };
     Accounts.addBalance(accounts, pm.makerPrincipal, pm.takerDebitToken, makerCredit);
     let takerCredit : Nat = if (pm.makerDebitToken == Types.QUOTE_TOKEN) {
-      let fee = quoteFeeFor(pm.takerPrincipal, pm.makerDebitAmount, #takerCredit);
-      creditTreasury(fee);
-      pm.makerDebitAmount - fee
+      creditTreasury(takerFee);
+      pm.makerDebitAmount - takerFee
     } else { pm.makerDebitAmount };
     Accounts.addBalance(accounts, pm.takerPrincipal, pm.makerDebitToken, takerCredit);
     // Release the maker's pending-qty lock and mark the fill on the maker.
