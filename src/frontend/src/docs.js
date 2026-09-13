@@ -1612,7 +1612,7 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         <li><b>Trust the DFINITY MCP server.</b> Open
         <a href="https://id.ai/manage/settings" target="_blank" rel="noopener noreferrer">id.ai/manage/settings</a>
         and add the following as a "Trusted MCP server":
-        <code>https://mcp.beta.id.ai/mcp-prod</code></li>
+        <code>https://mcp.beta.id.ai/mcp</code></li>
 
         <li><b>Add the same URL to your AI platform.</b>
           <ul>
