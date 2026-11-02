@@ -19,6 +19,10 @@ sim behaviour while `DEPLOY_MODE = #dev`.
 - [x] **C1 audit — `seedAmmPool`** confirmed *not* a mint vector: `requireAuth`
       + transfers the caller's own pre-existing, balance-checked funds into the
       vault. Its remaining issue is C2 (no initial-margin gate) — see blockers.
+      *Since apiVersion 6.0.0 (2026-09-07, task 1788731608) it is
+      **controller-only** — the one immediate mint door, kept for the seed
+      scripts; every other LP deposit is a sealed `depositLp` request that
+      settles at a post-request mark (`candid/README.md`, "Major bumps so far").*
 - [x] **H3a — `IS_PRODUCTION` marked `transient`** (`src/backend/main.mo`).
       A plain `let` in a `persistent actor` is implicitly stable, so flipping
       the literal + `--mode upgrade` would have silently kept the OLD `false`.
@@ -179,7 +183,11 @@ sim behaviour while `DEPLOY_MODE = #dev`.
       frozen pre-jump price. Held legs only, so first-seeding a market (whose
       own breaker trips for a tick) is unaffected. Withdrawals need no gate —
       `withdrawLp` redeems a pro-rata basket in kind (price-neutral by
-      construction). Lock-in: `tests/test_margin_collateral_escape.sh` §3
+      construction). *Superseded: since 2026-09-03 `withdrawLp` redeems at
+      NAV (price-sensitive), and since apiVersion 6.0.0 (2026-09-07) both LP
+      doors are sealed — a request settles only at a mark fetched after it,
+      never under a pend, with `vaultWithdrawPaused` as the settlement belt
+      (`docs/amm-vault-design.md` §5).* Lock-in: `tests/test_margin_collateral_escape.sh` §3
       (recreated pool-era escape test; dev hook `setTestPendingJump` makes
       the pend deterministic).
 - [x] **M3 — source floor on EVERY price-accept path — FIXED 2026-07-03**
@@ -218,6 +226,41 @@ sim behaviour while `DEPLOY_MODE = #dev`.
       (`chainStartSeq` 0) — ship the chain code before mainnet so no
       unverifiable prefix ever exists; smoke with `getCertifiedHead()` +
       `verifyChain(0, 10000)` on the archive after launch.
+      **The chain origin is 0 in EVERY epoch, season resets included**
+      (#55.1, 2026-09-03 — the reporter could not tell from the public
+      surface): `nextEventSeq` starts at 0 on first deploy, and
+      `performWorldWipe` (main.mo) sets it back to 0 and clears
+      `_chainHead`/`_chainStartSeq` at every boundary, so `resetSeason`
+      restarts the live chain at seq 0 with a null-`prevHash` genesis event
+      (the first `emitEventRaw` of the new season re-anchors at 0). The
+      closed season's segments are SEALED, detached from `getArchives`
+      (the routing table serves the current season only), and recorded
+      once in `getSeasonRecords()` — archive canister ids, the certified
+      `chainHead` at the boundary, and `finalEventSeq` where that tape
+      ended; those canisters stay queryable via `getEventsRange` /
+      `verifyChain` forever, and the closed season's own routing table
+      (per-segment `firstSeq`/`lastSeq`, the same row shape as
+      `getArchives`) is exported by `getSeasonArchives(N)` (1788468754),
+      so the sealed chain is walkable in PRACTICE, not only per canister:
+      `scripts/verify_ledger.mjs --season N` (page twin: `opts.season`)
+      routes by that table, pins the origin at 0, validates each sealed
+      segment's certificate as in `--full`, and additionally requires the
+      walked head to equal the record's `chainHead` with the tape ending
+      at `finalEventSeq - 1` — a second out-of-band anchor for the sealed
+      chain (gate: `test_verify_ledger_gate.sh` `sealed-season`; live:
+      `test_season_seal.sh` §4). The boundary also preserves the closed
+      season's gap tuples and shed re-baselines (`getSeasonGaps(N)` /
+      `getSeasonShedBaselines(N)`, 1788474114), so `--season N --fold`
+      resets at the season's own sheds (gate: `season-shed`; live:
+      `test_archive_failover.sh` §I). `_chainStartSeq` itself is exported nowhere
+      and each archive's `chainStartSeq` is its OWN per-canister anchor
+      (uncertified — only the head hash is in `certified_data`), never the
+      chain's. Consequently both verifiers (`scripts/verify_ledger.mjs`,
+      `src/frontend/src/ledger.js`) default the full-walk origin to 0 and
+      read it from nothing the host answers; `--expect-start` /
+      `opts.expectStart` is the out-of-band override, needed only on a dev
+      venue whose tape predates the chain code. Gate:
+      `tests/test_verify_ledger_gate.sh` (`consistent-liar`).
 - [x] **Fixed-point ledger (L4) — DONE 2026-06-28**: full Float→Nat/Int @10^8
       migration (backend + frontend boundary + seeds/tests), rounding always
       against the user / toward solvency, reconciliation exact.
@@ -226,7 +269,8 @@ sim behaviour while `DEPLOY_MODE = #dev`.
       `settleNettedPair`, booked through `bookPoolSide` at mid); isolated-pool
       guard covers PENDING entries; `openPosition` unwinds its borrow when
       staging fails (test: `tests/test_borrow_unwind.sh`);
-      `finalise`/`voidPendingMatch` fail CLOSED on reservation desync;
+      the PendingMatch path (with its fail-closed desync guards) was retired
+      2026-09-06 (task 1788516198 — dormant under sealing, inert Candid stubs);
       cross-swap leg 2 spends AVAILABLE balance; FOK-expiry + episodeAcc
       leaks plugged. No known open financial-accounting bugs remain from the
       June reviews — the open surface is oracle-integrity (M1 residual + M3

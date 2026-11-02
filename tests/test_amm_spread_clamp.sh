@@ -20,12 +20,16 @@
 # State-light on a seeded #dev venue: uses whatever pool exists, restores the
 # pend to empty. Needs #dev (setTestPendingJump, requoteAmm, setAmmRefPrice).
 set -u
+# The checked-in Candid contract for every backend call (--candid; the belt
+# tests/_lib.sh gives its call() — this suite is standalone, so it names the
+# file itself; task 1788512331).
+MDX_CANDID="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/candid/backend.did"
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 
 MKT=$(adm getAmmPools '()' --query | grep -o 'marketId = "[^"]*"' | head -1 | cut -d'"' -f2)

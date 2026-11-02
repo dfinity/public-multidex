@@ -5,7 +5,7 @@
 # running, populated exchange. The DEFAULT is the repo's canonical
 # deployment: posture #play — deploy, then hand seeding to
 # scripts/play_start.sh, which reinstalls backend+bridge fresh and seeds
-# the $1M AMM vault, the $50k insurance fund, price history, a maker
+# the $5,125,000 (AMM_TVL_TOTAL) AMM vault, the $144k (INSURANCE_USD) insurance fund, price history, a maker
 # ladder, and the sim bots. Replaces the old manual sequence:
 #   icp network start && icp deploy && bash scripts/seed_exchange.sh \
 #     && <manual AMM setup> && bash scripts/simulate_trading.sh
@@ -29,15 +29,19 @@
 #                                     (2 traders, 1 market, known book).
 #                          amm        AMM fixture (seeded pool, oracle
 #                                     price set, quoting enabled).
-#                          pending    Pending-match fixture (1 protected
-#                                     maker on the book, ready for a
-#                                     taker to cross).
+#                          staged     Staged-order fixture (alice's sealed
+#                                     BUY staged on BTC-ICPUSD, bob funded
+#                                     to sell; the settlement, cancel-refund,
+#                                     zombie and GEPTOR-inflight suites
+#                                     build on it).
 #                          load       Load-test fixture (N bulk-seeded
 #                                     principals, sparse book, no AMM).
-#                        The fixture modes (full/matching/amm/pending/
-#                        load) drive #dev-only surfaces and refuse to run
-#                        against a #play source — flip DEPLOY_MODE to
-#                        #dev in src/backend/main.mo for those.
+#                        seed.sh modes: full/empty/matching/amm/staged/load
+#                        (its dispatch). All but `empty` drive #dev-only
+#                        surfaces and refuse to run against a #play
+#                        source — flip DEPLOY_MODE to #dev in
+#                        src/backend/main.mo for those. `empty` (deploy
+#                        only, no data) is not posture-gated.
 #   --traders N          Number of load-test trader principals (default:
 #                        100; only used with --mode load or as the upper
 #                        bound when --mode full pads the crowd).
@@ -51,9 +55,14 @@
 #                        --no-deploy this turns cold_start into a pure
 #                        cycle top-up; combined with deploy enabled it
 #                        reinstalls code without wiping trading state.
-#   --no-simulate        Don't start the simulation after seeding (default:
-#                        started for --mode full only; --mode play's bots
-#                        are launched by play_start.sh itself).
+#   --no-simulate        Don't start a bot fleet after seeding (default:
+#                        started for --mode full only). Reaches --mode play
+#                        too: play_start.sh normally launches its own fleet
+#                        in its step 7, and an explicit --no-simulate is
+#                        forwarded to it as MDX_NO_SIMULATE=1 so the seeded
+#                        #play bring-up runs with NO fleet (a stale recorded
+#                        fleet is still stopped). This is how a factory seat
+#                        runs `deploy.sh local --seed --no-simulate`.
 #   --simulate           Force-start the simulation even for test modes.
 #   --help               Show this message and exit.
 #
@@ -86,6 +95,10 @@ DO_TOP_UP=true
 DO_SEED=true
 TOP_UP_AMOUNT="100t"
 SIMULATE=""
+# An EXPLICIT --no-simulate is distinguishable from the play-mode default
+# (also "no") because only the explicit one must reach play_start.sh: a bare
+# `cold_start.sh` keeps launching play's fleet as it always has.
+NO_SIMULATE_EXPLICIT=false
 while [ $# -gt 0 ]; do
   # Under `set -u` a bare "$2" on a value-less flag aborts with an unbound-
   # variable message that names nothing useful, and `shift 2` with one arg
@@ -102,15 +115,16 @@ while [ $# -gt 0 ]; do
     --no-top-up)      DO_TOP_UP=false;    shift ;;
     --top-up-amount)  TOP_UP_AMOUNT="$2"; shift 2 ;;
     --no-seed)        DO_SEED=false;      shift ;;
-    --no-simulate)    SIMULATE="no";      shift ;;
-    --simulate)       SIMULATE="yes";     shift ;;
+    --no-simulate)    SIMULATE="no";  NO_SIMULATE_EXPLICIT=true;  shift ;;
+    --simulate)       SIMULATE="yes"; NO_SIMULATE_EXPLICIT=false; shift ;;
     --help|-h)        sed -n '3,/^# Exit code/p' "$0" | sed -E 's/^# ?//'; exit 0 ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
 
 # Sensible default for --simulate if the user didn't set it explicitly.
-# (play mode never needs it: play_start.sh launches its own bot fleet.)
+# (play mode never needs §4's launcher: play_start.sh launches its own bot
+# fleet — unless an explicit --no-simulate is forwarded to it, §3 below.)
 if [ -z "$SIMULATE" ]; then
   if [ "$MODE" = "full" ]; then SIMULATE="yes"; else SIMULATE="no"; fi
 fi
@@ -122,6 +136,10 @@ if [ -z "$HISTORY_DAYS" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Law-5 tripwire (scripts/factory_guard.sh; fail-open without a seat
+# identity): a consumer seat never cold-starts the PRIMARY checkout's venue.
+. "$SCRIPT_DIR/factory_guard.sh"
+factory_primary_guard "cold_start.sh" local
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
@@ -173,6 +191,40 @@ if $DO_SEED; then
   fi
 fi
 
+# ── Banner truth (task 3088509465) ──────────────────────────────
+# The completion banner used to print `Mode    : $MODE` — the SEED-mode
+# default ("play", :86) — so `deploy.sh local` on a seeded venue (which is
+# `exec cold_start.sh --no-seed`) ended with "Mode : play" while the tree
+# AND the canister were on #dev: the guard above resolves SRC_POSTURE only
+# when seeding, and the no-seed update path never read the posture at all.
+# Read it HERE, before anything builds, so a tree edit mid-run cannot
+# recolour the banner; the banner itself prefers the LIVE getDeployMode and
+# falls back to this. `|| true`: the no-seed path is posture-agnostic by
+# design, so an unreadable posture is reported as "unresolved", not refused.
+BUILD_POSTURE="${SRC_POSTURE:-$(mdx_posture_of src/backend/main.mo || true)}"
+# Bridge posture LAG (task 1788488022): the Bridge has its OWN literal and
+# the seat posture rhythm flips BOTH. Read it here too — before anything
+# builds — so a one-file flip (DEX #dev, Bridge #play) is named while a
+# Ctrl-C still saves the deploy. A NOTE, never a refusal: the pair is legal
+# under W3-09 (the Bridge is LESS permissive), only the Bridge dev-hook suite
+# sections lose coverage. Only when this run deploys (the tree is what ships).
+BUILD_BRIDGE_POSTURE=$(mdx_posture_of src/bridge/main.mo || true)
+if $DO_DEPLOY; then mdx_note_bridge_posture_lag "${BUILD_POSTURE:-}" "${BUILD_BRIDGE_POSTURE:-}" tree; fi
+# Set ONLY at the two fleet launch sites below (§3 play seed via
+# play_start.sh, §4 the --simulate launcher) and read by the banner (tasks
+# 3088507290 + 3088509465 — two seats hit the same lie the same day): the
+# "Bot log" line is printed when THIS run launched a fleet, never inferred
+# from the seed mode (the old gate keyed on MODE=play, so --no-seed named a
+# stale log from an earlier bring-up as if a fleet were trading).
+FLEET_STARTED=false
+# A RECORDED local fleet whose supervisor PID is live — the PID file
+# scripts/lib/bots.sh writes, checked by `kill -0` on that one PID. Never a
+# process pattern (mdex-process-safety §2).
+fleet_alive() {
+  local pf; pf=$(mdx_pidfile local)
+  [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null
+}
+
 START_TS=$(date +%s)
 
 # ── 1. Ensure the replica is running (and not a ZOMBIE pair) ─────
@@ -218,7 +270,48 @@ if [ -n "$GW_PORT" ] && curl -s --max-time 2 "http://127.0.0.1:$GW_PORT/api/v2/s
   ok "replica already running at 127.0.0.1:$GW_PORT (single master owns the gateway)"
 else
   log "starting local replica (background)"
-  icp network start --background > "$MDX_NETWORK_START_LOG" 2>&1 || true
+  # The CLI used to run in the FOREGROUND here. In the 2026-09-05 launcher
+  # wedge (docs/seat-venue-bring-up.md, task 1788580163) `icp network start
+  # --background` itself never returns — it awaits a status.json the parked
+  # launcher never writes — so this line hung indefinitely, silent, with
+  # nothing recognising the state. Bound it (task 1788581044): run the CLI
+  # backgrounded, capture ITS pid, and watchdog that one pid with `kill -0`
+  # up to REPLICA_START_GRACE_S — the start doctor's own env name, default
+  # 90, so cold_start and the doctor agree on what "past the grace" means.
+  # bash 3.2, no `timeout` binary on this machine, never a process pattern
+  # (mdex-process-safety §1-2). On the deadline, or on a start that returned
+  # without a reachable gateway, the REAL doctor (replica-doctor.sh
+  # --start-wedge, read-only, no icp calls) reports and gives the verdict —
+  # WEDGED names the PIDs to kill, NO LAUNCHER is the self-inflicted shape —
+  # and cold_start exits 1. It kills NOTHING itself: the CLI child is left
+  # running and named, and the human/seat decides (the bring-up note's
+  # "WEDGED twice in a row -> HUMAN NEEDED" rule).
+  REPLICA_START_GRACE_S="${REPLICA_START_GRACE_S:-90}"
+  case "$REPLICA_START_GRACE_S" in ''|*[!0-9]*)
+    err "REPLICA_START_GRACE_S must be a whole number of seconds (got '$REPLICA_START_GRACE_S')"; exit 1 ;;
+  esac
+  export REPLICA_START_GRACE_S
+  icp network start --background > "$MDX_NETWORK_START_LOG" 2>&1 &
+  START_PID=$!
+  START_RETURNED=false
+  START_WAITED=0
+  while [ "$START_WAITED" -lt "$REPLICA_START_GRACE_S" ]; do
+    if ! kill -0 "$START_PID" 2>/dev/null; then START_RETURNED=true; break; fi
+    sleep 1
+    START_WAITED=$((START_WAITED + 1))
+  done
+  if ! kill -0 "$START_PID" 2>/dev/null; then START_RETURNED=true; fi
+  if $START_RETURNED; then
+    # Reap it; its exit status is not the signal (the old line was `|| true`
+    # too) — the gateway probe below is.
+    wait "$START_PID" 2>/dev/null || true
+  else
+    err "icp network start has not returned after ${REPLICA_START_GRACE_S}s (REPLICA_START_GRACE_S) — the launcher wedge signature"
+    err "the CLI child (pid $START_PID) is LEFT RUNNING — cold_start never kills on its own; act on the doctor's verdict below by PID"
+    bash "$SCRIPT_DIR/replica-doctor.sh" --start-wedge "$(pwd)" || true
+    err "replica did not start within the grace — see the start doctor's report above and docs/seat-venue-bring-up.md (WEDGED twice in a row -> HUMAN NEEDED)"
+    exit 1
+  fi
   # Give it a moment to come up.
   for i in $(seq 1 15); do
     GW_PORT=$(mdx_local_gateway || true); GW_PORT=${GW_PORT##* }
@@ -230,6 +323,8 @@ else
   done
   if [ -z "$GW_PORT" ] || ! curl -s --max-time 2 "http://127.0.0.1:$GW_PORT/api/v2/status" > /dev/null 2>&1; then
     err "replica failed to start — check $MDX_NETWORK_START_LOG"
+    bash "$SCRIPT_DIR/replica-doctor.sh" --start-wedge "$(pwd)" || true
+    err "replica returned from start but the gateway is unreachable — see the start doctor's report above and docs/seat-venue-bring-up.md"
     exit 1
   fi
 fi
@@ -255,9 +350,77 @@ if $DO_DEPLOY; then
     err "anonymous identity missing; cannot deploy as controller"
     exit 1
   fi
+  # ── Candid freshness: never ship a lying interface (W5-20) ───────
+  # mops.toml embeds src/backend/backend.did as the canister's PUBLIC
+  # candid:service metadata and gen-did.sh is its only writer. deploy.sh has
+  # gated on it since W5-20, but this script called `icp deploy` directly —
+  # so every cold start after an API edit shipped the PREVIOUS interface
+  # (found live on a factory seat, task 1788483105: the new method's reply
+  # printed as a raw hash variant, "WARN could not fetch candid type", and
+  # candid/backend.did showed no diff). Every seat brings its venue up
+  # through this path, so it carries the same gate, same wording; gen-did
+  # is idempotent and cheap relative to the deploy. Absolute path via
+  # SCRIPT_DIR — `$(dirname "$0")` is wrong after a cd (process-safety §3).
+  log "regenerating candid interface (gen-did.sh) so the deploy ships what the source says"
+  if ! bash "$SCRIPT_DIR/gen-did.sh" > /dev/null; then
+    err "scripts/gen-did.sh failed — refusing to deploy a stale candid:service interface. Run it by hand to see why."
+    exit 1
+  fi
+  # ── The LOCAL cycle floor (task 1788665638) ────────────────────
+  # The sidecars (arb, bridge) are endowed once, at CREATE time, and the
+  # phase-2.5 top-up below feeds the backend alone — so on a seat venue a
+  # week old THIS install fails IC0207 ("Failed to install canister 'arb' …
+  # is out of cycles") while `canister status` still shows hundreds of B (an
+  # install needs headroom above the freezing reserve). mdx_local_cycle_floor
+  # (lib/targets.sh) reads each balance, tops any below MDX_LOCAL_CYCLE_FLOOR
+  # (5t) up through scripts/top_up_cycles.sh, and prints both lines here as
+  # the deploy's diagnostics. Local only by construction (no -e; anonymous,
+  # the local controller, pays — free); never fails: an unreadable balance
+  # warns by name, and the failure arm below names the cure if it bites.
+  mdx_local_cycle_floor
+  # ── The frontend recipe migration (task 1793503326) ─────────────
+  # A venue whose `frontend` still runs the legacy @dfinity/asset-canister
+  # wasm cannot be UPGRADED to the certified-assets wasm the static-site
+  # recipe installs — unrelated Candid interfaces, so icp's pre-install check
+  # would refuse the WHOLE deploy below as BREAKING before installing
+  # anything (and `--yes` is not the answer: it pushes the upgrade onto
+  # stable memory the new wasm cannot read). The frontend holds no state, so
+  # on this LOCAL venue reinstall it first; the plain deploy then upgrades it
+  # in place like every later one. Detection: the legacy-only `api_version`
+  # query (mdx_frontend_is_legacy_asset_canister, lib/targets.sh).
+  if mdx_frontend_is_legacy_asset_canister local anonymous; then
+    warn "frontend still runs the legacy asset-canister wasm — reinstalling it on the certified-assets wasm first (stateless; icp would refuse the upgrade as BREAKING)"
+    if icp deploy frontend --mode reinstall --identity anonymous > "$MDX_COLD_DEPLOY_LOG" 2>&1; then
+      ok "frontend reinstalled on the static-site (certified-assets) recipe"
+    else
+      tail -20 "$MDX_COLD_DEPLOY_LOG"
+      err "frontend reinstall failed — by hand: icp deploy frontend --mode reinstall --identity anonymous"
+      exit 1
+    fi
+  fi
   log "icp deploy"
-  if ! icp deploy --identity anonymous 2>&1 | tail -20; then
-    err "deploy failed"
+  # The output lands in MDX_COLD_DEPLOY_LOG (runfiles.sh — .run/, never a
+  # fixed /tmp name) so the failure arm can READ it back: an `out of cycles`
+  # / IC0207 reject then names the frozen canister and the one-line cure
+  # instead of leaving the raw replica text as the whole diagnosis.
+  # MDX_DEPLOY_BREAKING (set non-empty by hand, never by a script): the one deploy
+  # that carries an apiVersion MAJOR bump is, by definition, not a Candid
+  # subtype of what the venue runs, and icp refuses such an upgrade unless
+  # told `--yes`. The ratchet already made the declaration (the committed
+  # major rose); this forwards it to icp for THAT deploy, loudly. Every
+  # later deploy is compatible again and must not carry it.
+  if [ -n "${MDX_DEPLOY_BREAKING:-}" ]; then warn "MDX_DEPLOY_BREAKING set: bypassing icp's Candid compatibility check (an apiVersion MAJOR bump is being installed)"; fi
+  if icp deploy --identity anonymous ${MDX_DEPLOY_BREAKING:+--yes} > "$MDX_COLD_DEPLOY_LOG" 2>&1; then
+    tail -20 "$MDX_COLD_DEPLOY_LOG"
+  else
+    tail -20 "$MDX_COLD_DEPLOY_LOG"
+    if grep -qE 'out of cycles|IC0207' "$MDX_COLD_DEPLOY_LOG"; then
+      # `|| true` inside; gated by name below (an unnamed canister still gets the cure text)
+      FROZEN="$(grep -oE "canister '[a-z0-9-]+'" "$MDX_COLD_DEPLOY_LOG" | head -1 | sed "s/canister '//; s/'//" || true)"
+      err "deploy failed — ${FROZEN:-a canister} is out of cycles (IC0207). Cure: bash scripts/top_up_cycles.sh --canister ${FROZEN:-<name>} --amount ${MDX_LOCAL_CYCLE_FLOOR:-5t} --identity anonymous  — then re-run. The pre-deploy floor covers '${MDX_LOCAL_CYCLE_FLOOR_CANISTERS:-arb bridge}' at ${MDX_LOCAL_CYCLE_FLOOR:-5t} (MDX_LOCAL_CYCLE_FLOOR); raise it, or add the canister to MDX_LOCAL_CYCLE_FLOOR_CANISTERS, if this recurs."
+    else
+      err "deploy failed"
+    fi
     exit 1
   fi
   ok "backend + frontend deployed"
@@ -350,22 +513,38 @@ fi
 # ── 3. Seed ──────────────────────────────────────────────────────
 # Both paths are destructive. `play` REINSTALLS backend+bridge (fresh play
 # state) via play_start.sh; `seed.sh full`'s first step is resetExchange,
-# which wipes orders, trades, AMM pools, pending matches, reserved
-# balances, P&L history, and counterparty stats. Pass `--no-seed`
-# to skip this step entirely (e.g. when you only want to redeploy
-# code + top up cycles without losing accumulated trading state).
+# which wipes the books and the trade tape, the AMM pools + LP balances +
+# vault (value histories included), staged orders / swaps / LP requests
+# and their soft-locked reservations, margin accounts / loans / pools,
+# rolling stats, levels / badges / volumes, the event log, the last-oracle
+# aggregates and the archive chain — wallet balances survive (the doc
+# comment above `resetExchange` in src/backend/main.mo is the authority).
+# Pass `--no-seed` to skip this step entirely (e.g. when you only want to
+# redeploy code + top up cycles without losing accumulated trading state).
 if $DO_SEED; then
   if [ "$MODE" = "play" ]; then
     hdr "Seed (mode: play → scripts/play_start.sh)"
     # The canonical #play bring-up: builds + reinstalls backend/bridge,
     # wires them (XRC deliberately unwired on play), injects price history,
-    # seeds the AMM vault ($1M across markets) and the insurance fund
-    # ($50k), lays a maker ladder, starts the sim bots, and redeploys the
+    # seeds the AMM vault ($5,125,000 across markets) and the insurance fund
+    # ($144k, INSURANCE_USD), lays a maker ladder, starts the sim bots, and redeploys the
     # frontend. Honors HISTORY_DAYS / AMM_TVL_TOTAL / INSURANCE_USD.
+    # An explicit --no-simulate is forwarded as MDX_NO_SIMULATE=1: play_start's
+    # step 7 then stops any recorded fleet but starts none (task 1788479256 —
+    # the knob that lets a factory seat run this bring-up at all).
+    if $NO_SIMULATE_EXPLICIT; then
+      export MDX_NO_SIMULATE=1
+      warn "--no-simulate: play_start.sh will NOT start the bot fleet (MDX_NO_SIMULATE=1)"
+    fi
     if ! HISTORY_DAYS="$HISTORY_DAYS" bash "$SCRIPT_DIR/play_start.sh"; then
       err "play_start.sh failed"
       exit 1
     fi
+    # play_start's step 7 stops any recorded fleet (PID file removed) and,
+    # unless the knob held it back, starts a fresh one through
+    # start_bots_local.sh — so a live PID file after it returns is THIS
+    # run's fleet, and the banner may name its log.
+    if ! $NO_SIMULATE_EXPLICIT && fleet_alive; then FLEET_STARTED=true; fi
   else
     hdr "Seed (mode: $MODE)"
     SEED_ARGS=( "$MODE" )
@@ -414,6 +593,7 @@ if [ "$SIMULATE" = "yes" ]; then
 
   log "starting the local trading fleet (scripts/start_bots_local.sh)"
   if bash "$SCRIPT_DIR/start_bots_local.sh"; then
+    FLEET_STARTED=true
     ok "local fleet running — stop it with: bash scripts/stop_bots_local.sh"
   else
     warn "bot start failed — start it by hand with scripts/start_bots_local.sh"
@@ -429,69 +609,82 @@ ELAPSED=$(( $(date +%s) - START_TS ))
 # in-canister tickPriceRefresh then silently fails — the AMM would
 # continue quoting on the frozen initial value while the market moves.
 #
-# The timer fires on a 30s interval with a 45s staleness guard:
-# pools newer than 45s get skipped. Because seed_full just set the
-# refPrice, we have to wait out the guard before we see a refresh.
-# We wait 90s, which spans one stale-threshold crossing plus at
-# least one subsequent timer tick.
+# Condition-driven, not a fixed sleep (task 3088502787; this used to be a
+# flat `sleep 90` "for the staleness guard to lapse + one refresh cycle").
+# Both seed paths zero the feed counters first (seed.sh full → resetExchange,
+# play_start.sh → reinstall) and resume the timers last, and the seed's own
+# setAmmRefPrice stamps never touch them — so getPriceFeedStats.successCount
+# ≥ 1 after the seed phase is proof that tickPriceRefresh fired AND applied
+# a live aggregate to a pool after the unpause (a pended/rejected sample
+# counts as a failure and moves nothing). `seed.sh full` already waits for
+# exactly that tick (its MDX_SEED_FEED_WAIT_SEC wait ends once every pool's
+# refPriceUpdatedNs has moved past its stamps, 45-70s measured), so on the
+# full path this phase sees successCount ≥ 4 on its FIRST sample and costs
+# ~0s where it used to add 90s on top of the seed's wait. play_start.sh runs
+# no such wait, so on the play path this poll IS the wait, and it ends at
+# the first applied tick (~45-70s after the unpause: PRICE_STALE_AFTER_NS 45s
+# on the HB_PRICE_NS 30s grid, then outcall latency) instead of always 90s.
+# The 90s bound is the one both waits share; a second price MOVE would need
+# a whole further cadence (the steady-state per-pool cadence is 60s by code —
+# age ≥ 45s at a 30s beat quantises to two beats, measured in task
+# 1788503312 — plus latency ≈ 60-90s), so
+# no shorter fixed residual exists — the "did a price change in my window"
+# check was dropped: since 3088500128 the seed stamps the marks AT the live
+# aggregate, so the first tick usually re-writes the same price. The counter
+# is the liveness evidence; the mark's AGE is what the LP-mint gate reads
+# (LP_DEPOSIT_MAX_REF_AGE_NS = 60s), so that is what gets printed per pool.
 if [ "$MODE" = "full" ] || [ "$MODE" = "play" ]; then
   hdr "AMM oracle health"
-  log "waiting 90s for the staleness guard to lapse + one refresh cycle"
+  HEALTH_MAX=90
+  log "waiting up to ${HEALTH_MAX}s for the first applied feed refresh since the seed (successCount ≥ 1)"
 
-  # Capture each pool's refPrice baseline BEFORE waiting so we can
-  # detect movement, not just presence. macOS ships bash 3.2 which
-  # doesn't support `declare -A` — use parallel indexed arrays
-  # instead (MARKETS + PX_BEFORE, indexed in lockstep).
-  #
-  # Candid prints Nats with underscore separators ("refPrice =
-  # 6_387_980_000_000 : nat"): strip the underscores, then cut at the
-  # first non-digit to drop the type suffix. Cutting at the first "_"
-  # instead would keep only the leading digit group, and the before/
-  # after comparison would misread most live refreshes as "unchanged".
   # Every call in this section is a READ-ONLY DIAGNOSTIC: a failure here means
   # "we couldn't measure", not "the cold start failed", so each one keeps its
   # own `|| true` and the reporting below handles the empty case. Without
   # them, -e would turn an unreachable query into a failed bring-up AFTER the
   # exchange was successfully deployed and seeded.
+  #
+  # Candid prints Nats with underscore separators ("successCount =
+  # 1_234 : nat"): strip the underscores, then cut at the first non-digit to
+  # drop the type suffix. Cutting at the first "_" instead would keep only
+  # the leading digit group.
+  HEALTH_T0=$(date +%s)
+  SUCCESS=""
+  FAILURES=""
+  while :; do
+    STATS=$(icp canister call backend getPriceFeedStats '()' --identity anonymous 2>&1 || true)
+    SUCCESS=$(echo "$STATS" | awk -F' *= *' '/successCount/ {gsub(/_/,"",$2); sub(/[^0-9].*/,"",$2); print $2; exit}')
+    FAILURES=$(echo "$STATS" | awk -F' *= *' '/failureCount/ {gsub(/_/,"",$2); sub(/[^0-9].*/,"",$2); print $2; exit}')
+    if [ "${SUCCESS:-0}" -ge 1 ] 2>/dev/null; then break; fi
+    if [ $(( $(date +%s) - HEALTH_T0 )) -ge "$HEALTH_MAX" ]; then break; fi
+    sleep 5
+  done
+  HEALTH_WAITED=$(( $(date +%s) - HEALTH_T0 ))
+  printf "  refreshes: %s successes · %s failures (sampled after %ss)\n" "${SUCCESS:-0}" "${FAILURES:-0}" "$HEALTH_WAITED"
+
+  # Per-pool mark age against the LP-mint staleness grace. macOS ships bash
+  # 3.2 (no `declare -A`), and refPriceUpdatedNs is a ~1.8e18 Nat — parse and
+  # subtract in awk rather than in shell arithmetic.
   MARKETS=(BTC-ICPUSD ETH-ICPUSD SOL-ICPUSD ICP-ICPUSD)
-  PX_BEFORE=()
+  NOW_S=$(date +%s)
   for m in "${MARKETS[@]}"; do
     POOL=$(icp canister call backend getAmmPool "(\"$m\")" --identity anonymous 2>&1 || true)
     PX=$(echo "$POOL" | awk -F' *= *' '/refPrice / {gsub(/_/,"",$2); sub(/[^0-9].*/,"",$2); print $2; exit}')
-    PX_BEFORE+=("$PX")
-  done
-
-  sleep 90
-
-  STATS=$(icp canister call backend getPriceFeedStats '()' --identity anonymous 2>&1 || true)
-  SUCCESS=$(echo "$STATS" | awk -F' *= *' '/successCount/ {gsub(/_/,"",$2); sub(/[^0-9].*/,"",$2); print $2}')
-  FAILURES=$(echo "$STATS" | awk -F' *= *' '/failureCount/ {gsub(/_/,"",$2); sub(/[^0-9].*/,"",$2); print $2}')
-  printf "  refreshes: %s successes · %s failures\n" "${SUCCESS:-0}" "${FAILURES:-0}"
-
-  LIVE=0
-  for i in "${!MARKETS[@]}"; do
-    m="${MARKETS[$i]}"
-    before="${PX_BEFORE[$i]}"
-    POOL=$(icp canister call backend getAmmPool "(\"$m\")" --identity anonymous 2>&1 || true)
-    PX_AFTER=$(echo "$POOL" | awk -F' *= *' '/refPrice / {gsub(/_/,"",$2); sub(/[^0-9].*/,"",$2); print $2; exit}')
-    if [ -n "$before" ] && [ -n "$PX_AFTER" ] && [ "$before" != "$PX_AFTER" ]; then
-      printf "  %-12s  %s → %s  ${GREEN}live${NC}\n" "$m" "$before" "$PX_AFTER"
-      LIVE=$(( LIVE + 1 ))
+    AGE=$(echo "$POOL" | awk -F' *= *' -v now="$NOW_S" '/refPriceUpdatedNs/ {gsub(/_/,"",$2); sub(/[^0-9].*/,"",$2); if ($2 + 0 > 0) printf "%d", now - $2 / 1000000000; exit}')
+    if [ -n "$PX" ] && [ -n "$AGE" ] && [ "$AGE" -le 60 ] 2>/dev/null; then
+      printf "  %-12s  refPrice %s  mark age %ss  ${GREEN}fresh${NC}\n" "$m" "$PX" "$AGE"
     else
-      printf "  %-12s  %s (unchanged)\n" "$m" "${PX_AFTER:-—}"
+      printf "  %-12s  refPrice %s  mark age %ss  ${YELLOW}stale${NC} (LP mints refuse past 60s)\n" "$m" "${PX:-—}" "${AGE:-—}"
     fi
   done
 
-  if [ "$LIVE" -eq 0 ] && [ "${SUCCESS:-0}" -lt 1 ]; then
-    warn "price-feed timer appears dead — no refPrice moved in 90s and no successes recorded"
+  if [ "${SUCCESS:-0}" -ge 1 ] 2>/dev/null; then
+    echo -e "  ${GREEN}oracle feed is live.${NC} (${SUCCESS} refresh(es) applied since the seed)"
+  else
+    warn "price-feed timer appears dead — no refresh applied within ${HEALTH_MAX}s of the seed (successCount 0, failures ${FAILURES:-0})"
     echo "  → try directly: icp canister call backend fetchAndSetRefPrice '(\"BTC-ICPUSD\")' --identity anonymous"
     echo "  → if that works, the outcall path is fine but the timer isn't firing (check postupgrade)"
-  elif [ "$LIVE" -eq 0 ]; then
-    # Prices very occasionally don't move in a 90s window — unusual
-    # but not alarming if successCount advanced.
-    echo -e "  ${YELLOW}note${NC}: successCount advanced but no price changed within 90s (quiet market)"
-  else
-    echo -e "  ${GREEN}oracle feed is live.${NC}"
+    echo "  → failures > 0 with 0 successes: the feed ticks but every sample is pended/rejected (circuit breaker / quality floor)"
   fi
 fi
 
@@ -500,9 +693,43 @@ echo -e "${GREEN}UPLANDS cold-start complete in ${ELAPSED}s (plus diagnostics).$
 echo ""
 echo "  Frontend: http://frontend.local.localhost:$GW_PORT/"
 echo "  Backend : http://$(icp canister list 2>/dev/null | head -1).localhost:$GW_PORT/"
-echo "  Mode    : $MODE"
-# play mode's bots are launched by play_start.sh, logging to the same file.
-# Both paths now launch the fleet through scripts/start_bots_local.sh, which
-# logs to the PID-file run dir (scripts/lib/targets.sh: MDX_RUN_DIR).
-{ [ "$SIMULATE" = "yes" ] || [ "$MODE" = "play" ]; } && echo "  Bot log : tail -f $MDX_RUN_DIR/bots-local.log"
+# Posture: the LIVE canister's word first (getDeployMode — what was actually
+# deployed, whatever the tree says now), the pre-build read as the fallback
+# (a replica that stopped answering), never the seed-mode default. The
+# no-seed update path is labelled as such: `Mode : dev (update, no seed; …)`.
+LIVE_POSTURE=$(echo y | icp canister call backend getDeployMode '()' --query --identity anonymous 2>/dev/null | grep -oE '"[a-z]+"' | tr -d '"' | head -1 || true)
+POSTURE_SHOWN="${LIVE_POSTURE:-${BUILD_POSTURE:-unresolved}}"
+if [ -n "$LIVE_POSTURE" ]; then POSTURE_SRC="live getDeployMode"; else POSTURE_SRC="pre-build read of src/backend/main.mo"; fi
+if $DO_SEED; then
+  echo "  Mode    : $POSTURE_SHOWN (seed: $MODE; $POSTURE_SRC)"
+else
+  echo "  Mode    : $POSTURE_SHOWN (update, no seed; $POSTURE_SRC)"
+fi
+if [ -n "$LIVE_POSTURE" ] && [ -n "$BUILD_POSTURE" ] && [ "$LIVE_POSTURE" != "$BUILD_POSTURE" ]; then
+  warn "live posture #$LIVE_POSTURE differs from the tree's #$BUILD_POSTURE (--no-deploy, or the tree moved mid-run)"
+fi
+# The Bridge's own word (task 1788488022): its literal is separate, the
+# rhythm flips both, and a venue whose Bridge lags at #play behind a #dev
+# DEX skips every Bridge dev-hook suite section — say so LOUDLY here, from
+# the LIVE answers, not the tree (the tree note above fires pre-build).
+LIVE_BRIDGE_POSTURE=$(echo y | icp canister call bridge getDeployMode '()' --query --identity anonymous 2>/dev/null | grep -oE '"[a-z]+"' | tr -d '"' | head -1 || true)
+echo "  Bridge  : ${LIVE_BRIDGE_POSTURE:-unresolved} (live getDeployMode)"
+mdx_note_bridge_posture_lag "${LIVE_POSTURE:-}" "${LIVE_BRIDGE_POSTURE:-}" live
+# Bot log: only for a fleet THIS run launched (FLEET_STARTED is set at the
+# two launch sites). Both launch paths go through scripts/start_bots_local.sh,
+# which logs to the PID-file run dir (scripts/lib/targets.sh: MDX_RUN_DIR).
+# Otherwise say so — and if a fleet recorded by an EARLIER run is still
+# trading, name it rather than pretend the venue is quiet.
+if $FLEET_STARTED; then
+  echo "  Bot log : tail -f $MDX_RUN_DIR/bots-local.log"
+else
+  if $NO_SIMULATE_EXPLICIT; then FLEET_WHY="--no-simulate"
+  elif ! $DO_SEED; then FLEET_WHY="the --no-seed update path launches none"
+  else FLEET_WHY="not requested for --mode $MODE"; fi
+  if fleet_alive; then
+    echo "  Bots    : fleet NOT started by this run ($FLEET_WHY) — a fleet recorded by an earlier run is still trading (pid $(cat "$(mdx_pidfile local)")): tail -f $MDX_RUN_DIR/bots-local.log"
+  else
+    echo "  Bots    : fleet NOT started ($FLEET_WHY) — bash scripts/start_bots_local.sh"
+  fi
+fi
 echo ""

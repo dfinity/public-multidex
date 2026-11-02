@@ -13,6 +13,8 @@ import Types "lib/Types";
 import SafeMath "lib/SafeMath";
 import RateLimit "lib/RateLimit";
 import Shard "lib/Shard";
+import PreReg "lib/PreReg";
+import Funding "lib/Funding";
 import Accounts "lib/Accounts";
 import OrderBook "lib/OrderBook";
 import MatchingEngine "lib/MatchingEngine";
@@ -24,8 +26,10 @@ import MarginPools "lib/MarginPools";
 import Profiles "lib/Profiles";
 import AMM "lib/AMM";
 import VaultMath "lib/VaultMath";
+import VaultLock "lib/VaultLock";
 import PriceFeed "lib/PriceFeed";
 import UserStatus "lib/UserStatus";
+import ReleaseLinks "lib/ReleaseLinks";
 import Blob "mo:core/Blob";
 import Char "mo:core/Char";
 import Nat32 "mo:core/Nat32";
@@ -58,24 +62,81 @@ import Expose "oql/Expose";
 import OqlJson "oql/Json"; // OQL query-JSON parser (for the History proxy; distinct from mo:json)
 import Json "mo:json"; // request-body build + response parse for the AI proxy
 
-// NOTE: FOUR one-shot EOP migrations have been applied to the live canister
+// NOTE: FIVE one-shot EOP migrations have been applied to the live canister
 // and are RETIRED here: dropping `nextDeferredId` (2026-06-01, git
 // 684124e→6ed3362), dropping the legacy stable `IS_PRODUCTION` field after
 // the flag became `transient` (2026-06-10), re-keying the order book's
 // price-level index by (timestamp, id) (migration.mo, 2026-08-07 — applied
 // to local, the cloud engine, and the subnet the same day; OrderBook's
-// rebuildLevelIndex was its worker and remains), and widening userEvents'
+// rebuildLevelIndex was its worker and remains), widening userEvents'
 // element kind with #gap (W2-04) plus the #config constructor riding the
 // same per-element rebuild (#47.4) — applied to the cloud engine and the
 // dedicated subnet on 2026-08-26 (rehearsed 2026-08-24 against the subnet's
-// 69d1f51-era state; retirement task 1786992189). A one-shot migration runs
-// only on upgrade and must be removed once applied — re-running a
-// consume-the-field one traps ("stable variable … expected but not found"),
-// and a transform one refuses the upgrade outright because the stored state
-// no longer matches its domain (post-W2-04 that refusal was IC0503
-// "Memory-incompatible program upgrade" on every born-widened venue's first
-// plain upgrade, mainnet's second upgrades included). New code and the
-// migrated state agree, so the plain upgrade is compatible.
+// 69d1f51-era state; retirement task 1786992189), and the fossil sweep
+// (migration.mo, tasks 1787222803 + 1787207569 — one one-shot for BOTH
+// fossil-parked stable fields, the slot being single-occupancy):
+// `counterpartyStats` (#49.5 retirement, task 1787182537 — empty on every
+// live target, its only writer was unreachable) consumed and DROPPED, and
+// the pre-reason `userAdjustments` legacy map (task 1787199451's
+// fossil-park) folded into `userAdjustmentsV2` per user (legacy rows first,
+// strictly older, reason = null, then V2 rows, re-capped at
+// UserStatus.ADJUSTMENTS_KEEP) — applied to the cloud engine and the
+// dedicated subnet on 2026-09-03, users and retained trades carried exactly
+// on both (rehearsed 2026-09-01 on a scratch replica with a stripped-wiring
+// negative control refusing IC0503; rollout task 1788285793, retirement
+// task 1788285811). A one-shot migration runs only on upgrade and must be
+// removed once applied — re-running a consume-the-field one traps
+// ("stable variable … expected but not found":
+// the fossil sweep's own SECOND upgrade refused exactly so in rehearsal,
+// and every venue born from post-sweep code hit it on its FIRST plain
+// upgrade until this retirement), and a transform one refuses the upgrade
+// outright because the stored state no longer matches its domain
+// (post-W2-04 that refusal was IC0503 "Memory-incompatible program
+// upgrade" on every born-widened venue's first plain upgrade, mainnet's
+// second upgrades included). New code and the migrated state agree, so the
+// plain upgrade is compatible.
+//
+// ACTIVE (the sixth): migration.mo sweeps the SIX PendingMatch-era fossils
+// in one one-shot (the slot is single-occupancy, so they ride together —
+// task 1788744109, the rehearsal the operator scheduled on 2026-11-01 for
+// after the 1.75 rollout): the five stable fields the retired PendingMatch /
+// protection-window machinery wrote (`orderSettlementWindows`,
+// `pendingByMaker`, `nextPendingMatchId`, `pendingQtyByMaker`,
+// `pendingMatches` — fossils since task 1788516198, empty / at their
+// initial value on every live target) are consumed and DROPPED, and the
+// stable `pools` map is mapped from the stored AMM.Pool WITH its fossil
+// `protectionWindowSec` onto the field-less record (apiVersion 6.0.0 had
+// projected it out through AMM.PoolView; that projection collapsed back
+// into Pool, the Candid record name kept as an alias — the published
+// contract is byte-identical). Types.PendingMatch / PendingMatchStatus went
+// with the map (frozen in migration.mo). See migration.mo for the frozen
+// shapes and the retirement rule. Remove the clause + file once every live
+// target (cloud engine, subnet) has upgraded through it once — the rollout
+// task and the retirement task are filed beside 1788744109.
+//
+// KNOWN LOCAL SYMPTOM until that retirement (same as the fifth's): a venue
+// cold-started from post-sweep code is BORN without the fossil fields and
+// with the field-less pool record, so its very FIRST plain `icp deploy`
+// upgrade is refused — "RTS error: Memory-incompatible program upgrade"
+// (IC0503): the domain's `pools` is a mutable Map of the OLD record and a
+// mutable Map is invariant in its element type, so the check fires before
+// the migration body ever runs (on moc 1.9.0 it is this RTS text, not the
+// fifth's "stable variable … expected but not found"). The clause working
+// as designed, not state corruption: the sweep's own SECOND upgrade refused
+// exactly so in rehearsal (2026-11-02, seat replica), with the read set
+// byte-identical before and after the refusal. Seat/dev venues until the
+// retirement: swap builds with `icp build backend` + `icp canister install
+// backend --mode reinstall -y --identity anonymous`, then reseed with
+// `cold_start.sh --mode full --no-simulate --no-deploy` (cold_start's own
+// deploy phase is a plain upgrade and would be refused the same way).
+// Rolling BACK a migrated venue to pre-sweep code is refused with the same
+// text (the stored pools no longer match the old record) — a rollback is a
+// reinstall. Only a venue installed from PRE-sweep code (the mainnet
+// targets, older local venues) actually runs this migration on its next
+// upgrade.
+import Migration "migration";
+
+(with migration = Migration.run)
 persistent actor Uplands {
 
   // ── Deployment posture ───────────────────────────────────────────
@@ -93,10 +154,14 @@ persistent actor Uplands {
   //                 MinSources,XrcRate}, debugInspectByUsername — are DEAD
   //                 (leaderboard fairness: the operator must not be able to
   //                 move prices or scorecards). Controller BOOTSTRAP tools
-  //                 stay alive: setTestBalance/bulk (vault seeding — mints
-  //                 record into extNetFlow, so they can't manufacture
-  //                 leaderboard profit), resetExchange (season resets),
-  //                 fetchAndSetRefPrice/requoteAmm (honest oracle ops).
+  //                 stay alive: setTestBalance + fundArbitrageur (ratified
+  //                 live by decision 1788529484 — fleet refills, per-market
+  //                 base legs; mints record into extNetFlow, so they can't
+  //                 manufacture leaderboard profit), resetExchange (season
+  //                 resets), fetchAndSetRefPrice/requoteAmm (honest oracle
+  //                 ops). bulkSetTestBalances is GENESIS-BOUND like
+  //                 injectHistoricalTrades and the repeat seedInsuranceFund:
+  //                 refused once _ammEverEnabled (lib/Genesis.mo).
   //   #production — value-bearing: everything hardened; balances enter only
   //                 via the Bridge (creditAndRegister); claims disabled.
   // `transient` is load-bearing: a plain `let` in a `persistent actor` is
@@ -116,7 +181,7 @@ persistent actor Uplands {
   // DIAGNOSTIC half: getAppVersion / getCanisterInfo.appVersion let anyone
   // see which release the backend runs, so a mixed frontend/backend deploy
   // is visible at a glance. Transient for the same reason as DEPLOY_MODE.
-  transient let APP_VERSION : Text = "1.60.0";
+  transient let APP_VERSION : Text = "1.75.0";
 
   // Runtime TARGET — ORTHOGONAL to DEPLOY_MODE (the posture axis above). It
   // governs WHO PAYS for cycles, and therefore how many cycles a call attaches
@@ -171,16 +236,11 @@ persistent actor Uplands {
   transient let TRADES_GLOBAL_CAP          : Nat = 600_000;
   transient let TRADES_GLOBAL_TRIM_AT      : Nat = 750_000;
 
-  // ── Settlement-window matching (Phase 1) ─────────────────────────
-  // Opt-in per-order maker-cancellation privilege. Maker flags an order
-  // with a non-zero settlement window; takers crossing that order produce
-  // PendingMatch entries that finalise after `expiryNs` (unless the maker
-  // cancels first). See doc/amm-design.md for rationale.
-  //
-  // orderSettlementWindows : Nat (orderId) → Nat (window in nanoseconds)
-  //   Stored out-of-band so we don't have to migrate the existing Order
-  //   record. Absent entry = 0 = instant matching (legacy behaviour).
-  let orderSettlementWindows = Map.empty<Nat, Nat>();
+  // (The settlement-window map `orderSettlementWindows` — orderId → window
+  // (ns), the per-order protection-window record of the retired PendingMatch
+  // machinery, a fossil since task 1788516198 — was consumed and DROPPED by
+  // the sixth one-shot migration, task 1788744109; see the NOTE above the
+  // actor and the retirement note near ownerIdxAdd.)
 
   // orderExpiry : orderId → expiry timestamp (ns). An order past its expiry is
   // skipped by the matcher (never filled, via ctx.isExpired) and swept off the
@@ -205,10 +265,21 @@ persistent actor Uplands {
   // which way the true price moved, so we defend both. The linear floor
   // guarantees pull-back; the vol term accelerates it in turbulent regimes;
   // the cap makes deep-stale quotes effectively unreachable without vanishing.
-  // Grace MUST exceed the normal refresh cadence (PRICE_STALE_AFTER_NS = 45s),
-  // else the AMM would widen every cycle as age climbs 0→45s between refreshes.
-  // 60s = one full refresh interval + margin, so widening engages only when a
-  // refresh has actually been MISSED (a real stall), not on routine jitter.
+  // Grace MUST exceed the normal refresh cadence, else the AMM would widen
+  // every cycle as age climbs between refreshes. That cadence is 60 s per
+  // pool BY CODE (measured 2026-09-04, task 1788503312: 40 intervals,
+  // 56.6/60.2/64.5 s min/median/max): the heartbeat dispatches a refresh
+  // every HB_PRICE_NS (30 s) but a pool is fetched only once its mark is
+  // ≥ PRICE_STALE_AFTER_NS (45 s) old, so a pool marked at t is skipped at
+  // the next beat (~30 s) and refreshed at the one after (~60 s) — two
+  // beats, plus overshoot and the sequential-fetch latency. So this 60 s
+  // grace EQUALS the cadence and the widening engages for 0.1-4.5 s before
+  // nearly every refresh — a quoting flicker, not a stall signal. Left as
+  // is on purpose: the LP doors that shared this bar now settle at a
+  // post-request mark (the staged path, docs/amm-vault-design.md §5 "Sealed
+  // LP requests"), which makes the grace a backstop rather than the
+  // correctness mechanism; the constants' own re-tuning is an operator
+  // decision (A/B/C in task 1788503312's measurement).
   transient let STALE_GRACE_NS : Int   = 60_000_000_000; // 60s
   transient let STALE_RATE_BPS : Float = 12.0;           // bps/s past grace (≈ +1.2% per 10s)
   transient let STALE_VOL_Z    : Float = 1.5;            // volatility accelerator on √age
@@ -230,23 +301,22 @@ persistent actor Uplands {
     switch (Map.get(orderExpiry, Nat.compare, orderId)) { case (?e) { now >= e }; case null { false } };
   };
 
-  // reservedBalances : "principal#token" key → Float amount locked in
-  //   pending matches. `available = Accounts.getBalance(…) - reserved`.
+  // reservedBalances : "principal#token" key → amount soft-locked by the
+  //   caller's STAGED orders and staged cross-swaps (addReserved at the
+  //   stage sites, subReserved at release/cancel — see softLockedReserved).
+  //   `available = Accounts.getBalance(…) - reserved`.
   let reservedBalances = Map.empty<Text, Nat>();
 
-  // pendingMatches : pendingMatchId → PendingMatch record.
-  let pendingMatches = Map.empty<Nat, Types.PendingMatch>();
-
-  // Secondary index: makerOrderId → set of pendingMatchIds. Lets us
-  // void every pending match for an order in O(pending-for-order)
-  // when the maker cancels (instead of scanning the whole map).
-  let pendingByMaker = Map.empty<Nat, Map.Map<Nat, Bool>>();
-  var nextPendingMatchId : Nat = 1;
-
-  // Pending-match quantity locked against a maker order. Subtracted from
-  // (remaining) available-to-fill when the next taker arrives, so two
-  // in-flight matches can't oversell the same maker inventory.
-  let pendingQtyByMaker = Map.empty<Nat, Nat>();
+  // (The retired PendingMatch machinery's four other fossil fields —
+  // `pendingMatches` (pendingMatchId → Types.PendingMatch, the record that
+  // outlived apiVersion 6.0.0 only as this map's element type),
+  // `pendingByMaker` (the void-on-cancel index), `nextPendingMatchId` (its
+  // id counter) and `pendingQtyByMaker` (the maker quantity lock) — fossils
+  // since task 1788516198, were consumed and DROPPED by the sixth one-shot
+  // migration, task 1788744109: EOP refuses a stable-field drop or retype
+  // on a plain upgrade (IC0503), so they had to wait for a sweep. See the
+  // NOTE above the actor; getStagedIndexAudit.pmLive stays in the Candid as
+  // a constant 0.)
 
   // ── Deferred AMM execution (defer-until-fresh model) ──────────────
   // The marketable (AMM-crossing) remainder of a taker order is parked HERE,
@@ -287,6 +357,8 @@ persistent actor Uplands {
         ignore Map.delete(deferredExecs, Nat.compare, id);
         decStagedCount(d.owner);
         ownerIdxDel(deferredIdsByOwner, d.owner, id);
+        marketIdxDel(d.marketId, id);
+        expiryIdxDel(d.expiresAt, id);   // the entry's CURRENT expiresAt is the key it sits under
         slAccDrop(d.owner, d.reservedTok, d.reservedAmt);
       };
       case null {};
@@ -294,13 +366,16 @@ persistent actor Uplands {
   };
 
   // The ONLY way to drop a staged cross-swap — the swap mirror of
-  // removeDeferredExec: keeps the owner index and the soft-locked
-  // accumulator in lockstep with the map. A bare Map.delete on
-  // deferredSwaps would silently leak both.
+  // removeDeferredExec: keeps the per-owner staged counter (H-13: cross-swaps
+  // count toward the parkDeferred cap since 2026-09-04), the owner index and
+  // the soft-locked accumulator in lockstep with the map. A bare Map.delete
+  // on deferredSwaps would silently leak all three.
   func removeDeferredSwap(id : Nat) {
     switch (Map.get(deferredSwaps, Nat.compare, id)) {
       case (?s) {
         ignore Map.delete(deferredSwaps, Nat.compare, id);
+        ignore Map.delete(swapFok, Nat.compare, id);   // H-21: the FOK flag rides with the entry
+        decStagedCount(s.owner);
         ownerIdxDel(swapIdsByOwner, s.owner, id);
         slAccDrop(s.owner, s.sellToken, s.amount);
       };
@@ -313,6 +388,21 @@ persistent actor Uplands {
   // Tracked in a side map so DeferredKind/DeferredExec need not gain a variant or
   // field — EOP rejects either as a memory-incompatible upgrade.
   let deferredFok = Map.empty<Nat, Bool>();
+  // H-21 (F19 + F38): ids of staged CROSS-swaps (deferredSwaps) that are
+  // FILL-OR-KILL (noPartialFill). The all-or-nothing cross-swap used to run
+  // both legs synchronously inside the caller's own message — the one
+  // player-reachable taker that settled outside the sealed release (no
+  // fresh-price gate, no sweep-before-release, no L4 shield), and not FOK
+  // either (both engine legs ran with noPartialFill = false; a thin buy
+  // book left the sell leg's proceeds unconverted under an honest-partial
+  // #ok). Now it stages like every other cross-swap and this flag makes
+  // releaseCrossSwap run fokCrossGate first: both legs simulated under the
+  // release ctx before any balance moves — full fill of `amount` AND full
+  // absorption of the proceeds, or a recorded kill with nothing settled.
+  // Side map (EOP-safe), like deferredFok — never a DeferredSwap field
+  // (the record is stable; adding a field is a memory-incompatible upgrade).
+  // Dropped with the entry in removeDeferredSwap, the ONLY drop path.
+  let swapFok = Map.empty<Nat, Bool>();
   // Staged-entry id → absolute expiry (ns) the user requested (advanced limit
   // option). Carried here while the order is staged; applied to the rested
   // remainder's orderExpiry when it releases. Side map (EOP-safe), like deferredFok.
@@ -332,6 +422,34 @@ persistent actor Uplands {
   // stop would partial-fill it). Side map (EOP-safe), like deferredFok —
   // NEVER a DeferredExec field.
   let deferredBudget = Map.empty<Nat, Nat>();
+  // Staged DIRECT-SWAP context (task 1788465056, #55 silent "complete"):
+  // what the caller ASKED for vs what was staged, threaded across re-defer
+  // walks so the entry's FINAL cycle can report the whole swap under the
+  // ORIGINAL staged id (the id the frontend's watchSwapOutcome polls for).
+  // Only budgeted #buy stagings (executeSwapDirect) carry one — they are the
+  // only entries with a deferredBudget. Side map (EOP-safe), never a
+  // DeferredExec field; FIXED record shape (adding a field to a record
+  // nested in a stable Map needs a migration). Cleared wherever
+  // deferredBudget is.
+  type DirectSwapCtx = {
+    origId    : Nat;   // the staged id swap() returned
+    requested : Nat;   // the swap's stated ICPUSD amount
+    eff       : Nat;   // the budget actually staged: min(requested, available), less any re-park clamp
+    spent     : Nat;   // quote spent in EARLIER walk cycles (re-defers)
+    received  : Nat;   // base received in earlier cycles
+  };
+  let deferredSwapCtx = Map.empty<Nat, DirectSwapCtx>();
+  // The completeness crumb of a quote-spend budget: the quote cost of ONE
+  // base unit at the cap price (price/SCALE) with the worst-case taker fee
+  // on it, plus the two integer-rounding crumbs — the REAL residue a budget
+  // walk can leave with nothing more affordable. Replaces the flat 1 bps of
+  // the budget (task 1788465056, #55 silent "complete": a book stop up to
+  // 1 bps short read as complete and stayed silent; one unit further out
+  // re-parked or recorded). The engine's #budgetExhausted stop is the exact
+  // answer; this crumb is the fallback for the other stops.
+  func budgetCrumb(capPrice : Nat) : Nat {
+    Fixed.mulDiv(capPrice / Fixed.SCALE + 1, 10_000 + TAKER_FEE_BPS, 10_000, true) + 1
+  };
 
   // ── Dead-man switch (MM program P0) ────────────────────────────
   // cancelAllAfter(?sec) arms a per-owner deadline serviced by the heartbeat;
@@ -341,6 +459,17 @@ persistent actor Uplands {
   let deadmanSwitches = Map.empty<Principal, DeadmanEntry>();
   transient let DEADMAN_MIN_SEC : Nat = 5;
   transient let DEADMAN_MAX_SEC : Nat = 86_400;   // 1 day — beyond that, the 30d GTC TTL is the backstop
+  // H-30 (F43): max switches FIRED in one tickDeadman pass — the dead-man
+  // mirror of MAX_EXPIRY_RELEASES_PER_PASS. A due cohort used to fire whole
+  // in one heartbeat message: each fire is a cancelAllOrdersFor walk plus a
+  // tape event, so a cohort armed together (a bot fleet losing its network,
+  // or throwaway keypairs before H-30 closed that door) could trap the
+  // sweep, and a trapped sweep re-fires the SAME cohort next beat behind the
+  // breaker's backoff. The remainder fires on the following beats (cadence 0
+  // → every beat while the streak is 0).
+  transient let DEADMAN_MAX_FIRES_PER_PASS : Nat = 256;
+  transient var _testDeadmanMaxFires : ?Nat = null;   // dev pin: setTestDeadmanMaxFires
+  func deadmanMaxFires() : Nat { Option.get(_testDeadmanMaxFires, DEADMAN_MAX_FIRES_PER_PASS) };
 
   // ── Per-trade fee attribution (MM program P1) ───────────────────
   // tradeId → (buyerFee, sellerFee) in quote units, recorded by the engine's
@@ -373,24 +502,16 @@ persistent actor Uplands {
   // forward links too, so the two maps never disagree — a dropped handle
   // simply stops resolving, the same contract as the map-wide cap prune.
   transient let STAGED_HANDLES_PER_ORDER_CAP : Nat = 32;
+  // Bodies live in lib/ReleaseLinks.mo (pure over the two maps) so the
+  // start-time rebuild below is unit-tested (tests/ReleaseLinks.test.mo).
   func revDrop(orderId : Nat, key : Nat) {
-    switch (Map.get(stagedReleasedFrom, Nat.compare, orderId)) {
-      case (?ks) {
-        let left = Array.filter<Nat>(ks, func(k : Nat) : Bool { k != key });
-        if (left.size() == 0) { ignore Map.delete(stagedReleasedFrom, Nat.compare, orderId) }
-        else { Map.add(stagedReleasedFrom, Nat.compare, orderId, left) };
-      };
-      case null {};
-    };
+    ReleaseLinks.revDrop(stagedReleasedFrom, orderId, key);
   };
+  // revAppend DELETES from stagedReleasedAs when a chain exceeds the cap —
+  // never call it while an entries() cursor over stagedReleasedAs is live
+  // (issue #55 "rebuild loop": the cursor skips entries, then traps).
   func revAppend(orderId : Nat, key : Nat) {
-    var next = Array.concat(Option.get(Map.get(stagedReleasedFrom, Nat.compare, orderId), ([] : [Nat])), [key]);
-    if (next.size() > STAGED_HANDLES_PER_ORDER_CAP) {
-      let drop : Nat = next.size() - STAGED_HANDLES_PER_ORDER_CAP;
-      for (i in Nat.range(0, drop)) { ignore Map.delete(stagedReleasedAs, Nat.compare, next[i]) };
-      next := Array.sliceToArray(next, drop, next.size());
-    };
-    Map.add(stagedReleasedFrom, Nat.compare, orderId, next);
+    ReleaseLinks.revAppend(stagedReleasedAs, stagedReleasedFrom, STAGED_HANDLES_PER_ORDER_CAP, orderId, key);
   };
   // W4-05/W4-07: keep an order reachable by EVERY handle the user holds when
   // the venue re-homes it under a fresh id (AMM sweep re-rest), and carry its
@@ -405,12 +526,14 @@ persistent actor Uplands {
   // the (then) 100k cap × ≤1024 sweep items it trapped the tick, the
   // rollback revived the crossers, and the next beat trapped again — the
   // AMM stayed offline until the crossers expired.
-  // No `newId == 0` guard: the engine's id-0 "nothing rested" sentinels are
-  // unreachable from the only call site — sweepCtx.onPendingFill returns
-  // null, and executeLimitOrderProtected mints a fresh id whenever
-  // remainingQty > 0 or totalFilled > 0 (a zero-fill requote re-mints too).
-  // A 0 arriving here would be a new-call-site bug, and the audit's mirror
-  // counters would surface the dangling links it created.
+  // No `newId == 0` guard HERE: the engine's id-0 "nothing rested" sentinel
+  // is reachable from the only call site in exactly one way — H-10's
+  // unfunded-aggressor cancel with no fill (the swept order's remainder is
+  // dropped, nothing re-rests) — and ammSweepResting skips the repoint on
+  // it: the user's handles keep resolving to the OLD id, now a #cancelled
+  // record, until the reaper's grace sweep frees it (the same "closed, then
+  // gone" a plain cancel gives). A 0 arriving here would be a new-call-site
+  // bug, and the audit's mirror counters would surface the dangling links.
   func repointOrderIdentity(oldId : Nat, newId : Nat) {
     if (newId == oldId) { return };
     switch (Map.get(stagedReleasedFrom, Nat.compare, oldId)) {
@@ -498,6 +621,47 @@ persistent actor Uplands {
     expiresAt   : Int;
   };
   let deferredSwaps = Map.empty<Nat, DeferredSwap>();
+
+  // ── Sealed LP requests (task 1788503312) ────────────────────────────
+  // docs/amm-vault-design.md §5 "Sealed LP requests". An LP deposit /
+  // withdrawal is STAGED here with its `ts` and settles (processStagedLp, at
+  // the LP block below) at the first NAV whose basket marks ALL postdate it
+  // — the price-postdates-entry rule parked entries and cross-swaps release
+  // on, so a stale mark is unexploitable by construction. A deposit's legs
+  // sit in reservedBalances (the staged-order soft lock); a withdrawal's
+  // shares in vaultLpReserved. One pending request per owner per kind.
+  // Expired (STAGED_LP_TTL_NS, a dead feed) → cancelled + refunded. All
+  // stable, ADDITIVE (EOP refuses drops); cleared with the vault on a wipe.
+  public type StagedLpKind = {
+    #deposit  : { marketId : Types.MarketId; baseAmount : Nat; quoteAmount : Nat };
+    #withdraw : { lpAmount : Nat };
+  };
+  type StagedLpStored = { id : Nat; owner : Principal; kind : StagedLpKind; ts : Int; expiresAt : Int };
+  // The query shape: the stored record minus the owner (caller-scoped) plus
+  // the markets that have not yet postdated it (computed at query time).
+  // cancelRefusal (task 1788731609, additive opt): why cancelStagedLpRequest
+  // would refuse RIGHT NOW (the commit window, or a post-request fetch in
+  // flight) — null = cancellable. The Earn card disables its cancel
+  // affordance with this exact text, so the UI never guesses the rule.
+  public type StagedLpRequest = { id : Nat; kind : StagedLpKind; ts : Int; expiresAt : Int; waitingOn : [Text]; cancelRefusal : ?Text };
+  public type LpRequestOutcome = {
+    id        : Nat;
+    kind      : StagedLpKind;
+    ts        : Int;            // when it was staged
+    settledNs : Int;            // when it settled or was cancelled
+    outcome   : { #minted : Nat; #redeemed : VaultBasket; #cancelled : Text };
+  };
+  public type StagedLpView = { pending : [StagedLpRequest]; recent : [LpRequestOutcome] };
+  let stagedLpRequests   = Map.empty<Nat, StagedLpStored>();
+  var nextStagedLpId : Nat = 1;
+  let stagedLpDepositOf  = Map.empty<Text, Nat>();   // owner text → its pending deposit id
+  let stagedLpWithdrawOf = Map.empty<Text, Nat>();   // owner text → its pending withdrawal id
+  let vaultLpReserved    = Map.empty<Text, Nat>();   // owner text → LP reserved by its staged withdrawal
+  let lpRequestOutcomes  = Map.empty<Text, [LpRequestOutcome]>();   // owner text → newest first, ≤ LP_OUTCOMES_KEEP
+  transient let LP_OUTCOMES_KEEP   : Nat = 8;
+  transient let STAGED_LP_TTL_NS   : Int = 300_000_000_000;  // 5 min — the outage backstop (fail-closed cancel + refund)
+  transient let STAGED_LP_REARM_NS : Int = 15_000_000_000;   // re-arm a waiting request's GEPTORs at most this often
+  transient let _stagedLpLastArm = Map.empty<Nat, Int>();    // request id → last GEPTOR arm ns
   // Past this long with no fresh oracle price, a staged entry is RELEASED
   // against user liquidity ONLY (no AMM) so user↔user trading survives an oracle
   // outage — generous vs the ~1s GEPTOR so a normal fetch always wins first.
@@ -522,6 +686,39 @@ persistent actor Uplands {
   // finalise tick (~seconds) continues from the oldest. Nothing is dropped,
   // only paced — the same liveness argument as the release cap.
   transient let EXPIRY_PASS_FILL_BUDGET : Nat = 1_024;
+  // H-22 (F22c + F28): the SAME pacing for the two FRESH-price release
+  // passes — processDeferred (one market's GEPTOR/tick release, run inside
+  // ammRequote) and processDeferredSwaps (the cross-swap release, run from
+  // the finaliser and the GEPTOR finalizer). Both used to release every due
+  // entry in one message with no cap, so a due cohort of identities ×
+  // STAGED_CAP_PER_OWNER (one placeLimitOrdersBulk each; the L0/L1 shed
+  // floors were the only aggregate bound) could trap the message that also
+  // carried the fetched mark and the fresh ladder — and re-trap at every
+  // retry, since a trap rolls the releases back. One ReleaseBudget per pass:
+  // a pass stops after MAX_RELEASES_PER_PASS releases OR once it has settled
+  // RELEASE_PASS_FILL_BUDGET fills (the release cap bounds RELEASES, the
+  // engine bounds fills PER release, their product is what the fill budget
+  // bounds — the EXPIRY_PASS_FILL_BUDGET argument), leaves the remainder
+  // staged in priority order with the GEPTOR re-armed, and the next requote
+  // (the GEPTOR's fetch or the 2s AMM tick) resumes from the head. Nothing
+  // is dropped, only paced. Sized like the expiry pass; the dev pin
+  // (setTestReleasePacing) lets a test drive small cohorts through several
+  // passes. `transient` — an actor-level `let` literal is STABLE (the
+  // EXIT_METHODS fossil, task 1788523828).
+  transient let MAX_RELEASES_PER_PASS : Nat = 256;
+  transient let RELEASE_PASS_FILL_BUDGET : Nat = 1_024;
+  transient var _testReleaseMaxPerPass : ?Nat = null;   // dev pin: setTestReleasePacing
+  transient var _testReleaseFillBudget : ?Nat = null;   // dev pin: setTestReleasePacing
+  func releaseMaxPerPass() : Nat { Option.get(_testReleaseMaxPerPass, MAX_RELEASES_PER_PASS) };
+  func releaseFillBudget() : Nat { Option.get(_testReleaseFillBudget, RELEASE_PASS_FILL_BUDGET) };
+  type ReleaseBudget = { var releases : Nat; var fills : Nat };
+  func newReleaseBudget() : ReleaseBudget { { var releases = 0; var fills = 0 } };
+  // Checked at the TOP of each release (like the expiry pass): a pass that
+  // has spent either budget releases nothing more this message.
+  func releaseBudgetOpen(b : ReleaseBudget) : Bool {
+    b.releases < releaseMaxPerPass() and b.fills < releaseFillBudget()
+  };
+  func chargeRelease(b : ReleaseBudget, fills : Nat) { b.releases += 1; b.fills += fills };
 
   // Anti-free-look: a staged TAKER entry is COMMITTED for this long before its
   // owner may cancel it. Without this, stage → watch a faster external feed →
@@ -535,12 +732,117 @@ persistent actor Uplands {
   // cancel/replace. The liquidation seize path (cancelAllUserOrders) bypasses
   // this deliberately — freeing collateral must never wait.
   transient let DEFERRED_COMMIT_NS : Int = 3_000_000_000; // 3 s
-  func deferredCommitted(id : Nat, ts : Int, now : Int) : Bool {
-    if (Option.get(Map.get(deferredPostOnly, Nat.compare, id), false)) { return false };
-    now - ts < DEFERRED_COMMIT_NS;
+  // H-23 (F6): the 3s wall clock was the WHOLE lock, on the premise that the
+  // GEPTOR releases in ~1–2s. The release is an 8-way HTTPS fan-out that
+  // returns with its slowest source — routinely past 3s (the notes at
+  // processGeptorDue / _geptorInFlight) — so whenever the fetch outlasted the
+  // window the owner had a free look: watch a faster feed while the venue's
+  // fetch is parked, cancel the adverse outcomes. The lock is now BOUND TO THE
+  // FETCH: past the window, an entry stays committed while a price fetch for
+  // its market DISPATCHED AFTER it was staged is still in flight (a GEPTOR arm
+  // in _geptorInFlight, or the periodic tick's / the admin fetch's dispatch in
+  // _fetchInFlight — any of them lands a mark that releases it), within the
+  // arm's TTL. Cancel is permitted again once that fetch finalizes (H-37: the
+  // fan-out's finalizer clears the guards on quorum, completion or the
+  // deadline, each through the guarded delete keyed by the stamp that
+  // dispatched — never another writer's), the TTL lapses (a latched arm never
+  // locks forever), or the entry's expiry passes (the users-only fallback owns it).
+  // Returns the refusal text; null = cancellable. Post-only stays exempt.
+  func deferredCommitReason(d : DeferredExec, now : Int) : ?Text {
+    if (Option.get(Map.get(deferredPostOnly, Nat.compare, d.id), false)) { return null };
+    if (now - d.ts < DEFERRED_COMMIT_NS) { return ?DEFERRED_COMMIT_ERR };
+    if (now >= d.expiresAt) { return null };
+    if (fetchInFlightSince(d.marketId, d.ts, now)) { return ?DEFERRED_INFLIGHT_ERR };
+    null;
+  };
+  // The cross-swap mirror: EITHER leg's fetch in flight keeps the swap
+  // committed (both legs release on their own market's fetch).
+  func swapCommitReason(s : DeferredSwap, now : Int) : ?Text {
+    if (now - s.ts < DEFERRED_COMMIT_NS) { return ?DEFERRED_COMMIT_ERR };
+    if (now >= s.expiresAt) { return null };
+    if (fetchInFlightSince(s.sellMarket, s.ts, now) or fetchInFlightSince(s.buyMarket, s.ts, now)) {
+      return ?DEFERRED_INFLIGHT_ERR;
+    };
+    null;
+  };
+  // Is a price fetch for `marketId` that was dispatched AFTER `ts` still in
+  // flight? Reads the GEPTOR arm (processGeptorDue's arm time) and the
+  // tick's / admin fetch's dispatch stamp, both under GEPTOR_INFLIGHT_TTL_NS
+  // so a latched entry (#52.6) self-heals here exactly as it does for the dedup.
+  func fetchInFlightSince(marketId : Types.MarketId, ts : Int, now : Int) : Bool {
+    let geptor = switch (Map.get(_geptorInFlight, Text.compare, marketId)) {
+      case (?armedAt) { armedAt > ts and now - armedAt < GEPTOR_INFLIGHT_TTL_NS };
+      case null { false };
+    };
+    if (geptor) { return true };
+    switch (Map.get(_fetchInFlight, Text.compare, marketId)) {
+      case (?dispatchNs) { dispatchNs > ts and now - dispatchNs < GEPTOR_INFLIGHT_TTL_NS };
+      case null { false };
+    };
   };
   transient let DEFERRED_COMMIT_ERR : Text =
     "Order is committed for settlement (releases on the next price tick) — cancellable in a few seconds";
+  transient let DEFERRED_INFLIGHT_ERR : Text =
+    "Order is committed for settlement — a price fetch dispatched after it was staged is in flight; cancellable once that fetch lands, its guard lapses, or the order expires";
+
+  // ── H-23 (F27/F39): the RELEASE REFERENCE — the mark keys on fetch DISPATCH ──
+  // `refPriceUpdatedNs` is the mark's OBSERVATION clock (the oldest arrival
+  // among the readings that entered the aggregate — W3-06), the right key for
+  // every STALENESS wall. It is the wrong key for anti-snipe: the providers
+  // served the price at or after the fetch was DISPATCHED, and a response can
+  // arrive seconds later — an order staged in between saw a ladder built on a
+  // price that already existed, yet `ts < refPriceUpdatedNs` released it
+  // against that pre-order ladder. The conservative reference for release is
+  // the dispatch clock: an entry releases only against a mark whose fetch was
+  // dispatched AFTER the entry was staged. Per-market side map (the pools map
+  // holds AMM.Pool by value — a field on the record is not an EOP-compatible
+  // upgrade; deferredFok / swapOutcomeStops set the pattern), written by the
+  // same writers that move the mark and nowhere else:
+  //   dispatchNs — Time.now() before the fan-out's first await (the GEPTOR's
+  //                arm time; the tick's and the admin fetch's own capture;
+  //                the dev override's call time)
+  //   appliedNs  — the continuation clock the mark was written on; the
+  //                cross-swap ladder-freshness predicate (F39) reads it
+  //                against pool.lastRequoteNs
+  // Readers: processDeferred (release gate), ammSweepResting (sweep gate), the
+  // L4 MM shield's pass reference, processDeferredSwaps (both legs). Absent
+  // (a market that has never applied a mark since this map existed) reads as
+  // 0 — nothing releases until the next fetch stamps it, which the GEPTOR a
+  // staging arms does within seconds. Cleared with the queues on a wipe.
+  type ReleaseRef = { dispatchNs : Int; appliedNs : Int };
+  let releaseRefs = Map.empty<Types.MarketId, ReleaseRef>();
+  func releaseRefOf(marketId : Types.MarketId) : ReleaseRef {
+    Option.get(Map.get(releaseRefs, Text.compare, marketId), { dispatchNs = 0; appliedNs = 0 });
+  };
+  func stampReleaseRef(marketId : Types.MarketId, dispatchNs : Int, appliedNs : Int) {
+    Map.add(releaseRefs, Text.compare, marketId, { dispatchNs; appliedNs });
+  };
+  // The per-market dispatch stamp of the two NON-GEPTOR fetch paths (transient
+  // — like _geptorInFlight): the periodic tick and the controller-only admin
+  // fetch (fetchAndSetRefPrice) each stamp it before their await for that
+  // market and drop it once the result is applied (a guarded delete — only the
+  // stamp they wrote, so the two paths overlapping on one market never free
+  // each other's live entry; a later stamp simply takes over the lock).
+  // fetchInFlightSince reads it so the commit lock covers a tick or an
+  // operator's manual fetch exactly as it covers a GEPTOR's — task 3088525590
+  // closed the admin path, which captured dispatchNs for the release
+  // reference but never stamped here, leaving an ops fetch free-lookable for
+  // its duration. Unwinding: the tick's `finally` drops the tick's OWN live
+  // stamp through the same guarded delete (no tick fetch outlives its tick;
+  // task 1788535668 — it used to clear the whole map, which also dropped a
+  // concurrent admin fetch's stamp and released the commit lock for the rest
+  // of that fetch); the admin path has no finally — a trap after its await
+  // leaves the entry to the 60s TTL or the next tick's re-stamp of that
+  // market (Map.add replaces it, and the tick then drops its own), which is
+  // acceptable (a stale entry can only over-lock, never under-lock, and
+  // lapses like a latched GEPTOR arm does).
+  transient let _fetchInFlight = Map.empty<Text, Int>();
+  func clearFetchInFlight(marketId : Types.MarketId, dispatchNs : Int) {
+    switch (Map.get(_fetchInFlight, Text.compare, marketId)) {
+      case (?t) { if (t == dispatchNs) { ignore Map.delete(_fetchInFlight, Text.compare, marketId) } };
+      case null {};
+    };
+  };
 
   // Swap OUTCOMES (latest per user). A cross-swap stages and releases later on a
   // GEPTOR, so the original `swap` call can't report what happened — and a swap
@@ -548,7 +850,7 @@ persistent actor Uplands {
   // the outcome here so the frontend can poll it (getMyRecentSwap) and tell the
   // user their staged swap filled / partly filled / couldn't fill, instead of it
   // vanishing with no explanation.
-  type SwapOutcome = {
+  type SwapOutcomeStored = {
     id         : Nat;
     ts         : Int;
     fromToken  : Text;
@@ -558,18 +860,64 @@ persistent actor Uplands {
     filled     : Bool;    // any `to` received
     note       : Text;    // human-readable status ("" = clean full fill)
   };
-  let swapOutcomes = Map.empty<Principal, SwapOutcome>();
-  func recordSwapOutcome(s : DeferredSwap, fromAmount : Nat, toAmount : Nat, filled : Bool, note : Text) {
-    Map.add(swapOutcomes, Principal.compare, s.owner, {
-      id = s.id; ts = Time.now();
-      fromToken = s.sellToken; fromAmount;
-      toToken = s.buyToken; toAmount; filled; note;
-    });
+  let swapOutcomes = Map.empty<Principal, SwapOutcomeStored>();
+  // The ENGINE's stop reason for the latest outcome (task 1788465056, #55
+  // silent "complete") — a sibling map because SwapOutcome's record shape is
+  // stable-fixed (adding a field to a record in a stable Map needs a
+  // migration); getMyRecentSwap joins the two. Absent for outcomes recorded
+  // before this map existed (the view's `stopReason` is opt for that reason —
+  // and it keeps the candid change additive).
+  let swapOutcomeStops = Map.empty<Principal, MatchingEngine.StopReason>();
+  // The QUERY shape (the published `SwapOutcome`): the stored record plus its
+  // stop reason — the stored type keeps its fixed shape under a private name.
+  type SwapOutcome = {
+    id         : Nat;
+    ts         : Int;
+    fromToken  : Text;
+    fromAmount : Nat;
+    toToken    : Text;
+    toAmount   : Nat;
+    filled     : Bool;
+    note       : Text;
+    stopReason : ?MatchingEngine.StopReason;   // why the walk stopped: filled | budgetExhausted | bookExhausted | slippage | unfunded | workBound
+  };
+  func recordSwapOutcomeCore(
+    owner : Principal, id : Nat, fromToken : Text, fromAmount : Nat, toToken : Text, toAmount : Nat,
+    filled : Bool, note : Text, market : ?Text, stop : MatchingEngine.StopReason,
+  ) {
+    Map.add(swapOutcomes, Principal.compare, owner, { id; ts = Time.now(); fromToken; fromAmount; toToken; toAmount; filled; note });
+    Map.add(swapOutcomeStops, Principal.compare, owner, stop);
     if (filled) {
-      logEventF("info", "swap", ?"swap", ?Principal.toText(s.owner), "Swap " # r2n(fromAmount) # " " # s.sellToken # " → " # r2n(toAmount) # " " # s.buyToken # (if (note == "") "" else " (" # note # ")"), ?s.buyMarket);
+      logEventF("info", "swap", ?"swap", ?Principal.toText(owner), "Swap " # r2n(fromAmount) # " " # fromToken # " → " # r2n(toAmount) # " " # toToken # (if (note == "") "" else " (" # note # ")"), market);
     } else {
-      logEventF("warn", "swap", ?"swap", ?Principal.toText(s.owner), "Swap " # s.sellToken # "→" # s.buyToken # " did not fill: " # note, ?s.buyMarket);
+      logEventF("warn", "swap", ?"swap", ?Principal.toText(owner), "Swap " # fromToken # "→" # toToken # " did not fill: " # note, market);
     };
+  };
+  func recordSwapOutcome(s : DeferredSwap, fromAmount : Nat, toAmount : Nat, filled : Bool, note : Text, stop : MatchingEngine.StopReason) {
+    recordSwapOutcomeCore(s.owner, s.id, s.sellToken, fromAmount, s.buyToken, toAmount, filled, note, ?s.buyMarket, stop);
+  };
+  // The DIRECT path's outcome (an ICPUSD → base budgeted swap released
+  // through releaseDeferred): recorded under the ORIGINAL staged id when the
+  // conversion stopped short of the request. The note says how much of what
+  // was asked converted, why the walk stopped, and — the #55 shape — how
+  // much of the request was never available because open orders reserved it.
+  func recordDirectSwapOutcome(c : DirectSwapCtx, d : DeferredExec, spent : Nat, received : Nat, reason : MatchingEngine.StopReason, tail : Text) {
+    let clampNote = if (c.eff < c.requested) {
+      "only $" # r2n(c.eff) # " of the $" # r2n(c.requested) # " asked was available at staging — $" # r2n(c.requested - c.eff) # " is reserved by your open orders"
+    } else { "" };
+    let why = switch (reason) {
+      case (#budgetExhausted) { "the available budget converted in full" };
+      case (#bookExhausted)   { "no more " # d.baseToken # " was offered within your slippage" };
+      case (#slippage)        { "the book moved past your slippage cap" };
+      case (#unfunded)        { "insufficient available balance to continue" };
+      case (#workBound)       { "the release hit its per-cycle work bound" };
+      case (#filled)          { "the sized quantity filled below the stated amount (the book improved after staging)" };
+    };
+    let note = "Converted $" # r2n(spent) # " of the $" # r2n(c.requested) # " asked — " # why
+      # (if (clampNote == "") "" else " (" # clampNote # ")")
+      # (if (tail == "") "" else "; " # tail)
+      # ". Unconverted ICPUSD stays in your balance.";
+    recordSwapOutcomeCore(d.owner, c.origId, Types.QUOTE_TOKEN, spent, d.baseToken, received, received > 0, note, ?d.marketId, reason);
   };
 
   // ── Event log (Stats → Events) ──────────────────────────────────────
@@ -688,11 +1036,14 @@ persistent actor Uplands {
     Array.tabulate<Event>(n, func(i) { sorted[i] });
   };
 
-  // Default settlement window for the future AMM's orders. Exposed as a
-  // constant now so Phase 1 clients can already place protected orders;
-  // becomes the AMM's standard window in Phase 2.
-  transient let DEFAULT_PROTECTION_WINDOW_NS : Nat = 5_000_000_000; // 5 s
-  transient let MAX_PROTECTION_WINDOW_NS     : Nat = 30_000_000_000; // 30 s cap
+  // (MAX_/DEFAULT_PROTECTION_WINDOW_NS were retired with the PendingMatch
+  // machinery — task 1788516198; PENDING_PROBE_SYNTH, the probe's pending
+  // owner-index saturation size, went with the fixture at apiVersion 6.0.0.)
+  // H-22: devSweepCostProbe's saturation size for the release pass's pre-pass
+  // selection (stagedForMarketTopK, task 1788550465) — synthetic staged entries on the walk
+  // market, seeded in query state. 5,000 = the L1 shed floor's staged depth,
+  // the most a release pass can be asked to sort on a live venue.
+  transient let RELEASE_PROBE_SYNTH : Nat = 5_000;
 
   // ── Phase 2: AMM state ────────────────────────────────────────
   // Pools, per-user LP balances, and the canister's own principal
@@ -786,7 +1137,7 @@ persistent actor Uplands {
   // per-counterparty hostility machinery (recordCounterpartyFill,
   // aggregateHostilityBps, the quote-site widening term) was identically
   // zero for its whole life: the AMM is non-takeable (MatchingEngine) and
-  // never a pending-match party, so the map below was provably never fed.
+  // never a pending-match party, so its stable map was provably never fed.
   // Wiring it instead was REJECTED: per-counterparty hostility is an
   // attacker-influenceable input to public quotes (widen-by-griefing;
   // Sybil laundering zeroes the score). Any future adverse-selection
@@ -794,19 +1145,11 @@ persistent actor Uplands {
   // requirements (markout / vol / inventory-based — the AMM already
   // tracks vol and inventory), not by resurrecting this map.
   //
-  // FROZEN shape + fossil-parked stable field: EOP refuses stable-field
-  // drops (IC0503), so the empty map stays declared. Never written; empty
-  // on every live target (its only writer was unreachable). A future
-  // migration sweep may remove it through the migration chain.
-  type CounterpartyStats = {
-    principal       : Principal;
-    totalFills      : Nat;
-    totalFillValue  : Float;  // quote-denominated
-    adverseRate     : Float;  // EWMA, 0.0 = all losses, 1.0 = all wins for AMM
-    lastFillNs      : Int;
-  };
-
-  let counterpartyStats = Map.empty<Text, CounterpartyStats>();
+  // The fossil-parked `counterpartyStats` stable map (EOP refuses
+  // stable-field drops) was SWEPT by the fifth one-shot migration (tasks
+  // 1787222803 + 1787207569; applied to both mainnet targets 2026-09-03,
+  // RETIRED with 1788285811 — see the NOTE above the actor) — empty on
+  // every live target, so the transform simply did not carry it forward.
 
   // ═══ Progressive access & fee levels (earned, algorithmic) ═══════════
   // docs/access-prioritization-design.md + docs/progressive-incentives-design.md.
@@ -852,17 +1195,29 @@ persistent actor Uplands {
   type UptimeStats = { var samples : Nat; var passes : Nat };
   let uptimeStats = Map.empty<Text, UptimeStats>();
 
-  // MM freshness shield. Stamped whenever an MM STAGES a limit order (their
-  // requote/reprice intent): "owner#market" → ts, plus an owner-level stamp for
-  // paths without market context. While a stamp is fresher than the pass price
-  // (and within TTL), the MM's RESTING quotes on that market are non-takeable —
-  // their staged intent (which releases FIRST by tier priority) lands before
-  // anyone can pick off the stale book. An idle MM's shield lapses with the TTL.
+  // MM freshness shield. Stamped when an L4 MM STAGES a limit order that is a
+  // genuine REPRICING intent for that market (isRepricingIntent — notional and
+  // price-proximity commensurate with their resting depth there; H-24/D1):
+  // "owner#market" → ts, plus an owner-level stamp for paths without market
+  // context. While a stamp is fresher than the pass price (and within TTL),
+  // the MM's RESTING quotes on that market are non-takeable — their staged
+  // intent (which releases FIRST by tier priority) lands before anyone can
+  // pick off the stale book. The stamp LAPSES the moment that intent lands
+  // (landMmShield) or is killed/cancelled (clearMmShield): a shield exists
+  // only while a repricing intent is in flight. Shielded depth is also
+  // excluded from getTakeableDepth and from the uptime sample — it is not
+  // takeable, so it earns neither display weight nor L4 uptime.
   let mmQuoteStamp  = Map.empty<Text, Int>();               // "owner#market" → ts
   let mmOwnerStamp  = Map.empty<Text, Int>();               // owner → ts (users-only path)
 
-  // Per-owner staged-order counter → parkDeferred cap (bounds deferred-queue
-  // occupancy per principal; incremented there, decremented in removeDeferredExec).
+  // Per-owner staged counter → the STAGED_CAP_PER_OWNER gate. Counts BOTH
+  // staged maps: deferredExecs (incremented in parkDeferred, decremented in
+  // removeDeferredExec) and, since H-13 (F22a, 2026-09-04), deferredSwaps
+  // (incremented in executeSwapCross's staged branch, decremented in
+  // removeDeferredSwap). Stable, but RECOUNTED from the two maps in the init
+  // block (rebuildStagedIndexes) so an upgrade over a venue that staged
+  // cross-swaps before the fix comes up with an honest count; the audit's
+  // (f) check reconciles it against the same recount.
   let stagedCountByOwner = Map.empty<Text, Nat>();
 
   transient var _shedFloor : Nat = 0;         // 0 open · 1 shed rank-0 · 2 shed rank-1 too
@@ -892,21 +1247,33 @@ persistent actor Uplands {
   transient let MM_MIN_UPTIME_PCT : Nat = 50;                 // L4 needs ≥ 50% sampled uptime
   transient let MM_MIN_SAMPLES    : Nat = 20;                 // …across at least 20 samples (dwell)
   transient let MM_STAMP_TTL_NS   : Int = 30_000_000_000;     // shield lifetime per staged intent
+  // H-24 (F2, D1): what makes a staged limit a REPRICING intent worth a shield
+  // (isRepricingIntent) — its notional must be ≥ this share of the owner's
+  // resting notional on that market, and its price within this band of the
+  // mark. 20% = one level of a five-level ladder against the opposite side;
+  // 200 bps = twice the uptime window the shielded quotes themselves sit in.
+  transient let MM_SHIELD_MIN_NOTIONAL_BPS : Nat = 2_000;
+  transient let MM_SHIELD_PROX_BPS         : Nat = 200;
   transient let STAGED_CAP_PER_OWNER : Nat = 32;              // max staged orders per principal
   transient let SHED_SOFT_STAGED  : Nat = 2_000;              // queue depth → floor 1
   transient let SHED_HARD_STAGED  : Nat = 5_000;              // queue depth → floor 2
   transient let SHED_SOFT_LOWER   : Nat = 1_400;              // hysteresis: lower floor below these
   transient let SHED_HARD_LOWER   : Nat = 3_500;
   // W1-08: the archive ship queue is the SECOND admission signal. The shipper
-  // drains at most SHIP_BATCH_MAX per HB_SHIP_NS (200 events/s, a hard
-  // ceiling); above that inflow the backlog grows in THIS canister's heap,
-  // the L2 shed deliberately never fires on a HEALTHY shipper below the L3
-  // shear ceiling (SHIP_SHEAR_CAP_DEFAULT, see tickShipEvents), and an
+  // drains SHIP_BATCH_MAX per HB_SHIP_NS (200 events/s) below the soft tier
+  // and, since H-32, bursts up to SHIP_BURST_MAX further batches per tick
+  // above it (see tickShipEvents); above that inflow the backlog grows in
+  // THIS canister's heap, the L2 shed deliberately never fires on a HEALTHY
+  // shipper below the L3 shear ceiling (SHIP_SHEAR_CAP_DEFAULT, gated on
+  // memory pressure since H-32, see tickShipEvents), and an
   // attacker who places no orders never moves staged
   // depth — so free tape-writing methods needed their own signal. The hard
   // tier engages 2.5× under the L2 cap (USER_EVENTS_HARD_CAP_DEFAULT, 250k);
   // a healthy shipper clears 50k in ~4 min, so only sustained overproduction
   // holds the floor up. Same 0.7 hysteresis ratio as the staged bands.
+  // The EXIT SET stays admitted at every tier (W1-05); its own tape inflow
+  // is bounded per principal by the dust-coalescing window (H-32, see
+  // exitFolds) rather than by this floor.
   transient let SHED_SOFT_SHIP        : Nat = 50_000;         // ship-queue depth → floor 1
   transient let SHED_HARD_SHIP        : Nat = 100_000;        // ship-queue depth → floor 2
   transient let SHED_SOFT_SHIP_LOWER  : Nat = 35_000;
@@ -914,6 +1281,10 @@ persistent actor Uplands {
   // Dev pin (soft, hard, softLower, hardLower) so the gate is testable
   // without producing 50k real events; null = the constants above.
   transient var _testShipShedBands : ?(Nat, Nat, Nat, Nat) = null;
+  // H-13: the same pin for the STAGED-depth signal (deferredExecs +
+  // deferredSwaps), so a test can prove staged cross-swap depth alone raises
+  // the floor without staging SHED_SOFT_STAGED real entries; null = constants.
+  transient var _testStagedShedBands : ?(Nat, Nat, Nat, Nat) = null;
 
   // Badge ids (names in badgeName(); thresholds are LIFETIME, never scaled —
   // they are milestones, not privileges).
@@ -1101,7 +1472,11 @@ persistent actor Uplands {
       case null { false };
     };
   };
-  func awardBadge(k : Text, id : Nat, now : Int) {
+  // Idempotent grant primitive: adds the badge and reports whether it was NEW.
+  // Deliberately silent — the caller decides how to narrate it: the inline
+  // paths log one per-user line (awardBadge), the sharded backfill in tickTier
+  // folds a whole slice into ONE summary line (3088514069).
+  func grantBadge(k : Text, id : Nat, now : Int) : Bool {
     let m = switch (Map.get(badges, Text.compare, k)) {
       case (?m) { m };
       case null {
@@ -1110,9 +1485,14 @@ persistent actor Uplands {
         m;
       };
     };
-    if (Map.get(m, Nat.compare, id) != null) { return };
+    if (Map.get(m, Nat.compare, id) != null) { return false };
     Map.add(m, Nat.compare, id, now);
-    logEventF("info", "access", ?"badge", ?k, "badge awarded: " # badgeName(id), null);
+    true;
+  };
+  func awardBadge(k : Text, id : Nat, now : Int) {
+    if (grantBadge(k, id, now)) {
+      logEventF("info", "access", ?"badge", ?k, "badge awarded: " # badgeName(id), null);
+    };
   };
   func checkVolumeBadges(k : Text, now : Int) {
     let lv = Option.get(Map.get(lifetimeVol, Text.compare, k), 0);
@@ -1130,7 +1510,7 @@ persistent actor Uplands {
   // The stamps are written at PLACEMENT and were once cleared nowhere but
   // resetExchange, so staging a post-only order and cancelling it immediately
   // bought a full quote shield for free: post-only bypasses the 3s
-  // anti-free-look lock (deferredCommitted returns false for it), the
+  // anti-free-look lock (deferredCommitReason returns null for it), the
   // reservation is refunded, and isMMShieldedStale is owner-level with a 30s
   // TTL — a two-call loop every ~29s held a shield over the maker's entire book
   // on every market with no live intent behind it. The shield's whole
@@ -1141,9 +1521,26 @@ persistent actor Uplands {
   // is precisely how it went wrong: the clear was added to cancelOwnSpotOrder
   // while the public cancelMyOrder kept its own near-identical staged branch,
   // and the exploit survived verbatim through the endpoint users actually call.
+  //
+  // H-24: the ONE place the stamps are deleted (hygiene pins it). `upTo`
+  // scopes the clear — null drops both stamps outright (kills, cancels);
+  // ?ts drops only a stamp written at or before `ts` (a landing intent —
+  // see landMmShield: a NEWER stamp belongs to a later in-flight intent).
+  func clearMmShieldUpTo(owner : Principal, marketId : Types.MarketId, upTo : ?Int) {
+    let mk = Principal.toText(owner) # "#" # marketId;
+    let ok = Principal.toText(owner);
+    func due(m : Map.Map<Text, Int>, k : Text) : Bool {
+      switch (upTo, Map.get(m, Text.compare, k)) {
+        case (null, _) { true };
+        case (?ts, ?stamp) { stamp <= ts };
+        case (?_, null) { false };
+      };
+    };
+    if (due(mmQuoteStamp, mk)) { ignore Map.delete(mmQuoteStamp, Text.compare, mk) };
+    if (due(mmOwnerStamp, ok)) { ignore Map.delete(mmOwnerStamp, Text.compare, ok) };
+  };
   func clearMmShield(owner : Principal, marketId : Types.MarketId) {
-    ignore Map.delete(mmQuoteStamp, Text.compare, Principal.toText(owner) # "#" # marketId);
-    ignore Map.delete(mmOwnerStamp, Text.compare, Principal.toText(owner));
+    clearMmShieldUpTo(owner, marketId, null);
   };
 
   // Freshness shield checks (see mmQuoteStamp above). Level 4 — the tier whose
@@ -1167,10 +1564,42 @@ persistent actor Uplands {
       case null { false };
     };
   };
+  // H-24 (F2, D1 option (a)): is this staged limit an intent that could
+  // actually REPRICE the owner's shielded book on `marketId`? Pre-fix ANY
+  // staged L4 limit stamped the shield, so a $10 dust limit far from the mid
+  // — always landing, one per <30 s — renewed the owner's shield forever.
+  // Commensurate means BOTH:
+  //   notional  — qty × price ≥ MM_SHIELD_MIN_NOTIONAL_BPS of the owner's
+  //               RESTING notional on that market (Σ open-bid value, plus
+  //               Σ open-ask base valued at the mark — the OrderBook's O(log n)
+  //               running totals, no walk); nothing resting → nothing to shield;
+  //   proximity — |price − mark| ≤ MM_SHIELD_PROX_BPS of the mark. A limit
+  //               parked far from the mid reprices nothing.
+  // Unpriced market (no pool / mark 0) → no shield: there is no sealed
+  // release there to shield against, and no mid to judge proximity by.
+  func isRepricingIntent(owner : Principal, marketId : Types.MarketId, price : Nat, qty : Nat) : Bool {
+    let ref = switch (AMM.getPool(pools, marketId)) { case (?p) { p.refPrice }; case null { 0 } };
+    if (ref == 0) { return false };
+    let restingNotional = OrderBook.getUserMarketBuyTotal(orderStore, owner, marketId)
+      + Fixed.mul(OrderBook.getUserMarketSellTotal(orderStore, owner, marketId), ref, false);
+    if (restingNotional == 0) { return false };
+    if (Fixed.mul(qty, price, false) * 10_000 < restingNotional * MM_SHIELD_MIN_NOTIONAL_BPS) { return false };
+    let dev = if (price > ref) { price - ref : Nat } else { ref - price : Nat };
+    Fixed.mulDiv(dev, 10_000, ref, true) <= MM_SHIELD_PROX_BPS;
+  };
+  // H-24: the intent stamped at `intentTs` has LANDED — its shield lapses. The
+  // stamps are per owner(#market), one value each, so only a stamp this intent
+  // (or an older one) wrote is dropped: a stamp NEWER than the landing intent
+  // belongs to a later in-flight repricing intent and stays. Kills and cancels
+  // keep the unconditional clearMmShield (an intent that never lands must not
+  // shield anything — #51.1).
+  func landMmShield(owner : Principal, marketId : Types.MarketId, intentTs : Int) {
+    clearMmShieldUpTo(owner, marketId, ?intentTs);
+  };
   // ═══ end progressive levels ═══════════════════════════════════════
 
-  // (Phase-4 counterparty scoring RETIRED — see the fossil-parked
-  // counterpartyStats declaration above for the record.)
+  // (Phase-4 counterparty scoring RETIRED — see the retirement note
+  // above the progressive-levels block for the record.)
 
   // Canister's own principal, assigned on first call to `ammPrincipal()`.
   transient var _ammPrincipal : ?Principal = null;
@@ -1214,7 +1643,8 @@ persistent actor Uplands {
     true;
   };
 
-  // Available = balance (held) − reserved (locked in pending matches).
+  // Available = balance (held) − reserved (the soft-lock of the caller's
+  // staged orders and staged cross-swaps — see reservedBalances).
   //
   // Cross-margin note: there is no margin "hard lock" any more. A margin
   // user's whole balance is collateral, but it remains fully spendable —
@@ -1236,34 +1666,59 @@ persistent actor Uplands {
   // Soft-locked reserves: a STAGED order (deferredExecs) or staged cross-swap
   // (deferredSwaps) reserves its debit via addReserved WITHOUT removing the
   // funds from balance — it's a soft availability lock (getAvailable = balance
-  // − reserved), not a balance→reserved MOVE. (Pending matches, by contrast,
-  // genuinely subtract the balance when they reserve.) The margin valuation
+  // − reserved), not a balance→reserved MOVE. (The retired pending matches,
+  // by contrast, genuinely subtracted the balance when they reserved.) The margin valuation
   // sums getBalance + reserved, so counting a soft-lock would DOUBLE-COUNT the
   // still-present balance and inflate collateral/health — letting a margin user
   // stage an order to dodge liquidation or borrow against phantom collateral,
   // then cancel. This returns the soft-locked amount for (user, token) so the
-  // margin reserved lookup can subtract it back out; the genuinely-moved
-  // pending-match portion is preserved. O(staged entries) — small.
+  // margin reserved lookup (reservedBalance, below) can subtract it back out,
+  // leaving only reserves that really moved out of balance — today none, since
+  // every live reservation is a soft-lock, so that lookup reads 0. O(1): an
+  // accumulator read (softLockedAcc); softLockedReservedRecomputed is the
+  // audit-oracle scan.
   // ── Owner-keyed indexes over the staged maps (W1-04 / W3-01) ──────
   // Both liquidation-path walks (cancelAllUserOrders) and the margin
   // valuation's soft-lock read (softLockedReserved) used to scan the ENTIRE
   // pendingMatches / deferredExecs / deferredSwaps maps — O(global staged),
   // attacker-inflatable, fired per liquidated user and five times per health
-  // check. These indexes make both O(that user's entries).
+  // check. The indexes make the liquidation walk O(that user's entries);
+  // the soft-lock read is O(1) through the softLockedAcc accumulator.
   //
   // Deliberately TRANSIENT: they are derived caches of the authoritative
   // maps, rebuilt by the init block at the bottom of the actor (actor-body
   // statements run on install AND upgrade), so they can never survive an
   // upgrade in a state the maps don't corroborate, and they need no
   // migration. Maintenance lives in the same chokepoints that keep
-  // stagedCountByOwner honest: recordPendingMatchIndex/removePendingIndex,
-  // the two stage sites, removeDeferredExec, and removeDeferredSwap (the
-  // swap mirror of removeDeferredExec — bare Map.delete on a staged map is
-  // banned by the same reasoning as at removeDeferredExec).
-  // getStagedIndexAudit is the drift detector.
-  transient let pmIdsByUser        = Map.empty<Principal, Map.Map<Nat, Bool>>(); // taker AND maker
+  // stagedCountByOwner honest: the two stage sites, removeDeferredExec, and
+  // removeDeferredSwap (the swap mirror of removeDeferredExec — bare
+  // Map.delete on a staged map is banned by the same reasoning as at
+  // removeDeferredExec). getStagedIndexAudit is the drift detector. (The
+  // pending-match owner index pmIdsByUser was retired at apiVersion 6.0.0
+  // with the last public reader of the fossil pendingMatches map.)
   transient let deferredIdsByOwner = Map.empty<Principal, Map.Map<Nat, Bool>>();
   transient let swapIdsByOwner     = Map.empty<Principal, Map.Map<Nat, Bool>>();
+  // Task 1788550465: the MARKET-keyed mirror of deferredIdsByOwner — the
+  // release pass's pre-pass collect (stagedForMarketTopK) reads one market's
+  // staged ids off it instead of walking EVERY deferredExecs entry (all
+  // markets) on each requote. Same chokepoints (parkDeferred /
+  // removeDeferredExec), same init rebuild, same audit (getStagedIndexAudit
+  // checks (a)/(b) for it too). A staged entry's market never changes, so
+  // the id sits under exactly one key for its whole life.
+  transient let deferredIdsByMarket = Map.empty<Types.MarketId, Map.Map<Nat, Bool>>();
+  // Task 1788552852: the EXPIRY-keyed index of deferredExecs — expiresAt →
+  // {id}, ascending. The expiry pass (expiredDeferredBatch) reads its due
+  // cohort off the head and stops at the first key past `now`, instead of
+  // scanning every staged entry on every finalise tick (8.4M instr per tick
+  // at the 5,000 floor with nothing due). expiresAt is a flat offset from
+  // staging for most entries, but setTestDeferredExpiry re-puts an entry
+  // under a new expiresAt (the ONE re-put site — grep `Map.add(deferredExecs`),
+  // which breaks id-order monotonicity, so the key is the value itself. Same
+  // chokepoints as deferredIdsByMarket (parkDeferred / removeDeferredExec)
+  // plus the re-put, wiped with the maps, init-rebuilt, reconciled by
+  // getStagedIndexAudit (g). An id sits under exactly one key: the key it
+  // was added under is the entry's CURRENT expiresAt, and the re-put moves it.
+  transient let deferredIdsByExpiry = Map.empty<Int, Map.Map<Nat, Bool>>();
   // (owner, token) → soft-locked total over deferredExecs + deferredSwaps.
   transient let softLockedAcc      = Map.empty<Text, Nat>();
 
@@ -1287,6 +1742,40 @@ persistent actor Uplands {
     switch (Map.get(idx, Principal.compare, p)) {
       case (?s) { Iter.toArray(Map.keys(s)) };
       case null { [] };
+    };
+  };
+  // The market-keyed twins (deferredIdsByMarket) — same shape, Text key.
+  func marketIdxAdd(m : Types.MarketId, id : Nat) {
+    let s = switch (Map.get(deferredIdsByMarket, Text.compare, m)) {
+      case (?s) { s };
+      case null { let s = Map.empty<Nat, Bool>(); Map.add(deferredIdsByMarket, Text.compare, m, s); s };
+    };
+    Map.add(s, Nat.compare, id, true);
+  };
+  func marketIdxDel(m : Types.MarketId, id : Nat) {
+    switch (Map.get(deferredIdsByMarket, Text.compare, m)) {
+      case (?s) {
+        ignore Map.delete(s, Nat.compare, id);
+        if (Map.size(s) == 0) { ignore Map.delete(deferredIdsByMarket, Text.compare, m) };
+      };
+      case null {};
+    };
+  };
+  // The expiry-keyed twins (deferredIdsByExpiry) — same shape, Int key.
+  func expiryIdxAdd(e : Int, id : Nat) {
+    let s = switch (Map.get(deferredIdsByExpiry, Int.compare, e)) {
+      case (?s) { s };
+      case null { let s = Map.empty<Nat, Bool>(); Map.add(deferredIdsByExpiry, Int.compare, e, s); s };
+    };
+    Map.add(s, Nat.compare, id, true);
+  };
+  func expiryIdxDel(e : Int, id : Nat) {
+    switch (Map.get(deferredIdsByExpiry, Int.compare, e)) {
+      case (?s) {
+        ignore Map.delete(s, Nat.compare, id);
+        if (Map.size(s) == 0) { ignore Map.delete(deferredIdsByExpiry, Int.compare, e) };
+      };
+      case null {};
     };
   };
 
@@ -1325,329 +1814,92 @@ persistent actor Uplands {
   };
 
   // Reserved-balance callback for the margin collateral valuation.
-  // Funds MOVED balance→reserved for in-flight pending matches are still the
-  // user's collateral (they'll settle into the bought asset or refund), so
-  // MarginEngine.valuations adds them back. Without this, a margin user buying
-  // against AMM-protected quotes is transiently under-valued and wrongly
-  // liquidated mid-settlement. We EXCLUDE soft-locked staged reserves (see
-  // softLockedReserved) because those funds are still in balance — adding them
-  // would double-count. For the common case (no staged orders) softLocked is 0
-  // and this is exactly getReserved.
+  // Funds MOVED balance→reserved are still the user's collateral (they settle
+  // into the bought asset or refund), so MarginEngine.valuations adds them
+  // back. (The one mover was the retired pending-match path — task
+  // 1788516198 — so today every reservation is a soft-lock and this reads 0;
+  // the shape stays so a future balance→reserved mover is valued correctly.)
+  // We EXCLUDE soft-locked staged reserves (see softLockedReserved) because
+  // those funds are still in balance — adding them would double-count. For
+  // the common case (no staged orders) softLocked is 0 and this is exactly
+  // getReserved.
   transient let reservedBalance : (Principal, Types.TokenId) -> Nat =
     func(p, t) { let g = getReserved(p, t); let s = softLockedReserved(p, t); if (g > s) { g - s } else { 0 } };
 
-  // ── Pending-match ledger operations ──────────────────────────
-  // A taker crossing a maker with a protection window triggers:
-  //   reserve taker's debit (debit token moves balance → reserved)
-  //   lock maker's quantity (accounted in pendingQtyByMaker)
-  //   record PendingMatch, indexed both by id and by makerOrderId
-  // Finalisation transfers reserved → counterparty balance. Voiding
-  // refunds reserved → original balance. Either exit path clears the
-  // pendingQtyByMaker entry for the consumed slice.
+  // ── Pending-match machinery: RETIRED, and its Candid REMOVED ──────────
+  // Task 1788516198 (operator decision 2026-09-06, option 2): the
+  // PendingMatch / protection-window machinery — createPendingMatch,
+  // finalisePendingMatch, voidPendingMatch, voidPendingMatchesForMaker,
+  // settleOrVoidAmmPending, the finaliser's pending scan, the AMM-quote
+  // orderSettlementWindows write, matchDebits and the pending-qty lock, the
+  // engine's deferred-fill arms (getMakerWindow / getMakerPending /
+  // onPendingFill) and the frontend poll — is DELETED. It had been dormant
+  // since the sealed model landed: every release settles at window 0 and
+  // the sealed release IS the anti-snipe (task 1788515326 recorded the
+  // dormancy chain; verified live 2026-09-04, pmLive 0 throughout). The
+  // 5.x line kept getMyPendingMatches, placeProtectedLimitOrder,
+  // MatchResult/PlaceLimitResult.pendingMatches, setAmmConfig's
+  // protectionWindowSec and AmmPool.protectionWindowSec as INERT STUBS for a
+  // byte-identical Candid; apiVersion 6.0.0 (task 1788731608) REMOVED every
+  // one of them, and with them the owner-index audit fixture (pmIdsByUser,
+  // recordPendingMatchIndex, myPendingMatchesOf, devSweepCostProbe's
+  // pending fields, tests/test_pending_owner_index.sh) whose only public
+  // reader was the removed query. The stable `pendingMatches` map and its
+  // four fossil siblings (orderSettlementWindows, pendingByMaker,
+  // nextPendingMatchId, pendingQtyByMaker — EOP refuses a stable-field drop
+  // or retype on a plain upgrade, IC0503) outlived 6.0.0 declared, never
+  // written and cleared by resetExchange, until the sixth one-shot
+  // migration (task 1788744109) consumed and DROPPED all five — see the
+  // NOTE above the actor. getStagedIndexAudit.pmLive stays in the Candid as
+  // a constant 0; Types.PendingMatch went with the map (its frozen shape
+  // lives in migration.mo until the retirement).
 
-  func recordPendingMatchIndex(pm : Types.PendingMatch) {
-    // Primary index
-    Map.add(pendingMatches, Nat.compare, pm.id, pm);
-    // Owner index (W1-04): both parties, so cancelAllUserOrders finds the
-    // match from either side without scanning the map.
-    ownerIdxAdd(pmIdsByUser, pm.takerPrincipal, pm.id);
-    ownerIdxAdd(pmIdsByUser, pm.makerPrincipal, pm.id);
-    // Secondary index: makerOrderId → {pmId}
-    let mkSet = switch (Map.get(pendingByMaker, Nat.compare, pm.makerOrderId)) {
-      case (?s) { s };
-      case null {
-        let s = Map.empty<Nat, Bool>();
-        Map.add(pendingByMaker, Nat.compare, pm.makerOrderId, s);
-        s;
-      };
-    };
-    Map.add(mkSet, Nat.compare, pm.id, true);
-  };
-
-  func addPendingQty(makerOrderId : Nat, qty : Nat) {
-    let cur = Option.get(Map.get(pendingQtyByMaker, Nat.compare, makerOrderId), 0);
-    Map.add(pendingQtyByMaker, Nat.compare, makerOrderId, cur + qty);
-  };
-
-  func subPendingQty(makerOrderId : Nat, qty : Nat) {
-    let cur = Option.get(Map.get(pendingQtyByMaker, Nat.compare, makerOrderId), 0);
-    // FAIL CLOSED on a pending-qty desync (W5-12, #28.4): this is subReserved's
-    // structural twin, and non-negativity here is an INVARIANT, not a clamp —
-    // SafeMath's own header says a silent 0 is exactly wrong for that. An
-    // underflow means the pending-match accounting desynced upstream: leave
-    // the row as it stands (the conservative direction — quantity stays
-    // locked) and log loudly instead of hiding it.
-    if (cur < qty) {
-      logEventF("warn", "settle", ?"pendingQty", null,
-        "pending-qty desync — maker order " # Nat.toText(makerOrderId)
-        # " asked to release " # Nat.toText(qty) # " with only " # Nat.toText(cur)
-        # " pending; row left unchanged (fail-closed)", null);
-      return;
-    };
-    let next : Nat = cur - qty;
-    if (next == 0) {
-      ignore Map.delete(pendingQtyByMaker, Nat.compare, makerOrderId);
-    } else {
-      Map.add(pendingQtyByMaker, Nat.compare, makerOrderId, next);
-    };
-  };
-
-  func removePendingIndex(pm : Types.PendingMatch) {
-    ignore Map.delete(pendingMatches, Nat.compare, pm.id);
-    ownerIdxDel(pmIdsByUser, pm.takerPrincipal, pm.id);
-    ownerIdxDel(pmIdsByUser, pm.makerPrincipal, pm.id);
-    switch (Map.get(pendingByMaker, Nat.compare, pm.makerOrderId)) {
-      case null {};
-      case (?s) {
-        ignore Map.delete(s, Nat.compare, pm.id);
-        if (Map.size(s) == 0) {
-          ignore Map.delete(pendingByMaker, Nat.compare, pm.makerOrderId);
-        };
-      };
-    };
-  };
-
-  // Compute the amounts the taker owes and the maker owes for a fill.
-  // Always denominated relative to the trade's base/quote.
-  //   taker BUYS  → taker debits quote, maker debits base
-  //   taker SELLS → taker debits base,  maker debits quote
-  func matchDebits(marketId : Types.MarketId, takerSide : Types.Side, price : Nat, quantity : Nat)
-      : ?(Types.TokenId, Nat, Types.TokenId, Nat) {
-    switch (Map.get(markets, Text.compare, marketId)) {
-      case null { null };
-      case (?(baseToken, _)) {
-        let quoteValue = Fixed.mul(price, quantity, true);   // debit reserved — round up to cover
-        switch (takerSide) {
-          case (#buy)  { ?(Types.QUOTE_TOKEN, quoteValue, baseToken,        quantity) };
-          case (#sell) { ?(baseToken,         quantity,   Types.QUOTE_TOKEN, quoteValue) };
-        };
-      };
-    };
-  };
-
-  // Create a PendingMatch atomically: move the taker's debit from balance
-  // → reserved, move the maker's debit from balance → reserved, bump the
-  // pending-qty lock on the maker's order, and store the record in the
-  // ledger. Invoked by the ProtectionCtx.onPendingFill callback from
-  // inside the matching engine.
-  func createPendingMatch(
-    marketId       : Types.MarketId,
-    makerOrderId   : Nat,
-    makerPrincipal : Principal,
-    takerPrincipal : Principal,
-    takerSide      : Types.Side,
-    takerOrderType : Types.OrderType,
-    fillQty        : Nat,
-    price          : Nat,
-    windowNs       : Nat,
-    now            : Int,
-  ) : ?Types.PendingMatch {
-    let dbg = matchDebits(marketId, takerSide, price, fillQty);
-    let (takerDebitToken, takerDebitAmount, makerDebitToken, makerDebitAmount) = switch (dbg) {
-      case (?t) { t };
-      case null { return null };
-    };
-    // Sanity: both parties must have enough AVAILABLE (balance - reserved)
-    // balance to back their side of the match. If not, skip (engine will
-    // have already drawn down their balance to zero for other reasons).
-    if (getAvailable(takerPrincipal, takerDebitToken) < takerDebitAmount) { return null };
-    if (getAvailable(makerPrincipal, makerDebitToken) < makerDebitAmount) { return null };
-    // Move both sides' debits from balance → reserved.
-    if (not Accounts.subtractBalance(accounts, takerPrincipal, takerDebitToken, takerDebitAmount)) { return null };
-    addReserved(takerPrincipal, takerDebitToken, takerDebitAmount);
-    if (not Accounts.subtractBalance(accounts, makerPrincipal, makerDebitToken, makerDebitAmount)) {
-      // Roll taker back
-      Accounts.addBalance(accounts, takerPrincipal, takerDebitToken, takerDebitAmount);
-      ignore subReserved(takerPrincipal, takerDebitToken, takerDebitAmount);
-      return null;
-    };
-    addReserved(makerPrincipal, makerDebitToken, makerDebitAmount);
-    // Lock the slice against the maker order so further matches against
-    // this maker see reduced availability.
-    addPendingQty(makerOrderId, fillQty);
-    let pm : Types.PendingMatch = {
-      id             = nextPendingMatchId;
-      marketId;
-      makerOrderId;
-      makerPrincipal;
-      takerPrincipal;
-      takerSide;
-      takerOrderType;
-      price;
-      quantity       = fillQty;
-      takerDebitToken; takerDebitAmount;
-      makerDebitToken; makerDebitAmount;
-      createdAtNs    = now;
-      expiryNs       = now + windowNs;
-      status         = #pending;
-    };
-    nextPendingMatchId += 1;
-    recordPendingMatchIndex(pm);
-    ?pm;
-  };
-
-  // Finalise a pending match: move reserved funds to the counterparties'
-  // balances, mark the maker's original order as partially filled, and
-  // record a Trade. Safe to call multiple times on the same id — after
-  // the first call the record is gone. Also scores the counterparty if
-  // the AMM was on one side of the trade.
-  func finalisePendingMatch(pmId : Nat, now : Int) {
-    let pm = switch (Map.get(pendingMatches, Nat.compare, pmId)) {
-      case (?x) { x };
-      case null { return };
-    };
-    if (pm.status != #pending) { return };
-    // Settle: reserved → counterparty. DORMANT in the sealed model (no live path
-    // creates pending matches). Fee the QUOTE-RECEIVING (seller) leg only, by the
-    // seller's role: taker #buy → maker receives quote (MAKER rate); taker #sell →
-    // taker receives quote (TAKER rate). Conservation-exact (seller credit net,
-    // treasury gets the fee, buyer pays the full reserved). The buyer-side
-    // (symmetric) fee is intentionally NOT applied here: it would require
-    // PendingMatch to carry the un-inflated gross, and adding a field to a stable
-    // record traps on upgrade — so it stays a TODO until this path is un-sealed.
-    // quoteFeeFor self-exempts internal principals.
-    // FAIL CLOSED on a reservation desync: createPendingMatch MOVED both debits
-    // balance→reserved, so if a reservation can no longer cover its leg the
-    // held funds are NOT there — crediting anyway would mint value. Refund
-    // whichever leg's reservation DID release (those funds were genuinely
-    // held), drop the match unsettled, and log loudly. subReserved returning
-    // false here means an accounting bug upstream; never launder it into
-    // balances.
-    let takerOk = subReserved(pm.takerPrincipal, pm.takerDebitToken, pm.takerDebitAmount);
-    let makerOk = subReserved(pm.makerPrincipal, pm.makerDebitToken, pm.makerDebitAmount);
-    if (not (takerOk and makerOk)) {
-      if (takerOk) { Accounts.addBalance(accounts, pm.takerPrincipal, pm.takerDebitToken, pm.takerDebitAmount) };
-      if (makerOk) { Accounts.addBalance(accounts, pm.makerPrincipal, pm.makerDebitToken, pm.makerDebitAmount) };
-      subPendingQty(pm.makerOrderId, pm.quantity);
-      removePendingIndex(pm);
-      logEventF("warn", "settle", ?"pendingMatch", ?Principal.toText(pm.takerPrincipal),
-        "reservation desync on finalise — pending match " # Nat.toText(pm.id)
-        # " dropped fail-closed (takerOk=" # debug_show (takerOk) # ", makerOk=" # debug_show (makerOk) # ")", null);
-      bumpUserVersion(pm.takerPrincipal);
-      bumpUserVersion(pm.makerPrincipal);
-      return;
-    };
-    let makerCredit : Nat = if (pm.takerDebitToken == Types.QUOTE_TOKEN) {
-      let fee = quoteFeeFor(pm.makerPrincipal, pm.takerDebitAmount, #makerCredit);
-      creditTreasury(fee);
-      pm.takerDebitAmount - fee
-    } else { pm.takerDebitAmount };
-    Accounts.addBalance(accounts, pm.makerPrincipal, pm.takerDebitToken, makerCredit);
-    let takerCredit : Nat = if (pm.makerDebitToken == Types.QUOTE_TOKEN) {
-      let fee = quoteFeeFor(pm.takerPrincipal, pm.makerDebitAmount, #takerCredit);
-      creditTreasury(fee);
-      pm.makerDebitAmount - fee
-    } else { pm.makerDebitAmount };
-    Accounts.addBalance(accounts, pm.takerPrincipal, pm.makerDebitToken, takerCredit);
-    // Release the maker's pending-qty lock and mark the fill on the maker.
-    subPendingQty(pm.makerOrderId, pm.quantity);
-    ignore OrderBook.fillOrder(orderStore, pm.makerOrderId, pm.quantity);
-    // Record the trade (attributing ids by side).
-    let (buyOrderId, sellOrderId, buyer, seller) = switch (pm.takerSide) {
-      case (#buy)  { (0 : Nat,          pm.makerOrderId, pm.takerPrincipal, pm.makerPrincipal) };
-      case (#sell) { (pm.makerOrderId, 0 : Nat,          pm.makerPrincipal, pm.takerPrincipal) };
-    };
-    let trade = OrderBook.recordTrade(
-      orderStore, pm.marketId, buyOrderId, sellOrderId,
-      buyer, seller, pm.price, pm.quantity, now, ?pm.takerOrderType
-    );
-    updateStatsAfterTrades(pm.marketId, [trade]);
-    refreshRolling24h(pm.marketId, [trade], now);
-    removePendingIndex(pm);
-    bumpUserVersionWithTrade(pm.takerPrincipal, now);
-    bumpUserVersionWithTrade(pm.makerPrincipal, now);
-    // (Phase-4 counterparty scoring formerly ran here — RETIRED, #49.5:
-    // see the fossil-parked counterpartyStats declaration.)
-  };
-
-  // Void a pending match: refund reserved funds to the original owners
-  // and release the maker's pending-qty lock. Called when the maker
-  // cancels their order before the window expires.
-  func voidPendingMatch(pmId : Nat) {
-    let pm = switch (Map.get(pendingMatches, Nat.compare, pmId)) {
-      case (?x) { x };
-      case null { return };
-    };
-    if (pm.status != #pending) { return };
-    // FAIL CLOSED: refund a leg only if its reservation actually released
-    // (same reasoning as finalisePendingMatch — the debit was MOVED into
-    // reserved at creation, so a failed release means the funds aren't held
-    // and crediting would mint).
-    let takerOk = subReserved(pm.takerPrincipal, pm.takerDebitToken, pm.takerDebitAmount);
-    if (takerOk) { Accounts.addBalance(accounts, pm.takerPrincipal, pm.takerDebitToken, pm.takerDebitAmount) };
-    let makerOk = subReserved(pm.makerPrincipal, pm.makerDebitToken, pm.makerDebitAmount);
-    if (makerOk) { Accounts.addBalance(accounts, pm.makerPrincipal, pm.makerDebitToken, pm.makerDebitAmount) };
-    if (not (takerOk and makerOk)) {
-      logEventF("warn", "settle", ?"pendingMatch", ?Principal.toText(pm.takerPrincipal),
-        "reservation desync on void — pending match " # Nat.toText(pm.id)
-        # " (takerOk=" # debug_show (takerOk) # ", makerOk=" # debug_show (makerOk) # ")", null);
-    };
-    subPendingQty(pm.makerOrderId, pm.quantity);
-    removePendingIndex(pm);
-    bumpUserVersion(pm.takerPrincipal);
-    bumpUserVersion(pm.makerPrincipal);
-  };
-
-  // Resolve in-flight pending matches against an AMM order that is about to be
-  // cancelled for a REQUOTE. Rather than void them all — which silently aborts
-  // committed taker fills (and strands Borrow & Buy / Borrow & Sell debt) — we
-  // HONOUR (settle) each match unless the ref price has since moved adverse to
-  // the AMM by more than the requote drift tolerance (a genuinely stale quote
-  // the AMM is right to protect LPs from). This is the same adverse test the
-  // counterparty-scoring uses: a taker BUY filled below current value, or a
-  // taker SELL above it.
-  func settleOrVoidAmmPending(makerOrderId : Nat) {
-    switch (Map.get(pendingByMaker, Nat.compare, makerOrderId)) {
-      case null {};
-      case (?idSet) {
-        let now = Time.now();
-        let tol = AMM_FORCE_REQUOTE_DRIFT_BPS / 10000.0;
-        let ids = Iter.toArray(Iter.map<(Nat, Bool), Nat>(Map.entries(idSet), func((k, _)) { k }));
-        for (id in ids.vals()) {
-          switch (Map.get(pendingMatches, Nat.compare, id)) {
-            case null {};
-            case (?pm) {
-              if (pm.status == #pending) {
-                let refPx = switch (AMM.getPool(pools, pm.marketId)) {
-                  case (?p) { p.refPrice }; case null { 0 };
-                };
-                let adverse = if (refPx == 0) { false } else switch (pm.takerSide) {
-                  case (#buy)  { Fixed.toFloat(refPx) > Fixed.toFloat(pm.price) * (1.0 + tol) };
-                  case (#sell) { Fixed.toFloat(refPx) < Fixed.toFloat(pm.price) * (1.0 - tol) };
-                };
-                if (adverse) { voidPendingMatch(id) } else { finalisePendingMatch(id, now) };
-              };
-            };
-          };
-        };
-      };
-    };
-  };
-
-  // Void every pending match currently referencing a given maker order.
-  // Called when the maker cancels that order (either explicitly or via
-  // LiquidityManager adjustments).
-  func voidPendingMatchesForMaker(makerOrderId : Nat) {
-    switch (Map.get(pendingByMaker, Nat.compare, makerOrderId)) {
-      case null {};
-      case (?idSet) {
-        // Snapshot the ids first because voidPendingMatch mutates the set.
-        let ids = Iter.toArray(
-          Iter.map<(Nat, Bool), Nat>(Map.entries(idSet), func((k, _)) { k })
-        );
-        for (id in ids.vals()) { voidPendingMatch(id) };
-      };
-    };
-  };
-
-  // Scan the pending-match ledger and finalise everything whose expiry
-  // has passed. Driven by a recurring timer (below).
   // Test-only quiescence: when true, every recurring timer (finaliser / AMM tick
   // / liquidation / price refresh) no-ops, so isolated tests fully drive state
   // through their explicit requote/admin calls — no background trades to race a
   // multi-query balance snapshot. transient → always false in production and
   // after any upgrade; flipped only by the controller-gated setTestTimersPaused.
   transient var _timersPaused : Bool = false;
+
+  // ── Season sealing latch (#54.1, with #55.2) ──────────────────────
+  // resetSeason evaluates its three seal gates, then AWAITS the Bridge's
+  // half of the two-phase wipe, then builds the permanent SeasonRecord from
+  // state it reads AFTER the await. emitEventRaw appends unconditionally, so
+  // any emitting message landing in that round-trip window (a fill, a
+  // stake, an LP deposit…) would be written into the record — finalEventSeq
+  // one past the archive's certified extent, a chainHead no archive can
+  // certify — and then deleted unshipped by the wipe. This latch closes the
+  // window from the ingress side: set before the await, cleared by
+  // performWorldWipe (and on the abort arms), and every EMITTING entry path
+  // refuses under it with a typed #err (sealingRefusal). The EXIT SET
+  // (inspect's carve-out — cancels, closes, unstakes, withdrawals) stays
+  // untouched: a user may always leave. Whatever still lands (an exit, an
+  // inter-canister credit, a timer) is caught by resetSeason's post-await
+  // re-check, which then seals HONESTLY at the shipped extent instead of
+  // recording events it is about to delete. Transient on purpose: a latch
+  // must never outlive the message that set it. An upgrade cannot land
+  // mid-seal — #55 (d) measured that an upgrade cannot land inside an await
+  // on this toolchain (the Motoko runtime refuses it while the Bridge call
+  // is outstanding; the upgrade lands only once resetSeason is done) — so
+  // the latch is false by construction at an upgrade, and a `true` reaching
+  // one could only be a seal continuation that trapped after setting it (the
+  // abort arms clear it on a refusal or a throw, not on a trap). Transient
+  // means that redeploy comes up open rather than sealed shut; resetExchange
+  // clears a stranded latch too.
+  transient var _seasonSealing : Bool = false;
+  // #dev one-shot (setTestSeasonSealRace): resetSeason emits ONE synthetic
+  // event inside the window — past the latch by construction — so the
+  // honest-seal path is exercised for real, not simulated.
+  transient var _testSeasonSealRace : Bool = false;
+  func sealingRefusal() : ?Text {
+    if (_seasonSealing) {
+      ?"season boundary sealing in progress — the tape is being sealed; retry in a moment (cancels, closes, unstakes and withdrawals still pass)"
+    } else { null };
+  };
+  // Every recurring timer honours the test pause AND the sealing latch: a
+  // heartbeat drain, AMM tick or liquidation pass landing inside the seal
+  // window emits exactly like an ingress call would.
+  func timersHeld() : Bool { _timersPaused or _seasonSealing };
 
   // Sweep orders past their orderExpiresDate off the book — cancel them and
   // prune the expiry map. Driven by the maintenance heartbeat. Expired AMM
@@ -1664,22 +1916,19 @@ persistent actor Uplands {
   };
 
   // Cancel a resting order through the same path the expiry sweep uses:
-  // void any pending matches that reference it as maker, drop it from the
-  // book, and clear its side-tables. Resting spot orders hold no reserved
-  // funds (reservations happen at pending-match time), so removal is purely
-  // book-side.
+  // drop it from the book and clear its side-table. Resting spot orders hold
+  // no reserved funds (the soft-lock is freed at release), so removal is
+  // purely book-side.
   func cancelRestingOrderInternal(id : Nat) {
     switch (OrderBook.getOrder(orderStore, id)) {
       case (?o) {
         if (OrderBook.isOpen(o)) {
-          voidPendingMatchesForMaker(id);   // no-op for AMM quotes (none), safe otherwise
           ignore OrderBook.cancelOrder(orderStore, id);
         };
       };
       case null {};
     };
     ignore Map.delete(orderExpiry, Nat.compare, id);
-    ignore Map.delete(orderSettlementWindows, Nat.compare, id);
   };
 
   // ── Resting-book bounds (GTC time-to-live + per-user order cap) ────
@@ -1757,14 +2006,26 @@ persistent actor Uplands {
   transient let EVICT_AGG_WINDOW : Int = 600_000_000_000;   // roll-up cadence, 10 min (ns)
   transient let _evictAgg = Map.empty<Text, (Int, Nat)>();  // ownerText → (windowStart, evictions in window)
 
-  // Evict the caller's oldest resting orders until they fit under the cap.
+  // Evict the caller's oldest resting WALLET orders until the caller's
+  // beneficial-owner count (own orders + owned pools' — ownerOpenOrderCount,
+  // the same count openOrderCapCheck rejects on) fits under the cap. #55
+  // ("two order budgets"): keyed on the raw wallet count, a pool-first
+  // sequence reached 2×cap under one owner (cap pool entries, then cap wallet
+  // orders, none evicted) while getApiDoc promised the cap counts account PLUS
+  // pools. Pool-owned orders are position machinery and are NEVER evicted —
+  // only the wallet's own resting orders retire — so when the pools alone
+  // stand at the cap the wallet path still places (nothing evictable, the
+  // deliberate contract test_order_caps_margin §7 pins: pool orders do not
+  // BLOCK the wallet path) and each further wallet placement retires the
+  // previous one. The owner's total is thereby bounded at cap (+1 in that
+  // pools-alone-at-cap corner), never 2×cap.
   func evictOverCap(caller : Principal) {
     if (isInternalPrincipal(caller)) { return };
     if (Option.isSome(Map.get(poolByPrincipal, Text.compare, Principal.toText(caller)))) { return };
     let cap = Option.get(_testOrderCap, USER_OPEN_ORDER_CAP);
     var evicted : Nat = 0;
     var last : ?Types.Order = null;   // sample order for the notice's record fields
-    label evict while (OrderBook.getUserOpenOrderCount(orderStore, caller) >= cap and evicted < EVICT_MAX_PER_CALL) {
+    label evict while (ownerOpenOrderCount(caller) >= cap and evicted < EVICT_MAX_PER_CALL) {
       switch (OrderBook.getOldestOpenOrderId(orderStore, caller)) {
         case (?oid) {
           last := OrderBook.getOrder(orderStore, oid);
@@ -1808,7 +2069,7 @@ persistent actor Uplands {
     };
   };
 
-  // GHSA-97xp: the open-order cap resolved to the BENEFICIAL owner — the
+  // GHSA-97xp / #52.1: the open-order cap resolved to the BENEFICIAL owner — the
   // caller's own resting orders plus every owned pool's. openPosition and
   // closePosition rest orders under POOL principals, and pool principals are
   // name-exempt from evictOverCap/sweepStaleUserOrders (their orders belong to
@@ -1839,15 +2100,22 @@ persistent actor Uplands {
     } else { null };
   };
 
-  func finaliseExpiredPending() : async () {
-    if (_timersPaused) { return };
+  // H-09 (D7, extension of W3-08): an `async*` COMPUTATION, not a message —
+  // it runs inline inside hbRunAsync("finalise")'s isolated self-send, so a
+  // trap anywhere here rolls back that one message and the breaker sees the
+  // lost completion (dispatch > done → streak → cadence backoff). It used to
+  // be a bare `async` self-send from the beat: a trap rolled back
+  // removeDeferredExec and the same entry re-trapped at full 0.5s cadence,
+  // unaccounted, forever. async* (not a sync task) because processGeptorDue
+  // is a genuine fire-and-forget message and needs send capability.
+  // (The name predates task 1788516198: it once finalised expired PENDING
+  // MATCHES first; that scan is retired with the machinery, and the pass is
+  // now the expiry sweep + GEPTOR + staged-order / staged-swap expiry it
+  // always also ran. Kept as the heartbeat's "finalise" task.)
+  func finaliseExpiredPending() : async* () {
+    if (timersHeld()) { return };
     let now = Time.now();
     sweepExpiredOrders(now);
-    let due = List.empty<Nat>();
-    for ((id, pm) in Map.entries(pendingMatches)) {
-      if (pm.status == #pending and pm.expiryNs <= now) { List.add(due, id) };
-    };
-    for (id in List.values(due)) { finalisePendingMatch(id, now) };
     // Piggyback the on-demand GEPTOR: fire any debounced requote+sweep whose
     // Nagle window has elapsed (same ~500ms cadence keeps latency ~1s). Fire-
     // and-forget — the GEPTOR's oracle fetch must not block the finaliser.
@@ -1859,12 +2127,12 @@ persistent actor Uplands {
     // Cross-market swaps release once BOTH legs' markets are fresh (or, past
     // expiry, against users only).
     processDeferredSwaps(now);
+    // Staged LP requests: settle the ready ones, re-arm the waiting ones,
+    // cancel + refund the expired ones (the TTL backstop, task 1788503312).
+    processStagedLp(now);
   };
 
-  // Start (or restart on upgrade) the recurring timer that finalises
-  // expired pending matches. Fires every 500 ms — fast enough for the
-  // 5s default window to feel responsive, cheap enough to not be noisy.
-  // (finaliseExpiredPending is now dispatched by the heartbeat, not a timer.)
+  // (finaliseExpiredPending is dispatched by the heartbeat, not a timer.)
 
   // ── Phase 2: AMM orchestration ────────────────────────────────
   // Each pool maintains a quote ladder on its market. On every tick
@@ -1873,26 +2141,22 @@ persistent actor Uplands {
   //   1) if the external refPrice has drifted > AMM_FORCE_REQUOTE_DRIFT_BPS
   //      since the last requote, OR
   //   2) if AMM_REQUOTE_INTERVAL_NS has passed since the last requote.
-  // Requoting = cancel every active AMM order (voiding any pending
-  // matches against them) and post a fresh ladder at the new mid.
+  // Requoting = diff the ladder against the resting quotes and post the
+  // changed levels at the new mid.
   //
   // Phase 4 layers volatility-widening and inventory-skew on top of the
   // ladder, both computed inside AMM.buildQuoteLadder and passed here
   // via the precomputed skewBps derived from current base holdings.
 
-  // Helper: cancel a single AMM-owned order, voiding any pending matches
-  // against it and cleaning up bookkeeping. Returns true if the order
-  // was in an open state (i.e. the cancel actually did something).
+  // Helper: cancel a single AMM-owned order and clean up its bookkeeping.
+  // Returns true if the order was in an open state (i.e. the cancel actually
+  // did something).
   func ammCancelOrder(orderId : Nat) : Bool {
     switch (OrderBook.getOrder(orderStore, orderId)) {
       case null { false };
       case (?order) {
         if (not OrderBook.isOpen(order)) { return false };
-        // Requote: honour committed taker fills (settle) unless the quote has
-        // gone stale-adverse; only then void. (Was: void all → aborted fills.)
-        settleOrVoidAmmPending(orderId);
         ignore OrderBook.cancelOrder(orderStore, orderId);
-        ignore Map.delete(orderSettlementWindows, Nat.compare, orderId);
         ignore Map.delete(orderExpiry, Nat.compare, orderId);
         true;
       };
@@ -1921,9 +2185,7 @@ persistent actor Uplands {
 
   // Place a single AMM quote, bypassing requireAuth and the usual
   // ensureInit (which is a caller-side bootstrap). Returns the order
-  // id on success. The quote is tagged with the pool's protection
-  // window so takers crossing it produce pending matches instead of
-  // instant trades — preserving the sniper-defence for the AMM.
+  // id on success. The quote is post-only and non-takeable (below).
   func ammPlaceQuote(
     pool      : AMM.Pool,
     side      : Types.Side,
@@ -1974,14 +2236,13 @@ persistent actor Uplands {
     // worse fill for the user, and with Stage-1A crossed books it fired on
     // every requote (it was the cause of the vault skewing into one asset).
     // Instead the quote just rests; ammSweepResting then fills any crossing
-    // resting orders AT THE AMM's price. Takers still hit this quote via the
-    // pending-match path (market orders / swaps).
+    // resting orders AT THE AMM's price. Takers never hit this quote directly:
+    // the AMM is non-takeable on every immediate path (buildProtectionCtx) and
+    // the release ctxs fill it only through the sweep. (The per-quote
+    // settlement window once written here is retired — task 1788516198; the
+    // pool field that carried it is a fossil projected out of the public
+    // view since apiVersion 6.0.0.)
     let order = OrderBook.createOrder(orderStore, pool.marketId, owner, side, #limit, price, quantity, timestamp);
-    if (pool.protectionWindowSec > 0) {
-      let windowNs : Nat = pool.protectionWindowSec * 1_000_000_000;
-      let capped = if (windowNs > MAX_PROTECTION_WINDOW_NS) { MAX_PROTECTION_WINDOW_NS } else { windowNs };
-      Map.add(orderSettlementWindows, Nat.compare, order.id, capped);
-    };
     // GC backstop only (wall-clock): the quote is swept if it somehow outlives
     // the requote cycle. Oracle staleness is handled by progressive widening
     // (ammStalenessWidenBps), not expiry, so a stale oracle yields wide quotes
@@ -1999,7 +2260,7 @@ persistent actor Uplands {
   //     transiently for this requote so buildQuoteLadder picks them up
   //     without a signature change.
   //   (Adverse-flow "hostility" widening was RETIRED 2026-08-20 — #49.5,
-  //   see the fossil-parked counterpartyStats declaration.)
+  //   see the retirement note above the progressive-levels block.)
   // Derive a pool's inventory target + per-level quote depth from the LIVE
   // vault (allocation policy — see vaultTargetWeight), so they track the vault
   // rather than static seed config and every market quotes the same fraction of
@@ -2020,7 +2281,7 @@ persistent actor Uplands {
     let targetBase = Fixed.fromFloat(targetBaseF);
     let depthBase  = Fixed.fromFloat(depthBaseF);
     let withTarget = AMM.withSkewConfig(pool, targetBase, pool.skewIntensityBps);
-    AMM.withConfig(withTarget, withTarget.spreadBps, depthBase, withTarget.numLevels, withTarget.levelSpacingBps, withTarget.protectionWindowSec)
+    AMM.withConfig(withTarget, withTarget.spreadBps, depthBase, withTarget.numLevels, withTarget.levelSpacingBps)
   };
 
   // Extra half-spread (bps) while the price-jump circuit breaker holds a
@@ -2191,24 +2452,21 @@ persistent actor Uplands {
     if (q > step) { (q - step) : Nat } else { q }
   };
 
-  func ammRequote(pool : AMM.Pool) : AMM.Pool {
+  // H-22 (F28): `release = false` requotes WITHOUT the deferred release pass.
+  // The GEPTOR finalizer (finalizePriceFanout, `#geptor`) passes false while
+  // this market's release breaker ("amm:<marketId>", hbStreakOf) carries a
+  // streak: the fetched mark and the fresh ladder then commit in the
+  // finalizer's message regardless, and the release runs ONLY under the
+  // market's own hbRun("amm:<marketId>") message — isolated, accounted,
+  // backed off. A healthy market keeps the inline release (no extra hop);
+  // the tick and the operator's requoteAmm always pass true.
+  func ammRequote(pool : AMM.Pool, release : Bool) : AMM.Pool {
     if (not pool.enabled or pool.refPrice == 0) { return pool };
     let now = Time.now();
-    // Adverse-fill protection, run for EVERY resting quote before anything
-    // else. A committed taker fill against an AMM quote is settled here — or
-    // VOIDED if the reference price has since moved against us by more than
-    // AMM_FORCE_REQUOTE_DRIFT_BPS. This used to happen as a side effect of
-    // cancelling the whole ladder each requote; with incremental requoting a
-    // KEPT quote would never be cancelled, so its pending would instead
-    // finalise unconditionally on the expiry timer (finaliseExpiredPending
-    // does no adversity check) — reopening exactly the stale-adverse leak the
-    // drain-proofing closed. The check must not depend on whether a level
-    // happened to move, so it is explicit and unconditional.
-    //
-    // Running it first also settles those fills BEFORE inventory is derived
-    // below, preserving the ordering the cancel-all had.
-    for (id in pool.activeBidIds.vals()) { settleOrVoidAmmPending(id) };
-    for (id in pool.activeAskIds.vals()) { settleOrVoidAmmPending(id) };
+    // (The adverse-fill settle-or-void pass over resting quotes is retired
+    // with the PendingMatch machinery — task 1788516198: no taker fill ever
+    // waits on an AMM quote; the sweep fills resting users at the fresh
+    // price.)
     // No cancel-all: the ladder is diffed against what is already resting
     // (ammApplyQuotes), so untouched levels keep their orders and their queue
     // priority.
@@ -2320,12 +2578,35 @@ persistent actor Uplands {
     let bidRes = ammApplyQuotes(working, #buy,  Iter.toArray(List.values(bidTargets)), working.activeBidIds, now);
     let askRes = ammApplyQuotes(working, #sell, Iter.toArray(List.values(askTargets)), working.activeAskIds, now);
     let updated = AMM.withActiveOrders(working, bidRes.ids, askRes.ids, now);
+    // COMMIT the fresh ladder to the pool map BEFORE the sweep and the
+    // release pass below (task 1788541235). Both read the pool back out of
+    // `pools` by market id, not the `updated` value handed to them: the #3a
+    // spot-market cap in releaseDeferred takes ammQuoteSpan(AMM.getPool(pools,
+    // ..)) as the ladder EDGE a taker may fill to this cycle. Every caller
+    // (requoteAmm, the tick, the GEPTOR sweep) put the pool only after this
+    // function returned, so the release saw the PREVIOUS requote's ids —
+    // and each level the diff had just cancelled and re-placed (the
+    // quote-liveness jitter re-posts ~2 levels per side per requote) read
+    // as closed. The edge then sat at the highest KEPT old level, a market
+    // order was capped there (99 + 100 = 199, or 100 + 99 + 100 = 299 of a
+    // 300 buy against a 5 × 100 ladder; 3.00 + 2.99 = 5.99 of 10 ETH) and
+    // the remainder re-deferred to the next requote — green or red on the
+    // jitter's clock (test_walk_scan_budget §4, test_market_walks_locked).
+    // The callers' later put re-writes this same record; nothing in the
+    // sweep or the release writes the pool.
+    AMM.putPool(pools, updated);
     // The AMM now fills resting USER orders that cross its fresh quotes — at
     // its own price — rather than being hit by takers (order-model design).
     ammSweepResting(updated, now);
     // …and executes any OFF-BOOK deferred entries (market/marketable remainders)
-    // against the same fresh quotes (defer-until-fresh).
-    processDeferred(updated, now);
+    // against the same fresh quotes (defer-until-fresh) — paced (H-22), and
+    // skipped by a tripped market's GEPTOR finalizer (`release`, above).
+    if (release) {
+      processDeferred(updated, now);
+      // …and settles any staged LP request every waited-on market now
+      // postdates (task 1788503312) — a no-op while the store is empty.
+      if (Map.size(stagedLpRequests) > 0) { processStagedLp(now) };
+    };
     updated
   };
 
@@ -2350,6 +2631,8 @@ persistent actor Uplands {
   func ammSweepResting(pool : AMM.Pool, now : Int) {
     let marketId  = pool.marketId;
     let baseToken = pool.baseToken;
+    // H-23 (F27): the sweep keys on the mark's DISPATCH clock, not its arrival.
+    let sweepRef = releaseRefOf(marketId).dispatchNs;
     // Best fresh AMM quote prices + the set of AMM order ids (to exclude when
     // scanning for the best USER order).
     let ammIds = Map.empty<Nat, Bool>();
@@ -2387,11 +2670,12 @@ persistent actor Uplands {
           case (?o) {
             if (o.price < bestAsk) { break bids };
             // Anti-snipe (Stage 3): only fill orders placed BEFORE the current
-            // price was fetched (refPriceUpdatedNs). An order can thus only ever
-            // be filled at an oracle price fetched after it was committed — so
-            // it can't be a deterministic snipe of a stale quote. Newer orders
-            // wait for the next fetch (the GEPTOR triggers one promptly).
-            if (o.timestamp < pool.refPriceUpdatedNs) {
+            // price's fetch was DISPATCHED (the release reference, H-23). An
+            // order can thus only ever be filled at an oracle price fetched
+            // after it was committed — so it can't be a deterministic snipe of
+            // a stale quote. Newer orders wait for the next fetch (the GEPTOR
+            // triggers one promptly).
+            if (o.timestamp < sweepRef) {
               List.add(items, { id = o.id; owner = o.owner; takerSide = #buy; price = o.price; qty = OrderBook.remaining(o); ts = o.timestamp });
             };
             Map.add(scan, Nat.compare, o.id, true);
@@ -2411,8 +2695,8 @@ persistent actor Uplands {
           case null { break asks };
           case (?o) {
             if (o.price > bestBid) { break asks };
-            // Anti-snipe (Stage 3): only fill orders placed before the fetch.
-            if (o.timestamp < pool.refPriceUpdatedNs) {
+            // Anti-snipe (Stage 3): only fill orders placed before the fetch was dispatched.
+            if (o.timestamp < sweepRef) {
               List.add(items, { id = o.id; owner = o.owner; takerSide = #sell; price = o.price; qty = OrderBook.remaining(o); ts = o.timestamp });
             };
             Map.add(scan2, Nat.compare, o.id, true);
@@ -2432,26 +2716,34 @@ persistent actor Uplands {
       // pool is one party on both sides, however different the principals look.
       beneficialOwner  = archiveOwnerOf;
       onTradeFees      = recordTradeFees;
-      getMakerWindow   = func(_) { 0 };
-      getMakerPending  = func(mid : Nat) { Option.get(Map.get(pendingQtyByMaker, Nat.compare, mid), 0) };
+      fundForFill      = poolFundForFill;   // H-34: a margin pool borrows its slice at the fill
+      fundableScorer   = poolFundableScorer;   // 1788641149 / 1788652744: the FOK pre-check scores a pool by what the vault would lend it, re-scored per slice as settled (never borrows)
       availableBalance;
-      // W4-22 DECISION: the sweep deliberately does NOT honour the L4 MM
-      // freshness shield (isNonTakeable). The shield exists to stop stale
-      // quotes being PICKED OFF at their stale price; the sweep fills at the
-      // venue's FRESH quote with equal-or-better price for the swept order —
-      // the opposite mechanism. Honouring it would exempt exactly the best
-      // quoters from the venue's price-improvement path.
-      isNonTakeable    = func(_, _) { false };
-      // W4-22 (R2): the swept user's order was RESTING — the venue chose to
-      // re-home it. They keep the MAKER fee rate (placeLimitOrderPO's
-      // "never pays taker" promise holds even after a sweep) and the maker
-      // volume/badge attribution; onPendingFill = null above means no
-      // pending leg can exist on this path, so the flag maps cleanly onto
-      // the immediate-settlement branch alone.
-      aggressorIsMaker = true;
+      // W4-22 DECISION, amended by D1 / H-24 (F25): the sweep does NOT
+      // honour the L4 MM freshness shield for the AMM LEG — the shield exists
+      // to stop stale quotes being PICKED OFF at their stale price; the AMM
+      // fills the swept order at the venue's FRESH quote with equal-or-better
+      // price, the opposite mechanism, and honouring it there would exempt
+      // exactly the best quoters from the price-improvement path. But the
+      // re-homed order is a full taker walk at its own limit and can ALSO hit
+      // other USERS' resting orders — for those the shield holds exactly as
+      // in the release pass: a shielded L4 quote must not be taken by a
+      // sweep before its staged reprice lands.
+      isNonTakeable    = func(_, makerOwner) {
+        (not Principal.equal(makerOwner, ammPrincipal())) and isMMShieldedFresh(makerOwner, marketId, sweepRef, now)
+      };
+      // W4-22 (R2) / H-24: the swept user's order was RESTING — the venue
+      // chose to re-home it against the AMM, so against the AMM it keeps the
+      // MAKER fee rate (placeLimitOrderPO's "never pays taker" promise holds
+      // after a sweep) and the maker volume/badge attribution. Against
+      // ANOTHER USER's resting order it is a plain taker leg (D1): a
+      // user-vs-user sweep fill settles maker/taker, never maker/maker — two
+      // maker legs contradicted the wash guardrail (2× maker volume both
+      // sides, no taker fee). Every slice settles immediately, so the role
+      // maps cleanly onto the one settlement branch.
+      aggressorRole    = #swept({ makerVs = func(counterparty : Principal) : Bool { Principal.equal(counterparty, ammPrincipal()) } });
       onUnfundedMaker  = onUnfundedMakerNotice;
       isExpired        = func(id : Nat) : Bool { orderExpired(id, Time.now()) };
-      onPendingFill    = func(_, _, _, _, _, _, _) : ?Types.PendingMatch { null };
     };
     let allTrades = List.empty<Types.Trade>();
     let affectedSet = Map.empty<Text, Principal>();
@@ -2461,12 +2753,44 @@ persistent actor Uplands {
         case null {};
         case (?o) {
           if (OrderBook.isOpen(o)) {
+            // #55 "sweep fills an expired order": an expired order is NEVER
+            // filled (MatchingEngine.ProtectionCtx.isExpired), but every
+            // isExpired site tests the MAKER — and here the swept order is
+            // re-submitted as the AGGRESSOR, so a GTD order whose expiry
+            // lapsed while it rested (the window: a GEPTOR requote landing
+            // after its outcall, before the finaliser beat sweeps the book)
+            // used to fill through this path. Retire it exactly as the
+            // maintenance sweep would — cancel, no trade — keyed on its
+            // CURRENT id: a prior sweep may have re-homed the order, and
+            // it.id is the live id the snapshot walk found (repointOrderIdentity
+            // carries orderExpiry across every re-home, so this lookup holds).
+            if (orderExpired(it.id, now)) {
+              cancelRestingOrderInternal(it.id);
+              continue;
+            };
             ignore OrderBook.cancelOrder(orderStore, it.id);
-            let (newOrder, trades, _, affected, _) = MatchingEngine.executeLimitOrderProtected(
+            // H-10 (F13): a swept BID carries its owner's available quote as
+            // the engine's spend budget, so a slice the owner can only PARTLY
+            // fund is shrunk to what they can pay (cost + their maker fee)
+            // instead of refused whole — the resting-#limit "no shrink"
+            // semantics the null budget preserves are for takers, and a
+            // swept order is a maker being re-homed. A swept ASK gets the
+            // engine's base-side twin of the shrink under the #swept aggressor role.
+            // Whatever the owner cannot fund is then CANCELLED with the
+            // unfunded-maker notice, never re-rested (see the engine's
+            // aggressorUnfunded): pre-fix an owner who had moved their
+            // balance out was re-swept every requote — 100 cancel/create
+            // cycles per account per 2 s, a stagedReleasedAs link each, and
+            // a permanent #orderClosed row per reaper pass, forever.
+            let budget : ?Nat = switch (it.takerSide) {
+              case (#buy)  { ?availableBalance(it.owner, Types.QUOTE_TOKEN) };
+              case (#sell) { null };
+            };
+            let (newOrder, trades, affected, _, _) = MatchingEngine.executeLimitOrderProtected(
               orderStore, accounts, marketId, baseToken, it.owner, it.takerSide, #limit, it.price, OrderBook.remaining(o),
               it.ts, Time.now(), sweepCtx,  // re-fetched remaining, NOT the stale snapshot it.qty — a prior sweep item may
                                             // have partially filled o, and re-submitting the snapshot size overfills it
-              null,                         // no spend budget on the sweep's re-homed #limit
+              budget,
             );
             // W4-07: the remainder re-rests under a FRESH id — re-point every
             // handle the user holds and carry their time-in-force, exactly as
@@ -2475,7 +2799,17 @@ persistent actor Uplands {
             // pure requote, but re-placement is what the book invariants were
             // built around; the row's meaning on a requote is "re-rested by
             // the venue", documented here.)
-            repointOrderIdentity(it.id, newOrder.id);
+            // H-10: id 0 = the engine dropped an unfundable remainder with no
+            // fill — nothing to re-point to; the handles stay on the old
+            // (now #cancelled) id, the one closure the reaper seals. A
+            // non-open result (the partial-then-cancelled record, or a full
+            // fill) carries no time-in-force to keep: drop the expiry the
+            // repoint moved (or, on id 0, the old id's own entry).
+            if (newOrder.id != 0) { repointOrderIdentity(it.id, newOrder.id) };
+            if (not OrderBook.isOpen(newOrder)) {
+              ignore Map.delete(orderExpiry, Nat.compare, it.id);
+              ignore Map.delete(orderExpiry, Nat.compare, newOrder.id);
+            };
             for (t in trades.vals()) { List.add(allTrades, t) };
             for (p in affected.vals()) { Map.add(affectedSet, Text.compare, Principal.toText(p), p) };
             Map.add(affectedSet, Text.compare, Principal.toText(it.owner), it.owner);
@@ -2484,12 +2818,25 @@ persistent actor Uplands {
       };
     };
     let tradesArr = Iter.toArray(List.values(allTrades));
+    let affectedArr = Iter.toArray(Iter.map<(Text, Principal), Principal>(Map.entries(affectedSet), func((_, p)) { p }));
     if (tradesArr.size() > 0) {
       updateStatsAfterTrades(marketId, tradesArr);
       refreshRolling24h(marketId, tradesArr, now);
       settlePoolFills(marketId, tradesArr, now);   // limit entries: the AMM sweep can take a pool's resting order
-      let affectedArr = Iter.toArray(Iter.map<(Text, Principal), Principal>(Map.entries(affectedSet), func((_, p)) { p }));
       adjustAffectedUsers(affectedArr, now);
+    } else if (affectedArr.size() > 0) {
+      // H-10 (2): the swept-owner set is re-validated even when nothing
+      // traded. The zero-trade sweep is exactly the unfunded case — an owner
+      // whose order was just cancelled unfunded almost certainly has OTHER
+      // resting orders their balance no longer covers; shrink/cancel them
+      // now (one pass, adjustments recorded, version bumped so the client
+      // sees the cancel) rather than one per requote as each gets swept.
+      // No trade → no lastTradeTime stamp and no liquidation probe (no
+      // balance moved).
+      for (u in affectedArr.vals()) {
+        ignore revalidateUserOrders(u, now);
+        bumpUserVersion(u);
+      };
     };
   };
 
@@ -2533,6 +2880,61 @@ persistent actor Uplands {
   // owner can back), and a prompt GEPTOR is scheduled (Nagle-debounced). Returns
   // the parked base qty. `limitPrice` is the absolute slippage-cap price for a
   // #market entry, or the resting price for a #limit entry.
+  // The per-owner staged cap as a REFUSAL TEXT, for the staging entries that
+  // pre-check it (executeSwapCross's staged branch, executeSwapDirect's two
+  // staged arms, placeMarketOrder): the same key and internal-principal
+  // exemption as parkDeferred's own check below, which stays in place as the
+  // last line of defence for every other caller. One sentence shared by every
+  // door (task 1788520988): parkDeferred returns null for the cap AND for a
+  // reservation that resolves to zero, so a caller that only saw the null
+  // told a bot at the cap its balance was short — and it retried forever.
+  func stagedCapRefusal(owner : Principal) : ?Text {
+    if (not isInternalPrincipal(owner) and stagedCountOf(owner) >= STAGED_CAP_PER_OWNER) {
+      ?("Staged-order cap reached (" # Nat.toText(STAGED_CAP_PER_OWNER)
+        # " staged orders and cross-swaps per account) — cancel one or wait for release")
+    } else { null };
+  };
+
+  // Task 1788557389: the price a margin pool's exposure-REDUCING #market #buy
+  // (a short's buy-back) reserves at — the market's mark, floored at the
+  // order's own cap (a mark that has run past the cap cannot be paid: the
+  // fill is capped there). `fallback` (the cap) for everyone else: spot
+  // wallets, pools with no short in this base (a #buy re-levers them and
+  // the cap earmark stays), and any market with no mark. Only reached from
+  // parkDeferred's UNDER-FUNDED branch, so the common full-headroom staging
+  // pays no pool lookup.
+  func poolDeleverMark(owner : Principal, baseToken : Types.TokenId, marketId : Types.MarketId, fallback : Nat) : Nat {
+    switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(owner))) {
+      case (?poolId) {
+        if (poolNetSize(poolId, baseToken) >= 0) { return fallback };   // no short here → a #buy re-levers
+        switch (AMM.getPool(pools, marketId)) {
+          case (?p) { if (p.refPrice > 0) { Nat.min(p.refPrice, fallback) } else { fallback } };
+          case null { fallback };
+        };
+      };
+      case null { fallback };
+    };
+  };
+
+  // Task 1788557389: a staging that parked LESS than it was asked to
+  // (parkDeferred's under-funded trim — free quote/base below the size) is
+  // never silent. The trader used to see #ok from closePosition and a
+  // residual position they had to notice and close again; now the record
+  // (getMyReleaseRejections, clampedTo = what staged) names the un-staged
+  // remainder. No-op when the whole size staged.
+  func noteStagedShort(owner : Principal, marketId : Types.MarketId, baseToken : Types.TokenId, side : Types.Side, asked : Nat, staged : Nat, price : Nat) {
+    if (staged >= asked) { return };
+    let short = SafeMath.subOrZero(asked, staged);
+    let sideStr = switch (side) { case (#buy) "BUY"; case (#sell) "SELL" };
+    let fundTok = switch (side) { case (#buy) { Types.QUOTE_TOKEN }; case (#sell) { baseToken } };
+    recordReleaseRejection(owner, marketId, side, asked, ?staged, price,
+      "Staged " # r2n(staged) # " of " # r2n(asked) # " — the free " # fundTok
+      # " covers only that much; " # r2n(short) # " is NOT staged. Close again (or re-place the order) for the rest once this fill settles, or add margin.");
+    logEventF("warn", "order", ?"order.clamp", ?Principal.toText(owner),
+      baseToken # " " # sideStr # " staged " # r2n(staged) # " of " # r2n(asked) # " — " # r2n(short)
+      # " not staged (free " # fundTok # " below the size)", ?marketId);
+  };
+
   func parkDeferred(
     marketId   : Types.MarketId,
     baseToken  : Types.TokenId,
@@ -2551,6 +2953,13 @@ persistent actor Uplands {
     // so no single (funded, registered) caller can crowd the release pass.
     // Internal principals are exempt (the venue's own flow must never bounce).
     if (not isInternalPrincipal(owner) and stagedCountOf(owner) >= STAGED_CAP_PER_OWNER) { return null };
+    // H-34 / D5 (d): is this a margin pool's exposure-INCREASING entry? Such
+    // an order borrows its shortfall AT THE FILL (poolFundForFill), so the
+    // reservation below never trims it to the pool's free funds.
+    let poolEntry = switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(owner))) {
+      case (?poolId) { poolOrderAddsExposure(poolId, side, baseToken, qty) };
+      case null { false };
+    };
     // A #buy must reserve the worst-case quote cost PLUS the worst-case (TAKER)
     // buyer fee, so settlement can debit tradeCost+fee. CRUCIAL: the PARKED QTY is
     // derived from the un-inflated BASE cost only — deriving it from the
@@ -2575,34 +2984,96 @@ persistent actor Uplands {
         let avail = getAvailable(owner, Types.QUOTE_TOKEN);
         // Internal principals (treasury / AMM / insurance) pay NO fee, so they
         // reserve exactly the base cost. Users AND margin pools reserve base +
-        // worst-case TAKER fee, so a pool's max-leverage open parks ~the fee
-        // fraction smaller (via the under-funded haircut below) — intended: the fee
-        // comes out of the pool's buying power, reducing equity like any trader's.
-        let feeBps = if (isInternalPrincipal(owner)) { 0 } else { TAKER_FEE_BPS };
+        // the TAKER fee, so a pool's max-leverage open parks ~the fee fraction
+        // smaller (via the under-funded haircut below, at the owner's earned
+        // rate) — intended: the fee comes out of the pool's buying power,
+        // reducing equity like any trader's.
+        //
+        // Two rates, deliberately (#55 flat-rate sizing, task 1788475362):
+        //  - FULL headroom reserves at the L0 CEILING (TAKER_FEE_BPS): a
+        //    caller who can afford it parks the qty the sizing site chose
+        //    and over-reserves by (L0 − earned) bps for the ~1s to release —
+        //    a free safety margin, never a smaller fill.
+        //  - The UNDER-FUNDED trim uses the caller's EARNED taker rate
+        //    (quoteFeeFor — whole bps, exact for the tenth-bps ladder; 0 for
+        //    internal principals, so the old isInternalPrincipal branch
+        //    collapses into the probe). Trimming at the ceiling re-shrank a
+        //    FOK/limit buy whose caller was funded within (L0 − earned) bps
+        //    of the spend — e.g. EXACTLY the swap amount — back to the
+        //    L0-sized qty, the flat-rate under-delivery the sizing sites had
+        //    just shed (task 1788465038) returning on the reservation side.
+        //    The release charges the earned rate (quoteFeeFor floors), so
+        //    base + ceil(base·earned) covers the settlement debit exactly.
+        let ceilBps = if (isInternalPrincipal(owner)) { 0 } else { TAKER_FEE_BPS };
         let base  = Fixed.mul(qty, limitPrice, true);                  // worst-case tradeCost (round up)
-        let feeUp = Fixed.mulDiv(base, feeBps, 10_000, true);          // worst-case buyer fee (round up)
+        let feeUp = Fixed.mulDiv(base, ceilBps, 10_000, true);         // worst-case buyer fee (round up, L0 ceiling)
         let want  = base + feeUp;
         if (want <= avail) {
           (Types.QUOTE_TOKEN, want, qty, null)                         // full headroom → park the full qty
+        } else if (poolEntry) {
+          // H-34 / D5 (d): a margin pool's exposure-INCREASING entry is
+          // never trimmed to its free quote — the shortfall is the fill's
+          // borrow (poolFundForFill). Soft-lock what the pool owns toward
+          // the size (concurrent-spend protection while staged; it may be
+          // 0 for a pool whose equity is all in positions) and park the
+          // WHOLE quantity. Exits keep the trim below: they are funded by
+          // holdings, never borrowed.
+          (Types.QUOTE_TOKEN, Nat.min(want, avail), qty, null)
         } else {
-          // Under-funded: largest BASE whose base+fee fits in `avail`.
-          // baseAfford ≈ avail/(1+feeBps/10_000); trim by one unit to absorb the
-          // fee's ceil-rounding so baseAfford + ceil(baseAfford·feeBps) <= avail.
-          var baseAfford = Fixed.mulDiv(avail, 10_000, 10_000 + feeBps, false);
-          label trim while (baseAfford > 0
-            and baseAfford + Fixed.mulDiv(baseAfford, feeBps, 10_000, true) > avail) {
-            baseAfford -= 1;
-          };
-          let res = baseAfford + Fixed.mulDiv(baseAfford, feeBps, 10_000, true);
-          (Types.QUOTE_TOKEN, res, Fixed.div(baseAfford, limitPrice, false), null)
+          // Task 1788557389 (H-05's carry-over): a margin pool's exposure-
+          // REDUCING #market #buy — a short's buy-back, closePosition's shape
+          // — is sized at the MARK, not at its slippage cap. The cap
+          // (mark × (1 + maxSlippage), up to 25 %) is the trader's CEILING;
+          // the release then bounds the fill in price to the AMM ladder edge
+          // / ±USERS_ONLY_CLAMP_PCT of mid (#3a, walksLadder) and in size to
+          // the pool's raw equity at that price (clampToInitialMargin, H-05),
+          // so reserving qty × cap over-earmarked by up to 25 % and TRIMMED a
+          // thin pool's close below its position — the un-parked rest was
+          // never re-staged (a 2,100 ICP short staged ≈ 1,696 at a 25 % cap;
+          // test_initial_margin §F2). Sizing at the mark parks the whole
+          // position whenever the pool's free quote covers it at the mark.
+          // Safe by the engine, not by the earmark: the reservation is
+          // refunded at release and every slice is clamped to the buyer's
+          // AVAILABLE quote (MatchingEngine affordableQty), so a debit past
+          // the reservation fills less and re-parks — it never fails
+          // settlement; and the equity bound gives r × (effLimit + fee) ≤
+          // equity + r × mark ≤ the pool's collateral for the released r.
+          // Spot orders, pool #limit exits and re-levering pool buys keep
+          // the cap price here (a long entry pre-borrowed at the cap, so it
+          // has full headroom above and never reaches this branch).
+          let sizePrice = if (kind == #market) { poolDeleverMark(owner, baseToken, marketId, limitPrice) } else { limitPrice };
+          let baseM = if (sizePrice == limitPrice) { base } else { Fixed.mul(qty, sizePrice, true) };
+          let wantM = baseM + Fixed.mulDiv(baseM, ceilBps, 10_000, true);
+          if (wantM <= avail) {
+            (Types.QUOTE_TOKEN, wantM, qty, null)                      // full headroom AT THE MARK → the whole position
+          } else {
+            // Under-funded: largest BASE whose base + fee AT THE EARNED RATE fits
+            // in `avail`. baseAfford ≈ avail/(1+effBps/10_000); trim by one unit
+            // to absorb the fee's ceil-rounding so
+            // baseAfford + ceil(baseAfford·effBps) <= avail.
+            let effBps = quoteFeeFor(owner, 10_000, #takerDebit);
+            var baseAfford = Fixed.mulDiv(avail, 10_000, 10_000 + effBps, false);
+            label trim while (baseAfford > 0
+              and baseAfford + Fixed.mulDiv(baseAfford, effBps, 10_000, true) > avail) {
+              baseAfford -= 1;
+            };
+            let res = baseAfford + Fixed.mulDiv(baseAfford, effBps, 10_000, true);
+            // Never MORE than asked: a caller funded within (ceiling − earned)
+            // bps of the spend has baseAfford > qty × price by that sliver.
+            (Types.QUOTE_TOKEN, res, Nat.min(qty, Fixed.div(baseAfford, sizePrice, false)), null)
+          }
         }
       };
       case (#sell, _) {
         let amt = Nat.min(qty, getAvailable(owner, baseToken));
-        (baseToken, amt, amt, null)
+        // H-34: a pool's SHORT entry parks its whole size against the base it
+        // holds (usually none) — the rest is borrowed at the fill.
+        (baseToken, amt, if (poolEntry) { qty } else { amt }, null)
       };
     };
-    if (reserve == 0 or parkedQty == 0) { return null };
+    // A pool entry may legitimately reserve NOTHING (all of it borrows at the
+    // fill); every other staging must lock something to be real.
+    if (parkedQty == 0 or (reserve == 0 and not poolEntry)) { return null };
     addReserved(owner, tok, reserve);
     let id = OrderBook.allocateId(orderStore);
     let entry : DeferredExec = {
@@ -2612,6 +3083,8 @@ persistent actor Uplands {
     Map.add(deferredExecs, Nat.compare, id, entry);
     incStagedCount(owner);
     ownerIdxAdd(deferredIdsByOwner, owner, id);
+    marketIdxAdd(marketId, id);
+    expiryIdxAdd(entry.expiresAt, id);
     slAccBump(owner, tok, reserve);
     if (fok) { Map.add(deferredFok, Nat.compare, id, true) };
     switch (effBudget) { case (?b) { Map.add(deferredBudget, Nat.compare, id, b) }; case null {} };
@@ -2641,15 +3114,63 @@ persistent actor Uplands {
     originalQuantity = d.qty;
   };
 
+  // ── H-09 (F4 · F35): scan budgets for the book-walking simulators ──────
+  // crossableDepth and walkFillable iterate findBestMatchExcluding with a
+  // GROWING exclude set: each call re-skips the whole excluded prefix (the
+  // "O(log K + entries skipped)" in OrderBook), so a walk over N resting
+  // entries costs O(N²) entry-skips — and N is a count anyone inflates
+  // (resting orders hold no reservation, W4-24; spend-all placements are
+  // exempt from min notional). Measured on the seat venue before the budget:
+  // 2,048 unfunded 2-ICP asks inside a 5% cap trapped BOTH public queries
+  // (quoteSwap / getTakeableDepth) at the 5B-instruction query limit, and the
+  // same walk sits on the release path (the FOK gate, the post-only probe,
+  // releaseCrossSwap) inside the AMM tick — the sibling expiry pass was
+  // capped after 2,970 orders trapped 40B. Every walker now counts EVERY
+  // entry it visits (skipped, unfunded, shielded, self — the engine spends an
+  // iteration on each of those too) against a budget and reports `truncated`.
+  //
+  //   WALK_SCAN_MAX         the preview/query budget (quoteSwap,
+  //                         getTakeableDepth, crossableDepth): a truncated
+  //                         answer is a LOWER bound on depth, the safe
+  //                         direction for anyone sizing flow against it.
+  //                         Each exclude-set skip costs ~5.5k instructions
+  //                         (2,053 entries → 2.1M skips → the 5B trap), so
+  //                         a 1,024-visit walk ran ~2.9B and three of them
+  //                         in one probe tripped the query limit; 512
+  //                         visits ≈ 131k skips ≈ 0.73B measured — the
+  //                         budget a keystroke-driven preview can afford.
+  //                         Measured by devSweepCostProbe (`walkDepth`),
+  //                         pinned in test_walk_scan_budget.sh.
+  //   FOK_GATE_ITER_BUDGET  the RELEASE-gate budget = the engine's per-call
+  //                         iteration cap (F35). The engine spends one of
+  //                         MAX_MATCH_ITERATIONS_PER_CALL per maker it
+  //                         touches, so a gate that reaches d.qty only by
+  //                         visiting more makers than that promises a fill
+  //                         the engine cannot complete in one call — a
+  //                         partial fill on a fill-or-kill order. Hitting the
+  //                         budget before d.qty KILLS (fails closed).
+  //   DEPTH_QUERY_BAND_BPS  the public depth query's cap is clamped to this
+  //                         band around the pool's refPrice (the widest
+  //                         slippage a taker may request), so a caller-chosen
+  //                         cap cannot open the walk to the whole side.
+  transient let WALK_SCAN_MAX : Nat = 512;
+  transient let FOK_GATE_ITER_BUDGET : Nat = MatchingEngine.MAX_MATCH_ITERATIONS_PER_CALL;
+  transient let DEPTH_QUERY_BAND_BPS : Nat = 2_500;
+
   // Total base quantity (and its quote value Σ price·qty) of makers a taker on
   // `side` can cross within `capPrice`, walking the book in price priority. The
   // AMM's quotes rest on the book, so they're included — matching what the
-  // engine will actually take when the AMM is takeable.
-  func crossableDepth(marketId : Types.MarketId, takerSide : Types.Side, capPrice : Nat, excludeAmm : Bool) : (Nat, Nat) {
+  // engine will actually take when the AMM is takeable. H-09: bounded by
+  // WALK_SCAN_MAX visits; `truncated` means the sums are a lower bound (the
+  // sole consumer, releaseCrossSwap, sizes DOWN from them — safe direction).
+  func crossableDepth(marketId : Types.MarketId, takerSide : Types.Side, capPrice : Nat, excludeAmm : Bool)
+    : { qty : Nat; usd : Nat; truncated : Bool } {
     let amm = ammPrincipal();
     let exclude = Map.empty<Nat, Bool>();
     var qty : Nat = 0; var usd : Nat = 0;
+    var scanned : Nat = 0; var truncated = false;
     label walk loop {
+      if (scanned >= WALK_SCAN_MAX) { truncated := true; break walk };
       switch (OrderBook.findBestMatchExcluding(orderStore, marketId, takerSide, ?exclude)) {
         case null { break walk };
         case (?o) {
@@ -2658,6 +3179,7 @@ persistent actor Uplands {
             case (#sell) { o.price >= capPrice };
           };
           if (not within) { break walk };
+          scanned += 1;
           // Count this level unless we're excluding the (non-takeable) AMM.
           if (not (excludeAmm and Principal.equal(o.owner, amm))) {
             let r = OrderBook.remaining(o);
@@ -2667,13 +3189,13 @@ persistent actor Uplands {
         };
       };
     };
-    (qty, usd);
+    { qty; usd; truncated };
   };
 
   // Sound all-or-nothing predicate for a fill-or-kill taker: how much of the
   // order can ACTUALLY fill at/under (buy) or at/over (sell) capPrice right now.
   // crossableDepth sums raw maker `remaining`, which over-counts — the matching
-  // engine also subtracts pending-match locks AND skips makers that lack the
+  // engine skips makers that lack the
   // AVAILABLE balance to honour their quote (a sell maker whose base was spent
   // elsewhere, a bid maker short of quote). This mirrors that exactly, deducting
   // each maker's consumed funds along a per-owner running tally so one owner's
@@ -2698,24 +3220,28 @@ persistent actor Uplands {
   // past the preview). Carries the taker's fee closure + effective bps probe
   // because fees are per-slice-floored and ladder-rated, not linear.
   //
-  // `perMaker` picks how an UNDER-funded maker is credited — the two consumers
-  // genuinely need different semantics (#48.4):
-  //   #fundedPartial — credit the maker's funded PART (min of order remaining
-  //     and its available balance). Right for quoteSwap: a swap taker fills
-  //     whatever each maker can honour, level by level.
-  //   #allOrNothing  — credit the maker the way executeLimitOrderProtected
-  //     will actually take it on the release path (immediate settlement,
-  //     getMakerWindow = 0 in both release ctxs): the engine sizes fillQty
-  //     from the ORDER remaining (trimmed only by the taker's own remaining
-  //     need, which the #base budget models), then CANCELS a maker that
-  //     cannot fund that full fillQty (MatchingEngine.mo — the graceful
-  //     unfunded-maker cancel) and takes ZERO from it. Crediting the funded
-  //     partial here is exactly the #48.4 bug: the FOK gate counts depth the
-  //     engine then refuses, and a "passing" FOK partial-fills. A maker
-  //     funded for its full take counts fully; an under-funded one counts 0
-  //     (the walk continues past it, like the engine's cancel+continue).
-  //     The quote-side funding check includes the maker's fee, mirroring the
-  //     engine's `tradeCost + buyerFee` gate.
+  // An UNDER-funded maker is credited ALL-OR-NOTHING per engine slice — the
+  // way executeLimitOrderProtected will actually take it on the release path
+  // (immediate settlement — the engine's one branch): the
+  // engine sizes fillQty from the ORDER remaining, trimmed only by the
+  // taker's own remaining need (which the #base / #quoteSpend budgets model
+  // BEFORE the funding check below, so a maker funded for the taker's
+  // remaining slice still counts fully — fokFillableDepth's takerQty note),
+  // then CANCELS a maker that cannot fund that fillQty (MatchingEngine.mo —
+  // the graceful unfunded-maker cancel, in both live loops AND
+  // simulateAvailableFill) and takes ZERO from it. A maker funded for its
+  // take counts fully; an under-funded one counts 0 and the walk continues
+  // past it, like the engine's cancel+continue. The quote-side funding check
+  // includes the maker's fee, mirroring the engine's `tradeCost + buyerFee`
+  // gate. Crediting a funded PARTIAL instead is the #48.4 bug: the FOK gate
+  // counted depth the engine then refused and a "passing" FOK partial-filled.
+  // Until 1788660963 a second mode (#fundedPartial: credit the maker's
+  // funded part, "a swap taker fills whatever each maker can honour") served
+  // quoteSwap and the cross-swap preview — but NO engine path fills a part
+  // of a slice the maker cannot fund, so the preview promised depth the fill
+  // cancelled outright (test_fok_market.sh §13 / §14: a cost-only-funded bid
+  // previewed at 99.95 of 100 and settled nothing). Retired: one mode, the
+  // engine's, for every consumer.
   //
   // `excl` (#48.5) threads the RELEASE ctx's remaining maker exclusions into
   // the walk: the engine also SKIPS makers via ctx.isNonTakeable (sidelined
@@ -2735,28 +3261,39 @@ persistent actor Uplands {
       #quoteSpend : { budget : Nat; feeOf : Nat -> Nat; effBps : Nat };
       #all;
     },
-    perMaker : { #fundedPartial; #allOrNothing },
+    // H-09: the scan budget — every entry the walk VISITS (skipped, unfunded,
+    // shielded, self, filled) draws one unit, plus one more for a fill on a
+    // pending-locked maker (the engine re-finds such a maker and spends a
+    // second iteration excluding it). WALK_SCAN_MAX for previews/queries,
+    // FOK_GATE_ITER_BUDGET (the engine's cap) for the release gate.
+    scanMax : Nat,
     excl : ?{
       isNonTakeable   : (Nat, Principal) -> Bool;
       isExpired       : Nat -> Bool;
       beneficialOwner : Principal -> Principal;
-      taker           : Principal;
+      taker           : ?Principal;   // null = caller-agnostic (no self-trade exclusion; H-24's getTakeableDepth)
     },
-  ) : { base : Nat; quote : Nat; spent : Nat } {
+  ) : { base : Nat; quote : Nat; spent : Nat; truncated : Bool; scanned : Nat } {
     let exclude = Map.empty<Nat, Bool>();
-    let runBal  = Map.empty<Text, Nat>();   // ownerText#token → remaining available (lazy)
-    func avail(owner : Principal, token : Types.TokenId) : Nat {
-      let k = Principal.toText(owner) # "#" # token;
-      switch (Map.get(runBal, Text.compare, k)) {
-        case (?b) { b };
-        case null { let b = getAvailable(owner, token); Map.add(runBal, Text.compare, k, b); b };
-      };
-    };
-    func consume(owner : Principal, token : Types.TokenId, amt : Nat) {
-      let k = Principal.toText(owner) # "#" # token;
-      let a = avail(owner, token);
-      Map.add(runBal, Text.compare, k, SafeMath.subOrZero(a, amt));
-    };
+    var scanned : Nat = 0; var truncated = false;
+    // 1788641149 / 1788652744: a maker is scored by its FUNDABLE balance —
+    // what it can BRING to a fill of `fillQty`: a wallet's available
+    // balance; a margin pool's available PLUS the vault's lendable room for
+    // an exposure-increasing slice (poolFundableScorer — poolFundForFill's
+    // read-only twin, same freshness gates, never borrows). Pre-1788641149
+    // the walk read raw availability and a leveraged pool bid with no cash
+    // behind it counted ZERO depth, though the live engine borrows its slice
+    // at the fill (H-34) and fills it. One scorer per walk: a party's ledger
+    // is snapshotted at its first slice (one accrueAll + a ≤5-token
+    // valuation per pool maker visited — so the walk-budget pins in
+    // test_walk_scan_budget.sh hold) and every credited slice is COMMITTED
+    // to it, so a pool's later slices are scored on the collateral/debt the
+    // earlier ones leave (the fill-time borrowCheck's view), not on the
+    // first slice's room drawn down like cash.
+    let scorer = poolFundableScorer();
+    // The received leg of a maker-SELL slice (its quote, net of the maker
+    // fee) — what the scorer carries forward as the maker's new collateral.
+    func sellerGets(owner : Principal, gross : Nat) : Nat { SafeMath.subOrZero(gross, quoteFeeFor(owner, gross, #makerCredit)) };
     var totalBase : Nat = 0;
     var totalQuote : Nat = 0;   // Σ tradeCost — FLOORED per slice under #quoteSpend (the engine's tradeCost)
     var totalSpent : Nat = 0;   // #quoteSpend only: Σ (tradeCost + takerFee) — the engine's quoteSpent
@@ -2775,12 +3312,16 @@ persistent actor Uplands {
       Nat.min(take, Fixed.div(Fixed.mulDiv(remB, 10_000, 10_000 + s.effBps, false), price, false));
     };
     label walk loop {
-      // Budget exhausted?
+      // Budget exhausted? (Checked BEFORE the scan budget: reaching the
+      // quantity within the budget is a pass; the scan cap only truncates a
+      // walk that has not reached it.)
       switch (budget) {
         case (#base(b))       { if (totalBase >= b) { break walk } };
         case (#quoteSpend(s)) { if (totalSpent >= s.budget) { break walk } };
         case (#all) {};
       };
+      // H-09: scan budget — see scanMax.
+      if (scanned >= scanMax) { truncated := true; break walk };
       switch (OrderBook.findBestMatchExcluding(orderStore, marketId, takerSide, ?exclude)) {
         case null { break walk };
         case (?o) {
@@ -2789,6 +3330,7 @@ persistent actor Uplands {
             case (#sell) { o.price >= capPrice };
           };
           if (not within) { break walk };
+          scanned += 1;
           Map.add(exclude, Nat.compare, o.id, true);
           // #48.5: engine-parity exclusions — a maker the engine will skip
           // (non-takeable / expired / the taker's own beneficial-owner order)
@@ -2797,84 +3339,59 @@ persistent actor Uplands {
           let engineSkips = switch (excl) {
             case (?x) {
               x.isNonTakeable(o.id, o.owner) or x.isExpired(o.id)
-                or Principal.equal(x.beneficialOwner(x.taker), x.beneficialOwner(o.owner));
+                or (switch (x.taker) {
+                  case (?t) { Principal.equal(x.beneficialOwner(t), x.beneficialOwner(o.owner)) };
+                  case null { false };
+                });
             };
             case null { false };
           };
           if (engineSkips) { continue walk };
-          let pendingLocked = Option.get(Map.get(pendingQtyByMaker, Nat.compare, o.id), 0);
-          let rem = OrderBook.remaining(o);
-          let availForFill = SafeMath.subOrZero(rem, pendingLocked);
+          let availForFill = OrderBook.remaining(o);
           if (availForFill > 0) {
-            switch (perMaker) {
-              case (#fundedPartial) {
-                // taker buy → maker sells base (needs base); taker sell → maker buys (needs quote).
-                let funded = switch (takerSide) {
-                  case (#buy)  { Nat.min(availForFill, avail(o.owner, baseToken)) };
-                  case (#sell) { if (o.price > 0) { Nat.min(availForFill, Fixed.div(avail(o.owner, Types.QUOTE_TOKEN), o.price, false)) } else { 0 } };
-                };
-                if (funded > 0) {
-                  // Trim the take to the remaining budget. A trim to zero means
-                  // the budget is spent at this price — stop; an UNFUNDED maker
-                  // (funded = 0 above) merely skips to the next level.
-                  var take = funded;
-                  switch (budget) {
-                    case (#base(b))       { if (totalBase + take > b) { take := b - totalBase } };
-                    case (#quoteSpend(s)) { take := trimToSpend(take, o.price, s) };
-                    case (#all) {};
-                  };
-                  if (take == 0) { break walk };
+            // The engine's fillQty: the maker's order-sized remaining,
+            // trimmed only by the taker's own remaining need (#base budget).
+            var take = availForFill;
+            switch (budget) {
+              case (#base(b))       { if (totalBase + take > b) { take := b - totalBase } };
+              case (#quoteSpend(s)) { take := trimToSpend(take, o.price, s) };
+              case (#all) {};
+            };
+            if (take == 0) { break walk };
+            let cost = Fixed.mul(take, o.price, false);   // engine's tradeCost (floors)
+            // Can the maker fund this FULL take? Base side: the seller-maker
+            // needs the base outright. Quote side: the buyer-maker needs
+            // tradeCost + its maker fee (the engine's exact gate). If not,
+            // the engine cancels the maker and takes ZERO — count zero and
+            // walk on, exactly like its cancel+continue.
+            // 1788660964: the FLOOR is deliberate and exact — the release path
+            // (releaseDeferred → executeLimitOrderProtected, every staged order
+            // incl. FOK markets) gates AND debits the maker-buy on ⌊qty × price⌋
+            // + fee(⌊…⌋); test_fok_market.sh §15 pins it to the quote unit
+            // (floor-cost + fee fills whole with residue 0; one unit less is zero
+            // depth). 1788661917: executeMarketOrderProtected's early makerNeeds
+            // pre-gate and simulateAvailableFill (the cross-swap legs' engine)
+            // floor the same way now — they CEILED, one unit above their own
+            // settlement debit, and refused a maker funded to the unit on the
+            // cross-swap's sell leg (test_cross_swap_atomic §4, hygiene §6ax).
+            // One rounding, every maker-buy gate. Ceiling here would kill FOKs
+            // the engine fills and under-report depth by one funded maker.
+            switch (takerSide) {
+              case (#buy) {
+                if (scorer.balance(o.owner, baseToken, baseToken, take) >= take) {
                   totalBase += take;
-                  switch (budget) {
-                    case (#quoteSpend(s)) {
-                      // Engine parity: tradeCost FLOORS; the budget draw is
-                      // cost + takerFee per slice (the engine's quoteSpent).
-                      let cost = Fixed.mul(take, o.price, false);
-                      totalQuote += cost;
-                      totalSpent += cost + s.feeOf(cost);
-                    };
-                    case _ { totalQuote += Fixed.mul(take, o.price, true) };
-                  };
-                  switch (takerSide) {
-                    case (#buy)  { consume(o.owner, baseToken, take) };
-                    case (#sell) { consume(o.owner, Types.QUOTE_TOKEN, Fixed.mul(take, o.price, true)) };
-                  };
+                  totalQuote += cost;
+                  switch (budget) { case (#quoteSpend(s)) { totalSpent += cost + s.feeOf(cost) }; case _ {} };
+                  scorer.commit(o.owner, baseToken, baseToken, take, sellerGets(o.owner, cost));
                 };
               };
-              case (#allOrNothing) {
-                // The engine's fillQty: the maker's order-sized remaining,
-                // trimmed only by the taker's own remaining need (#base budget).
-                var take = availForFill;
-                switch (budget) {
-                  case (#base(b))       { if (totalBase + take > b) { take := b - totalBase } };
-                  case (#quoteSpend(s)) { take := trimToSpend(take, o.price, s) };
-                  case (#all) {};
-                };
-                if (take == 0) { break walk };
-                let cost = Fixed.mul(take, o.price, false);   // engine's tradeCost (floors)
-                // Can the maker fund this FULL take? Base side: the seller-maker
-                // needs the base outright. Quote side: the buyer-maker needs
-                // tradeCost + its maker fee (the engine's exact gate). If not,
-                // the engine cancels the maker and takes ZERO — count zero and
-                // walk on, exactly like its cancel+continue.
-                switch (takerSide) {
-                  case (#buy) {
-                    if (avail(o.owner, baseToken) >= take) {
-                      totalBase += take;
-                      totalQuote += cost;
-                      switch (budget) { case (#quoteSpend(s)) { totalSpent += cost + s.feeOf(cost) }; case _ {} };
-                      consume(o.owner, baseToken, take);
-                    };
-                  };
-                  case (#sell) {
-                    let costPlusFee = cost + quoteFeeFor(o.owner, cost, #makerDebit);
-                    if (avail(o.owner, Types.QUOTE_TOKEN) >= costPlusFee) {
-                      totalBase += take;
-                      totalQuote += cost;
-                      switch (budget) { case (#quoteSpend(s)) { totalSpent += cost + s.feeOf(cost) }; case _ {} };
-                      consume(o.owner, Types.QUOTE_TOKEN, costPlusFee);
-                    };
-                  };
+              case (#sell) {
+                let costPlusFee = cost + quoteFeeFor(o.owner, cost, #makerDebit);
+                if (scorer.balance(o.owner, baseToken, Types.QUOTE_TOKEN, take) >= costPlusFee) {
+                  totalBase += take;
+                  totalQuote += cost;
+                  switch (budget) { case (#quoteSpend(s)) { totalSpent += cost + s.feeOf(cost) }; case _ {} };
+                  scorer.commit(o.owner, baseToken, Types.QUOTE_TOKEN, costPlusFee, take);
                 };
               };
             };
@@ -2882,27 +3399,48 @@ persistent actor Uplands {
         };
       };
     };
-    { base = totalBase; quote = totalQuote; spent = totalSpent };
+    { base = totalBase; quote = totalQuote; spent = totalSpent; truncated; scanned };
   };
 
-  // Engine-consistent takeable depth (#allOrNothing — see walkFillable).
+  // Engine-consistent takeable depth (all-or-nothing per slice — see walkFillable).
   // `takerQty` bounds the walk to the taker's own need, which is what lets an
   // under-funded maker still count when the taker's remaining need at that
   // level is WITHIN the maker's funding (the engine fills that case — fillQty
   // = min(taker remaining, order remaining) is funded). Pass null (#all) for
   // a size-independent depth: then every maker is credited all-or-nothing on
   // its FULL order-sized fill, a sound lower bound for a taker of any size.
+  // H-09: `scanMax` is the visit budget (see walkFillable); `truncated` means
+  // the walk stopped on it before exhausting the book / reaching takerQty.
   func fokFillableDepth(
     marketId : Types.MarketId, baseToken : Types.TokenId, takerSide : Types.Side, capPrice : Nat, takerQty : ?Nat,
+    scanMax : Nat,
     excl : ?{
       isNonTakeable   : (Nat, Principal) -> Bool;
       isExpired       : Nat -> Bool;
       beneficialOwner : Principal -> Principal;
-      taker           : Principal;
+      taker           : ?Principal;
     },
-  ) : Nat {
+  ) : { qty : Nat; truncated : Bool; scanned : Nat } {
     let budget = switch (takerQty) { case (?q) { #base(q) }; case null { #all } };
-    walkFillable(marketId, baseToken, takerSide, capPrice, budget, #allOrNothing, excl).base;
+    let w = walkFillable(marketId, baseToken, takerSide, capPrice, budget, scanMax, excl);
+    { qty = w.base; truncated = w.truncated; scanned = w.scanned };
+  };
+
+  // H-09 (3): the public depth query's cap, clamped to ±DEPTH_QUERY_BAND_BPS
+  // around the pool's refPrice (no pool / no price → the caller's cap stands;
+  // the scan budget still bounds the walk). A clamped cap can only LOWER the
+  // answer — the safe direction for a caller sizing flow against it.
+  func depthQueryCap(marketId : Types.MarketId, takerSide : Types.Side, capPrice : Nat) : Nat {
+    switch (AMM.getPool(pools, marketId)) {
+      case (?p) {
+        if (p.refPrice == 0) { return capPrice };
+        switch (takerSide) {
+          case (#buy)  { Nat.min(capPrice, Fixed.mulDiv(p.refPrice, 10_000 + DEPTH_QUERY_BAND_BPS, 10_000, true)) };
+          case (#sell) { Nat.max(capPrice, Fixed.mulDiv(p.refPrice, SafeMath.subOrZero(10_000, DEPTH_QUERY_BAND_BPS), 10_000, false)) };
+        };
+      };
+      case null { capPrice };
+    };
   };
 
   // W4-24 (R5(c)): TAKEABLE depth, public. The raw book (getOrderBookDepth)
@@ -2912,7 +3450,7 @@ persistent actor Uplands {
   // returns what a taker at `capPrice` could actually clear, net of maker
   // funding and pending locks. Anyone SIZING flow against the book (the
   // arbitrageur does; W4-25's spoof rode the gap) must use this, not raw.
-  // #48.4: engine-consistent (#allOrNothing) — an under-funded maker counts
+  // #48.4: engine-consistent (all-or-nothing per slice) — an under-funded maker counts
   // ZERO (the engine cancels it, taking nothing), not its funded partial, so
   // a taker sized to this depth genuinely clears it (sound lower bound for
   // any taker size; see fokFillableDepth).
@@ -2922,15 +3460,231 @@ persistent actor Uplands {
     if (_testTakeableSpoofActive == ?marketId) { return 0 };
     switch (Map.get(markets, Text.compare, marketId)) {
       case null { 0 };
-      case (?m) { fokFillableDepth(marketId, m.0, takerSide, capPrice, null, null) };
+      // H-09: band-clamped cap + WALK_SCAN_MAX visits — a truncated walk
+      // returns the depth found so far (a lower bound), never traps.
+      // H-24 (F2): the walk carries the release pass's maker exclusions —
+      // an L4 quoter's SHIELDED quotes (a repricing intent in flight past
+      // the standing mark's dispatch: isMMShieldedFresh, the same predicate
+      // processDeferred's ctx applies) and expired makers count ZERO. Pre-fix
+      // the null excl counted shielded depth, so a phantom book that no
+      // taker could reach still read as takeable (display weight for a
+      // shield). Caller-agnostic: no taker, so no self-trade exclusion.
+      case (?m) {
+        let now = Time.now();
+        let releaseRef = releaseRefOf(marketId).dispatchNs;
+        fokFillableDepth(marketId, m.0, takerSide, depthQueryCap(marketId, takerSide, capPrice), null, WALK_SCAN_MAX,
+          ?{ isNonTakeable   = func(_ : Nat, makerOwner : Principal) : Bool { isMMShieldedFresh(makerOwner, marketId, releaseRef, now) };
+             isExpired       = func(id : Nat) : Bool { orderExpired(id, now) };
+             beneficialOwner = archiveOwnerOf;
+             taker           = null }).qty
+      };
     };
   };
 
   // W4-24: the engine's graceful unfunded-maker cancel now reports — the
   // "never silent" doctrine (see cancelPoolRestingOrder / cancelSelfMaker).
+  // Also fired for a sub-unit residue (task 1788497411: a remainder whose
+  // quote value floors to zero, cleared instead of jamming its level), so
+  // the text names both causes; test_unfunded_maker_notice pins 'mid-match'.
   func onUnfundedMakerNotice(marketId : Types.MarketId, owner : Principal, side : Types.Side, price : Nat, qty : Nat) {
-    recordReleaseRejection(owner, marketId, side, qty, null, price,
-      "Resting order cancelled mid-match: available balance no longer covers it.");
+    // H-34: a margin pool whose BORROW-AT-FILL was just refused gets the same
+    // ONE notice, naming the vault's reason (stashed by poolFundForFill in the
+    // same message) instead of the wallet wording — one record, actionable.
+    switch (Map.take(_borrowRefusal, Text.compare, Principal.toText(owner))) {
+      case (?why) {
+        recordReleaseRejection(owner, marketId, side, qty, null, price,
+          "Pool order cancelled mid-match: the vault could not lend this pool's leverage at the fill (" # why
+          # ") — nothing of that slice settled and the remainder is cancelled, not rested. Reduce the size, add margin, or place it again when the vault has capacity.");
+      };
+      case null {
+        recordReleaseRejection(owner, marketId, side, qty, null, price,
+          "Resting order cancelled mid-match: its remainder can no longer settle (available balance short, or worth less than one quote unit).");
+      };
+    };
+  };
+
+  // ── H-34 / D5 option (d): BORROW AT FILL ──────────────────────────────
+  // A leveraged pool entry reserves NOTHING from the vault at placement:
+  // openPosition only CHECKS the borrow (sized at the ceiling, reserving
+  // nothing) and stages; the engine calls this hook (ProtectionCtx.fundForFill)
+  // for each party of each slice it is about to settle, and a margin pool
+  // borrows exactly that slice's shortfall here — synchronously, inside the
+  // matching pass (BorrowEngine.borrow is await-free), gated by borrowCheck's
+  // vault cap + post-borrow initial-health projection on FRESH marks (H-06's
+  // basket-wide bar, plus the traded token). So a pool with only staged /
+  // resting entries holds ZERO vault debt, interest accrues from the fill,
+  // and getMaxInstantWithdraw never moves for a resting entry. If the vault
+  // cannot lend at that instant the slice FAILS CLOSED: `false` makes the
+  // engine cancel the order (maker: W4-24's notice + cancel; aggressor: the
+  // H-10 remainder cancel + one notice — onUnfundedMakerNotice names the
+  // reason from _borrowRefusal). Only an exposure-INCREASING fill borrows:
+  // an exit is funded by the pool's holdings (its reservation/earmark, as
+  // before), and a refusal here must never touch "closing is always
+  // available" — so for an exit the hook is a no-op and the engine's own
+  // balance gates decide, exactly as they always did.
+  transient let _borrowRefusal = Map.empty<Text, Text>();   // pool principal → the vault's reason, consumed by the notice
+  // Does a fill of `qty` on `side` ADD exposure for the pool in this base?
+  // Quantity-aware (#49.1's lesson): a buy against a short is an exit only up
+  // to |net| — a buy that crosses THROUGH flat re-levers with its excess and
+  // is an entry for the purpose of every rule below (it borrows at the fill,
+  // parks whole, earns no earmark). A pure close (closePosition sizes exactly
+  // |net|) is never an entry.
+  func poolOrderAddsExposure(poolId : Nat, side : Types.Side, baseToken : Types.TokenId, qty : Nat) : Bool {
+    netAddsExposure(poolNetSize(poolId, baseToken), side, qty)
+  };
+  // The same predicate on a GIVEN net (1788652744: the probe carries a pool's
+  // net through a walk and asks it of the state each credited slice leaves).
+  func netAddsExposure(net : Int, side : Types.Side, qty : Nat) : Bool {
+    switch (side) {
+      case (#buy)  { net >= 0 or qty > Int.abs(net) };   // long/flat + buy → more long; a buy-back past flat → long
+      case (#sell) { net <= 0 or qty > Int.abs(net) };   // short/flat + sell → more short; a sell-down past flat → short
+    };
+  };
+  func poolFundForFill(party : Principal, baseToken : Types.TokenId, token : Types.TokenId, needed : Nat, fillQty : Nat) : Bool {
+    let poolId = switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(party))) {
+      case (?id) { id };
+      case null { return true };   // a wallet: the engine's own gates decide
+    };
+    let side : Types.Side = if (token == Types.QUOTE_TOKEN) { #buy } else { #sell };
+    // A purely exposure-reducing slice is funded by holdings, never borrowed;
+    // a slice that adds exposure (or crosses through flat) borrows its
+    // shortfall — the holdings cover its reducing part, the vault the rest.
+    if (not poolOrderAddsExposure(poolId, side, baseToken, fillQty)) { return true };
+    let avail = getAvailable(party, token);
+    if (avail >= needed) { return true };
+    let short = SafeMath.subOrZero(needed, avail);   // > 0 here (avail < needed above)
+    let now = Time.now();
+    let refuse = func(why : Text) : Bool {
+      Map.add(_borrowRefusal, Text.compare, Principal.toText(party), why);
+      false
+    };
+    // Fresh marks, or no new debt (F1 + H-06): the traded token and the
+    // whole collateral/debt basket, the same bar openPosition holds.
+    if (not marginPriceFreshAt(baseToken, now)) { return refuse("oracle price stale for " # baseToken) };
+    switch (userStaleMarkAt(party, now)) {
+      case (?t) { return refuse("oracle price stale for " # t # " (this pool's collateral/debt)") };
+      case null {};
+    };
+    switch (BorrowEngine.borrow(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), party, token, short, now, marginPriceLookup)) {
+      case (#ok(_)) {
+        reprovisionPool(party);   // a loan-book mutation re-provisions the ONE pool it touched (3b8693b)
+        true
+      };
+      case (#err(e)) { refuse(e) };
+    };
+  };
+  // 1788641149 / 1788652744: the PROBE-side twin of poolFundForFill — a
+  // per-WALK scorer of what each `party` could bring to a fill in `token`
+  // WITHOUT borrowing anything: a wallet's available balance; a margin
+  // pool's available balance plus, for an exposure-INCREASING slice, the
+  // most the vault would lend it (BorrowEngine's initial-health room ∧ vault
+  // cap) on the same F1 + H-06 freshness gates the hook holds — stale marks
+  // lend nothing here exactly as the hook refuses there. Every book-walking
+  // simulator scores a maker with THIS (walkFillable → the FOK gate, the
+  // post-only probe, quoteSwap, getTakeableDepth, the cross-swap gate; the
+  // engine's FOK pre-check via ProtectionCtx.fundableScorer), so a leveraged
+  // resting pool entry counts as the depth the live walk will actually fund
+  // at the fill — pre-1788641149 it counted ZERO (a FOK sell against it was
+  // killed "only 0 was takeable"; previews under-reported by the pool's
+  // leveraged size). Read-only: roomState's accrueAll folds interest into
+  // principal the way every loanOf-derived read must (1a3ebb4) and moves no
+  // balance; the live engine's fundForFill stays the ONLY borrower.
+  //
+  // The scorer carries one ledger per (party, token) for the walk's life —
+  // for a pool: the LTV-weighted collateral, the debt, the vault's remaining
+  // room and the pool's net base — snapshotted at the party's first slice
+  // (one accrueAll + one ≤5-token valuation per pool per walk, so the walk-
+  // budget pins hold) and re-scored per SLICE as if each credited slice had
+  // settled: the pool's own cash leaves the collateral at `token`'s LTV, the
+  // received leg joins at ITS LTV (quote 1.0, ICP 0.8, BTC 0.9 — valued
+  // DOWN), the shortfall becomes debt (valued UP) and draws the vault's
+  // room, and the closed form a ≤ (C − R·D)/(R − ltv) is re-run on that
+  // state (BorrowEngine.healthRoom) — the inequality the fill-time
+  // borrowCheck will evaluate on the balances slice k leaves. Pre-1788652744
+  // the room was maxBorrowable ONCE at current marks, drawn down like cash:
+  // exact for a single slice, optimistic across several slices of ONE pool
+  // (the settled base is worth less than the quote it cost), so a FOK
+  // spanning two leveraged entries of one pool passed the gate, filled the
+  // first, had the second refused at the fill and ended PARTIALLY filled —
+  // the #48.4 shape (test_fok_market.sh §13). openPosition's placement check
+  // keeps its single-order optimism (it admits each entry alone; the fill
+  // and now the probes decide the sequence).
+  func poolFundableScorer() : MatchingEngine.FundableScorer {
+    type PoolLedger = {
+      var collUsd   : Nat;   // LTV-weighted collateral as settled so far (USD)
+      var debtUsd   : Nat;   // debt as settled so far (USD, valued UP)
+      var vaultRoom : Nat;   // the vault's remaining lendable `token`
+      var net       : Int;   // the pool's net base as settled so far (the entry/exit predicate)
+      ltv           : Nat;   // `token`'s LTV and mark
+      price         : Nat;
+      otherLtv      : Nat;   // the received leg's LTV and mark
+      otherPrice    : Nat;
+    };
+    type Ledger = { var cash : Nat; pool : ?PoolLedger };   // pool = null: cash is all this party can bring
+    let ledgers = Map.empty<Text, Ledger>();
+    func sideOf(token : Types.TokenId) : Types.Side { if (token == Types.QUOTE_TOKEN) { #buy } else { #sell } };
+    func ledger(party : Principal, baseToken : Types.TokenId, token : Types.TokenId) : Ledger {
+      let k = Principal.toText(party) # "#" # token;
+      switch (Map.get(ledgers, Text.compare, k)) { case (?e) { return e }; case null {} };
+      let cash = getAvailable(party, token);
+      let pool : ?PoolLedger = switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(party))) {
+        case null { null };   // a wallet: cash is what it can bring
+        case (?poolId) {
+          let now = Time.now();
+          // The hook's gates (F1 + H-06): stale marks → no new debt → cash only.
+          if (not marginPriceFreshAt(baseToken, now)) { null }
+          else if (Option.isSome(userStaleMarkAt(party, now))) { null }
+          else {
+            switch (BorrowEngine.roomState(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), party, token, now, marginPriceLookup)) {
+              case null { null };   // not a borrowable token — cash only
+              case (?r) {
+                let other = if (token == Types.QUOTE_TOKEN) { baseToken } else { Types.QUOTE_TOKEN };
+                let otherPrice = if (other == Types.QUOTE_TOKEN) { Fixed.SCALE } else { Option.get(marginPriceLookup(other), 0) };
+                let otherLtv = Option.get(Types.marginLTV(other), 0);
+                ?{ var collUsd = r.collUsd; var debtUsd = r.debtUsd; var vaultRoom = r.vaultRoom;
+                   var net = poolNetSize(poolId, baseToken); ltv = r.ltv; price = r.price; otherLtv; otherPrice }
+              };
+            };
+          };
+        };
+      };
+      let e : Ledger = { var cash = cash; pool };
+      Map.add(ledgers, Text.compare, k, e);
+      e
+    };
+    {
+      balance = func(party, baseToken, token, fillQty) {
+        let e = ledger(party, baseToken, token);
+        switch (e.pool) {
+          case null { e.cash };
+          case (?p) {
+            // An exposure-reducing slice is funded by holdings, never borrowed.
+            if (not netAddsExposure(p.net, sideOf(token), fillQty)) { return e.cash };
+            e.cash + Nat.min(BorrowEngine.healthRoom(p.collUsd, p.debtUsd, p.ltv, p.price), p.vaultRoom)
+          };
+        };
+      };
+      commit = func(party, baseToken, token, spent, received) {
+        let e = ledger(party, baseToken, token);
+        let fromCash = Nat.min(e.cash, spent);   // the hook borrows only the shortfall
+        e.cash := SafeMath.subOrZero(e.cash, fromCash);
+        switch (e.pool) {
+          case null {};
+          case (?p) {
+            // As settled: the own cash spent leaves the collateral at `token`'s
+            // LTV (a borrowed shortfall enters and leaves within the slice), the
+            // received leg joins at its own LTV, the shortfall is new debt and
+            // vault room used, and the net base moves for the entry/exit test.
+            let short = SafeMath.subOrZero(spent, fromCash);
+            p.collUsd := SafeMath.subOrZero(p.collUsd, Fixed.mul(Fixed.mul(fromCash, p.price, false), p.ltv, false))
+              + Fixed.mul(Fixed.mul(received, p.otherPrice, false), p.otherLtv, false);
+            p.debtUsd += Fixed.mul(short, p.price, true);
+            p.vaultRoom := SafeMath.subOrZero(p.vaultRoom, short);
+            p.net := switch (sideOf(token)) { case (#buy) { p.net + received }; case (#sell) { p.net - spent } };
+          };
+        };
+      };
+    }
   };
 
   // Release one eligible staged entry: subtract its reservation, drop it, then
@@ -2959,6 +3713,12 @@ persistent actor Uplands {
     // Read + delete HERE so every kill/clamp early-return below also cleans it.
     let budget = Map.get(deferredBudget, Nat.compare, d.id);
     ignore Map.delete(deferredBudget, Nat.compare, d.id);
+    // Direct-swap context (budgeted stagings only — see deferredSwapCtx). Read
+    // + delete here too; the kill/clamp early-returns below are unreachable
+    // for a budgeted entry (never FOK, always a wallet caller → margin clamp
+    // #full), so the outcome is recorded once, in the #market case.
+    let swapCtx = Map.get(deferredSwapCtx, Nat.compare, d.id);
+    ignore Map.delete(deferredSwapCtx, Nat.compare, d.id);
     let userExpiry = Map.get(deferredExpiry, Nat.compare, d.id);
     ignore Map.delete(deferredExpiry, Nat.compare, d.id);
     // #3a re-defer count for this staged id (read + clear here so the kill/clamp
@@ -2977,8 +3737,10 @@ persistent actor Uplands {
     // anything — without the clear, an L4 quoter could hold their whole book
     // off the users-only fallback through an oracle stall by renewing KILLS
     // (expiry / FOK / post-only / margin) instead of cancels. The landing
-    // fall-through keeps its shield (the stamp IS the repricing intent that
-    // just landed).
+    // fall-through drops it too, since H-24 (D1): the stamp IS the repricing
+    // intent, and once that intent has landed there is nothing left in flight
+    // to shield — landMmShield after the engine call below (a NEWER staged
+    // intent's stamp survives it).
     switch (userExpiry) {
       case (?e) {
         if (Time.now() >= e) {
@@ -3027,15 +3789,26 @@ persistent actor Uplands {
       // remaining-sum over-counted and let FOK orders partial-fill; #48.4: so
       // did crediting an under-funded maker its funded PARTIAL — the engine
       // cancels such a maker and takes zero, so the gate must count it the
-      // engine's way (fokFillableDepth is #allOrNothing, bounded to d.qty).
+      // engine's way (fokFillableDepth is bounded to d.qty).
       // #48.5: the gate also runs at effLimit (what the engine executes at) and
       // threads this release's ctx exclusions plus the taker into the walk —
       // makers the engine will SKIP (non-takeable / expired / the taker's own)
       // must count ZERO here, or the gate passes on depth the engine refuses
       // and the FOK partial-fills.
-      let availQty = fokFillableDepth(d.marketId, d.baseToken, d.side, effLimit, ?d.qty,
+      // H-09 (F35): the walk carries the ENGINE's iteration budget
+      // (FOK_GATE_ITER_BUDGET = MAX_MATCH_ITERATIONS_PER_CALL) and counts
+      // every maker it passes — fills, skips, unfunded cancels, the pending-
+      // lock re-find — exactly as the engine spends them. `truncated` means
+      // the budget ran out BEFORE d.qty was reached: the engine would cap
+      // out short of the full size, so the gate fails CLOSED (>256 small
+      // funded makers, or ~250 unfunded dust makers ahead of real depth,
+      // used to pass on depth alone and partial-fill — test_fok_market
+      // §10/§11). The recorded "only N was takeable" is what the budget
+      // reached, never d.qty itself.
+      let gate = fokFillableDepth(d.marketId, d.baseToken, d.side, effLimit, ?d.qty, FOK_GATE_ITER_BUDGET,
         ?{ isNonTakeable = ctx.isNonTakeable; isExpired = ctx.isExpired;
-           beneficialOwner = ctx.beneficialOwner; taker = d.owner });
+           beneficialOwner = ctx.beneficialOwner; taker = ?d.owner });
+      let availQty = if (gate.truncated) { Nat.min(gate.qty, SafeMath.subOrZero(d.qty, 1)) } else { gate.qty };
       if (availQty < d.qty) {
         // KILL — never silently: record why, and repay a pool's idle pre-borrow.
         recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, null, effLimit,
@@ -3057,9 +3830,15 @@ persistent actor Uplands {
     // makers, sidelined AMM) it kills rather than risks taking — the safe,
     // conservative direction for a maker-fee-0 quoter.
     if (postOnly and d.kind == #limit) {
-      // (#fundedPartial vs #allOrNothing is moot at a 1-unit budget: both
-      // credit a maker 1 iff it can fund a 1-unit fill.)
-      let cross = walkFillable(d.marketId, d.baseToken, d.side, d.limitPrice, #base(1), #fundedPartial, null).base;
+      // (A maker is credited 1 iff it can fund a 1-unit fill — the walker's
+      // all-or-nothing scoring at a 1-unit budget.)
+      // H-09: the probe walks with the ENGINE's iteration budget. A probe
+      // that truncates with cross == 0 has visited exactly the makers the
+      // engine's one call would spend its iterations skipping/cancelling
+      // (all unfundable within the cap) — the engine takes nothing and rests
+      // the order, so resting here is engine-consistent; the kill stays
+      // reserved for a FUNDED crossing maker within reach.
+      let cross = walkFillable(d.marketId, d.baseToken, d.side, d.limitPrice, #base(1), FOK_GATE_ITER_BUDGET, null).base;
       if (cross > 0) {
         recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, null, d.limitPrice,
           "Post-only order killed at release: it would have crossed the book and taken liquidity.");
@@ -3071,16 +3850,24 @@ persistent actor Uplands {
         bumpUserVersion(d.owner); return;
       };
     };
-    // #3a: a SPOT market order walks the AMM curve instead of spilling into
+    // #3a: a market order walks the AMM curve instead of spilling into
     // stranded book. Cap its fill THIS cycle to the AMM's quoted ladder edge —
     // it takes the fresh AMM + any in-band users, but NOT a far stranded order
     // beyond the ladder; the unfilled remainder re-defers to the next requote
     // (in the #market case below), where the AMM has reskewed from absorbing
-    // this tranche. Scoped to spot (pools/positions and FOK keep existing
-    // semantics — their fill/clamp/deleverage accounting is left untouched).
-    let isSpotMarket = (d.kind == #market) and (not fok)
-      and (Map.get(poolByPrincipal, Text.compare, Principal.toText(d.owner)) == null);
-    if (isSpotMarket and not ctx.isNonTakeable(0, ammPrincipal())) {
+    // this tranche. H-05 (F1): POOL market orders walk too — the cap used to
+    // be scoped to spot wallets, so a pool's #market close/entry staged at
+    // mark × (1 ± maxSlippage) (up to 25 %) executed at its raw cap against
+    // whatever rested there: a colluding ask at the 25 % edge behind an
+    // emptied AMM side filled a de-levering close straight through the
+    // pool's equity into socialised bad debt. Every taker now gets the same
+    // bound (the ladder edge, or ±USERS_ONLY_CLAMP_PCT of mid when the AMM
+    // is not quoting that side); a pool remainder re-parks for MAX_REDEFER
+    // walks and then drops — its idle pre-borrow repaid on the drop (H-07's
+    // re-park arm keeps a LIVE remainder's borrow, by construction). FOK
+    // keeps its all-or-nothing semantics (H-20 carries #3a-for-FOK).
+    let walksLadder = (d.kind == #market) and (not fok);
+    if (walksLadder and not ctx.isNonTakeable(0, ammPrincipal())) {
       switch (AMM.getPool(pools, d.marketId)) {
         case (?p) {
           let span = ammQuoteSpan(p, d.side);
@@ -3112,12 +3899,20 @@ persistent actor Uplands {
     // Evaluated at the worst-case fill price (effLimit) and CLAMPED rather than
     // killed: release the largest health-safe quantity, surface the reduction,
     // and only kill (with a record) when no quantity is safe. A clamped/killed
-    // pool order also repays its now-idle pre-borrow (recordReleaseRejection →
-    // deleveragePool) so failed attempts don't strand debt against the pool.
+    // pool order also repays its now-idle pre-borrow — every kill arm calls
+    // repayIdlePoolBorrow explicitly (recordReleaseRejection only WRITES the
+    // rejection record; it repays nothing), and the clamp's excess is repaid
+    // after the fill below — so failed attempts don't strand debt against
+    // the pool.
     var relQty = d.qty;
+    // H-05: the exposure-reducing quantity the clamp's equity bound HOLDS for
+    // the next requote (a pool close whose worst-case loss at effLimit would
+    // exceed the pool's raw equity). Re-parks with the #market remainder
+    // below, exactly like an unfilled tail; never dropped silently.
+    var heldQty : Nat = 0;
     switch (clampToInitialMargin(d.owner, d.baseToken, d.side, d.qty, effLimit)) {
       case (#full) {};
-      case (#partial(q)) {
+      case (#partial(p)) {
         // #48.5: a fill-or-kill order never releases a REDUCED size — all-or-
         // nothing is the contract the user bought with noPartialFill, and this
         // clamp runs AFTER the FOK depth gate passed. KILL instead (recorded,
@@ -3127,20 +3922,34 @@ persistent actor Uplands {
         // that coincidence; setTestDeferredFok exercises it on #dev.)
         if (fok) {
           recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, null, effLimit,
-            "Fill-or-kill order killed at release: filling the full size at the worst-case price would breach the initial-margin requirement (only " # r2n(q) # " was margin-safe).");
+            "Fill-or-kill order killed at release: filling the full size at the worst-case price would breach the initial-margin requirement (only " # r2n(p.qty) # " was margin-safe).");
           logEventF("warn", "order", ?"order.kill", ?Principal.toText(d.owner),
             d.baseToken # " " # (switch (d.side) { case (#buy) "BUY"; case (#sell) "SELL" }) # " " # r2n(d.qty)
-            # " FILL-OR-KILL killed at release — margin clamp allowed only " # r2n(q) # " at $" # r2n(effLimit), ?d.marketId);
+            # " FILL-OR-KILL killed at release — margin clamp allowed only " # r2n(p.qty) # " at $" # r2n(effLimit), ?d.marketId);
           clearMmShield(d.owner, d.marketId);
           repayIdlePoolBorrow(d.owner, d.marketId);
           bumpUserVersion(d.owner); return;
         };
-        relQty := q;
-        recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, ?q, effLimit,
-          "Order reduced at release: filling the full size at the worst-case price would breach the initial-margin requirement. Released " # r2n(q) # " of " # r2n(d.qty) # ".");
+        relQty := p.qty;
+        heldQty := p.held;
+        // Two distinct reductions, told apart in the record: the H-05 equity
+        // HOLD (an exposure-reducing quantity that waits for a better requote)
+        // and the #49.1 initial-margin REFUSAL of a re-levering excess (which
+        // drops — it never had a right to fill). Both may apply to one order.
+        let refused = SafeMath.subOrZero(SafeMath.subOrZero(d.qty, p.qty), p.held);
+        let reason = if (p.held > 0) {
+          "Close reduced at release: filling " # r2n(d.qty) # " at the worst-case price $" # r2n(effLimit)
+          # " would leave the pool with negative equity. Released " # r2n(p.qty) # "; " # r2n(p.held)
+          # (switch (d.kind) { case (#market) { " re-staged for the next requote" }; case (#limit) { " not released" } })
+          # (if (refused > 0) { "; " # r2n(refused) # " re-levering excess refused at the initial-margin bound" } else { "" }) # "."
+        } else {
+          "Order reduced at release: filling the full size at the worst-case price would breach the initial-margin requirement. Released " # r2n(p.qty) # " of " # r2n(d.qty) # "."
+        };
+        recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, ?p.qty, effLimit, reason);
         logEventF("warn", "order", ?"order.clamp", ?Principal.toText(d.owner),
           d.baseToken # " " # (switch (d.side) { case (#buy) "BUY"; case (#sell) "SELL" }) # " reduced at release "
-          # r2n(d.qty) # " → " # r2n(q) # " — full size would breach initial margin at $" # r2n(effLimit), ?d.marketId);
+          # r2n(d.qty) # " → " # r2n(p.qty) # (if (p.held > 0) { " (" # r2n(p.held) # " held for the next requote — equity bound)" } else { " — full size would breach initial margin" })
+          # " at $" # r2n(effLimit), ?d.marketId);
       };
       case (#none(reason)) {
         recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, null, effLimit, reason);
@@ -3152,19 +3961,39 @@ persistent actor Uplands {
         bumpUserVersion(d.owner); return;
       };
     };
+    // H-05: NO equity-safe quantity at this price (the whole exposure-reducing
+    // fill is held). Nothing goes to the engine: the held quantity re-stages
+    // for the next requote — or drops with a record once the walks run out.
+    if (relQty == 0) {
+      holdWholeRelease(d, heldQty, reDeferCount, effLimit);
+      // The hold is pool-only by construction (the equity bound lives in the
+      // clamp's poolByPrincipal branch), so this clear is a no-op — a pool
+      // principal never holds an MM shield; kept so the #51.1 exit-block
+      // census (every early return here clears the shield) stays uniform.
+      clearMmShield(d.owner, d.marketId);
+      bumpUserVersion(d.owner); return;
+    };
     // Thread the ORIGIN type through: the created order record and every
     // trade's takerOrderType report what the user actually placed. #market
     // also selects IOC semantics in the engine (never rests — see the walk
     // handling below), which is what makes the walk record-clean.
     let originType : Types.OrderType = switch (d.kind) { case (#market) { #market }; case (#limit) { #limit } };
-    let (order, trades, _pending, aff, quoteSpent) = MatchingEngine.executeLimitOrderProtected(
+    let (order, trades, aff, quoteSpent, stop) = MatchingEngine.executeLimitOrderProtected(
       orderStore, accounts, d.marketId, d.baseToken, d.owner, d.side, originType, effLimit, relQty,
       d.ts, Time.now(), ctx,   // order keeps its submission ts; trades stamp at THIS release (settlement)
       // The budget rides ONLY on #market releases (it is only ever staged for
       // direct-swap #market #buy entries; #limit resting semantics stay null).
       switch (d.kind) { case (#market) { budget }; case (#limit) { null } },
     );
+    // H-24 (F2): the intent has landed — its shield lapses (a newer in-flight
+    // intent's stamp is kept; see landMmShield).
+    landMmShield(d.owner, d.marketId, d.ts);
     for (t in trades.vals()) { List.add(allTrades, t) };
+    // H-34: a pool aggressor the vault could not fund (borrow-at-fill refused
+    // mid-walk). The engine cancelled its remainder and filed the one notice;
+    // the #market arm must not re-park it and the #limit arm has nothing to
+    // link (id 0). A wallet's #unfunded is the legacy shape and untouched.
+    let borrowRefused = (stop == #unfunded) and Option.isSome(Map.get(poolByPrincipal, Text.compare, Principal.toText(d.owner)));
     // Phase 3: single choke point for ALL pool-order fills (every pool order is a
     // parkDeferred entry released here). Books exact VWAP/realized into the pool's
     // Position and repays its debt from the proceeds. No-op when no pool is a party.
@@ -3210,27 +4039,58 @@ persistent actor Uplands {
     };
     for (p in aff.vals()) { Map.add(affected, Text.compare, Principal.toText(p), p) };
     Map.add(affected, Text.compare, Principal.toText(d.owner), d.owner);
+    // H-07 (F31): does an UNFILLED remainder of this release live on — re-
+    // parked as a staged entry (#market re-defer) or resting on the book
+    // (#limit)? A live remainder keeps the pre-borrow that backs it; a
+    // remainder that DROPS leaves that borrow idle (see the repay below).
+    var remainderLives = false;
     switch (d.kind) {
       case (#market) {
         // IOC in the engine: a market taker NEVER rests, so there is no book
         // entry to cancel (the old rest→cancel per walk cycle is what littered
         // Recently Closed Orders with phantom "cancelled limit orders"). The
         // remainder is simply what didn't fill this cycle.
-        let rem = SafeMath.subOrZero(relQty, order.filled);
+        // H-05: the equity-HELD quantity rides with the unfilled remainder —
+        // it re-parks for the next requote (or drops with the tail).
+        let rem = SafeMath.subOrZero(relQty, order.filled) + heldQty;
+        // Direct-swap bookkeeping (task 1788465056): the swap's running totals
+        // across walk cycles. `final` is the entry's stop reason when THIS
+        // cycle ends its life (nothing re-parked) — null while it walks on.
+        let swapSpent = switch (swapCtx) { case (?c) { c.spent + quoteSpent }; case null { quoteSpent } };
+        let swapRecv  = switch (swapCtx) { case (?c) { c.received + order.filled }; case null { order.filled } };
+        var final : ?MatchingEngine.StopReason = ?stop;
+        var finalNote : Text = "";
         if (rem > 0) {
           // Budget truthfulness: with a spend budget the qty was sized at the
           // BEST price, so on a walking book the engine stops at the budget
           // with base left over — that is a COMPLETE conversion (all budget
-          // spent), not a partial fill. Judge by budget exhaustion (crumb
-          // tolerance, quoteSwap's spentAll shape) and finish SILENTLY: no
-          // re-defer (nothing left to spend) and no drop note (the "no
-          // liquidity within the slippage cap" record would be a lie).
+          // spent), not a partial fill. The ENGINE says so (#budgetExhausted:
+          // not one more base unit fits under the budget); the real-residue
+          // crumb (budgetCrumb: one base unit at the cap + fee) is the
+          // fallback for a book/cap stop within a unit of the budget. The
+          // old flat 1 bps crumb was #55 silent "complete" — a stop up to
+          // 1 bps short read as complete and was never reported. A complete
+          // budget finishes with no re-defer (nothing left to spend) and no
+          // drop note (the "no liquidity within the slippage cap" record
+          // would be a lie); whether the SWAP still stopped short of what
+          // the caller asked is judged below, against the request.
           let spentAll = switch (budget) {
-            case (?b) { b <= quoteSpent + Nat.max(1, b / 10_000) };
+            case (?b) { stop == #budgetExhausted or b <= quoteSpent + budgetCrumb(effLimit) };
             case null { false };
           };
           if (spentAll) {
-            // complete conversion — nothing to re-park, nothing to record
+            // complete conversion of the staged budget — nothing to re-park
+          }
+          // H-34 / D5 (d): the vault refused this pool's borrow-at-fill
+          // (stop #unfunded on a pool aggressor — poolFundForFill said no).
+          // Fail CLOSED: the remainder is CANCELLED, not re-parked for
+          // another walk and not recorded a second time — the engine already
+          // filed the ONE unfunded-maker notice (H-10's shape) naming the
+          // vault's reason. Nothing lives on: the H-07 tail below finds no
+          // remainder and nothing idle to repay.
+          else if (borrowRefused) {
+            final := ?#unfunded;
+            finalNote := "the vault could not lend the pool's leverage at the fill — remainder cancelled";
           }
           // #3a: re-defer a SPOT market remainder to the next requote so it walks
           // the reskewed AMM curve rather than dropping (or having spilled into
@@ -3238,11 +4098,37 @@ persistent actor Uplands {
           // re-reserves from raw balance; releaseDeferred is synchronous. Capped
           // at MAX_REDEFER walks; then it drops. A budgeted remainder re-parks
           // with the REMAINING budget (budget − spent this cycle).
-          else if (isSpotMarket and reDeferCount < MAX_REDEFER) {
+          else if (walksLadder and reDeferCount < MAX_REDEFER) {
             let remBudget = switch (budget) { case (?b) { ?SafeMath.subOrZero(b, quoteSpent) }; case null { null } };
             switch (parkDeferred(d.marketId, d.baseToken, d.owner, d.side, #market, d.limitPrice, rem, false, remBudget, null, Time.now())) {
-              case (?e2) { Map.add(_reDeferCount, Nat.compare, e2.id, reDeferCount + 1) };
-              case null {}; // couldn't re-park (no funds) → dropped
+              case (?e2) {
+                Map.add(_reDeferCount, Nat.compare, e2.id, reDeferCount + 1);
+                // A re-park that parked less than the remainder (a pool's free
+                // quote thinned by this cycle's fill) is recorded, not silent
+                // (task 1788557389; a budgeted spot remainder is sized by its
+                // budget and never trims here).
+                if (remBudget == null) { noteStagedShort(d.owner, d.marketId, d.baseToken, d.side, rem, e2.qty, d.limitPrice) };
+                // The swap's context rides to the re-parked id with the
+                // running totals; a further available-clamp at re-park
+                // (parkDeferred's min(budget, avail)) shrinks eff too, so
+                // "the budget was the clamp" stays honest across walks.
+                switch (swapCtx, remBudget) {
+                  case (?c, ?rb) {
+                    let clampedMore = SafeMath.subOrZero(rb, e2.reservedAmt);
+                    Map.add(deferredSwapCtx, Nat.compare, e2.id,
+                      { origId = c.origId; requested = c.requested; eff = SafeMath.subOrZero(c.eff, clampedMore); spent = swapSpent; received = swapRecv });
+                  };
+                  case _ {};
+                };
+                final := null;
+                remainderLives := true;
+              };
+              case null {
+                // couldn't re-park (no available funds) → dropped. Told below
+                // for a swap; a plain market order's silent drop is unchanged.
+                final := ?#unfunded;
+                finalNote := "the remainder could not be re-staged (insufficient available balance)";
+              };
             };
           } else {
             // No more walks (gave up after MAX_REDEFER, or a non-re-deferring
@@ -3259,7 +4145,28 @@ persistent actor Uplands {
             logEventF("info", "order", ?"order.nofill", ?Principal.toText(d.owner),
               d.baseToken # " " # dropSide # " market order — " # r2n(rem) # " unfilled, dropped" # walkNote
               # " (no liquidity within $" # r2n(effLimit) # ")", ?d.marketId);
+            finalNote := r2n(rem) # " " # d.baseToken # " of the sized quantity dropped" # walkNote;
           };
+        };
+        // The swap's final word (direct path — task 1788465056, #55 silent
+        // "complete"): when this cycle ends the entry's life, record a
+        // SwapOutcome under the ORIGINAL staged id if the conversion stopped
+        // short of what the caller ASKED for — the staged budget was clamped
+        // to available at staging (the reserved-600 shape), the book or the
+        // cap stopped the walk, the remainder dropped, or the sized quantity
+        // filled below the amount (the book improved after staging). A swap
+        // whose whole request converted records nothing (nothing spurious):
+        // a #budgetExhausted stop on an unclamped budget IS the request met,
+        // whatever integer crumb the walk left.
+        switch (swapCtx, final) {
+          case (?c, ?reason) {
+            let short = switch (reason) {
+              case (#budgetExhausted) { c.eff < c.requested };
+              case _ { swapSpent + budgetCrumb(effLimit) < c.requested };
+            };
+            if (short) { recordDirectSwapOutcome(c, d, swapSpent, swapRecv, reason, finalNote) };
+          };
+          case _ {};
         };
       };
       case (#limit) {
@@ -3271,14 +4178,25 @@ persistent actor Uplands {
         };
         // The staged id is reborn as this order id — record the link so
         // status/cancel/replace by the PLACEMENT id survive the release.
-        linkStagedRelease(d.id, order.id);
+        // (id 0 = nothing was created: a pool aggressor whose borrow-at-fill
+        // was refused before any fill, H-34 — there is no order to link.)
+        if (order.id != 0) { linkStagedRelease(d.id, order.id) };
+        remainderLives := OrderBook.isOpen(order);
       };
     };
-    // A clamped pool order pre-borrowed for its FULL size; the excess beyond
-    // the released quantity is idle now — repay it. (Reserved funds backing a
-    // rested remainder are untouched; settlePoolFills already deleveraged the
-    // filled part.)
-    if (relQty < d.qty) { repayIdlePoolBorrow(d.owner, d.marketId) };
+    // H-07 (F31), kept DEAD-SAFE under H-34 / D5 (d). A pool order used to
+    // pre-borrow its FULL size at placement, and this line repaid the part
+    // left idle when the clamp released less than d.qty or the release ended
+    // with no staged and no resting remainder. With borrow-at-fill there is
+    // no placement borrow to strand — a pool's debt only ever equals what
+    // its fills took — so this is a no-op for the loan book in every case
+    // the old arms covered (repayIdlePoolBorrow → deleveragePool spends only
+    // FREE, non-earmarked funds against debt that exists). It stays as the
+    // stated invariant's backstop: an order that is gone holds no borrow,
+    // and free funds never sit against debt after a release. A wallet owner
+    // is a Map lookup no-op.
+    let unfilled = SafeMath.subOrZero(relQty, order.filled);
+    if (relQty < d.qty or (unfilled > 0 and not remainderLives)) { repayIdlePoolBorrow(d.owner, d.marketId) };
   };
 
   // Release eligible staged entries against a freshly-requoted pool. Called at
@@ -3290,12 +4208,19 @@ persistent actor Uplands {
   // Released oldest-first (time priority).
   func processDeferred(pool : AMM.Pool, now : Int) {
     let marketId = pool.marketId;
-    let dueArr = stagedForMarketSorted(marketId);
-    if (dueArr.size() == 0) { return };
+    // H-23 (F27): the release reference is the standing mark's DISPATCH clock
+    // (releaseRefs), not refPriceUpdatedNs — an entry staged while the fetch
+    // was parked in its fan-out must wait for the NEXT fetch.
+    let releaseRef = releaseRefOf(marketId).dispatchNs;
+    // Task 1788550465: the pre-pass hands back only the top-k DUE entries
+    // (k = the pass's release cap) in release order, plus the counts —
+    // O(M log k) off the market index, not a sort of every staged entry.
+    let pre = stagedForMarketTopK(marketId, releaseRef, releaseMaxPerPass());
+    if (pre.due == 0 and pre.notDue == 0) { return };
 
     // AMM IS takeable here (its quotes are fresh) and fills settle immediately.
     let deferCtx : MatchingEngine.ProtectionCtx = {
-      aggressorIsMaker = false;              // W4-22: only the AMM sweep re-homes resting orders
+      aggressorRole    = #taker;             // W4-22/H-24: only the AMM sweep re-homes resting orders
       onUnfundedMaker  = onUnfundedMakerNotice;
       quoteFee         = quoteFeeFor;        // GEPTOR release (processDeferred) — dominant spot-fill path
       creditTreasury;
@@ -3304,30 +4229,41 @@ persistent actor Uplands {
       // pool is one party on both sides, however different the principals look.
       beneficialOwner  = archiveOwnerOf;
       onTradeFees      = recordTradeFees;
-      getMakerWindow   = func(_) { 0 };
-      getMakerPending  = func(mid : Nat) { Option.get(Map.get(pendingQtyByMaker, Nat.compare, mid), 0) };
+      fundForFill      = poolFundForFill;   // H-34: a margin pool borrows its slice at the fill
+      fundableScorer   = poolFundableScorer;   // 1788641149 / 1788652744: the FOK pre-check scores a pool by what the vault would lend it, re-scored per slice as settled (never borrows)
       availableBalance;
       // MM freshness shield: an MM's resting quotes are off-limits while their
       // staged repricing intent postdates this pass's price — that intent (which
       // releases FIRST by tier priority) replaces the book before takers see it.
-      isNonTakeable    = func(_, makerOwner) { isMMShieldedFresh(makerOwner, marketId, pool.refPriceUpdatedNs, now) };
+      isNonTakeable    = func(_, makerOwner) { isMMShieldedFresh(makerOwner, marketId, releaseRef, now) };
       isExpired        = func(id : Nat) : Bool { orderExpired(id, Time.now()) };
-      onPendingFill    = func(_, _, _, _, _, _, _) : ?Types.PendingMatch { null };
     };
     let allTrades = List.empty<Types.Trade>();
     let affectedSet = Map.empty<Text, Principal>();
-    var stillStaged = false;
+    // Not-yet-due entries (staged after the mark's dispatch) stay for the
+    // next fetch; a due remainder beyond this pass's top-k stays too.
+    var stillStaged = pre.notDue > 0;
 
-    for (d in dueArr.vals()) {
-      if (d.ts < pool.refPriceUpdatedNs) {
-        releaseDeferred(d, deferCtx, allTrades, affectedSet);
-      } else {
-        stillStaged := true;
-      };
+    // H-22: paced — MAX_RELEASES_PER_PASS releases / RELEASE_PASS_FILL_BUDGET
+    // settled fills per pass; the remainder stays staged in the SAME priority
+    // order (pre.top is (tierRank DESC, ts ASC, id ASC) — the first k due
+    // entries of the full order, so the head releases first and a cut pass
+    // resumes from the oldest unreleased entry of the top tier).
+    let budget = newReleaseBudget();
+    var released : Nat = 0;
+    label rel for (d in pre.top.vals()) {
+      if (not releaseBudgetOpen(budget)) { break rel };
+      let fillsBefore = List.size(allTrades);
+      releaseDeferred(d, deferCtx, allTrades, affectedSet);
+      chargeRelease(budget, SafeMath.subOrZero(List.size(allTrades), fillsBefore));
+      released += 1;
     };
+    if (released < pre.due) { stillStaged := true };
 
-    // Liveness: while entries remain staged (price not yet advanced past them),
-    // re-arm a GEPTOR so the next fetch gets them — bounded by their expiry.
+    // Liveness: while entries remain staged (price not yet advanced past them,
+    // or a budget-cut pass), re-arm a GEPTOR so the next fetch gets them —
+    // bounded by their expiry. The 2s AMM tick's requote resumes a cut pass
+    // too (its release reference already postdates the remainder).
     if (stillStaged and Map.get(_geptorDeadline, Text.compare, marketId) == null) {
       Map.add(_geptorDeadline, Text.compare, marketId, now + GEPTOR_DELAY_NS);
     };
@@ -3339,29 +4275,57 @@ persistent actor Uplands {
   // arrived) is RELEASED against USER liquidity only — the AMM is non-takeable in
   // this ctx — so user↔user trading survives an oracle outage. Runs from the
   // recurring finaliser regardless of AMM/requote state. Sorted oldest-first.
-  func processDeferredExpiry(now : Int) {
+  // The expiry pass's pre-loop term: the due cohort, capped and oldest-first.
+  // Factored out so devSweepCostProbe measures exactly this (expiryScan /
+  // expiryScanSynth) — the per-tick term that used to scale with the staged
+  // depth. Task 1788552852: it reads deferredIdsByExpiry in ascending
+  // expiresAt order and STOPS at the first key past `now`, so a tick with
+  // nothing due costs one B-tree seek (8.4M instr → ~µ at the 5,000 floor),
+  // and a due cohort costs O(collected), never O(staged). The cohort taken
+  // when more than the cap is due is the EARLIEST-EXPIRING cap entries (id
+  // ascending within one instant) — identical to the old id-order scan
+  // whenever expiresAt is the flat staging offset (expiresAt order = ts
+  // order = id order on a live venue), and the more sensible choice where a
+  // setTestDeferredExpiry override splits them. The map's own expiresAt is
+  // re-checked per entry: index drift (getStagedIndexAudit (g) is the
+  // detector) can never release an entry the map says is not due, and a
+  // stray id is skipped, never trapped on — the pass keeps its liveness.
+  func expiredDeferredBatch(now : Int) : [DeferredExec] {
     let expired = List.empty<DeferredExec>();
-    label collect for ((_, d) in Map.entries(deferredExecs)) {
-      if (now >= d.expiresAt) {
-        List.add(expired, d);
-        // CAP THE COHORT. Entries staged in the same window share an expiry
-        // instant (DEFERRED_EXPIRY_NS is a flat offset from staging), so one
-        // stalled price-refresh window expires the whole queue at once, and an
-        // uncapped pass once trapped the 40B instruction limit (measured at
-        // ~2,970 orders stacked on one price, back when the matcher re-walked
-        // its level per fill — that quadratic is fixed structurally now; see
-        // MAX_EXPIRY_RELEASES_PER_PASS). The cap keeps each pass's release
-        // machinery bounded; the remainder is picked up on the next pass —
-        // this loop is re-entered every finalise tick, so nothing is dropped,
-        // only deferred.
-        if (List.size(expired) >= MAX_EXPIRY_RELEASES_PER_PASS) { break collect };
+    label collect for ((e, ids) in Map.entries(deferredIdsByExpiry)) {
+      if (now < e) { break collect };   // ascending keys: nothing past here is due
+      for (id in Map.keys(ids)) {
+        switch (Map.get(deferredExecs, Nat.compare, id)) {
+          case (?d) {
+            if (now >= d.expiresAt) {
+              List.add(expired, d);
+              // CAP THE COHORT. Entries staged in the same window share an expiry
+              // instant (DEFERRED_EXPIRY_NS is a flat offset from staging), so one
+              // stalled price-refresh window expires the whole queue at once, and an
+              // uncapped pass once trapped the 40B instruction limit (measured at
+              // ~2,970 orders stacked on one price, back when the matcher re-walked
+              // its level per fill — that quadratic is fixed structurally now; see
+              // MAX_EXPIRY_RELEASES_PER_PASS). The cap keeps each pass's release
+              // machinery bounded; the remainder is picked up on the next pass —
+              // this loop is re-entered every finalise tick, so nothing is dropped,
+              // only deferred.
+              if (List.size(expired) >= MAX_EXPIRY_RELEASES_PER_PASS) { break collect };
+            };
+          };
+          case null {};   // index drift — audited, never trapped on
+        };
       };
     };
-    if (List.size(expired) == 0) { return };
-    let arr = sortDeferredByTs(Iter.toArray(List.values(expired)));
+    if (List.size(expired) == 0) { return [] };
+    sortDeferredByTs(Iter.toArray(List.values(expired)));
+  };
+
+  func processDeferredExpiry(now : Int) {
+    let arr = expiredDeferredBatch(now);
+    if (arr.size() == 0) { return };
 
     let usersOnlyCtx : MatchingEngine.ProtectionCtx = {
-      aggressorIsMaker = false;              // W4-22
+      aggressorRole    = #taker;             // W4-22/H-24
       onUnfundedMaker  = onUnfundedMakerNotice;
       quoteFee         = quoteFeeFor;        // oracle-stall users-only fallback — real user trades
       creditTreasury;
@@ -3370,8 +4334,8 @@ persistent actor Uplands {
       // pool is one party on both sides, however different the principals look.
       beneficialOwner  = archiveOwnerOf;
       onTradeFees      = recordTradeFees;
-      getMakerWindow   = func(_) { 0 };
-      getMakerPending  = func(mid : Nat) { Option.get(Map.get(pendingQtyByMaker, Nat.compare, mid), 0) };
+      fundForFill      = poolFundForFill;   // H-34: a margin pool borrows its slice at the fill
+      fundableScorer   = poolFundableScorer;   // 1788641149 / 1788652744: the FOK pre-check scores a pool by what the vault would lend it, re-scored per slice as settled (never borrows)
       availableBalance;
       // AMM sidelined (as before) + shielded MMs: a stall is exactly when
       // stale-quote sniping pays best, so ANY recent staged MM intent takes
@@ -3381,7 +4345,6 @@ persistent actor Uplands {
         Principal.equal(makerOwner, ammPrincipal()) or isMMShieldedStale(makerOwner, now)
       };
       isExpired        = func(id : Nat) : Bool { orderExpired(id, Time.now()) };
-      onPendingFill    = func(_, _, _, _, _, _, _) : ?Types.PendingMatch { null };
     };
     // Group trades/affected by market so stats update per market.
     let byMarketTrades = Map.empty<Text, List.List<Types.Trade>>();
@@ -3401,6 +4364,7 @@ persistent actor Uplands {
         ignore Map.delete(deferredFok, Nat.compare, d.id);
         ignore Map.delete(deferredPostOnly, Nat.compare, d.id);
         ignore Map.delete(deferredBudget, Nat.compare, d.id);
+        ignore Map.delete(deferredSwapCtx, Nat.compare, d.id);
         ignore Map.delete(deferredExpiry, Nat.compare, d.id);   // user-expiry side map — this kill path missed it (leak)
         recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, null, d.limitPrice,
           "Fill-or-kill order killed: no fresh price arrived before the staging window expired.");
@@ -3427,19 +4391,6 @@ persistent actor Uplands {
     if (affectedArr.size() > 0) { adjustAffectedUsers(affectedArr, now) };
   };
 
-  // Staged entries for a market, oldest-first (time priority on release).
-  func stagedForMarketSorted(marketId : Types.MarketId) : [DeferredExec] {
-    let due = List.empty<DeferredExec>();
-    for ((_, d) in Map.entries(deferredExecs)) {
-      if (d.marketId == marketId) { List.add(due, d) };
-    };
-    sortDeferredByPriority(Iter.toArray(List.values(due)));
-  };
-
-  func sortDeferredByTs(arr : [DeferredExec]) : [DeferredExec] {
-    Array.sort(arr, func(a : DeferredExec, b : DeferredExec) : Order.Order { Int.compare(a.ts, b.ts) });
-  };
-
   // Release-pass effect ordering (L2 of the access-prioritization design):
   // (tierRank DESC, ts ASC). Within one sealed batch window the anti-snipe has
   // already severed "arrived first" from "fills first", so ordering here is
@@ -3447,13 +4398,107 @@ persistent actor Uplands {
   // SAME pass, FIFO within a tier (no starvation inside a tier). Deterministic,
   // replicated, and auditable — this IS the priority mechanism; there is no
   // wire-level ordering on the IC to appeal to.
-  func sortDeferredByPriority(arr : [DeferredExec]) : [DeferredExec] {
-    Array.sort(arr, func(a : DeferredExec, b : DeferredExec) : Order.Order {
-      let ra = tierRankOf(a.owner);
-      let rb = tierRankOf(b.owner);
-      if (ra != rb) { return Nat.compare(rb, ra) };   // higher tier first
-      Int.compare(a.ts, b.ts);
+  //
+  // Task 1788550465: the pre-pass is sub-linear in the venue's staged depth.
+  // It collects ONE market's staged ids off deferredIdsByMarket (O(M log S),
+  // M = this market's staged count — not a walk of every deferredExecs entry),
+  // splits them at the release reference, and returns the top-`k` DUE
+  // entries in release order through a k-sized heap (O(M log k)) — not the
+  // full O(M log M) sort a paced pass (H-22) then threw most of away, since
+  // it releases at most k = releaseMaxPerPass(). Not-yet-due entries are
+  // COUNTED, never ranked: ranking them would let a newer high-tier entry
+  // crowd a due lower-tier one out of the top-k that the full sort's skip
+  // would have released. The order is EXACT: (tierRank DESC, ts ASC, id ASC)
+  // — `id ASC` is the tie-break the stable full sort applied implicitly
+  // through Map.entries order (bulk placements share one ts), made explicit
+  // (test_release_priority §A pins tier-before-FIFO, test_release_pacing
+  // §1/§2 pin oldest-first survivors). The tier rank resolves once per
+  // owner for the pass (`ranks`), not once per compare. `due`/`notDue` are
+  // the counts the pass needs for its liveness re-arm. devSweepCostProbe
+  // measures this at RELEASE_PROBE_SYNTH (releaseSortSynth).
+  type RelCand = { rank : Nat; ts : Int; id : Nat; d : DeferredExec };
+  func relBeforeRaw(aRank : Nat, aTs : Int, aId : Nat, b : RelCand) : Bool {   // a releases before b
+    if (aRank != b.rank) { return aRank > b.rank };
+    if (aTs != b.ts) { return aTs < b.ts };
+    aId < b.id
+  };
+  func relBefore(a : RelCand, b : RelCand) : Bool { relBeforeRaw(a.rank, a.ts, a.id, b) };
+  func stagedForMarketTopK(marketId : Types.MarketId, releaseRef : Int, k : Nat) : { top : [DeferredExec]; due : Nat; notDue : Nat } {
+    let ids = switch (Map.get(deferredIdsByMarket, Text.compare, marketId)) {
+      case (?s) { s };
+      case null { return { top = []; due = 0; notDue = 0 } };
+    };
+    let ranks = Map.empty<Principal, Nat>();
+    func rankOf(p : Principal) : Nat {
+      switch (Map.get(ranks, Principal.compare, p)) {
+        case (?r) { r };
+        case null { let r = tierRankOf(p); Map.add(ranks, Principal.compare, p, r); r };
+      };
+    };
+    // A k-sized binary heap with the WORST kept candidate at the root: a
+    // candidate releasing after the root is dropped in O(1); one releasing
+    // before it replaces the root and sifts down in O(log k). Allocated on
+    // the first due candidate (it doubles as the fill sentinel — only the
+    // prefix [0, n) is ever read).
+    var heap : [var RelCand] = [var];
+    var n = 0;
+    func siftDown(start : Nat) {
+      var i = start;
+      label s loop {
+        let l = 2 * i + 1; let r = l + 1;
+        var w = i;   // the worst of i and its children
+        if (l < n and relBefore(heap[w], heap[l])) { w := l };
+        if (r < n and relBefore(heap[w], heap[r])) { w := r };
+        if (w == i) { break s };
+        let t = heap[i]; heap[i] := heap[w]; heap[w] := t;
+        i := w;
+      };
+    };
+    func siftUp(start : Nat) {
+      var i = start;
+      while (i > 0) {
+        let p = SafeMath.subOrZero(i, 1) / 2; // i > 0 is the loop invariant; the clamp never bites (M0155 guard, 1788555085)
+        if (relBefore(heap[p], heap[i])) {   // worse than its parent → up
+          let t = heap[i]; heap[i] := heap[p]; heap[p] := t; i := p;
+        } else { return };
+      };
+    };
+    var due = 0; var notDue = 0;
+    for (id in Map.keys(ids)) {
+      switch (Map.get(deferredExecs, Nat.compare, id)) {
+        case (?d) {
+          if (d.ts < releaseRef) {
+            due += 1;
+            if (k > 0) {
+              let rank = rankOf(d.owner);
+              if (n == 0) { heap := VarArray.repeat<RelCand>({ rank; ts = d.ts; id; d }, k); n := 1 }
+              else if (n < k) { heap[n] := { rank; ts = d.ts; id; d }; n += 1; siftUp(n - 1) }
+              else if (relBeforeRaw(rank, d.ts, id, heap[0])) { heap[0] := { rank; ts = d.ts; id; d }; siftDown(0) };
+              // (a dropped candidate — the common case past the first k on a
+              // live venue, whose ids ascend with ts — allocates nothing)
+            };
+          } else { notDue += 1 };
+        };
+        case null {};   // index drift — getStagedIndexAudit is the detector; never trap the release path
+      };
+    };
+    // Drain: the root is the worst kept, so popping fills the tail first
+    // and `top` reads best-first.
+    let kept = n;
+    let out = VarArray.repeat<?DeferredExec>(null, kept);
+    while (n > 0) {
+      out[n - 1] := ?(heap[0].d);
+      n -= 1;
+      if (n > 0) { heap[0] := heap[n]; siftDown(0) };
+    };
+    let top = Array.tabulate<DeferredExec>(kept, func(i) {
+      switch (out[i]) { case (?d) { d }; case null { Runtime.trap("release heap: hole") } };   // unreachable: the drain filled every slot
     });
+    { top; due; notDue };
+  };
+
+  func sortDeferredByTs(arr : [DeferredExec]) : [DeferredExec] {
+    Array.sort(arr, func(a : DeferredExec, b : DeferredExec) : Order.Order { Int.compare(a.ts, b.ts) });
   };
 
   func commitDeferredTrades(marketId : Types.MarketId, allTrades : List.List<Types.Trade>, affectedSet : Map.Map<Text, Principal>, now : Int) {
@@ -3475,26 +4520,134 @@ persistent actor Uplands {
   // when BOTH legs' markets have re-quoted at a price postdating the request —
   // then both legs execute atomically against their fresh AMMs (anti-snipe on
   // both). Processed from the recurring finaliser. Oldest-first.
-  func processDeferredSwaps(now : Int) {
-    if (Map.size(deferredSwaps) == 0) { return };
-    let arr = Array.sort(
+  // The cross-swap pass's pre-loop term: every staged swap, oldest-first.
+  // Factored out so devSweepCostProbe measures exactly this (swapSort /
+  // swapSortSynth) — the whole-map collect + sort that scales with the
+  // staged swap depth.
+  func deferredSwapsByTs() : [DeferredSwap] {
+    Array.sort(
       Iter.toArray(Iter.map<(Nat, DeferredSwap), DeferredSwap>(Map.entries(deferredSwaps), func((_, s)) { s })),
       func(a : DeferredSwap, b : DeferredSwap) : Order.Order { Int.compare(a.ts, b.ts) },
     );
-    for (s in arr.vals()) {
-      let sellFresh = switch (AMM.getPool(pools, s.sellMarket)) { case (?p) { p.refPriceUpdatedNs > s.ts }; case null { false } };
-      let buyFresh  = switch (AMM.getPool(pools, s.buyMarket))  { case (?p) { p.refPriceUpdatedNs > s.ts }; case null { false } };
+  };
+  func processDeferredSwaps(now : Int) {
+    if (Map.size(deferredSwaps) == 0) { return };
+    let arr = deferredSwapsByTs();
+    // H-22: the same per-pass budget as processDeferred (releases + settled
+    // fills over both legs). A cut pass leaves the remainder staged, oldest
+    // first; the finaliser's next run (HB_FINALISE_NS) resumes it — the
+    // freshness predicate below stays true until the next mark, and an
+    // expired entry stays expired.
+    let budget = newReleaseBudget();
+    label rel for (s in arr.vals()) {
+      if (not releaseBudgetOpen(budget)) { break rel };
+      let sellFresh = crossSwapLegFresh(s.sellMarket, s.ts, #sell);   // the sell leg lifts the sell market's BIDS
+      let buyFresh  = crossSwapLegFresh(s.buyMarket, s.ts, #buy);     // the buy leg lifts the buy market's ASKS
       if (sellFresh and buyFresh) {
-        releaseCrossSwap(s, false, now);          // both fresh → take both AMMs
+        chargeRelease(budget, releaseCrossSwap(s, false, now));          // both fresh → take both AMMs
       } else if (now >= s.expiresAt) {
-        releaseCrossSwap(s, true, now);           // stalled → users-only fallback
+        chargeRelease(budget, releaseCrossSwap(s, true, now));           // stalled → users-only fallback
       };
     };
   };
 
+  // H-23 (F27 + F39): a leg is fresh when its mark's fetch was DISPATCHED
+  // after the swap was staged (the release reference — `refPriceUpdatedNs`
+  // is the arrival clock) AND the AMM ladder was requoted on or after that
+  // mark was APPLIED: a fresh mark is not a fresh ladder. tickPriceRefresh
+  // advances the mark without requoting and the beat runs this processor
+  // before tickAmm, so the old `refPriceUpdatedNs > s.ts` released a swap
+  // against a ladder built on the previous mark. lastRequoteNs is stamped by
+  // every ammRequote (the GEPTOR requotes unconditionally in the same
+  // message the mark lands, so lastRequoteNs == appliedNs there — hence ≥).
+  // The ladder half is asked only where it can bite: F39's exposure is the
+  // AMM being lifted at quotes built on the previous mark, so it applies to
+  // the SIDE this leg takes (the sell leg lifts bids, the buy leg lifts
+  // asks) and only while the AMM has a LIVE quote there. A disabled pool, or
+  // a side whose ladder is gone (expired by the stale-quote sweep, the cash
+  // floor, `_bidsGone`), has no stale AMM quote to protect — the leg then
+  // meets users only, and the mark half alone decides, as it did before.
+  func crossSwapLegFresh(marketId : Types.MarketId, stagedTs : Int, legSide : Types.Side) : Bool {
+    switch (AMM.getPool(pools, marketId)) {
+      case (?p) {
+        let r = releaseRefOf(marketId);
+        if (r.dispatchNs <= stagedTs) { return false };
+        if (not p.enabled) { return true };
+        let taken = switch (legSide) { case (#sell) { p.activeBidIds }; case (#buy) { p.activeAskIds } };
+        (not ammSideLive(taken)) or p.lastRequoteNs >= r.appliedNs;
+      };
+      case null { false };
+    };
+  };
+  // Does the AMM have any OPEN quote among `ids` (one side of a pool's
+  // active-id list)? The list is reconciled at requote, so between a sweep
+  // and the next requote it can still name expired/cancelled orders — read
+  // the book, as ammSweepResting does, rather than trusting the ids.
+  func ammSideLive(ids : [Nat]) : Bool {
+    for (id in ids.vals()) {
+      switch (OrderBook.getOrder(orderStore, id)) {
+        case (?o) { if (OrderBook.isOpen(o)) { return true } };
+        case null {};
+      };
+    };
+    false;
+  };
+  // H-21 (F38): the all-or-nothing gate for a staged FILL-OR-KILL cross-swap,
+  // run at release under THIS release's ctx and caps BEFORE any balance
+  // moves. Both legs are simulated the engine's way — walkFillable with
+  // all-or-nothing maker crediting (an under-funded maker counts zero, as the
+  // engine cancels it), the engine's iteration budget (FOK_GATE_ITER_BUDGET;
+  // a truncated walk fails CLOSED, like the direct FOK gate), and the ctx's
+  // exclusions (the sidelined AMM in the users-only fallback, expired makers,
+  // the owner's own orders):
+  //   leg 1 — the FULL `amount` must be takeable within the sell floor;
+  //   leg 2 — the buy book must absorb the FULL gross proceeds (to the
+  //           budgetCrumb the release itself judges by) within the buy
+  //           ceiling. The walker's per-slice CEILed quote is ≥ the engine's
+  //           floored tradeCost sum, so the simulated budget is never smaller
+  //           than the one the buy leg will actually spend (the safe
+  //           direction: the gate demands at least the depth execution
+  //           needs); the taker fee comes out of the same walk per slice.
+  // A short leg is a #kill — the reservation is already refunded by the
+  // caller, nothing has executed, no fill reaches the tape — and the note
+  // says which leg and how much WAS takeable. This is what makes the
+  // all-or-nothing promise real: a naive engine-FOK on the buy leg would
+  // re-open W2-03's settle-then-err (the sell would already have settled).
+  func fokCrossGate(s : DeferredSwap, ctx : MatchingEngine.ProtectionCtx, sellCap : Nat, buyCap : Nat)
+    : { #ok; #kill : (Text, MatchingEngine.StopReason) } {
+    let excl = ?{ isNonTakeable = ctx.isNonTakeable; isExpired = ctx.isExpired;
+                  beneficialOwner = ctx.beneficialOwner; taker = ?s.owner };
+    let sellSim = walkFillable(s.sellMarket, s.sellToken, #sell, sellCap, #base(s.amount), FOK_GATE_ITER_BUDGET, excl);
+    let sellQty = if (sellSim.truncated) { Nat.min(sellSim.base, SafeMath.subOrZero(s.amount, 1)) } else { sellSim.base };
+    if (sellQty < s.amount) {
+      return #kill(("Fill-or-kill swap killed at release: only " # r2n(sellQty) # " " # s.sellToken
+        # " of " # r2n(s.amount) # " was takeable within your slippage — funds returned",
+        if (sellSim.truncated) { #workBound } else { #bookExhausted }));
+    };
+    let grossUsd = sellSim.quote;
+    if (grossUsd == 0) {
+      return #kill(("Fill-or-kill swap killed at release: the " # s.sellToken # " proceeds round to nothing — funds returned", #bookExhausted));
+    };
+    let buySim = walkFillable(s.buyMarket, s.buyToken, #buy, buyCap,
+      #quoteSpend({ budget = grossUsd;
+                    feeOf  = func(c : Nat) : Nat { quoteFeeFor(s.owner, c, #takerDebit) };
+                    effBps = quoteFeeFor(s.owner, 10_000, #takerDebit) }),
+      FOK_GATE_ITER_BUDGET, excl);
+    if (buySim.truncated or grossUsd > buySim.spent + budgetCrumb(buyCap)) {
+      return #kill(("Fill-or-kill swap killed at release: the " # s.buyToken # " book absorbs only $" # r2n(buySim.spent)
+        # " of the $" # r2n(grossUsd) # " proceeds within your slippage — funds returned",
+        if (buySim.truncated) { #workBound } else { #bookExhausted }));
+    };
+    #ok
+  };
+
   // Execute a staged cross-swap's two legs. `usersOnly` makes the AMM
   // non-takeable (oracle-stall fallback); otherwise both legs take the fresh AMM.
-  func releaseCrossSwap(s : DeferredSwap, usersOnly : Bool, now : Int) {
+  // Returns the fills settled over both legs (H-22: the pass's fill budget).
+  func releaseCrossSwap(s : DeferredSwap, usersOnly : Bool, now : Int) : Nat {
+    // H-21 (F38): the all-or-nothing flag lives in the swapFok side map —
+    // read it BEFORE removeDeferredSwap drops the entry (and the flag).
+    let fok = (Map.get(swapFok, Nat.compare, s.id) == ?true);
     ignore subReserved(s.owner, s.sellToken, s.amount);
     removeDeferredSwap(s.id);
     // W5-23: the wallet-era release-time swap re-gate (M2) that stood here
@@ -3502,7 +4655,7 @@ persistent actor Uplands {
     // human principal holds a margin account or debt (enforced at
     // MarginEngine.open).
     let ctx : MatchingEngine.ProtectionCtx = {
-      aggressorIsMaker = false;              // W4-22
+      aggressorRole    = #taker;             // W4-22/H-24
       onUnfundedMaker  = onUnfundedMakerNotice;
       quoteFee         = quoteFeeFor;        // cross-swap release leg (swapper's quote)
       creditTreasury;
@@ -3511,58 +4664,107 @@ persistent actor Uplands {
       // pool is one party on both sides, however different the principals look.
       beneficialOwner  = archiveOwnerOf;
       onTradeFees      = recordTradeFees;
-      getMakerWindow   = func(_) { 0 };
-      getMakerPending  = func(mid : Nat) { Option.get(Map.get(pendingQtyByMaker, Nat.compare, mid), 0) };
+      fundForFill      = poolFundForFill;   // H-34: a margin pool borrows its slice at the fill
+      fundableScorer   = poolFundableScorer;   // 1788641149 / 1788652744: the FOK pre-check scores a pool by what the vault would lend it, re-scored per slice as settled (never borrows)
       availableBalance;
       isNonTakeable    = func(_, makerOwner) { usersOnly and Principal.equal(makerOwner, ammPrincipal()) };
       isExpired        = func(id : Nat) : Bool { orderExpired(id, Time.now()) };
-      onPendingFill    = func(_, _, _, _, _, _, _) : ?Types.PendingMatch { null };
     };
     // SIZE LEG 1 TO LEG 2's CAPACITY. Sell only enough `from` that the ICPUSD it
     // raises can be fully spent buying `to` within leg 2's slippage band — so the
     // worst case is that LESS of the source is converted, never that ICPUSD is
     // left stranded as a side effect.
-    //   buyCap   = best buy-leg ask × (1+slippage)  (leg 2's price ceiling)
+    //   buyCap    = buy-leg mid × (1+slippage)  (leg 2's price ceiling)
     //   absorbUsd = ICPUSD the buy book can absorb within buyCap (AMM-aware)
-    //   sizedQty  = min(amount, absorbUsd / bestBid) — selling walks DOWN the bid
-    //               ladder, so realised proceeds ≤ absorbUsd (the safe direction).
-    // Buy-leg price ceiling anchored to the buy market's AMM/oracle MID (fair
-    // value), not the book's best ask — same reasoning as placeMarketOrder: a
-    // pulled AMM ladder must not let the best-ask reference jump to a stranded
-    // far quote and inflate the cap. Falls back to best-ask for non-AMM markets.
-    let buyRef = switch (AMM.getPool(pools, s.buyMarket)) {
-      case (?p) { if (p.enabled and p.refPrice > 0) { p.refPrice } else {
-        switch (OrderBook.findBestMatch(orderStore, s.buyMarket, #buy)) { case (?ask) { ask.price }; case null { 0 } } } };
-      case null { switch (OrderBook.findBestMatch(orderStore, s.buyMarket, #buy)) { case (?ask) { ask.price }; case null { 0 } } };
+    //   sizedQty  = min(amount, absorbUsd / max(sellRef, bestBid)) — selling
+    //               walks DOWN the bid ladder, so realised proceeds ≤ absorbUsd
+    //               (the safe direction).
+    // H-20: BOTH legs' caps come from crossLegCap — anchored to that market's
+    // AMM/oracle MID (slippageAnchor: fair value, book-best only without an
+    // enabled AMM), tightened to the #3a users-only band when the AMM is
+    // sidelined on that side — and the SAME caps are handed to the engine as
+    // its absolute priceCap, so the executed band is the sized band. The
+    // engine's own band anchors to findBestMatch: with the AMM bids absent a
+    // funded lowball bid IS the best bid, and the old sell leg (banded off it,
+    // sized by it) printed the victim's whole sized quantity at the
+    // attacker's price (F14). Sizing divides by max(sellRef, bestBid): never
+    // by a lowball (the mid floors the divisor), while a best bid ABOVE the
+    // mid still bounds proceeds at ≤ absorbUsd (fills walk down from it) so
+    // no ICPUSD is stranded.
+    // H-21: a FILL-OR-KILL cross-swap is outside the #3a sidelined clamp,
+    // like the direct FOK path (releaseDeferred's walksLadder excludes
+    // fok) — the user's own slippage off the mid IS the all-or-nothing
+    // band; the mid anchor is what keeps a lowball out of it.
+    let buyCap = Option.get(crossLegCap(s.buyMarket, #buy, s.maxSlippage, (not fok) and ammSidelined(s.buyMarket, #buy, usersOnly)), 0);
+    let sellRef = slippageAnchor(s.sellMarket, #sell);
+    let sellCap = Option.get(crossLegCap(s.sellMarket, #sell, s.maxSlippage, (not fok) and ammSidelined(s.sellMarket, #sell, usersOnly)), 0);
+    let sizedSellQty = if (fok) {
+      // H-21 (F38): all-or-nothing — BOTH legs are simulated under this
+      // release's ctx and caps before anything moves; a short leg kills
+      // the swap here (reservation already refunded above, nothing
+      // executed, no fill on the tape) and the outcome says which leg.
+      switch (fokCrossGate(s, ctx, sellCap, buyCap)) {
+        case (#kill(note, stop)) {
+          recordSwapOutcome(s, 0, 0, false, note, stop);
+          bumpUserVersion(s.owner);
+          return 0;
+        };
+        case (#ok) { s.amount };   // the gate proved the buy leg absorbs the whole amount's proceeds
+      };
+    } else {
+      // H-09: a WALK_SCAN_MAX-truncated absorbUsd is a lower bound — the sizing
+      // below only ever converts LESS of the source, the safe direction.
+      let absorbUsd = if (buyCap > 0) { crossableDepth(s.buyMarket, #buy, buyCap, usersOnly).usd } else { 0 };
+      let sellBestBid = switch (OrderBook.findBestMatch(orderStore, s.sellMarket, #sell)) {
+        case (?bid) { bid.price };
+        case null   { 0 };
+      };
+      let sizeRef = Nat.max(sellRef, sellBestBid);
+      if (absorbUsd > 0 and sizeRef > 0) {
+        Nat.min(s.amount, Fixed.div(absorbUsd, sizeRef, false))
+      } else { 0 };
     };
-    let buyCap = if (buyRef > 0) { Fixed.mul(buyRef, Fixed.SCALE + s.maxSlippage, false) } else { 0 };
-    let (_buyDepth, absorbUsd) = if (buyCap > 0) { crossableDepth(s.buyMarket, #buy, buyCap, usersOnly) } else { (0, 0) };
-    let sellBestBid = switch (OrderBook.findBestMatch(orderStore, s.sellMarket, #sell)) {
-      case (?bid) { bid.price };
-      case null   { 0 };
-    };
-    let sizedSellQty = if (absorbUsd > 0 and sellBestBid > 0) {
-      Nat.min(s.amount, Fixed.div(absorbUsd, sellBestBid, false))
-    } else { 0 };
     if (sizedSellQty == 0) {
       // Buy leg can't absorb anything within slippage — don't convert source into
       // stranded ICPUSD. Reservation already refunded. Record the outcome so the
       // user is TOLD the swap couldn't fill, instead of it silently vanishing.
       recordSwapOutcome(s, 0, 0, false,
-        "No " # s.buyToken # " offered within your slippage — funds returned");
+        "No " # s.buyToken # " offered within your slippage — funds returned", #slippage);
       bumpUserVersion(s.owner);
-      return;
+      return 0;
     };
-    // Leg 1: sell the sized quantity of `from` for ICPUSD.
+    // Leg 1: sell the sized quantity of `from` for ICPUSD — under the
+    // mid-anchored floor (H-20), never the book-best band alone.
+    // H-21: a FOK swap's sell leg runs with the ENGINE's own FOK pre-check
+    // too (belt to fokCrossGate's braces): the quantity is exact here, so
+    // a pre-check refusal (e.g. > FOK_SIM_MAKER_BUDGET distinct makers)
+    // fills NOTHING — never a settled sell in front of a killed buy. The
+    // buy leg below must NOT carry it: its quantity is sized at the best
+    // ask and bounded by the proceeds budget, so on a walking book the
+    // engine's quantity-based pre-check would kill a conversion the budget
+    // completes — after the sell had settled (W2-03's settle-then-err).
     let sell = MatchingEngine.executeMarketOrderProtected(
-      orderStore, accounts, s.sellMarket, s.sellToken, s.owner, #sell, sizedSellQty, s.maxSlippage, false, now, ctx, null,   // trades stamp at release (settlement), not the swap's staging ts
+      orderStore, accounts, s.sellMarket, s.sellToken, s.owner, #sell, sizedSellQty, s.maxSlippage, fok, now, ctx, null, ?sellCap,   // trades stamp at release (settlement), not the swap's staging ts
     );
+    if (sell.totalFilled == 0) {
+      // Nothing bid for the source within the mid-anchored band (the only
+      // bids sit past the floor — #slippage — or there are none —
+      // #bookExhausted). Reservation already refunded; nothing moved. Say so,
+      // rather than reporting a buy-leg failure that never ran.
+      recordSwapOutcome(s, 0, 0, false,
+        (if (fok) { "Fill-or-kill swap killed at release: " } else { "" })
+          # "No liquidity for " # s.sellToken # " within your slippage — funds returned", sell.stopReason);
+      bumpUserVersion(s.owner);
+      return 0;
+    };
     let icpusd = Fixed.mul(sell.totalFilled, sell.avgPrice, false);
     let affected = List.empty<Principal>();
     for (p in sell.affectedUsers.vals()) { List.add(affected, p) };
     if (sell.trades.size() > 0) { updateStatsAfterTrades(s.sellMarket, sell.trades); refreshRolling24h(s.sellMarket, sell.trades, now) };
     // Leg 2: buy the `to` token with the ICPUSD obtained.
     var toReceived : Nat = 0;
+    var buyFills : Nat = 0;
+    var buyStop : MatchingEngine.StopReason = #bookExhausted;   // no buy leg ran ⇒ nothing was offered
     if (icpusd > 0) {
       // AVAILABLE, not raw balance: the owner may have OTHER staged orders
       // soft-locking ICPUSD — spending those locked funds here would leave
@@ -3574,8 +4776,10 @@ persistent actor Uplands {
         case (?ask) {
           if (ask.price > 0) {
             // Budget-bound leg (task 1787204744, replacing the #48.5 cap-sizing):
-            // size the quantity at the BEST ask with the worst-case taker fee
-            // carved out — the maximum `spend` could convert on a flat book — and
+            // size the quantity at the BEST ask with the OWNER'S taker fee
+            // carved out (quoteFeeFor's earned-level rate, not the flat L0
+            // TAKER_FEE_BPS — #55 flat-rate sizing, task 1788465038) — the
+            // maximum `spend` could convert on a flat book — and
             // hand the engine `spend` itself as maxQuoteSpend (a cost+takerFee
             // budget). The engine shrinks every slice to min(balance, remaining
             // budget), so fills above the best ask stop EXACTLY at the proceeds:
@@ -3584,11 +4788,13 @@ persistent actor Uplands {
             // fills land below the cap (the old cap-sizing left up to
             // spend×slip/(1+slip) unconverted — test_cross_swap_sizing pins the
             // tightened bound).
-            let buyQty = Fixed.div(Fixed.mulDiv(spend, 10_000, 10_000 + TAKER_FEE_BPS, false), ask.price, false);
+            let buyQty = Fixed.div(Fixed.mulDiv(spend, 10_000, 10_000 + quoteFeeFor(s.owner, 10_000, #takerDebit), false), ask.price, false);
             let buy = MatchingEngine.executeMarketOrderProtected(
-              orderStore, accounts, s.buyMarket, s.buyToken, s.owner, #buy, buyQty, s.maxSlippage, false, now, ctx, ?spend,   // settlement stamp — see the sell leg above
+              orderStore, accounts, s.buyMarket, s.buyToken, s.owner, #buy, buyQty, s.maxSlippage, false, now, ctx, ?spend, ?buyCap,   // settlement stamp — see the sell leg above; H-20: the sized cap IS the executed ceiling
             );
             toReceived := buy.totalFilled;
+            buyFills := buy.trades.size();
+            buyStop := buy.stopReason;
             for (p in buy.affectedUsers.vals()) { List.add(affected, p) };
             if (buy.trades.size() > 0) { updateStatsAfterTrades(s.buyMarket, buy.trades); refreshRolling24h(s.buyMarket, buy.trades, now) };
           };
@@ -3598,15 +4804,24 @@ persistent actor Uplands {
     };
     // Record the outcome so the staged swap reports back to its owner (it can't
     // be returned synchronously — the swap released long after the `swap` call).
+    // H-20: the source actually SOLD (sell.totalFilled), not the sized
+    // quantity — the sell leg can now stop short of its size at the
+    // mid-anchored floor, and the unsold remainder is back in the balance.
     let note = if (toReceived == 0) {
       "Couldn't buy " # s.buyToken # " — ICPUSD proceeds credited"
-    } else if (sizedSellQty < s.amount) {
+    } else if (sell.totalFilled < s.amount) {
       "Partly filled — unconverted " # s.sellToken # " returned"
     } else { "" };
-    recordSwapOutcome(s, sizedSellQty, toReceived, toReceived > 0, note);
+    // Stop reason: the buy leg's own when it ran to a verdict; a sell leg
+    // short of the amount is a slippage bound — the absorb-sizing (leg 2's
+    // crossableDepth within its cap) or the sell floor itself.
+    let crossStop : MatchingEngine.StopReason =
+      if (toReceived == 0) { buyStop } else if (sell.totalFilled < s.amount) { #slippage } else { buyStop };
+    recordSwapOutcome(s, sell.totalFilled, toReceived, toReceived > 0, note, crossStop);
     List.add(affected, s.owner);
     adjustAffectedUsers(Iter.toArray(List.values(affected)), now);
     bumpUserVersion(s.owner);
+    sell.trades.size() + buyFills;
   };
 
   // Fire any GEPTORs whose Nagle window has elapsed (called from the recurring
@@ -3644,53 +4859,42 @@ persistent actor Uplands {
       if (inFlight) { /* already fetching */ }
       else {
         Map.add(_geptorInFlight, Text.compare, mid, now); // overwrites an expired arm
-        ignore geptorFetchAndSweep(mid, now); // async: fetch fresh price → requote → sweep
+        await* geptorFetchAndSweep(mid, now); // dispatch the fan-out inline: fresh price → requote → sweep run in its finalizer (H-37)
       };
     };
   };
 
-  // The GEPTOR itself: fetch a fresh oracle price (so refPriceUpdatedNs advances
-  // past any just-rested crossing orders, making them eligible — they were
-  // placed before this fetch, so they can't be sniping a stale price), then
-  // requote + sweep. Fire-and-forget from the debounce poll. If the fetch fails
-  // we still requote+sweep at the existing price; the periodic price timer is
-  // the fallback. In production the fetch is the HTTPS oracle outcall.
-  func geptorFetchAndSweep(marketId : Types.MarketId, armedAt : Int) : async () {
-    // Released in `finally` so an early return OR a thrown error still clears
-    // the guard — the same idiom tickShipEvents uses. What the `finally` does
-    // NOT cover (#52.6): a trap before the first await rolls back only THIS
-    // message, and a failed self-call send never starts it — while the arm was
-    // committed in processGeptorDue's message and stays put. The arm-time TTL
-    // there is what un-wedges that case. The delete below is conditioned on
-    // the entry still being OUR arm (`armedAt`): after a TTL expiry a newer
-    // dispatch may own the entry, and a parked straggler completing late must
-    // not release the newer flight's guard (the W4-13 one-owner/epoch shape).
-    try {
+  // The GEPTOR itself: fetch a fresh oracle price (so the release reference
+  // advances past any just-rested crossing orders, making them eligible —
+  // they were placed before this fetch, so they can't be sniping a stale
+  // price), then requote + sweep. H-37: this DISPATCHES the fan-out in the
+  // caller's message — arm and dispatch commit together — and returns; the
+  // fetch → apply → requote → processDeferredSwaps sequence runs in the
+  // fan-out's finalizer (finalizePriceFanout, `#geptor`), in whichever
+  // message reaches quorum, completion or the deadline — never the slowest
+  // provider's. If the fetch fails the floor the finalizer still requotes at
+  // the standing mark; the periodic tick is the fallback. The finalizer
+  // releases the arm only while the entry is still OUR arm (`armedAt`):
+  // after a TTL expiry a newer dispatch may own the entry, and a straggler
+  // must not release the newer flight's guard (the W4-13 one-owner shape).
+  // M3: the finalizer's apply is the SAME quality floor as the periodic tick
+  // (this path used to accept a single surviving source, which allowed a
+  // 2.5%-per-tick mark-walk by whoever controlled it). H-23: the arm time IS
+  // the dispatch clock — committed in processGeptorDue's message, before the
+  // fan-out's first send. The fan-out is the GEPTOR's own (never a join):
+  // a fleet dispatched BEFORE this arm could not release the entry that
+  // armed it.
+  func geptorFetchAndSweep(marketId : Types.MarketId, armedAt : Int) : async* () {
     switch (Map.get(markets, Text.compare, marketId)) {
-      case null {};
-      case (?(baseToken, _)) {
-        try {
-          let agg = await refreshMultiSourcePrice(baseToken);
-          // M3: the GEPTOR hot path enforces the SAME quality floor as the
-          // periodic tick (it used to accept a single surviving source, which
-          // allowed a 2.5%-per-tick mark-walk by whoever controlled it).
-          // applyFreshAggregate also owns the XRC fallback when the floor
-          // fails — synchronous state logic, so GEPTOR's latency is unchanged.
-          ignore applyFreshAggregate(marketId, baseToken, agg, Time.now());
-        } catch (_e) { /* fetch failed — fall back to the periodic price timer */ };
-        switch (AMM.getPool(pools, marketId)) {
-          case (?p) { if (p.enabled and p.refPrice > 0) { AMM.putPool(pools, ammRequote(p)) } };
+      case null {
+        switch (Map.get(_geptorInFlight, Text.compare, marketId)) {
+          case (?t) { if (t == armedAt) { ignore Map.delete(_geptorInFlight, Text.compare, marketId) } };
           case null {};
         };
-        // This market is now fresh in `pools` — release any staged cross-swap
-        // whose OTHER leg is already fresh too (defer-until-both-fresh).
-        processDeferredSwaps(Time.now());
       };
-    };
-    } finally {
-      switch (Map.get(_geptorInFlight, Text.compare, marketId)) {
-        case (?t) { if (t == armedAt) { ignore Map.delete(_geptorInFlight, Text.compare, marketId) } };
-        case null {};
+      case (?(baseToken, _)) {
+        let (f, _) = openPriceFanout(baseToken, marketId, #geptor(armedAt), armedAt, false);
+        await* firePriceFanout(f);
       };
     };
   };
@@ -3710,6 +4914,98 @@ persistent actor Uplands {
     requireDevHook("devGetGeptorInFlight");
     if (not Principal.isController(msg.caller)) { Runtime.trap("controller-only probe") };
     Map.get(_geptorInFlight, Text.compare, marketId);
+  };
+
+  // ── H-37 (F34) test hooks ─────────────────────────────────────────
+  // A provider that never answers cannot be staged against the live feed
+  // (#dev runs the real sources), so #dev stalls one by name: #never — its
+  // self-call records nothing, so the fan-out finalizes on quorum, on the
+  // rest of the fleet completing, or on the deadline; #park — it fetches,
+  // then holds the reading until devReleaseParkedReadings, which lands it
+  // AFTER the mark applied (the late-attach path); #hold — records nothing
+  // like #never AND, while it is set, the admin fetch does NOT drain its own
+  // fan-out after its awaits: the fan-out (and the _fetchInFlight stamp) stays
+  // OPEN until the heartbeat's deadline sweep closes it at
+  // PRICE_FANOUT_DEADLINE_NS, exactly as a tick/GEPTOR fan-out under #never
+  // does — an 8s window a test can stage into with a RESPONSIVE replica
+  // (test_vault_lp §10(e), test_oracle_time_bases §4). The admin call itself
+  // returns when its fleet has (~1.5s) with a "left open" err. It used to
+  // park the self-call's RETURN in an `await async {}` loop (task 1788544376),
+  // which starved pocket-ic's request serving for the whole hold (a 15s query
+  // rtt — task 1788748485); it never widened the observable window. #clear —
+  // normal again. Cleared by the wipe. devGetFanout reads the asset's latest.
+  public shared (msg) func devStallSource(sourceId : Text, mode : { #never; #park; #hold; #clear }) : async () {
+    requireController(msg.caller);
+    requireDevHook("devStallSource");
+    if (Array.find<PriceFeed.Source>(PRICE_SOURCES, func(s) { s.id == sourceId }) == null) {
+      Runtime.trap("devStallSource: unknown source id " # sourceId);
+    };
+    switch (mode) {
+      case (#never) { Map.add(_devStalledSources, Text.compare, sourceId, #never) };
+      case (#park)  { Map.add(_devStalledSources, Text.compare, sourceId, #park) };
+      case (#hold)  { Map.add(_devStalledSources, Text.compare, sourceId, #hold) };
+      case (#clear) { ignore Map.delete(_devStalledSources, Text.compare, sourceId) };
+    };
+  };
+  // Land every parked reading (returns how many). Each goes through the same
+  // recordFanoutReading as a live arrival — late if its fan-out finalized.
+  public shared (msg) func devReleaseParkedReadings() : async Nat {
+    requireController(msg.caller);
+    requireDevHook("devReleaseParkedReadings");
+    let parked = List.toArray(_devParkedReadings);
+    List.clear(_devParkedReadings);
+    for ((fanoutId, r) in parked.vals()) { recordFanoutReading(fanoutId, r) };
+    parked.size();
+  };
+  public type FanoutView = {
+    id         : Nat;
+    open       : Bool;
+    reason     : Text;        // open | quorum | complete | deadline | drained
+    arrived    : Nat;         // readings recorded (late ones included)
+    expected   : Nat;
+    quorum     : Nat;
+    late       : Nat;
+    dispatchNs : Int;
+    markets    : [Text];
+    outcomes   : [(Text, Text)];
+  };
+  public shared query (msg) func devGetFanout(asset : Text) : async ?FanoutView {
+    requireDevHook("devGetFanout");
+    if (not Principal.isController(msg.caller)) { Runtime.trap("controller-only probe") };
+    switch (latestFanoutFor(asset)) {
+      case null { null };
+      case (?f) {
+        ?{
+          id = f.id; open = fanoutIsOpen(f); reason = PriceFeed.fanoutReasonText(f.st.finalized);
+          arrived = f.st.readings.size(); expected = f.st.expected; quorum = f.st.quorum; late = f.st.late;
+          dispatchNs = f.dispatchNs;
+          markets = Array.map<(Types.MarketId, FanoutCaller), Text>(f.markets, func((m, _)) { m });
+          outcomes = Array.map<(Types.MarketId, FanoutOutcome), (Text, Text)>(f.outcomes, func((m, o)) {
+            (m, switch (o) {
+              case (#applied(px)) { "applied " # Nat.toText(px) };
+              case (#pended) { "pended" };
+              case (#rejected(e)) { "rejected: " # e };
+              case (#abandoned(w)) { "abandoned: " # w };
+            });
+          });
+        };
+      };
+    };
+  };
+
+  // ── #55 "epoch guard on one caller" test hook ─────────────────────
+  // The oracle epoch is transient internal state whose only production
+  // writer is performWorldWipe. Staging "a wipe lands while a fetch is parked
+  // in its fan-out" through resetExchange would wipe the whole venue for one
+  // assertion, so #dev exposes the bump alone: fire a fetch, bump the epoch
+  // while its outcalls are in flight, and watch the callee abandon the result
+  // unwritten (lastAggregates untouched, the caller sees null). Nothing else
+  // reads the epoch, so a bump without a wipe is otherwise inert.
+  public shared (msg) func devBumpOracleEpoch() : async Nat {
+    requireController(msg.caller);
+    requireDevHook("devBumpOracleEpoch");
+    _oracleEpoch += 1;
+    _oracleEpoch;
   };
 
   func appendNat(xs : [Nat], x : Nat) : [Nat] {
@@ -3849,9 +5145,10 @@ persistent actor Uplands {
   };
 
   // Execute an AMM rebalance by placing a market-taker order. Bypasses
-  // the requireAuth check (internal) but uses the full protection-aware
-  // execution path so any protected makers in its way produce pending
-  // matches. Returns true if the rebalance actually placed an order.
+  // the requireAuth check (internal) and runs through buildProtectionCtx —
+  // where the AMM's own quotes are non-takeable; every fill settles
+  // immediately (the engine's one branch). Returns true if the rebalance
+  // actually placed an order.
   func ammExecuteRebalance(pool : AMM.Pool, now : Int) : Bool {
     let cfg = rebalanceCfgFor(pool);
     let baseHeld = Accounts.getBalance(accounts, ammPrincipal(), pool.baseToken);
@@ -3892,7 +5189,7 @@ persistent actor Uplands {
         let result = MatchingEngine.executeMarketOrderProtected(
           orderStore, accounts, pool.marketId, pool.baseToken,
           owner, d.side, d.quantity, Fixed.fromFloat(bandCappedSlippage(pool, d.side, cfg.maxSlippage)), false, now,
-          buildProtectionCtx(now), null,
+          buildProtectionCtx(now), null, null,   // H-20 priceCap: the AMM's own band-capped slippage already bounds this walk
         );
         if (result.totalFilled > 0 or result.trades.size() > 0) {
           updateStatsAfterTrades(pool.marketId, result.trades);
@@ -3941,58 +5238,65 @@ persistent actor Uplands {
   };
   public query func getAmmRebalanceEnabled() : async Bool { _ammRebalanceEnabled };
 
-  func tickAmm() : async () {
-    if (_timersPaused) { return };
-    let now = Time.now();
-    // Collect pool ids first so we can mutate the map during iteration.
-    let ids = Iter.toArray(
-      Iter.map<(Text, AMM.Pool), Text>(Map.entries(pools), func((k, _)) { k })
-    );
-    for (id in ids.vals()) {
-      switch (Map.get(pools, Text.compare, id)) {
-        case null {};
-        case (?p) {
-          // Stale-feed panic: cancel any active quotes if refPrice is
-          // severely stale. Off-market quotes are free arbitrage for
-          // snipers; better to be off the book entirely until the
-          // oracle recovers.
-          let panicStale =
-            p.enabled
-            and p.refPriceUpdatedNs > 0
-            and now - p.refPriceUpdatedNs > AMM_PANIC_REFPRICE_AGE_NS
-            and (p.activeBidIds.size() > 0 or p.activeAskIds.size() > 0);
-          if (panicStale) {
-            let cancelled = ammCancelAllQuotes(p);
-            Map.add(pools, Text.compare, id, cancelled);
-            _ammPanicCancels += 1;
-          } else if (ammShouldRequote(p, now)) {
-            let updated = ammRequote(p);
-            Map.add(pools, Text.compare, id, updated);
-          };
-          // After requoting, see if a rebalance should fire (opt-in — see
-          // _ammRebalanceEnabled). The decide-function's cooldown check
-          // prevents double-execution.
-          if (_ammRebalanceEnabled) {
-            switch (Map.get(pools, Text.compare, id)) {
-              case null {};
-              case (?refreshed) {
-                if (refreshed.enabled) {
-                  ignore ammExecuteRebalance(refreshed, now);
-                };
+  // H-09 (D7, extension of W3-08): ONE market's AMM tick — requote (or panic-
+  // cancel on a severely stale feed), the opt-in rebalance, and, inside
+  // ammRequote, the resting-order sweep and the deferred RELEASE pass for
+  // that market. The heartbeat dispatches one hbRun("amm:<marketId>") per
+  // pool, so each market's tick is its own isolated message behind the
+  // breaker: a trap in one market's release (the F4 shape — a junk band
+  // wedging the walk) rolls back and backs off THAT market only, and the
+  // other markets are serviced on the next beat. tickAmm used to run every
+  // pool in one bare `async` self-send: one market's trap took every
+  // market's requote down, at full cadence, unaccounted.
+  func tickAmmPool(id : Text, now : Int) {
+    if (timersHeld()) { return };
+    switch (Map.get(pools, Text.compare, id)) {
+      case null {};
+      case (?p) {
+        // Stale-feed panic: cancel any active quotes if refPrice is
+        // severely stale. Off-market quotes are free arbitrage for
+        // snipers; better to be off the book entirely until the
+        // oracle recovers.
+        let panicStale =
+          p.enabled
+          and p.refPriceUpdatedNs > 0
+          and now - p.refPriceUpdatedNs > AMM_PANIC_REFPRICE_AGE_NS
+          and (p.activeBidIds.size() > 0 or p.activeAskIds.size() > 0);
+        if (panicStale) {
+          let cancelled = ammCancelAllQuotes(p);
+          Map.add(pools, Text.compare, id, cancelled);
+          _ammPanicCancels += 1;
+        } else if (ammShouldRequote(p, now)) {
+          let updated = ammRequote(p, true);
+          Map.add(pools, Text.compare, id, updated);
+        };
+        // After requoting, see if a rebalance should fire (opt-in — see
+        // _ammRebalanceEnabled). The decide-function's cooldown check
+        // prevents double-execution.
+        if (_ammRebalanceEnabled) {
+          switch (Map.get(pools, Text.compare, id)) {
+            case null {};
+            case (?refreshed) {
+              if (refreshed.enabled) {
+                ignore ammExecuteRebalance(refreshed, now);
               };
             };
           };
         };
       };
     };
-    // Vault-wide snapshot for the equity curve. Cheap when not due
-    // (just reads lastVaultSnapshotNs); when due, samples every
-    // token balance the AMM holds plus each pool's refPrice and
-    // appends one entry to the ring buffer.
+  };
+
+  // Vault-wide snapshot for the equity curve (its own isolated subtask,
+  // "ammsnap", on the AMM cadence). Cheap when not due (just reads
+  // lastVaultSnapshotNs); when due, samples every token balance the AMM holds
+  // plus each pool's refPrice and appends one entry to the ring buffer.
+  func tickAmmSnapshot(now : Int) {
+    if (timersHeld()) { return };
     recordVaultSnapshotIfDue(now);
   };
 
-  // (tickAmm is now dispatched by the heartbeat, not a timer.)
+  // (The AMM tick is dispatched by the heartbeat — per market — not a timer.)
 
   // ── Margin Phase 2B: liquidation timer ───────────────────────
   // Scans every user with an open loan every 30s and fires the
@@ -4001,7 +5305,7 @@ persistent actor Uplands {
   // bumps a user underwater; this timer catches users whose
   // collateral devalued without them trading (oracle drop).
   func tickLiquidations() : async () {
-    if (_timersPaused) { return };
+    if (timersHeld()) { return };
     completeLiquidationPass();
   };
 
@@ -4135,6 +5439,37 @@ persistent actor Uplands {
     if (not trap) { completeLiquidationPass() };
   };
 
+  // Dev hook: run the heat beat (heat maps, risk summary, market-side
+  // aggregates) NOW on a paused venue, so a fixture can read getMarketTele
+  // against a mark it just stamped without racing the liquidation batch
+  // that the same heartbeat would dispatch first (#54.8 shell check).
+  public shared (msg) func devTickHeatmaps() : async () {
+    requireController(msg.caller);
+    requireDevHook("devTickHeatmaps");
+    tickHeatmaps();
+  };
+
+  // Dev hook: run ONE closed-order reaper pass now (the HB_REAP_NS beat, with
+  // timers paused). H-10's fixture counts the closures the reaper seals for a
+  // swept-unfunded order — exactly one — which needs the pass to be
+  // deterministic, same idiom as devTickHeatmaps.
+  public shared (msg) func devTickReap() : async () {
+    requireController(msg.caller);
+    requireDevHook("devTickReap");
+    reapClosedOrders();
+  };
+
+  // Dev hook: run ONE access-tier tick now (the HB_TIER_NS beat: window
+  // roll, the uptime sample of every quoter, level recompute, badge
+  // backfill slices). H-14's fixture takes uptime samples against a
+  // deliberately mis-funded book and needs each sample to land on demand
+  // with timers paused, same idiom as devTickReap.
+  public shared (msg) func devTickTier() : async () {
+    requireController(msg.caller);
+    requireDevHook("devTickTier");
+    tickTier(Time.now());
+  };
+
   // ── Margin Phase 3B: cross-market netting ────────────────────
   // Before any liquidation hits the order book, match opposing flows on
   // the same base asset against each other at the oracle mid. In a
@@ -4155,18 +5490,38 @@ persistent actor Uplands {
   // and we must not act on it. Returns true only when every relevant mark is
   // fresh. (QUOTE_TOKEN is the unit of account and always fresh.)
   // As of `now` (threaded through so a batch uses one clock — see marginPriceFreshAt).
-  func userMarksFreshAt(user : Principal, now : Int) : Bool {
+  // H-06 (F23): the token-returning form names the FIRST stale mark so a
+  // refusal is actionable ("stale for ETH" on a BTC open tells the trader
+  // which feed to wait for); userMarksFreshAt is its Bool face. Callers that
+  // INCREASE a pool's debt (openPosition's borrow gate, the release clamp's
+  // re-levering path) need the whole basket fresh exactly as
+  // withdrawMarginPool and the liquidator already do — the borrow check
+  // values every collateral/loan token through the age-blind
+  // marginPriceLookup, so a frozen mark on any ONE of them sized the borrow
+  // off a stale price while only the traded token was checked.
+  func userStaleMarkAt(user : Principal, now : Int) : ?Types.TokenId {
     for (token in Types.MARGIN_COLLATERAL_TOKENS.vals()) {
       if (token != Types.QUOTE_TOKEN) {
         let hasLoan = BorrowEngine.loanOf(loans, user, token) > 0;
         let hasColl = (Accounts.getBalance(accounts, user, token) + reservedBalance(user, token)) > 0;
-        if ((hasLoan or hasColl) and not marginPriceFreshAt(token, now)) { return false };
+        if ((hasLoan or hasColl) and not marginPriceFreshAt(token, now)) { return ?token };
       };
     };
-    true;
+    null;
   };
+  func userMarksFreshAt(user : Principal, now : Int) : Bool { userStaleMarkAt(user, now) == null };
   func userMarksFresh(user : Principal) : Bool { userMarksFreshAt(user, Time.now()) };
 
+  // Deliberately NOT here: a periodic deleveragePool reconcile of loaned pools
+  // holding free quote (H-07's optional criterion, task 1788523828). Beyond
+  // the per-beat bill (a poolRestingOrderNeeds walk per loaned pool inside a
+  // slice that is already bounded for the instruction limit), it would turn
+  // an owner's fundMarginPool top-up — margin, by the frontend's own flow:
+  // fund, then place the order the preview sized — into a repayment within
+  // one heartbeat, and would make "debt across a frame while free quote
+  // exists" a timing race for every suite that pins it. Idle debt is the
+  // OWNER's to retire, through repayPoolDebt; whether the batch should also
+  // reconcile is an operator (economics) call, filed for input.
   func runLiquidationBatch(now : Int) {
     // Snapshot a BOUNDED SLICE of loaned users, resuming after _liqCursor — the
     // loan map mutates (entries get deleted as debts clear) during netting +
@@ -4261,6 +5616,11 @@ persistent actor Uplands {
                 bRem := if (bRem > settled.qty) { bRem - settled.qty } else { 0 };
                 bumpUserVersionWithTrade(sArr[si].user, now);
                 bumpUserVersionWithTrade(bArr[bi].user, now);
+                // settleNettedPair wrote off both sides' loans — re-provision
+                // each pool now (task 1788480502); Phase 3's tryLiquidate only
+                // re-provisions the ones it actually seizes.
+                reprovisionPool(sArr[si].user);
+                reprovisionPool(bArr[bi].user);
               } else {
                 // Neither side could move (balance/debt exhausted) —
                 // advance the smaller remaining side to avoid a stall.
@@ -4296,16 +5656,13 @@ persistent actor Uplands {
   // ── Persistent user-profile & history state ───────────────────
   let userProfiles     = Map.empty<Text, Types.UserProfile>();
   let userDeposits     = Map.empty<Text, List.List<Types.DepositRecord>>();
-  // FOSSIL-PARKED (task 1787199451): frozen at the pre-reason element type.
-  // Adding `reason` in place is EOP-incompatible (mutable containers are
-  // invariant → IC0503 on upgrade), and the one-shot migration slot is
-  // occupied by the ACTIVE W2-04 migration (migration.mo — cannot be
-  // extended, see Types.OrderAdjustmentLegacy's note). Never written again;
-  // read only by getMyAdjustments' merge (fossil rows surface with
-  // reason = null). A sweep into V2 can ride the one-shot slot after W2-04
-  // retires (task 1786992189).
-  let userAdjustments   = Map.empty<Text, List.List<Types.OrderAdjustmentLegacy>>();
-  // The live adjustment history — every record since the reason field landed.
+  // The full adjustment history. Rows recorded before the reason field
+  // landed (task 1787199451) carry reason = null: the pre-reason fossil map
+  // `userAdjustments` was folded in here by the fifth one-shot migration
+  // (tasks 1787222803 + 1787207569 — legacy rows first, strictly older,
+  // re-capped at UserStatus.ADJUSTMENTS_KEEP; applied to both mainnet
+  // targets 2026-09-03 and RETIRED with 1788285811 — see the NOTE above the
+  // actor). The V2 name is kept: it is the deployed stable-field name.
   let userAdjustmentsV2 = Map.empty<Text, List.List<Types.OrderAdjustment>>();
   // Capped per-user closed-order history (appended by the reaper as it
   // deletes terminal orders from the hot map; storage cap in UserStatus).
@@ -4314,6 +5671,181 @@ persistent actor Uplands {
   let userClosedOrders = Map.empty<Text, List.List<Types.ClosedOrderRecord>>();
   let userPreferences  = Map.empty<Text, Types.UserPreferences>();
   let userStatuses     = Map.empty<Text, Types.UserStatus>();
+
+  // ── H-36 (F33, D4 (a′)): the bounded PRE-REGISTRATION store ─────────────
+  // Profile and preferences are written BEFORE registration by design (the
+  // frontend's sign-in path creates the profile; H-30's gate allowlists the
+  // six pre-registration methods), so every free keypair could buy a
+  // permanent record in userProfiles + userPreferences — the one stable-heap
+  // growth path an attacker paid nothing for. The D4 answer is a store that is
+  // bounded BY CONSTRUCTION (a grace-period sweep alone cannot bound the peak:
+  // free identities fill any window), autonomous (MULTI/DEX is NNS-run — no
+  // correctness property may depend on an operator tool), and lifted on
+  // registration:
+  //   1. HARD CAP at write time: every pre-registration write (getMyProfile,
+  //      setUserPreferences, regenerateUsername) stamps the caller in
+  //      `preRegStore`; a NEW unregistered principal arriving at the cap
+  //      evicts the least-recently-seen unregistered entry — index slot AND
+  //      its profile/preferences records — so Map.size(userProfiles) grows by
+  //      at most PREREG_CAP over the registered population, at any ingress rate.
+  //   2. AUTONOMOUS EXPIRY: the heartbeat's `prereg` subtask (behind the pause
+  //      gate, breaker-isolated like every maintenance job) ages out entries
+  //      older than PREREG_GRACE_NS, PREREG_STEP_BUDGET per tick, oldest first
+  //      — O(log n) pops off the recency queue, no scan, no cursor.
+  //   3. PROMOTION on registration: the four registration sites
+  //      (creditAndRegister, the #dev faucet, setTestBalance,
+  //      bulkSetTestBalances) call preRegPromote — the principal leaves the
+  //      bounded store and its records stay in the permanent maps, untouched
+  //      by cap or expiry forever after. Belt: every drop re-checks
+  //      registeredUsers, so a registration that somehow skipped promotion is
+  //      still a promotion at drop time, never a deletion.
+  // Pre-upgrade residue (unregistered profiles written before this landed)
+  // is ADOPTED into the store by a sharded backfill inside the same subtask
+  // (stamped `now` — a full grace from the upgrade, conservative), so the
+  // fossil population is bounded and aged out too, without a migration.
+  // The Internet Identity sign-in HANDSHAKE state (the nonce store) is bounded
+  // by mo:identity-attributes itself — Challenges.maxTotal = 4096, 5-minute
+  // expiry, transient (hygiene H-36 pins the version) — and is not per-principal.
+  // Accepted degradation (D4): under a flood a real user's pre-deposit draft
+  // can be evicted; getMyProfile then mints a fresh username on the next call.
+  // Layout: ONE new stable record (PreReg.Store — Maps + counters), additive;
+  // userProfiles / userPreferences unchanged in shape.
+  let preRegStore = PreReg.empty();
+  // At ~0.5 KB per entry (profile + preferences + two index rows) the cap
+  // bounds the pre-registration footprint to ~5 MB; #play's whole registered
+  // population is ~160, so 10,000 concurrent pre-deposit browsers is a flood,
+  // not a season.
+  transient let PREREG_CAP : Nat = 10_000;
+  transient let PREREG_GRACE_NS : Int = 7 * 24 * 3_600 * 1_000_000_000;   // 7 days
+  transient let PREREG_STEP_BUDGET : Nat = 1_000;   // pops per tick (expiry + trim); ~5 Map ops each
+  transient let PREREG_ADOPT_SHARD : Nat = 500;     // residue keys examined per tick
+  transient let HB_PREREG_NS : Int = 60_000_000_000; // 60s — pre-registration store expiry/adopt step
+  transient var _lastPreRegNs : Int = 0;
+  // #dev overrides (setTestPreRegBounds) so the suite can pin the cap, the
+  // grace and the cadence at test scale; null = the constants above.
+  transient var _preRegCapOverride : ?Nat = null;
+  transient var _preRegGraceOverride : ?Int = null;
+  transient var _preRegCadenceOverride : ?Int = null;
+  transient var _preRegAdoptPhase : Nat = 0;          // 0 = profiles, 1 = preferences, 2 = done
+  transient var _preRegAdoptCursor : ?Text = null;
+  transient var _preRegAdopted : Nat = 0;
+  func preRegCap() : Nat { Option.get(_preRegCapOverride, PREREG_CAP) };
+  func preRegGraceNs() : Int { Option.get(_preRegGraceOverride, PREREG_GRACE_NS) };
+  func preRegCadenceNs() : Int { Option.get(_preRegCadenceOverride, HB_PREREG_NS) };
+  func isRegisteredKey(key : Text) : Bool { Map.get(registeredUsers, Text.compare, key) != null };
+  // Drop an evicted/expired principal's records — unless it registered in the
+  // meantime, in which case the index slot's removal WAS its promotion.
+  func preRegDrop(key : Text) {
+    if (isRegisteredKey(key)) { preRegStore.promoted += 1; return };
+    ignore Map.delete(userProfiles, Text.compare, key);
+    ignore Map.delete(userPreferences, Text.compare, key);
+  };
+  // Every pre-registration write path calls this BEFORE it writes: a
+  // registered caller is lifted out (belt), an unregistered one is stamped
+  // most-recent and, when NEW at the cap, the least-recently-seen entry goes.
+  func preRegTouch(caller : Principal) {
+    let key = Principal.toText(caller);
+    if (isRegisteredKey(key)) { ignore PreReg.forget(preRegStore, key); return };
+    switch (PreReg.touch(preRegStore, key, Time.now(), preRegCap())) {
+      case (?victim) { preRegDrop(victim) };
+      case null {};
+    };
+  };
+  // Registration: the principal leaves the bounded store (its records stay).
+  func preRegPromote(user : Principal) {
+    ignore PreReg.forget(preRegStore, Principal.toText(user));
+  };
+  // The heartbeat step — its ONLY caller (the #dev bounds hook trims on its
+  // own; no operator entry point runs this): trim over the cap, expire past
+  // the grace, adopt residue.
+  func tickPreReg(now : Int) {
+    for (k in PreReg.trim(preRegStore, preRegCap(), PREREG_STEP_BUDGET).vals()) { preRegDrop(k) };
+    for (k in PreReg.expire(preRegStore, now, preRegGraceNs(), PREREG_STEP_BUDGET).vals()) { preRegDrop(k) };
+    // Adoption of pre-H-36 residue: unregistered keys already in the maps but
+    // not yet in the store. Two sharded passes (profiles, then preferences),
+    // then done until the next upgrade re-initialises the transient phase —
+    // a cheap, idempotent safety net each deploy.
+    let adopt = func(k : Text) {
+      if (not isRegisteredKey(k) and not PreReg.contains(preRegStore, k)) {
+        _preRegAdopted += 1;
+        switch (PreReg.touch(preRegStore, k, now, preRegCap())) {
+          case (?victim) { preRegDrop(victim) };
+          case null {};
+        };
+      };
+    };
+    if (_preRegAdoptPhase == 0) {
+      let r = Shard.step<Types.UserProfile>(userProfiles, _preRegAdoptCursor, PREREG_ADOPT_SHARD, adopt);
+      if (r.completed) { _preRegAdoptPhase := 1; _preRegAdoptCursor := null } else { _preRegAdoptCursor := r.nextCursor };
+    } else if (_preRegAdoptPhase == 1) {
+      let r = Shard.step<Types.UserPreferences>(userPreferences, _preRegAdoptCursor, PREREG_ADOPT_SHARD, adopt);
+      if (r.completed) { _preRegAdoptPhase := 2; _preRegAdoptCursor := null } else { _preRegAdoptCursor := r.nextCursor };
+    };
+  };
+  // Observability (anonymous query — transparency doctrine): the bound is a
+  // MEASUREMENT (W5-19), so the size, the cap in force and the lifetime
+  // counters are readable by anyone; tests pin size ≤ cap under a flood.
+  public query func getPreRegStoreStats() : async {
+    size : Nat; cap : Nat; graceNs : Int; cadenceNs : Int;
+    evicted : Nat; expired : Nat; promoted : Nat; adopted : Nat;
+    oldestSeenNs : ?Int; adoptPhase : Nat;
+    profiles : Nat; preferences : Nat;   // Map.size of the two permanent maps
+  } {
+    {
+      size = PreReg.size(preRegStore); cap = preRegCap(); graceNs = preRegGraceNs(); cadenceNs = preRegCadenceNs();
+      evicted = preRegStore.evicted; expired = preRegStore.expired; promoted = preRegStore.promoted; adopted = _preRegAdopted;
+      oldestSeenNs = PreReg.oldestSeenNs(preRegStore); adoptPhase = _preRegAdoptPhase;
+      profiles = Map.size(userProfiles); preferences = Map.size(userPreferences);
+    }
+  };
+  // #dev: pin the cap / grace / cadence at test scale (null restores the
+  // constant). A LOWERED cap is applied at once (trim), so the suite reads a
+  // deterministic size instead of waiting a tick.
+  public shared (msg) func setTestPreRegBounds(cap : ?Nat, graceNs : ?Int, cadenceNs : ?Int) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestPreRegBounds");
+    _preRegCapOverride := cap;
+    _preRegGraceOverride := graceNs;
+    _preRegCadenceOverride := cadenceNs;
+    for (k in PreReg.trim(preRegStore, preRegCap(), PREREG_STEP_BUDGET).vals()) { preRegDrop(k) };
+  };
+  // #dev: a synthetic flood — `n` fresh (never-registered) principals through
+  // the SAME insertion primitive the live path uses (profile create + touch),
+  // in one message, so a test can measure the bound at a stated size without
+  // minting n keypairs. Returns the store size afterwards and the instruction
+  // cost of the LAST insert (taken at the cap, so it is the at-capacity
+  // eviction cost — O(log n), and the test pins it flat across sizes).
+  public shared (msg) func devSeedPreRegFlood(n : Nat, salt : Nat) : async { size : Nat; lastInsertInstr : Nat64; evicted : Nat } {
+    requireController(msg.caller);
+    requireDevHook("devSeedPreRegFlood");
+    let now = Time.now();
+    var last : Nat64 = 0;
+    var i = 0;
+    while (i < n) {
+      // A valid opaque principal per (salt, i): 8 bytes of salt, 8 of index,
+      // one tag byte — never self-authenticating, never anonymous.
+      let bytes : [Nat8] = [
+        Nat8.fromNat((salt / 72_057_594_037_927_936) % 256), Nat8.fromNat((salt / 281_474_976_710_656) % 256),
+        Nat8.fromNat((salt / 1_099_511_627_776) % 256), Nat8.fromNat((salt / 4_294_967_296) % 256),
+        Nat8.fromNat((salt / 16_777_216) % 256), Nat8.fromNat((salt / 65_536) % 256),
+        Nat8.fromNat((salt / 256) % 256), Nat8.fromNat(salt % 256),
+        Nat8.fromNat((i / 72_057_594_037_927_936) % 256), Nat8.fromNat((i / 281_474_976_710_656) % 256),
+        Nat8.fromNat((i / 1_099_511_627_776) % 256), Nat8.fromNat((i / 4_294_967_296) % 256),
+        Nat8.fromNat((i / 16_777_216) % 256), Nat8.fromNat((i / 65_536) % 256),
+        Nat8.fromNat((i / 256) % 256), Nat8.fromNat(i % 256), 0x7f,
+      ];
+      let p = Principal.fromBlob(Blob.fromArray(bytes));
+      let key = Principal.toText(p);
+      let t0 = Prim.performanceCounter(0);
+      preRegTouch(p);
+      if (Map.get(userProfiles, Text.compare, key) == null) {
+        Map.add(userProfiles, Text.compare, key, Profiles.createProfile(p, now, drawUsername()));
+      };
+      last := Prim.performanceCounter(0) - t0;
+      i += 1;
+    };
+    { size = PreReg.size(preRegStore); lastInsertInstr = last; evicted = preRegStore.evicted }
+  };
 
   // ── Margin Phase 1: per-user opt-in margin accounts ───────────
   // Map<principalText, MarginAccount{openedAt, collateral: [(token, amt)]}>.
@@ -4426,10 +5958,16 @@ persistent actor Uplands {
       case null {};
     };
   };
-  // Repay a pool's idle pre-borrow after a kill/clamp left it unused. Reserved
-  // funds backing a still-resting order are excluded (deleveragePool only
-  // spends what getAvailable reports), so this never starves a live order.
-  // No-op for non-pool owners and debt-free pools.
+  // H-07's idle-repay arm, DEAD-SAFE under H-34 / D5 (d): every kill / clamp /
+  // drop arm still calls it, but with borrow-at-fill a killed pool order
+  // holds no placement borrow to repay — its debt is exactly what its fills
+  // took, and settlePoolFills' deleverage already retired anything free. So
+  // this is a no-op for the loan book on every kill path; it stays as the
+  // backstop of the invariant ("free funds never sit against debt after a
+  // release") and as the one repay hook a future path can reuse. Reserved
+  // funds backing a still-resting EXIT are excluded (deleveragePool spends
+  // only what getAvailable reports, net of the exit earmark), so it never
+  // starves a live order. No-op for non-pool owners and debt-free pools.
   func repayIdlePoolBorrow(owner : Principal, marketId : Types.MarketId) {
     switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(owner))) {
       case (?poolId) {
@@ -4438,6 +5976,39 @@ persistent actor Uplands {
       };
       case null {};
     };
+  };
+  // H-05 (F1): a release whose margin clamp found NO equity-safe quantity at
+  // this price — clampToInitialMargin answered #partial with qty = 0 and
+  // held > 0: a pool's exposure-reducing fill whose worst-case loss at the
+  // effective limit exceeds the pool's whole raw equity. Nothing reaches the
+  // engine. A #market entry re-stages its held quantity for the next requote
+  // like any unfilled remainder (MAX_REDEFER walks — the AMM may be quoting
+  // closer by then), then drops with a record; a #limit exit at a price that
+  // breaches equity drops at once (a resting order is not a walk). The drop
+  // repays the idle pre-borrow (H-07: an order that is gone holds no borrow)
+  // and clears the MM shield like every other kill arm (#51.1).
+  func holdWholeRelease(d : DeferredExec, held : Nat, reDeferCount : Nat, effLimit : Nat) {
+    if (d.kind == #market and reDeferCount < MAX_REDEFER) {
+      switch (parkDeferred(d.marketId, d.baseToken, d.owner, d.side, #market, d.limitPrice, held, false, null, null, Time.now())) {
+        case (?e2) {
+          Map.add(_reDeferCount, Nat.compare, e2.id, reDeferCount + 1);
+          noteStagedShort(d.owner, d.marketId, d.baseToken, d.side, held, e2.qty, d.limitPrice);   // task 1788557389: a trimmed re-park is recorded
+          return;
+        };
+        case null {};   // could not re-stage (no available funds) → drops below
+      };
+    };
+    let sideStr = switch (d.side) { case (#buy) "BUY"; case (#sell) "SELL" };
+    let walkNote = if (reDeferCount > 0) { " after walking the AMM curve " # Nat.toText(reDeferCount) # " requote(s)" } else { "" };
+    let kindStr = switch (d.kind) { case (#market) { "Market order remainder dropped: " }; case (#limit) { "Limit order not released: " } };
+    recordReleaseRejection(d.owner, d.marketId, d.side, d.qty, ?0, effLimit,
+      kindStr # r2n(held) # " unfilled" # walkNote
+      # " — no equity-safe quantity within the slippage cap ($" # r2n(effLimit) # "); add margin or wait for a closer quote.");
+    logEventF("info", "order", ?"order.nofill", ?Principal.toText(d.owner),
+      d.baseToken # " " # sideStr # " order — " # r2n(held) # " held at release, dropped" # walkNote
+      # " (no equity-safe quantity within $" # r2n(effLimit) # ")", ?d.marketId);
+    clearMmShield(d.owner, d.marketId);
+    repayIdlePoolBorrow(d.owner, d.marketId);
   };
 
   // STABLE-FOSSIL (W5-12): unused since the integer-money migration, but a
@@ -4519,6 +6090,16 @@ persistent actor Uplands {
   // transferred (creation is the only write), so an append-only list is the
   // whole index. Transient — rebuilt from marginPools at actor init.
   transient let poolIdsByOwner = Map.empty<Text, List.List<Nat>>();
+  // H-31 (F48): principal → that principal's fills, in tape order — the
+  // per-principal trade side index (OrderBook.UserTradeIndex; same shape as
+  // poolIdsByOwner: transient, rebuilt from orderStore.trades at init, never
+  // a field on the stable OrderStore record). Written at the single
+  // fill-capture choke point (refreshRolling24h), pruned with the global tape
+  // trim, cleared with the world wipe. Every "my fills" read — getMyTradeHistory,
+  // getMyTradeHistorySince, getMyTradesSinceId, getMarketChanges' user-trade
+  // leg, getMyPositionFills — resolves through it at O(own fills) instead of
+  // O(tape); devTradeHistoryCostProbe measures that at a saturated tape.
+  transient let userTradeIndex = OrderBook.newUserTradeIndex();
   func indexPoolOwner(owner : Principal, id : Nat) {
     let k = Principal.toText(owner);
     switch (Map.get(poolIdsByOwner, Text.compare, k)) {
@@ -4530,6 +6111,18 @@ persistent actor Uplands {
     switch (Map.get(poolIdsByOwner, Text.compare, Principal.toText(owner))) {
       case (?l) { Iter.toArray(List.values(l)) }; case null { [] };
     };
+  };
+  // H-30: a pool with no loan record and no positive balance is registry-only
+  // — it cannot carry a position (a position is held base or borrowed base,
+  // both visible here), so the heat/risk scans skip it BEFORE their
+  // HEAT_MAX_POOLS accounting: thousands of empty pools must not truncate the
+  // disclosure. Conservative on both inputs (a surviving zero-principal loan
+  // entry or any dust balance counts the pool as live). Two lookups — a Text
+  // Map.get and a balance prefix seek — per empty pool, no getHealth.
+  // (Every pool has a marginAccounts entry from creation — W5-23 opens the
+  // account with the registry row — so that map is not an emptiness signal.)
+  func poolIsEmpty(poolP : Principal) : Bool {
+    not BorrowEngine.hasLoanEntry(loans, poolP) and not Accounts.hasAnyBalance(accounts, poolP)
   };
   // Derived net base exposure of a pool in a market: + long, − short.
   // Long  : the pool bought & holds base (debt is quote)  →  baseHeld − 0.
@@ -4562,9 +6155,16 @@ persistent actor Uplands {
   //               branch always carried this term; the short branch
   //               previously dropped it (term 1) and mis-scaled the held
   //               base by netting before ltv/maint (term 2).
-  func positionLiqPrice(poolId : Nat, marketId : Types.MarketId, baseToken : Types.TokenId) : ?Nat {
+  //
+  // #54.8: the result carries the DIRECTION with the price (MarginPools.Liq —
+  // read off the same A the price derives from) and the pool's isLiquidatable
+  // from the very getHealth the legs were decomposed from, so every display
+  // consumer takes "which way" and "already past" from here — never from the
+  // net-size sign or from mark-vs-price.
+  type PositionLiq = { liq : ?MarginPools.Liq; isLiquidatable : Bool };
+  func positionLiq(poolId : Nat, marketId : Types.MarketId, baseToken : Types.TokenId) : PositionLiq {
     let size = poolNetSize(poolId, baseToken);
-    if (size == 0) { return null };
+    if (size == 0) { return { liq = null; isLiquidatable = false } };
     let mark = switch (AMM.getPool(pools, marketId)) { case (?p) { p.refPrice }; case null { 0 } };
     let poolP = poolPrincipalOf(poolId);
     let h = BorrowEngine.getHealth(loans, marginAccounts, accounts, reservedBalance, poolP, marginPriceLookup);
@@ -4574,7 +6174,13 @@ persistent actor Uplands {
     let otherColl = SafeMath.subOrZero(h.collateralUsd, baseLegUsd);
     let debtBase = BorrowEngine.loanOf(loans, poolP, baseToken);
     let otherDebt = SafeMath.subOrZero(h.debtUsd, Fixed.mul(debtBase, mark, true));
-    MarginPools.liqPrice(otherColl, otherDebt, heldBase, debtBase, ltv, Types.MAINTENANCE_HEALTH_RATIO);
+    { liq = MarginPools.liqPrice(otherColl, otherDebt, heldBase, debtBase, ltv, Types.MAINTENANCE_HEALTH_RATIO);
+      isLiquidatable = h.isLiquidatable };
+  };
+  // Price-only projection for the consumers that bucket by price alone (the
+  // heat map's bands, previewOpenPosition's estimate).
+  func positionLiqPrice(poolId : Nat, marketId : Types.MarketId, baseToken : Types.TokenId) : ?Nat {
+    switch (positionLiq(poolId, marketId, baseToken).liq) { case (?l) { ?l.price }; case null { null } };
   };
 
   // ── Margin heat map: the exact liquidation surface, 1% bands ───────
@@ -4675,6 +6281,7 @@ persistent actor Uplands {
 
     if (mark > 0) {
       label scan for ((poolId, _) in Map.entries(marginPools)) {
+        if (poolIsEmpty(poolPrincipalOf(poolId))) { continue scan };   // H-30: registry-only pools do not count
         if (scanned >= HEAT_MAX_POOLS) { truncated := true; break scan };
         scanned += 1;
         let size = poolNetSize(poolId, baseToken);
@@ -4804,6 +6411,8 @@ persistent actor Uplands {
     vaultBorrowCapUsd    : Nat;   // vaultValue × VAULT_BORROW_FRACTION_CAP
     vaultUtilisationBps  : Nat;   // debt / cap, in bps (10000 = at the cap)
     insuranceValueUsd    : Nat;   // first-loss buffer ahead of the vault
+    impairmentReserveUsd : Nat;   // expected loss provisioned in NAV beyond that buffer (task 1788475754)
+    impairmentGrossUsd   : Nat;   // Σ per-pool expected loss before the buffer is netted
     liquidatablePositions : Nat;  // health already below maintenance
     liquidatableNotionalUsd : Nat;
     worstCaseAbsorbUsd   : Nat;   // debt carried by liquidatable positions —
@@ -4812,21 +6421,28 @@ persistent actor Uplands {
     truncated            : Bool;
     computedNs           : Int;
   };
-  transient var _riskSummary : MarginRiskSummary = {
+  // The computed-empty summary: what a fresh install answers until the first
+  // heat beat, and what performWorldWipe resets the cache to (task
+  // 1788490347) so a wiped venue does not keep publishing the pre-wipe
+  // loan book for up to 30s.
+  transient let EMPTY_RISK_SUMMARY : MarginRiskSummary = {
     positions = 0; totalNotionalUsd = 0; totalDebtUsd = 0; vaultValueUsd = 0;
     vaultBorrowCapUsd = 0; vaultUtilisationBps = 0; insuranceValueUsd = 0;
+    impairmentReserveUsd = 0; impairmentGrossUsd = 0;
     liquidatablePositions = 0; liquidatableNotionalUsd = 0; worstCaseAbsorbUsd = 0;
     truncated = false; computedNs = 0;
   };
+  transient var _riskSummary : MarginRiskSummary = EMPTY_RISK_SUMMARY;
 
   func computeRiskSummary() : MarginRiskSummary {
     var nPos : Nat = 0; var notional : Nat = 0; var debt : Nat = 0;
     var liqN : Nat = 0; var liqNotional : Nat = 0; var worst : Nat = 0;
     var scanned : Nat = 0; var truncated = false;
     label scan for ((poolId, _) in Map.entries(marginPools)) {
+      let poolP = poolPrincipalOf(poolId);
+      if (poolIsEmpty(poolP)) { continue scan };   // H-30: registry-only pools do not count
       if (scanned >= HEAT_MAX_POOLS) { truncated := true; break scan };
       scanned += 1;
-      let poolP = poolPrincipalOf(poolId);
       // Pool-wide debt+health once per pool (not per market).
       let h = BorrowEngine.getHealth(loans, marginAccounts, accounts, reservedBalance, poolP, marginPriceLookup);
       debt += h.debtUsd;
@@ -4859,6 +6475,8 @@ persistent actor Uplands {
       vaultBorrowCapUsd = cap;
       vaultUtilisationBps = if (cap > 0) { debt * 10_000 / cap } else { 0 };
       insuranceValueUsd = insurancePoolValue();
+      impairmentReserveUsd = vaultImpairmentReserveUsd();
+      impairmentGrossUsd = vaultImpairmentGrossUsd;
       liquidatablePositions = liqN;
       liquidatableNotionalUsd = liqNotional;
       worstCaseAbsorbUsd = worst;
@@ -4880,6 +6498,11 @@ persistent actor Uplands {
       // should not gap because disclosure is withheld.)
       if (hm.markPrice > 0) { heatHistoryAppend(mid, hm) };
     };
+    refreshVaultImpairment(true);   // the per-pool expected-loss scan, same beat (task 1788475754); a WORLD beat: accrues each pool to it first (1788736589)
+    // Locked shares (task 1788475756): a periodic touch while any lock
+    // exists — the belt behind the mutation-time settle (task 1788727876:
+    // reprovisionPool settles at every borrow / repay / write-off / seize).
+    if (vaultLockRawSum > 0) { settleVaultLocks(vaultHoldingsUsd(), currentVaultValue().totalQuoteValue) };
     _riskSummary := computeRiskSummary();
     tickMarketSideAgg();   // market-bar Longs/Shorts + side-health cache, same beat
   };
@@ -4940,28 +6563,38 @@ persistent actor Uplands {
     shortHealth      : ?Nat;
     longNearLiqBps   : ?Nat;   // quantized distance to the side's nearest
     shortNearLiqBps  : ?Nat;   //   liquidation — see tickMarketSideAgg
+    longNearLiqDir   : ?MarginPools.LiqDir;   // #54.8: which way the mark must move to
+    shortNearLiqDir  : ?MarginPools.LiqDir;   //   reach that nearest liquidation (from A)
+    longLiquidatable  : Bool;  // #54.8: a leg on this side is ALREADY past
+    shortLiquidatable : Bool;  //   maintenance (getHealth.isLiquidatable)
   };
   transient var _marketSideAgg : Map.Map<Text, MarketSideAgg> = Map.empty<Text, MarketSideAgg>();
 
   // Per-(market, side) accumulator for one tick.
   type SideAcc = {
-    lN : Nat; lC : Nat; lD : Nat; lMinBps : ?Nat;
-    sN : Nat; sC : Nat; sD : Nat; sMinBps : ?Nat;
+    lN : Nat; lC : Nat; lD : Nat; lMinBps : ?Nat; lMinDir : ?MarginPools.LiqDir; lLiq : Bool;
+    sN : Nat; sC : Nat; sD : Nat; sMinBps : ?Nat; sMinDir : ?MarginPools.LiqDir; sLiq : Bool;
   };
 
   func tickMarketSideAgg() {
     let acc = Map.empty<Text, SideAcc>();
     var scanned : Nat = 0;
     label scan for ((poolId, _) in Map.entries(marginPools)) {
+      if (poolIsEmpty(poolPrincipalOf(poolId))) { continue scan };   // H-30: registry-only pools do not count
       if (scanned >= HEAT_MAX_POOLS) { break scan };
       scanned += 1;
-      // The pool's priced legs: (market, |notional|, isLong, liq distance).
-      // Distance is bps from the CURRENT mark to the leg's liquidation
-      // price, on the side it liquidates toward; a position already at or
-      // past its liquidation price clamps to 0. null = no finite liq price
-      // (an unlevered leg).
+      // The pool's priced legs: (market, |notional|, isLong, liq distance,
+      // liq direction, liquidatable). Distance is bps from the CURRENT mark
+      // to the leg's liquidation price, on the side it liquidates toward —
+      // the direction MarginPools.liqPrice derived from the health slope
+      // (#54.8), NOT the sign of the net size: a net-long pool with
+      // heldLtv < M·debtBase liquidates on a RISING mark and reads a
+      // positive distance here where the size-sign convention read 0. A
+      // leg whose pool is already past maintenance clamps to 0 and flags
+      // the side liquidatable — "past" is getHealth.isLiquidatable, never
+      // mark-vs-price. null = no finite liq price (an unlevered leg).
       var tot : Nat = 0;
-      let legs = List.empty<(Text, Nat, Bool, ?Nat)>();
+      let legs = List.empty<(Text, Nat, Bool, ?Nat, ?MarginPools.LiqDir, Bool)>();
       for ((mid, (base, _)) in Map.entries(markets)) {
         let net = poolNetSize(poolId, base);
         if (net != 0) {
@@ -4969,40 +6602,43 @@ persistent actor Uplands {
           if (mark > 0) {
             let n = Fixed.mul(Int.abs(net), mark, false);
             tot += n;
-            let distBps : ?Nat = switch (positionLiqPrice(poolId, mid, base)) {
-              case null { null };
-              case (?lp) {
-                let signed : Int = if (net > 0) { (mark : Int) - (lp : Int) } else { (lp : Int) - (mark : Int) };
-                ?(if (signed <= 0) { 0 } else { Int.abs(signed * 10_000 / (mark : Int)) });
-              };
+            let pl = positionLiq(poolId, mid, base);
+            let (distBps, dir) : (?Nat, ?MarginPools.LiqDir) = switch (pl.liq) {
+              case null { (null, null) };
+              case (?l) { (?(if (pl.isLiquidatable) { 0 } else { MarginPools.distBps(mark, l) }), ?l.dir) };
             };
-            List.add(legs, (mid, n, net > 0, distBps));
+            List.add(legs, (mid, n, net > 0, distBps, dir, pl.isLiquidatable));
           };
         };
       };
       if (tot == 0) { continue scan };
       let h = BorrowEngine.getHealth(loans, marginAccounts, accounts, reservedBalance, poolPrincipalOf(poolId), marginPriceLookup);
-      for ((mid, n, isLong, distBps) in List.values(legs)) {
+      for ((mid, n, isLong, distBps, dir, liquidatable) in List.values(legs)) {
         let collShare = h.collateralUsd * n / tot;   // Nat is unbounded — no overflow
         let debtShare = h.debtUsd * n / tot;
         let a = switch (Map.get(acc, Text.compare, mid)) {
           case (?t) { t };
-          case null { { lN = 0; lC = 0; lD = 0; lMinBps = null;
-                        sN = 0; sC = 0; sD = 0; sMinBps = null } };
+          case null { { lN = 0; lC = 0; lD = 0; lMinBps = null; lMinDir = null; lLiq = false;
+                        sN = 0; sC = 0; sD = 0; sMinBps = null; sMinDir = null; sLiq = false } };
         };
-        let minOpt = func (cur : ?Nat, cand : ?Nat) : ?Nat {
+        // Nearest liquidation on the side, carrying the direction of the leg
+        // that set the minimum (the "which way" the bar prints belongs to the
+        // figure it prints).
+        let minOpt = func (cur : ?Nat, curDir : ?MarginPools.LiqDir, cand : ?Nat, candDir : ?MarginPools.LiqDir) : (?Nat, ?MarginPools.LiqDir) {
           switch (cur, cand) {
-            case (null, c) { c };
-            case (c, null) { c };
-            case (?a_, ?b_) { ?Nat.min(a_, b_) };
+            case (null, _) { (cand, candDir) };
+            case (_, null) { (cur, curDir) };
+            case (?a_, ?b_) { if (b_ < a_) { (cand, candDir) } else { (cur, curDir) } };
           };
         };
         let next = if (isLong) {
+          let (m, d) = minOpt(a.lMinBps, a.lMinDir, distBps, dir);
           { a with lN = a.lN + n; lC = a.lC + collShare; lD = a.lD + debtShare;
-                   lMinBps = minOpt(a.lMinBps, distBps) };
+                   lMinBps = m; lMinDir = d; lLiq = a.lLiq or liquidatable };
         } else {
+          let (m, d) = minOpt(a.sMinBps, a.sMinDir, distBps, dir);
           { a with sN = a.sN + n; sC = a.sC + collShare; sD = a.sD + debtShare;
-                   sMinBps = minOpt(a.sMinBps, distBps) };
+                   sMinBps = m; sMinDir = d; sLiq = a.sLiq or liquidatable };
         };
         Map.add(acc, Text.compare, mid, next);
       };
@@ -5025,25 +6661,33 @@ persistent actor Uplands {
       // dust gate as health.
       let base = switch (Map.get(markets, Text.compare, mid)) { case (?(b, _)) { b }; case null { "" } };
       let tier = heatTierFor(base);
-      let nearLiq = func (nRounded : Nat, minBps : ?Nat) : ?Nat {
-        if (nRounded == 0 or tier == "none") { return null };
+      // The liquidatable flag and the direction ride under the same gates as
+      // the distance: dust and "none"-tier disclose nothing.
+      let nearLiq = func (nRounded : Nat, minBps : ?Nat, dir : ?MarginPools.LiqDir, liquidatable : Bool) : (?Nat, ?MarginPools.LiqDir, Bool) {
+        if (nRounded == 0 or tier == "none") { return (null, null, false) };
         switch (minBps) {
-          case null { null };
+          case null { (null, null, liquidatable) };
           case (?d) {
             let quantum = Int.abs(HEAT_BAND_BPS_FULL);
-            ?(d / quantum * quantum);
+            (?(d / quantum * quantum), dir, liquidatable);
           };
         };
       };
       let lR = roundUsd(a.lN);
       let sR = roundUsd(a.sN);
+      let (lBps, lDir, lLiq) = nearLiq(lR, a.lMinBps, a.lMinDir, a.lLiq);
+      let (sBps, sDir, sLiq) = nearLiq(sR, a.sMinBps, a.sMinDir, a.sLiq);
       Map.add(fresh, Text.compare, mid, {
         longNotionalUsd  = lR;
         shortNotionalUsd = sR;
         longHealth  = sideHealth(lR, a.lC, a.lD);
         shortHealth = sideHealth(sR, a.sC, a.sD);
-        longNearLiqBps  = nearLiq(lR, a.lMinBps);
-        shortNearLiqBps = nearLiq(sR, a.sMinBps);
+        longNearLiqBps  = lBps;
+        shortNearLiqBps = sBps;
+        longNearLiqDir  = lDir;
+        shortNearLiqDir = sDir;
+        longLiquidatable  = lLiq;
+        shortLiquidatable = sLiq;
       });
     };
     _marketSideAgg := fresh;
@@ -5063,6 +6707,10 @@ persistent actor Uplands {
     shortHealth      : ?Nat;
     longNearLiqBps   : ?Nat;  // quantized nearest-liquidation distances
     shortNearLiqBps  : ?Nat;
+    longNearLiqDir   : ?MarginPools.LiqDir;   // #54.8 (additive): the direction the mark
+    shortNearLiqDir  : ?MarginPools.LiqDir;   //   must move to reach it — from A, not the side
+    longLiquidatable  : Bool;  // #54.8 (additive): a leg on the side is already past
+    shortLiquidatable : Bool;  //   maintenance — the bar prints "liquidatable", not a distance
     computedNs       : Int;   // side-agg tick time; 0 until the first beat after upgrade
   };
 
@@ -5090,7 +6738,8 @@ persistent actor Uplands {
         let agg = switch (Map.get(_marketSideAgg, Text.compare, marketId)) {
           case (?a) { a };
           case null { { longNotionalUsd = 0; shortNotionalUsd = 0; longHealth = null; shortHealth = null;
-                        longNearLiqBps = null; shortNearLiqBps = null } };
+                        longNearLiqBps = null; shortNearLiqBps = null; longNearLiqDir = null; shortNearLiqDir = null;
+                        longLiquidatable = false; shortLiquidatable = false } };
         };
         ?{
           marketId;
@@ -5103,6 +6752,10 @@ persistent actor Uplands {
           shortHealth = agg.shortHealth;
           longNearLiqBps  = agg.longNearLiqBps;
           shortNearLiqBps = agg.shortNearLiqBps;
+          longNearLiqDir  = agg.longNearLiqDir;
+          shortNearLiqDir = agg.shortNearLiqDir;
+          longLiquidatable  = agg.longLiquidatable;
+          shortLiquidatable = agg.shortLiquidatable;
           computedNs = _lastHeatNs;
         };
       };
@@ -5110,14 +6763,13 @@ persistent actor Uplands {
   };
 
   // Cancel one of a pool's RESTING orders (no reservation to refund — the
-  // soft-lock was freed at release) and repay the freed pre-borrow. Records a
-  // never-silent notice so the owner is told why it vanished.
+  // soft-lock was freed at release) and deleverage (dead-safe under H-34: a
+  // resting entry holds no borrow to free). Records a never-silent notice so
+  // the owner is told why it vanished.
   func cancelPoolRestingOrder(poolId : Nat, order : Types.Order, now : Int) {
     let rem = OrderBook.remaining(order);
     let baseToken = switch (Map.get(markets, Text.compare, order.marketId)) { case (?(b, _)) { b }; case null { "" } };
-    voidPendingMatchesForMaker(order.id);
     ignore OrderBook.cancelOrder(orderStore, order.id);
-    ignore Map.delete(orderSettlementWindows, Nat.compare, order.id);
     ignore Map.delete(orderExpiry, Nat.compare, order.id);
     deleveragePool(poolId, baseToken, now);   // F1: the freed borrow is now idle (order gone)
     recordReleaseRejection(poolPrincipalOf(poolId), order.marketId, order.side, rem, null, order.price,
@@ -5139,9 +6791,7 @@ persistent actor Uplands {
         if (OrderBook.isOpen(order)) {
           let rem = OrderBook.remaining(order);
           let baseToken = switch (Map.get(markets, Text.compare, order.marketId)) { case (?(b, _)) { b }; case null { "" } };
-          voidPendingMatchesForMaker(makerOrderId);
           ignore OrderBook.cancelOrder(orderStore, makerOrderId);
-          ignore Map.delete(orderSettlementWindows, Nat.compare, makerOrderId);
           ignore Map.delete(orderExpiry, Nat.compare, makerOrderId);
           switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(makerOwner))) {
             case (?poolId) { deleveragePool(poolId, baseToken, Time.now()) };   // freed pre-borrow now idle
@@ -5305,9 +6955,18 @@ persistent actor Uplands {
   func poolRestingOrderNeeds(poolP : Principal, baseToken : Types.TokenId) : (Nat, Nat) {
     var quoteNeed : Nat = 0;
     var baseNeed  : Nat = 0;
+    // H-34 / D5 (d): only EXITS are earmarked. A resting exposure-INCREASING
+    // entry is funded at its fill by the vault (poolFundForFill), so holding
+    // free funds back from debt repayment for it would only keep interest
+    // running against cash the order does not need — the idle-borrow shape
+    // this decision abolished. An exit (a resting close) is funded by the
+    // pool's holdings and stays protected exactly as before.
+    let poolId = Map.get(poolByPrincipal, Text.compare, Principal.toText(poolP));
     for (o in OrderBook.getUserOpenOrders(orderStore, poolP).vals()) {
       let rem = OrderBook.remaining(o);
-      if (rem > 0) {
+      let oBase = switch (Map.get(markets, Text.compare, o.marketId)) { case (?(b, _)) { b }; case null { "" } };
+      let isEntry = switch (poolId) { case (?id) { poolOrderAddsExposure(id, o.side, oBase, rem) }; case null { false } };
+      if (rem > 0 and not isEntry) {
         switch (o.side) {
           // Round UP — this is a PROTECTIVE earmark (subtracted from `free`
           // before debt repayment), and it must match the quote actually
@@ -5319,6 +6978,10 @@ persistent actor Uplands {
           // (F1). Use TAKER_FEE_BPS rounded UP to mirror the parkDeferred placement
           // reservation (earmark == reserve invariant); ≥ the MAKER fee actually
           // owed on a resting fill, so it only ever over-earmarks (always safe).
+          // Deliberately STAYS at the L0 ceiling after parkDeferred's
+          // under-funded trim moved to the owner's earned rate (task
+          // 1788475362): the ceiling is ≥ every ladder rate, so this earmark
+          // is ≥ that reserve too — over-earmarking, never under.
           case (#buy)  {
             let base = Fixed.mul(rem, o.price, true);
             quoteNeed += base + Fixed.mulDiv(base, TAKER_FEE_BPS, 10_000, true);
@@ -5335,6 +6998,28 @@ persistent actor Uplands {
     (quoteNeed, baseNeed);
   };
 
+  // The ONE repay arithmetic every pool repay path shares — deleveragePool's
+  // two in-kind legs and the owner's repayPoolDebt (task 1788523828): retire
+  // the pool's `token` debt from its FREE holding of that token — available
+  // (balance − staged reservations) minus `earmark`, the resting-order need
+  // poolRestingOrderNeeds reports for that token — capped at `cap` when the
+  // caller names one. Reads the debt AFTER the caller's accrual (the loan must
+  // be accrued to `now` first — 1788515291 — so the read is the full claim).
+  // Returns what was paid: 0 when the pool owes nothing in `token`, holds
+  // nothing free, or the cap is 0 — so the caller can report or reprovision.
+  func repayPoolFromFree(poolP : Principal, token : Types.TokenId, earmark : Nat, cap : ?Nat, now : Int) : Nat {
+    let debt = BorrowEngine.loanOf(loans, poolP, token);
+    if (debt == 0) { return 0 };
+    let free = SafeMath.subOrZero(getAvailable(poolP, token), earmark);
+    var pay = Nat.min(debt, free);
+    switch (cap) { case (?c) { pay := Nat.min(pay, c) }; case null {} };
+    if (pay == 0) { return 0 };
+    switch (BorrowEngine.repay(loans, accounts, ammPrincipal(), poolP, token, pay, now, marginPriceLookup)) {
+      case (#ok(_)) { pay };
+      case (#err(_)) { 0 };   // unreachable by construction (pay ≤ available ≤ balance); never over-report
+    };
+  };
+
   // Repay a pool's debt from its free funds: quote debt from free quote, base
   // debt from free base, EXCLUDING funds earmarked for the pool's own resting
   // orders (see poolRestingOrderNeeds). On an OPENING fill that fully fills, the
@@ -5344,20 +7029,92 @@ persistent actor Uplands {
   func deleveragePool(poolId : Nat, baseToken : Types.TokenId, now : Int) {
     let poolP = poolPrincipalOf(poolId);
     let (quoteNeed, baseNeed) = poolRestingOrderNeeds(poolP, baseToken);
-    let qDebt = BorrowEngine.loanOf(loans, poolP, Types.QUOTE_TOKEN);
-    if (qDebt > 0) {
-      let av = getAvailable(poolP, Types.QUOTE_TOKEN);
-      let free = SafeMath.subOrZero(av, quoteNeed);
-      let pay = Nat.min(qDebt, free);
-      if (pay > 0) { ignore BorrowEngine.repay(loans, accounts, ammPrincipal(), poolP, Types.QUOTE_TOKEN, pay, now, marginPriceLookup) };
+    var repaid = false;
+    // Accrue FIRST, then read the debt (task 1788515291). BorrowEngine.repay
+    // accrues the loan to `now` before it subtracts, so a debt read at the
+    // LAST accrual under-asks by the interest booked in between — a closing
+    // fill lands in a later message than the close's own accrueAll, and the
+    // pool, holding plenty of free quote, was left owing exactly that in-
+    // message interest (the "~$0.001 dust residue" that kept NAV != holdings
+    // and the redeem-side mark gate armed forever). After this accrual the
+    // repay's own accrueLoan is a no-op (same `now`), so pay == the full debt
+    // whenever the pool can cover it and the loan entry is deleted outright —
+    // nothing is forgiven: the interest is owed and the borrower pays it.
+    BorrowEngine.accrueAll(loans, poolP, now);
+    if (repayPoolFromFree(poolP, Types.QUOTE_TOKEN, quoteNeed, null, now) > 0) { repaid := true };
+    if (repayPoolFromFree(poolP, baseToken, baseNeed, null, now) > 0) { repaid := true };
+    // A BASE residue the pool holds no base to pay is settled from its free
+    // QUOTE, capped (task 1788516128). A SHORT's close buys back the debt as
+    // sized at CALL time (closePosition accrues before sizing), but the fill
+    // settles in a LATER message — the mark update that releases the staged
+    // buy, or the 15 s expiry pass — and the base debt keeps accruing until
+    // then. The pool then holds EXACTLY the call-time size in base, repays it
+    // above, and is left owing the in-flight interest in base with none left
+    // to pay — while holding the quote the buy-back did not spend. That
+    // residue kept vaultLentOutUsd > 0 (the redeem-side mark gate armed on
+    // every pend, exactly the class 1788515291 closed for longs) and is the
+    // "dust shorts unclosable" shape recorded atop lib/BorrowEngine.mo. It is
+    // OWED, and the borrower has the quote: settle it at the mark, rounded UP
+    // against the borrower (BorrowEngine.settleFromQuote), and delete the
+    // entry. Never for a real position: refused (a no-op, the debt stays
+    // in-kind repayable) unless the residue is worth at most
+    // BASE_RESIDUE_CASH_SETTLE_CAP_USD at the mark, fits in the pool's free
+    // quote net of its resting-order earmark, and no order of the pool that
+    // would DELIVER this base (a staged or resting buy in its market — a
+    // partial close's remainder) is still in flight.
+    let bLeft = BorrowEngine.loanOf(loans, poolP, baseToken);
+    if (bLeft > 0 and baseToken != Types.QUOTE_TOKEN and not poolHasPendingBuy(poolP, baseToken)) {
+      let freeQuote = SafeMath.subOrZero(getAvailable(poolP, Types.QUOTE_TOKEN), quoteNeed);
+      let cap = Nat.min(BASE_RESIDUE_CASH_SETTLE_CAP_USD, freeQuote);
+      switch (BorrowEngine.settleFromQuote(loans, accounts, ammPrincipal(), poolP, baseToken, now, marginPriceLookup, cap)) {
+        case (#ok(paid)) { if (paid > 0) { repaid := true } };
+        case (#err(_)) {};   // over the cap / no mark / no free quote: stays a real, in-kind claim
+      };
     };
-    let bDebt = BorrowEngine.loanOf(loans, poolP, baseToken);
-    if (bDebt > 0) {
-      let av = getAvailable(poolP, baseToken);
-      let free = SafeMath.subOrZero(av, baseNeed);
-      let pay = Nat.min(bDebt, free);
-      if (pay > 0) { ignore BorrowEngine.repay(loans, accounts, ammPrincipal(), poolP, baseToken, pay, now, marginPriceLookup) };
+    // The repayment releases its impairment provision in the SAME message
+    // (task 1788480502) — a fill that lands on a mark update lands after that
+    // update's own scan, so without this the cached gross would carry the
+    // repaid loan's EL until the next scan.
+    if (repaid) { reprovisionPool(poolP) };
+  };
+
+  // The most a pool's BASE debt residue may be worth at the mark for
+  // deleveragePool to settle it from quote: $5. Sized against the physics of
+  // the residue — interest on the short between closePosition's own accrual
+  // and the fill's settlement, a window bounded by the staged release
+  // (DEFERRED_EXPIRY_NS = 15 s, processed on the finaliser cadence — call it
+  // ≤ 45 s live): at the highest base APR (10 %, SOL/ICP; BTC/ETH 8 %) that is
+  // 1.4e-7 of the notional, so $5 covers a short of up to ~$35M — more than
+  // 30× the largest short the vault can lend (its base leg × the 50 % borrow
+  // fraction cap, on a basket well under $10M). And small: $5 is under the
+  // smallest order the venue admits (Types.MIN_ORDER_ICPUSD = $10 — no
+  // deliberate position is that small), and a cash settle at the mark
+  // forgoes at most the AMM half-spread on $5 (≈ a cent), so nothing can be
+  // extracted by leaving residues on purpose.
+  // Above the cap the residue stays a real in-kind claim (the borrower's next
+  // close buys it) — the pre-existing behaviour, no new failure mode.
+  transient let BASE_RESIDUE_CASH_SETTLE_CAP_USD : Nat = 500_000_000;   // $5 at 10^8
+
+  // Does the pool have an order in flight that would DELIVER `baseToken` —
+  // a staged (deferred) or resting BUY in that base's market? deleveragePool
+  // must not cash-settle a base residue such an order is about to cover, or
+  // the pool would end up long the residue instead of flat.
+  func poolHasPendingBuy(poolP : Principal, baseToken : Types.TokenId) : Bool {
+    for (id in ownerIdxIds(deferredIdsByOwner, poolP).vals()) {
+      switch (Map.get(deferredExecs, Nat.compare, id)) {
+        case (?d) { if (d.baseToken == baseToken and d.side == #buy) { return true } };
+        case null {};
+      };
     };
+    for (o in OrderBook.getUserOpenOrders(orderStore, poolP).vals()) {
+      if (o.side == #buy and OrderBook.remaining(o) > 0) {
+        switch (Map.get(markets, Text.compare, o.marketId)) {
+          case (?(b, _)) { if (b == baseToken) { return true } };
+          case null {};
+        };
+      };
+    };
+    false
   };
 
   // After a pool principal is liquidated, reconcile its Position records to the
@@ -5489,6 +7246,63 @@ persistent actor Uplands {
   let insuranceShares      = Map.empty<Text, Nat>();
   var insuranceShareSupply : Nat = 0;
   var uncoveredBadDebtUsd  : Nat = 0;
+  // H-35 (F42, decision D3 (a)): when each holder LAST staked — userText →
+  // Time.now() at the mint. unstakeInsurance refuses until
+  // INSURANCE_UNSTAKE_COOLDOWN_NS has elapsed since this stamp, so a stake
+  // entered one message before a predictable solvent liquidation (the 30 s
+  // HB_LIQ_NS sweep, readable through getLiquidationSweepHealth /
+  // getMarginRiskSummary) cannot exit one message after it with A/(V+A) of
+  // the penalty that the long-term stakers carried the bad-debt risk for.
+  // A top-up RESTARTS the clock for the whole holding (the simplest rule the
+  // decision named; a per-lot ledger was rejected as state growth for no
+  // added protection). Keyed like insuranceShares and kept a SUBSET of it:
+  // the stamp is written only at a mint and deleted when the holding falls
+  // to zero, so the map is bounded by the share map. A holder WITHOUT a
+  // stamp (shares minted before this upgrade, or a controller seed through
+  // seedInsuranceFund — controller-only, never on #production, and the
+  // operator's seed IS the long-term stake the cooldown protects) is
+  // unlocked. STABLE and ADDITIVE (EOP adds fields freely; drops need a
+  // migration) — the penalty distribution itself is unchanged, so the
+  // #insShareDelta replay stays reconcilable.
+  let insuranceStakedAt    = Map.empty<Text, Int>();
+  // Longer than one liquidation cycle (HB_LIQ_NS = 30 s) by a wide margin,
+  // and past the sweep's backed-off retry cadence short of its 32 min cap —
+  // the skim needs the event to land inside the window between entry and
+  // exit, and the window is now 10 min wide on both sides of every sweep.
+  // TRANSIENT (W5-12 / hygiene §7b): a plain let would be stable and the
+  // upgrade would keep the first-installed value.
+  transient let INSURANCE_UNSTAKE_COOLDOWN_NS : Int = 600_000_000_000; // 10 min
+  // Per-loan impairment reserve cache (task 1788475754) — the per-pool
+  // expected-loss scan NAV deducts from the loan book (refreshVaultImpairment;
+  // rationale at that function and in docs/amm-vault-design.md §5). Stable so
+  // NAV is provisioned from the first query after an upgrade, not from the
+  // first heartbeat. Added fields only — EOP refuses drops, never adds.
+  var vaultImpairmentGrossUsd   : Nat = 0;   // Σ per-pool VaultMath.expectedLoss, at marks
+  var vaultImpairedLoans        : Nat = 0;   // pools carrying a non-zero provision
+  var vaultImpairmentComputedNs : Int = 0;   // when the scan last ran (0 = never / wiped)
+  // The D and C the gross was PRICED ON (task 1788733762): Σ debt (rounded
+  // up) and Σ haircut collateral (rounded down) over the impaired pools, as
+  // BorrowEngine.getHealth returned them to the scan. A pool's debt accrues
+  // interest on every read (getMyMarginPools accrues to now before it
+  // reports), so a reader re-deriving the gross from a LATER read of the
+  // pool lands a few seconds of interest above it (~14.5k units/s on a $90k
+  // ICPUSD loan at 5 %) — these two figures are the exact inputs, so
+  // gross == VaultMath.expectedLoss(D, C) holds to the base unit for a
+  // one-pool book and Σ EL_i over the map for N. Add-only, like the three
+  // above; the map below carries the per-pool split.
+  var vaultImpairedDebtUsd       : Nat = 0;   // Σ D of the provisioned pools, as priced
+  var vaultImpairedCollateralUsd : Nat = 0;   // Σ C of the provisioned pools, as priced
+  // The per-pool split of that gross — poolId → { el; debtUsd; collUsd },
+  // non-zero-EL entries only — so a LOAN-BOOK MUTATION (borrow, repay,
+  // write-off, seize) re-provisions ONE pool and adjusts the aggregates by
+  // the delta instead of rescanning (reprovisionPool, task 1788480502).
+  // TRANSIENT: it is derivable from the scan, so no stable-schema change;
+  // after an upgrade the latch below is false and the first incremental
+  // request runs the full scan instead — the stable gross can never
+  // double-count a pool the map has not seen.
+  type PoolProvision = { el : Nat; debtUsd : Nat; collUsd : Nat };
+  transient let vaultProvisionByPool = Map.empty<Nat, PoolProvision>();
+  transient var vaultProvisionMapValid : Bool = false;
   // Penalties EARNED by stakers that the vault has not paid across yet — a
   // liability of the vault and a claim of the fund. See accrueInsurancePenalty
   // for why a solvent vault can still be unable to pay one on the spot.
@@ -5519,9 +7333,12 @@ persistent actor Uplands {
   // non-transient constant would keep its OLD value on upgrade and silently no-op.
   // BASE (level-0) rates. The rate a party actually pays comes from the earned
   // fee-level ladder (MAKER/TAKER_TENTH_BPS[level] in quoteFeeFor) — these two
-  // remain the WORST-CASE bounds used for reservation sizing (parkDeferred,
-  // swap sizing, quoteNeed): reserve at the ceiling, settle at the earned rate,
-  // so a discount can never under-reserve.
+  // remain the WORST-CASE bounds used for RESERVATION sizing (parkDeferred,
+  // quoteNeed): reserve at the ceiling, settle at the earned rate, so a
+  // discount can never under-reserve. Swap QUANTITY sizing is NOT a
+  // reservation and sizes at the caller's earned rate
+  // (quoteFeeFor(caller, 10_000, #takerDebit)) — at the ceiling the qty cap
+  // bound before the budget for a discounted caller (#55 flat-rate sizing).
   transient let MAKER_FEE_BPS : Nat = 5;    // 5 bps  — resting/passive (maker) leg, L0
   transient let TAKER_FEE_BPS : Nat = 10;   // 10 bps — aggressing/marketable (taker) leg, L0
 
@@ -5563,8 +7380,8 @@ persistent actor Uplands {
     or Principal.equal(p, treasuryPrincipal())
   };
 
-  // PURE fee-rate helper wired into the matching engine (ProtectionCtx.quoteFee)
-  // and finalisePendingMatch. Given a fill leg's gross quote notional and the
+  // PURE fee-rate helper wired into the matching engine (ProtectionCtx.quoteFee).
+  // Given a fill leg's gross quote notional and the
   // party's ROLE on that leg, returns the FEE amount — 0 for internal principals
   // (AMM/insurance/treasury only; margin pools are fee-bearing), exempt on BOTH the
   // debit and credit side. It
@@ -5677,6 +7494,23 @@ persistent actor Uplands {
     emitConfig(msg.caller, "setBridge", Principal.toText(p));
   };
   public query func getBridge() : async ?Principal { cachedBridge() };
+  // #55.2 verification surface: WHICH wiring resolves the Bridge — the
+  // break-glass override (setBridge) or the deploy-injected env — so a test
+  // can assert the season wipe went through the env path rather than through
+  // a setBridge some earlier suite happened to leave behind.
+  public query func getBridgeWiring() : async { override : ?Principal; env : ?Principal } {
+    { override = _bridgePrincipal; env = _envBridgeCache };
+  };
+  // #dev hook: replace or CLEAR the override (null → the env wiring is the
+  // only resolver again). setBridge has no unset and never needed one until a
+  // suite wanted to pin the env path on a venue an earlier test had wired.
+  public shared (msg) func setTestBridgeOverride(p : ?Principal) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    if (not IS_DEV) { return #err("setTestBridgeOverride is a dev-only hook (posture: play/production)") };
+    _bridgePrincipal := p;
+    logEvent("info", "system", "Bridge override set by test hook: " # (switch (p) { case (?q) { Principal.toText(q) }; case null { "cleared (env wiring resolves)" } }), null);
+    #ok
+  };
 
   // ── Arbitrage canister: simulated external market ─────────────────
   // docs/amm-vault-design.md §"The missing arbitrageur". Synthetic play assets
@@ -5854,6 +7688,7 @@ persistent actor Uplands {
   // fold still reproduces balances.
   public shared (msg) func donateToVault(amount : Nat, fromTreasury : Bool) : async { #ok; #err : Text } {
     requireController(msg.caller);
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     if (amount == 0 or amount > 100_000_000_000_000) { return #err("amount must be 0 < a <= $1M e8") };
     // The fromTreasury=true path debits the treasury first and is
     // conservation-neutral, so it stays available. The false path is a bare
@@ -5901,6 +7736,7 @@ persistent actor Uplands {
   // is stale by construction. Trailing opt — omitted means unbounded (legacy).
   public shared (msg) func extMarketSwap(token : Types.TokenId, side : ArbSide, baseAmount : Nat, maxMarkE8 : ?Nat) : async { #ok : Nat; #err : Text } {
     if (not isArbitrageur(msg.caller)) { return #err("Caller is not the wired arbitrage canister") };
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     // #importBase mints synthetic base supply against no custody, and this is
     // reachable by a NON-controller (the wired arb canister) — so it is the one
     // unbacked-credit path an attacker could reach without the controller key.
@@ -5990,9 +7826,10 @@ persistent actor Uplands {
         // W4-25: an export of base whose import produced ZERO venue fills is
         // an UNWIND — credit that import's charge back to the budget,
         // bounded by the memo (single-slot, decremented, voided by any
-        // settled arb fill via bumpPartyVolume, expired after 30s). Without
-        // this a spoofed cycle kept its charge and ~2 minutes of spoof
-        // bursts darked the import leg for the rest of the hour.
+        // settled arb fill via bumpPartyVolume, expired after
+        // ARB_UNWIND_MEMO_TTL_NS = 60 s). Without this a spoofed cycle kept
+        // its charge and ~2 minutes of spoof bursts darked the import leg
+        // for the rest of the hour.
         switch (Map.get(_arbLastImport, Text.compare, token)) {
           case (?memo) {
             if (now - memo.atNs <= ARB_UNWIND_MEMO_TTL_NS and memo.remaining > 0) {
@@ -6101,8 +7938,8 @@ persistent actor Uplands {
     myUptimePct        : ?Nat;
     myUptimeSamples    : Nat;
     myUptimeQualified  : Bool;   // passing the L4 uptime gate right now
-    myStagedCount      : Nat;
-    myOpenOrderCount   : Nat;    // resting orders vs the eviction cap below
+    myStagedCount      : Nat;    // staged orders + staged cross-swaps (H-13) vs thresholds.stagedCapPerOwner
+    myOpenOrderCount   : Nat;    // resting orders (account + owned pools) vs the eviction cap below
     openOrderCap       : Nat;
     myDeadmanArmed     : Bool;   // armed = SPOT-WALLET orders auto-cancel on expiry; pool-owned orders are NOT swept (2026-08-20 — see tickDeadman)
     timersPaused       : Bool;   // #47.1: the ops brake, cross-referenced beside the armed flag (the deadman still fires under it — see getMyCancelAllAfter)
@@ -6157,7 +7994,7 @@ persistent actor Uplands {
       myUptimeSamples  = samples;
       myUptimeQualified = uptimeQualified(k);
       myStagedCount    = stagedCountOf(msg.caller);
-      // GHSA-97xp: beneficial-owner count (self + owned pools) — see
+      // GHSA-97xp / #52.1: beneficial-owner count (self + owned pools) — see
       // ownerOpenOrderCount; the raw-principal count undercounted pool orders.
       myOpenOrderCount = ownerOpenOrderCount(msg.caller);
       openOrderCap     = Option.get(_testOrderCap, USER_OPEN_ORDER_CAP);
@@ -6247,6 +8084,17 @@ persistent actor Uplands {
     recomputeShedFloor();
   };
 
+  // Test/ops (H-13): pin the STAGED-depth shed bands the same way, so the
+  // staged signal — deferredExecs + deferredSwaps — is testable from a few
+  // dozen real staged cross-swaps instead of SHED_SOFT_STAGED (2,000) of
+  // them. null releases the pin; recomputes at once like its sibling.
+  public shared (msg) func setTestStagedShedBands(bands : ?(Nat, Nat, Nat, Nat)) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestStagedShedBands");
+    _testStagedShedBands := bands;
+    recomputeShedFloor();
+  };
+
   // Test/ops: inject or clear a circuit-breaker pending jump (dev only), so
   // the M1 LP-mint gate is testable deterministically — the real pend is only
   // reachable through live oracle traffic. `price` is the proposed (held-out)
@@ -6333,10 +8181,46 @@ persistent actor Uplands {
   // team's), so value integrity can't depend on it not double-calling.
   let creditedSeq = Map.empty<Text, Nat>();
 
-  public shared (msg) func creditAndRegister(user : Principal, token : Types.TokenId, amount : Nat, seq : Nat) : async { #ok; #err : Text } {
+  // H-15 (F5-DEX): the RELAY CEILING — the DEX half of H-27's Bridge gate.
+  // `amount`, `seq`, `pendingUnits` and the legacy `outstanding` hints are
+  // unbounded Nats from the caller, and until this gate the only bound on the
+  // three Bridge-facing updates below was `amount == 0`. A ~100 KB Nat then
+  // reached a refusal that formats it (or a value derived from it) through
+  // Nat.toText — the per-decimal-digit bignum loop, Θ(bits²) — so THIS
+  // canister burned its whole 40 B instruction budget (~20 DTS rounds during
+  // which nothing else ran) and trapped with IC0522; the Bridge's catch arm
+  // rolled its own writes back, but the stall was reachable on demand by any
+  // email-bound player (and a huge `seq` would also have been STORED in
+  // playAdmitSeq/creditedSeq — 100 KB of state per call). Now every relayed
+  // Nat above SafeMath.RELAY_CEILING (2^128 — the Bridge's AMOUNT_CEILING,
+  // kept in step so the two halves agree) is refused FIRST: before the
+  // replay-seq compare, before valuation, before any write. The compare is
+  // one linear bignum op, and everything that passes has ≤ 39 decimal digits,
+  // so no downstream formatting can be expensive again. Belt to that brace:
+  // the refusal texts below format caller-derived values ONLY through
+  // SafeMath.natDisplay (plain digits at or below the ceiling, a clamp text
+  // above it) — never Nat.toText — so a legacy or ops-written bignum already
+  // in state (a huge creditedSeq) cannot resurrect the cost either. The
+  // refusal never echoes the offending value (formatting it is the cost).
+  transient let RELAY_CEILING : Nat = SafeMath.RELAY_CEILING;
+  transient let RELAY_CEILING_MSG : Text = "Amount or sequence exceeds the deposit relay ceiling (2^128 units) — refused before valuation; nothing was reserved, credited or written";
+
+  // `pendingUnits` (trailing `opt nat`, candid-additive — a 4-argument caller
+  // decodes it as null): the units of this (user, token) the Bridge has
+  // ADMITTED but not yet CONFIRMED at the moment of this claim. Its claimable
+  // (confirmed − claimed) is disjoint from its pending, so no claim can cover
+  // pending units — the settlement below fences them off from the
+  // reservation it consumes. null = no ledger knowledge (an ops credit, a
+  // pre-fence Bridge): nothing is fenced, i.e. the pre-3088472021 semantics.
+  public shared (msg) func creditAndRegister(user : Principal, token : Types.TokenId, amount : Nat, seq : Nat, pendingUnits : ?Nat) : async { #ok; #err : Text } {
     let isBridge = switch (effectiveBridge<system>()) { case (?b) { Principal.equal(msg.caller, b) }; case null { false } };
     if (not (isBridge or Principal.isController(msg.caller))) { return #err("Only the Bridge canister may credit deposits") };
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     if (amount == 0) { return #err("Amount must be positive") };
+    // H-15: the relay ceiling, ahead of the seq compare, the slice arithmetic,
+    // the valuation and every write (see RELAY_CEILING above). `pendingUnits`
+    // wears it too: it is compared against the reservation below.
+    if (amount > RELAY_CEILING or seq > RELAY_CEILING or Option.get(pendingUnits, 0) > RELAY_CEILING) { return #err(RELAY_CEILING_MSG) };
     ensureInit<system>();
     // Idempotency gate: a seq we've already applied (or passed) is a replay —
     // no-op BEFORE any mint or allowance consumption. A REJECTED credit (e.g.
@@ -6370,10 +8254,13 @@ persistent actor Uplands {
     //
     // Refuse and say so. A refusal costs one failed claim and is trivially
     // repaired by advancing `creditedSeq`; a silent mint is unrecoverable.
+    // (natDisplay, never Nat.toText: amount/seq are ceiling-bounded above,
+    // creditAmt ≤ seq, but prevSeq is STATE — a bignum written before the
+    // ceiling existed, or by an ops call, must not cost the budget here.)
     if (creditAmt > amount) {
-      return #err("Deposit ledger divergence: bridge sent " # Nat.toText(amount)
-        # " units but our high-water implies " # Nat.toText(creditAmt)
-        # " (seq " # Nat.toText(seq) # " vs applied " # Nat.toText(prevSeq)
+      return #err("Deposit ledger divergence: bridge sent " # SafeMath.natDisplay(amount)
+        # " units but our high-water implies " # SafeMath.natDisplay(creditAmt)
+        # " (seq " # SafeMath.natDisplay(seq) # " vs applied " # SafeMath.natDisplay(prevSeq)
         # "). Refusing to credit — reconcile creditedSeq before retrying.");
     };
     // Play-mode lifetime allowance — RESERVATION settlement (the model lives
@@ -6391,25 +8278,54 @@ persistent actor Uplands {
       case null {};
       case (?cap) {
         let reserved = Option.get(Map.get(playReservedUnits, Text.compare, sk), 0);
-        if (creditAmt <= reserved) {
+        // THE FENCE (task 3088472021, the settlement-side twin of #55). The
+        // reservation is per (user, token) and covers EVERY admitted-but-
+        // uncredited unit — including a deposit still PENDING on the Bridge
+        // (admitted and allowance-charged at press time, not yet confirmed).
+        // A claim can only ever cover CONFIRMED units (the Bridge's claimable
+        // is disjoint from its pending), so the pending's units are not this
+        // claim's to consume: the Bridge names them and they are fenced off.
+        // Without the fence, a claim larger than the reservation (a legacy
+        // claimable, an ops credit, a re-armed allowance) took the pending's
+        // reserved units as its own — under-valuing ITS excess — and the
+        // pending's later claim found reserved == 0, ran the excess branch,
+        // and was re-valued at current marks + debited a SECOND time (or
+        // refused, stranding an ADMITTED deposit — the one thing the
+        // reservation model promises cannot happen). The fence never exceeds
+        // the reservation, so an over-stated hint can only push units of
+        // THIS claim into the valued excess path: user-unfavourable, never a
+        // free mint — custody code still cannot mint play value here.
+        //   INVARIANT at every exit of this block:
+        //     reservedUnits ≥ min(reserved, pendingUnits)
+        //   — the Bridge's pending for this key stays reserved across a claim,
+        //   whichever branch settles it (below: reserved − creditAmt ≥ fenced
+        //   on the normal branch; exactly `fenced` on the excess branch).
+        let fenced : Nat = Nat.min(reserved, Option.get(pendingUnits, 0));
+        let available : Nat = reserved - fenced;   // the reservation this claim may consume
+        if (creditAmt <= available) {
           setReservedUnits(sk, (reserved - creditAmt) : Nat);
         } else {
-          let excess : Nat = creditAmt - reserved;
+          let excess : Nat = creditAmt - available;
           let bucket = switch (playBucketFor(user)) {
             case (#err(e)) { return #err(e) };
             case (#ok(b)) { b };
           };
-          switch (markValueUsd(token, excess)) {
-            case null { return #err("Deposit can't be valued — no mark price for " # token # " yet; try again once its market is live") };
-            case (?v) {
+          // H-33: the excess is valued at a FRESH, un-pended mark only (the
+          // 5-min wall) — a stale refusal rolls the Bridge back like any #err.
+          switch (markValueUsdFresh(token, excess, Time.now())) {
+            case (#err(e)) { return #err(e) };
+            case (#ok(v)) {
               let used = playUsedOf(bucket);
               if (used + v > cap) {
                 let remaining : Nat = if (cap > used) { cap - used } else { 0 };
                 return #err("Play-mode deposit allowance exceeded: this claim is worth ≈$"
-                  # Nat.toText(v / 100_000_000) # " at mark, but only $" # Nat.toText(remaining / 100_000_000)
+                  # SafeMath.natDisplay(v / 100_000_000) # " at mark, but only $" # Nat.toText(remaining / 100_000_000)
                   # " of the $" # Nat.toText(cap / 100_000_000) # " lifetime allowance remains");
               };
-              setReservedUnits(sk, 0);
+              // Consumed everything this claim MAY consume (`available`); the
+              // fenced units — the still-pending admissions — stay reserved
+              // for their own claims. (Pre-fence this was a flat 0.)
+              setReservedUnits(sk, fenced);
               playDebit(bucket, v);
             };
           };
@@ -6419,6 +8335,7 @@ persistent actor Uplands {
     Accounts.addBalance(accounts, user, token, creditAmt);
     Map.add(creditedSeq, Text.compare, sk, seq);                            // advance the applied high-water
     Map.add(registeredUsers, Text.compare, Principal.toText(user), true);   // first deposit = registration
+    preRegPromote(user);                                                    // H-36: …which lifts the pre-registration record out of the bounded store
     awardBadge(Principal.toText(user), BADGE_JOIN, Time.now());             // …and the first badge
     appendDeposit(user, { token; amount = creditAmt; timestamp = Time.now(); kind = #deposit });
     bumpUserVersion(user);
@@ -6528,6 +8445,32 @@ persistent actor Uplands {
     switch (AMM.getPool(pools, token # "-" # Types.QUOTE_TOKEN)) {
       case (?p) { if (p.refPrice > 0) { ?Fixed.mul(amount, p.refPrice, true) } else { null } };
       case null { null };
+    };
+  };
+
+  // H-33 (F47): the ADMISSION bar — a play deposit is valued only at a fresh,
+  // un-pended mark. markValueUsd above reads `p.refPrice` with no age bound
+  // and no circuit-breaker check, so a deposit made while an asset's mark sat
+  // frozen below market (an oracle outage, a held-out jump) was charged
+  // allowance at the stale value. The bar is the 5-min MARGIN wall, not the
+  // 60 s LP/swap bar (LP_DEPOSIT_MAX_REF_AGE_NS): quiet markets refresh at
+  // ≥ 45 s age on a 30 s cadence, so a 60 s bar would refuse honest deposits
+  // between refreshes. ICPUSD is 1:1 and never stale. The verdict itself is
+  // AMM.markStaleReason (pure; boundary pinned in AMM.test.mo); the refusal
+  // text is actionable — the Bridge relays it and rolls its write-ahead back
+  // on #err (W3-04), so a refused deposit is never created.
+  transient let PLAY_DEPOSIT_MAX_MARK_AGE_NS : Int = MARGIN_MAX_REFPRICE_AGE_NS;
+  func markValueUsdFresh(token : Types.TokenId, amount : Nat, now : Int) : { #ok : Nat; #err : Text } {
+    if (token == Types.QUOTE_TOKEN) { return #ok(amount) };
+    switch (AMM.getPool(pools, token # "-" # Types.QUOTE_TOKEN)) {
+      case null { #err("Deposit can't be valued — no mark price for " # token # " yet; try again once its market is live") };
+      case (?p) {
+        let pended = Map.get(pendingPriceJumps, Text.compare, token) != null;
+        switch (AMM.markStaleReason(p, pended, now, PLAY_DEPOSIT_MAX_MARK_AGE_NS)) {
+          case (?why) { #err("Deposit can't be valued — " # why # " (nothing was created, nothing was consumed)") };
+          case null { #ok(Fixed.mul(amount, p.refPrice, true)) };
+        };
+      };
     };
   };
 
@@ -6735,6 +8678,10 @@ persistent actor Uplands {
     let isBridge = switch (effectiveBridge<system>()) { case (?b) { Principal.equal(msg.caller, b) }; case null { false } };
     if (not (isBridge or Principal.isController(msg.caller))) { return #err("Only the Bridge canister may check deposit admission") };
     if (amount == 0) { return #err("Amount must be positive") };
+    // H-15: the relay ceiling — the amount AND every outstanding hint (each
+    // is valued below), ahead of the valuation (see RELAY_CEILING above).
+    if (amount > RELAY_CEILING) { return #err(RELAY_CEILING_MSG) };
+    for ((_, a) in outstanding.vals()) { if (a > RELAY_CEILING) { return #err(RELAY_CEILING_MSG) } };
     switch (playDepositCap()) {
       case null { #ok };
       case (?cap) {
@@ -6742,9 +8689,11 @@ persistent actor Uplands {
           case (#err(e)) { return #err(e) };
           case (#ok(b)) { b };
         };
-        switch (markValueUsd(token, amount)) {
-          case null { #err("Deposit can't be valued — no mark price for " # token # " yet; try again once its market is live") };
-          case (?v) {
+        // H-33: the amount itself wears the admission freshness bar too
+        // (the outstanding hints stay best-effort: skipped when unpriceable).
+        switch (markValueUsdFresh(token, amount, Time.now())) {
+          case (#err(e)) { #err(e) };
+          case (#ok(v)) {
             var unclaimedUsd : Nat = 0;
             for ((t, a) in outstanding.vals()) {
               switch (markValueUsd(t, a)) { case (?w) { unclaimedUsd += w }; case null {} };
@@ -6753,7 +8702,7 @@ persistent actor Uplands {
             if (committed + v > cap) {
               let remaining : Nat = if (cap > committed) { cap - committed } else { 0 };
               #err("Play-mode deposit allowance exceeded: this deposit is worth ≈$"
-                # Nat.toText(v / 100_000_000) # " at mark, but only $" # Nat.toText(remaining / 100_000_000)
+                # SafeMath.natDisplay(v / 100_000_000) # " at mark, but only $" # Nat.toText(remaining / 100_000_000)
                 # " of the $" # Nat.toText(cap / 100_000_000)
                 # " lifetime allowance remains (claimed and unclaimed deposits both count)");
             } else { #ok };
@@ -6791,6 +8740,10 @@ persistent actor Uplands {
     let isBridge = switch (effectiveBridge<system>()) { case (?b) { Principal.equal(msg.caller, b) }; case null { false } };
     if (not (isBridge or Principal.isController(msg.caller))) { return #err("Only the Bridge canister may admit deposits") };
     if (amount == 0) { return #err("Amount must be positive") };
+    // H-15: the relay ceiling on BOTH Nats, ahead of the replay-seq compare,
+    // the valuation and the reservation writes (see RELAY_CEILING above) —
+    // a huge seq would otherwise be STORED in playAdmitSeq.
+    if (amount > RELAY_CEILING or seq > RELAY_CEILING) { return #err(RELAY_CEILING_MSG) };
     switch (playDepositCap()) {
       case null { #ok };   // no cap → nothing to consume (claims are uncapped too)
       case (?cap) {
@@ -6800,14 +8753,15 @@ persistent actor Uplands {
           case (#err(e)) { return #err(e) };
           case (#ok(b)) { b };
         };
-        switch (markValueUsd(token, amount)) {
-          case null { #err("Deposit can't be valued — no mark price for " # token # " yet; try again once its market is live") };
-          case (?v) {
+        // H-33: valued at a FRESH, un-pended mark only (the 5-min wall).
+        switch (markValueUsdFresh(token, amount, Time.now())) {
+          case (#err(e)) { #err(e) };
+          case (#ok(v)) {
             let used = playUsedOf(bucket);
             if (used + v > cap) {
               let remaining : Nat = if (cap > used) { cap - used } else { 0 };
               return #err("Play-mode deposit allowance exceeded: this deposit is worth ≈$"
-                # Nat.toText(v / 100_000_000) # " at mark, but only $" # Nat.toText(remaining / 100_000_000)
+                # SafeMath.natDisplay(v / 100_000_000) # " at mark, but only $" # Nat.toText(remaining / 100_000_000)
                 # " of the $" # Nat.toText(cap / 100_000_000)
                 # " lifetime allowance remains (the allowance is consumed when a deposit is made)");
             };
@@ -6819,6 +8773,35 @@ persistent actor Uplands {
         };
       };
     };
+  };
+
+  // Bridge-facing RESERVATION VIEW (#55 "phantom pending"). The Bridge writes
+  // its pending row AHEAD of our verdict (W3-04), so an admission that never
+  // reached us — the call rejected at the system level because this canister
+  // was STOPPED (every DEX upgrade goes through a stop) while the Bridge's own
+  // continuation was lost to its upgrade in the same window — leaves a
+  // pending the Bridge cannot tell from an admitted one. Before it confirms a
+  // pending into a claimable, the Bridge asks here whether the admission
+  // actually landed. `admitSeq` is the last admission seq we APPLIED for this
+  // user+token (the replay gate above): a Bridge counter that has run ahead
+  // of it names EXACTLY the units we never reserved — sharper than "is the
+  // reservation zero", which adminResetPlayAllowances can zero under a
+  // perfectly legitimate pending (a claim's excess branch no longer can: it
+  // fences the Bridge-named pending units, 3088472021). `reservedUnits` is the
+  // still-uncredited reservation; `capActive` says whether admissions are
+  // reserved at all on this posture (they are not on #production, where the
+  // stub Bridge is refused anyway). Read-only; Bridge-or-controller, the same
+  // gate as the three Bridge-facing updates above. Additive candid.
+  public query (msg) func playDepositReservation(user : Principal, token : Types.TokenId)
+    : async { #ok : { capActive : Bool; reservedUnits : Nat; admitSeq : Nat }; #err : Text } {
+    let isBridge = switch (cachedBridge()) { case (?b) { Principal.equal(msg.caller, b) }; case null { false } };
+    if (not (isBridge or Principal.isController(msg.caller))) { return #err("Only the Bridge canister may read deposit reservations") };
+    let sk = Accounts.balKey(user, token);
+    #ok({
+      capActive = playDepositCap() != null;
+      reservedUnits = Option.get(Map.get(playReservedUnits, Text.compare, sk), 0);
+      admitSeq = Option.get(Map.get(playAdmitSeq, Text.compare, sk), 0);
+    });
   };
 
   // Dev-only: arm/override the cap so tests can exercise the play-mode
@@ -6868,9 +8851,23 @@ persistent actor Uplands {
     let cur = getInsuranceShares(user);
     if (cur < amt) { return false };
     let rem : Nat = cur - amt;
-    if (rem == 0) { ignore Map.delete(insuranceShares, Text.compare, Principal.toText(user)) }
+    if (rem == 0) {
+      ignore Map.delete(insuranceShares, Text.compare, Principal.toText(user));
+      // H-35: the stamp lives exactly as long as the holding (bounded map).
+      ignore Map.delete(insuranceStakedAt, Text.compare, Principal.toText(user));
+    }
     else { Map.add(insuranceShares, Text.compare, Principal.toText(user), rem) };
     true
+  };
+  // H-35: when `user` may unstake — their latest stake stamp plus the
+  // cooldown; 0 (the epoch, i.e. unlocked) for a holder with no stamp. ONE
+  // function shared by the unstakeInsurance gate and the getMyInsuranceStake
+  // quote, so the refusal and the quote can never disagree (#48.1's shape).
+  func insuranceUnlockAtNs(user : Principal) : Int {
+    switch (Map.get(insuranceStakedAt, Text.compare, Principal.toText(user))) {
+      case (?stakedAt) { stakedAt + INSURANCE_UNSTAKE_COOLDOWN_NS };
+      case null { 0 };
+    }
   };
 
   // Route a liquidation penalty (USD) into the staked pool — realised as
@@ -6932,6 +8929,12 @@ persistent actor Uplands {
     for (d in BorrowEngine.getDebt(loans, user, marginPriceLookup).vals()) {
       ignore BorrowEngine.writeOffLoan(loans, user, d.token, d.principal, now);
     };
+    // The written-off loan's provision dies with it (task 1788480502), and
+    // the lock index settles on THIS message's shrink net of the uncovered
+    // slice (task 1788752774): the covered slice just landed in the vault as
+    // cash and keeps scaling the locks; the uncovered one is a loss — every
+    // LP's cash entitlement is unchanged by it, so no lock may move for it.
+    reprovisionPoolAfterWriteOff(user, uncovered);
     (covered, uncovered);
   };
 
@@ -7027,6 +9030,7 @@ persistent actor Uplands {
   // not opaque timer registrations. (`_timersPaused` still quiesces it for tests.)
   transient var _lastFinaliseNs : Int = 0;
   transient var _lastAmmNs       : Int = 0;
+  transient var _lastAmmSnapNs   : Int = 0;   // H-09: the vault-snapshot subtask ("ammsnap")
   transient var _lastReapNs      : Int = 0;
   transient var _lastShipNs      : Int = 0;
   transient var _lastLiqNs       : Int = 0;
@@ -7053,9 +9057,13 @@ persistent actor Uplands {
   // so `pending` returns to 0 by construction: no reconciliation sweep, no
   // reset endpoint, and in particular NO time-based reset, which would mask
   // a stuck engine (the flag clears only on the completion stamp itself).
-  // Transient: an upgrade destroys any in-flight message, so "dispatch
-  // outstanding" cannot be true across an upgrade — re-learning from false
-  // is correct, same rationale as the hb breaker's transient counters.
+  // Transient: an upgrade cannot land inside an await on this toolchain —
+  // the Motoko runtime refuses it while a message is outstanding (#55 (d),
+  // measured: pre_upgrade traps "attempted with outstanding message
+  // callbacks"), so the upgrade lands only once the message is done and no
+  // dispatch is ever outstanding across one; a `true` reaching an upgrade
+  // could only be a trapped pass's stale latch, so re-learning from false
+  // is correct — same rationale as the hb breaker's transient counters.
   transient var _liqInFlight : Bool = false;
   // Consecutive dispatches that were still incomplete when the NEXT one came
   // due. Counters alone only make the failure visible; they do not stop it, and
@@ -7267,10 +9275,24 @@ persistent actor Uplands {
     // registration paths (setTestBalance/addTestTokens) that bypass it. Awarding
     // is idempotent, so no staging is needed — backfill a slice per tick and let
     // the cursor wrap to re-scan (catching newly dev-registered users).
+    // QUIET (3088514069): performWorldWipe once cleared `badges` but never
+    // `registeredUsers`, so the first tick after a season reset re-granted the
+    // join badge to EVERY registered principal at once — one per-user ring-log
+    // line each (161 on a 160-user venue) buried the `Season N closed` line and
+    // the honest-seal error line, and past EVENT_LOG_CAP users would evict
+    // them. The slice grants through the silent primitive and reports ONE
+    // summary line; the per-user line stays on the inline first-deposit path.
+    // LIFETIME (1788515790): the wipe now KEEPS the join badge (it rides with
+    // registeredUsers), so after a season reset this sweep finds nothing to
+    // do — it remains the safety net for dev registration paths only.
+    var joinBackfilled = 0;
     let br = Shard.step<Bool>(registeredUsers, _tierBadgeCursor, TIER_BADGE_SHARD_SIZE, func(k) {
-      if (not hasBadge(k, BADGE_JOIN)) { awardBadge(k, BADGE_JOIN, now) };
+      if (grantBadge(k, BADGE_JOIN, now)) { joinBackfilled += 1 };
     });
     _tierBadgeCursor := if (br.completed) { null } else { br.nextCursor };
+    if (joinBackfilled > 0) {
+      logEventF("info", "access", ?"badge", null, "join-badge backfill: " # Nat.toText(joinBackfilled) # " awarded", null);
+    };
     // W5-19 (F30): volume badges are awarded inline by bumpPartyVolume; this
     // sharded, idempotent backfill covers only paths that bypass it (dev
     // setters writing lifetimeVol directly) — a slice per tick, cursor wraps.
@@ -7285,6 +9307,24 @@ persistent actor Uplands {
   // that market's ref price at ≥ MM_MIN_DEPTH_USD quote value per side. Stats
   // accrue to the SCORECARD key (a pool's resting orders credit its owner).
   // Returns the scorecard key sampled, or null for internal principals.
+  //
+  // H-14 (F26): a side is credited only with the depth the owner's AVAILABLE
+  // balance could honour at sample time. Resting orders reserve nothing, so
+  // the order record alone said nothing about fundability: a player could
+  // rest $500/side within ±1%, move the backing into a stake / a pool / a
+  // staged order's soft-lock, and keep passing samples — L4's behavioural
+  // half (0 bps maker + the shield) — on quotes that could never fill. Each
+  // market's bids draw on a budget of the owner's available QUOTE and its
+  // asks on the owner's available BASE (valued at each order's own price);
+  // an order past its budget credits only the slice the budget still
+  // covers. Per market (the pass is per market too), in order-walk order,
+  // no book walk — the owner's open orders were already the iteration.
+  //
+  // H-24 (F2): a market on which the owner's quotes are SHIELDED at sample
+  // time (an L4 repricing intent in flight past the standing mark's dispatch
+  // — isMMShieldedFresh, the release pass's own predicate) credits nothing:
+  // no taker can reach those quotes, so they are not uptime. Pre-fix a
+  // permanently shielded phantom book sustained the L4 it was shielded by.
   func sampleUptime(rawKey : Text, now : Int) : ?Text {
     let p = Principal.fromText(rawKey);
     if (isInternalPrincipal(p)) { return null };
@@ -7292,17 +9332,29 @@ persistent actor Uplands {
     var pass = false;
     let bidVal = Map.empty<Text, Nat>();
     let askVal = Map.empty<Text, Nat>();
+    let quoteAvail = getAvailable(p, Types.QUOTE_TOKEN);
+    let bidBudget = Map.empty<Text, Nat>();   // marketId → quote still creditable
+    let askBudget = Map.empty<Text, Nat>();   // marketId → base still creditable
     for (o in OrderBook.getUserOpenOrders(orderStore, p).vals()) {
       switch (AMM.getPool(pools, o.marketId)) {
         case (?pool) {
-          if (pool.refPrice > 0) {
+          if (pool.refPrice > 0 and not isMMShieldedFresh(p, o.marketId, releaseRefOf(o.marketId).dispatchNs, now)) {
             let dev = if (o.price > pool.refPrice) { o.price - pool.refPrice : Nat } else { pool.refPrice - o.price : Nat };
             if (Fixed.mulDiv(dev, 10_000, pool.refPrice, true) <= MM_MAX_SPREAD_BPS) {
               let rem = SafeMath.subOrZero(o.quantity, o.filled);
-              let v = Fixed.mul(rem, o.price, false);
               switch (o.side) {
-                case (#buy)  { Map.add(bidVal, Text.compare, o.marketId, Option.get(Map.get(bidVal, Text.compare, o.marketId), 0) + v) };
-                case (#sell) { Map.add(askVal, Text.compare, o.marketId, Option.get(Map.get(askVal, Text.compare, o.marketId), 0) + v) };
+                case (#buy) {
+                  let budget = Option.get(Map.get(bidBudget, Text.compare, o.marketId), quoteAvail);
+                  let v = Nat.min(Fixed.mul(rem, o.price, false), budget);
+                  Map.add(bidBudget, Text.compare, o.marketId, (budget - v) : Nat);
+                  Map.add(bidVal, Text.compare, o.marketId, Option.get(Map.get(bidVal, Text.compare, o.marketId), 0) + v);
+                };
+                case (#sell) {
+                  let budget = Option.get(Map.get(askBudget, Text.compare, o.marketId), getAvailable(p, pool.baseToken));
+                  let q = Nat.min(rem, budget);
+                  Map.add(askBudget, Text.compare, o.marketId, (budget - q) : Nat);
+                  Map.add(askVal, Text.compare, o.marketId, Option.get(Map.get(askVal, Text.compare, o.marketId), 0) + Fixed.mul(q, o.price, false));
+                };
               };
             };
           };
@@ -7344,10 +9396,14 @@ persistent actor Uplands {
 
   // ── Load-shed floor (L1) ────────────────────────────────────────
   // TWO depth signals, each with its own hysteresis tier; the floor is their
-  // max. Staged-order depth is the original signal (the doc's open question
-  // #4: inspect can't maintain per-principal counters, and the per-owner
-  // staged cap already bounds each caller, so depth is the honest
-  // aggregate). W1-08 adds the archive ship queue: it grows in OUR heap
+  // max. Staged depth is the original signal (the doc's open question #4:
+  // inspect can't maintain per-principal counters, and the per-owner staged
+  // cap already bounds each caller, so depth is the honest aggregate) — and
+  // since H-13 (F22b) it is BOTH staged maps, deferredExecs + deferredSwaps:
+  // the cap-bounds-each-caller premise only holds because cross-swaps now
+  // count toward that cap too, and a signal that ignored deferredSwaps let
+  // ~10k soft-locked, refundable cross-swaps per account sit invisible to
+  // the floor. W1-08 adds the archive ship queue: it grows in OUR heap
   // whenever events are produced faster than the shipper's 200/s drain, the
   // L2 shed deliberately never fires on a healthy shipper, and an attacker
   // placing zero orders never moves staged depth — so free tape writes get
@@ -7361,9 +9417,14 @@ persistent actor Uplands {
     else if (depth < softLower) { 0 }
     else { cur };   // between softLower and soft: hold the current tier
   };
+  // Staged depth as the floor sees it: every entry in either staged map.
+  func stagedDepth() : Nat { Map.size(deferredExecs) + Map.size(deferredSwaps) };
   func recomputeShedFloor() {
-    _shedFloorStaged := shedTierOf(Map.size(deferredExecs), _shedFloorStaged,
-      SHED_SOFT_STAGED, SHED_HARD_STAGED, SHED_SOFT_LOWER, SHED_HARD_LOWER);
+    let (sst, hst, slt, hlt) = switch (_testStagedShedBands) {
+      case (?b) { b };
+      case null { (SHED_SOFT_STAGED, SHED_HARD_STAGED, SHED_SOFT_LOWER, SHED_HARD_LOWER) };
+    };
+    _shedFloorStaged := shedTierOf(stagedDepth(), _shedFloorStaged, sst, hst, slt, hlt);
     let (ss, hs, sl, hl) = switch (_testShipShedBands) {
       case (?b) { b };
       case null { (SHED_SOFT_SHIP, SHED_HARD_SHIP, SHED_SOFT_SHIP_LOWER, SHED_HARD_SHIP_LOWER) };
@@ -7389,14 +9450,20 @@ persistent actor Uplands {
     };
   };
 
-  // The actor had NO postupgrade hook at all, which is why the entropy latch
-  // below could survive an upgrade in a state that stopped it ever re-seeding:
-  // `_nameEntropySeeded` is stable and is assigned BEFORE its `await`, so an
-  // upgrade landing in that window kept the latch `true` while the pool it was
-  // guarding was never filled. Clearing it here makes the next heartbeat re-seed
-  // exactly once, which is the same remedy src/bridge/main.mo applies to its own
-  // set-before-await latches — and it costs one boolean rather than an `await`
-  // on every beat.
+  // The actor had NO postupgrade hook at all, so a stale entropy latch could
+  // survive an upgrade in a state that stopped it ever re-seeding:
+  // `_nameEntropySeeded` is stable and is assigned BEFORE its `await`. The
+  // stale shape was told as an upgrade landing in that window; #55 (d)
+  // measured that an upgrade cannot land inside an await on this toolchain
+  // (the Motoko runtime refuses it while a message is outstanding — the
+  // upgrade lands only once the beat is done), so a `true` latch meeting an
+  // upgrade with the pool never filled can only be the leftover of a seeding
+  // continuation that trapped after the set (the catch arm resets it on a
+  // throw, not on a trap). Clearing it here makes the next heartbeat re-seed
+  // exactly once — the recovery for that shape, and one extra fold of beacon
+  // entropy otherwise — which is the same remedy src/bridge/main.mo applies
+  // to its own set-before-await latches, and it costs one boolean rather than
+  // an `await` on every beat.
   system func postupgrade() {
     _nameEntropySeeded := false;
     // Re-latch the genesis window from surviving state: an install upgraded
@@ -7455,18 +9522,43 @@ persistent actor Uplands {
     Map.add(_hbDisp, Text.compare, name, disp + 1);
     true;
   };
-  func hbRun(name : Text, task : () -> ()) : async () {
+  func hbTrapTest(name : Text) {
     switch (_hbTrapTest) {
       case (?t) { if (t == name) { Runtime.trap("test trap: heartbeat subtask " # name) } };
       case null {};
     };
-    task();
+  };
+  // H-22: the breaker's current failure streak for a subtask (0 = healthy) —
+  // read by the GEPTOR finalizer to keep a tripped market's release pass out
+  // of the message that commits the fetched mark.
+  func hbStreakOf(name : Text) : Nat { Option.get(Map.get(_hbStreak, Text.compare, name), 0) };
+  func hbComplete(name : Text) {
     Map.add(_hbDone, Text.compare, name, Option.get(Map.get(_hbDisp, Text.compare, name), 0));
     if (Option.get(Map.get(_hbStreak, Text.compare, name), 0) > 0) {
       Map.add(_hbStreak, Text.compare, name, 0);
       logEvent("info", "system", "HEARTBEAT subtask '" # name # "' recovered", null);
     };
   };
+  func hbRun(name : Text, task : () -> ()) : async () {
+    hbTrapTest(name);
+    task();
+    hbComplete(name);
+  };
+  // H-09 (D7): the async variant — for a subtask that must itself SEND
+  // (finaliseExpiredPending fires processGeptorDue). The task is an `async*`
+  // computation awaited INLINE, so this is still one isolated message with
+  // the same accounting as hbRun: a trap inside the task kills this message
+  // before hbComplete, and the next hbReady sees dispatch > done. (A genuine
+  // `async` self-send awaited here would split the message across rounds
+  // and a 0.5s-cadence task would read as "lost" every beat on mainnet.)
+  func hbRunAsync(name : Text, task : () -> async* ()) : async () {
+    hbTrapTest(name);
+    await* task();
+    hbComplete(name);
+  };
+  // H-09 (D7): the per-market AMM subtasks' last-dispatch stamps
+  // ("amm:<marketId>" — the breaker keys on the same name).
+  transient let _lastAmmPoolNs = Map.empty<Text, Int>();
 
   // Observability for the breaker (and the isolation test): per-subtask
   // dispatch/completion/streak counters.
@@ -7502,12 +9594,17 @@ persistent actor Uplands {
     // Before this lands, drawUsername still varies (it folds in the clock) —
     // this replaces "varying" with "unpredictable". Ahead of the pause gate
     // so a paused venue still seeds.
-    // The latch is stable and set BEFORE the await, so an upgrade landing
-    // between the call and the reply destroyed the continuation while the latch
-    // survived as `true` — and nothing re-seeded, leaving the draw sequence a
-    // deterministic function of public registration timestamps, which is exactly
-    // what usernameFromDraws exists to prevent. The fix is the `postupgrade`
-    // below (the shape src/bridge/main.mo already documents and fixes), NOT a
+    // The latch is stable and set BEFORE the await. A continuation that never
+    // reaches `_nameEntropy += acc` leaves it `true` with nothing folded in —
+    // and nothing re-seeds, leaving the draw sequence a deterministic function
+    // of public registration timestamps, which is exactly what
+    // usernameFromDraws exists to prevent. That strand was told as an upgrade
+    // landing between the call and the reply; #55 (d) measured that an upgrade
+    // cannot land inside an await on this toolchain (the upgrade lands only
+    // once the beat is done), so the shape that is real is a continuation that
+    // trapped after the set (the catch arm below resets the latch on a throw,
+    // not on a trap). The remedy is the `postupgrade` below (the shape
+    // src/bridge/main.mo already documents and fixes), NOT a
     // `_nameEntropy == 0` test here: that condition re-enters this branch on
     // EVERY beat whenever the beacon is unavailable, and the `await` splits the
     // heartbeat message, so the rest of the beat — requotes, heatmaps, shipping
@@ -7540,12 +9637,39 @@ persistent actor Uplands {
     if (Map.size(deadmanSwitches) > 0) {
       if (hbReady("deadman", now, _lastDeadmanNs, 0)) { _lastDeadmanNs := now; ignore hbRun("deadman", func() { tickDeadman(now) }) };
     };
-    if (_timersPaused) { return };
+    // H-37 (F34): the oracle fan-out's deadline sweep — ABOVE the pause gate
+    // too. It only COMPLETES fetches already dispatched (finalizing an open
+    // fan-out past PRICE_FANOUT_DEADLINE_NS on what arrived, reaping the
+    // stale, pruning the retained), which is exactly what the in-order
+    // awaits it replaced did under a pause: a fleet in flight when the brake
+    // came on still landed its mark. Every beat while a fan-out exists, zero
+    // cost otherwise; isolated behind the breaker like the deadman.
+    if (Map.size(_priceFanouts) > 0) {
+      if (hbReady("oraclefan", now, _lastFanoutSweepNs, 0)) { _lastFanoutSweepNs := now; ignore hbRun("oraclefan", func() { sweepPriceFanouts(now) }) };
+    };
+    if (timersHeld()) { return };
     // Track the resting-balance high-water mark every beat (cheap, synchronous).
     let bal = Cycles.balance();
     if (bal > _burnWinMax) { _burnWinMax := bal };
-    if (now - _lastFinaliseNs >= HB_FINALISE_NS) { _lastFinaliseNs := now; ignore finaliseExpiredPending() };
-    if (now - _lastAmmNs      >= HB_AMM_NS)      { _lastAmmNs := now;      ignore tickAmm() };
+    // H-09 (D7, extension of W3-08): the finaliser and the AMM tick were the
+    // two bare self-sends left outside the breaker — a trap in either
+    // re-trapped at full cadence with no accounting (the F4 wedge: a junk
+    // band inflating a release-path walk). Both now dispatch through it —
+    // the finaliser via hbRunAsync (it must send), the AMM tick PER MARKET
+    // ("amm:<marketId>", cadence HB_AMM_NS each) so one market's trap backs
+    // off that market alone and the others are serviced on the next beat.
+    if (hbReady("finalise", now, _lastFinaliseNs, HB_FINALISE_NS)) { _lastFinaliseNs := now; ignore hbRunAsync("finalise", finaliseExpiredPending) };
+    if (now - _lastAmmNs >= HB_AMM_NS) {
+      _lastAmmNs := now;
+      for ((id, _) in Map.entries(pools)) {
+        let name = "amm:" # id;
+        if (hbReady(name, now, Option.get(Map.get(_lastAmmPoolNs, Text.compare, id), 0), HB_AMM_NS)) {
+          Map.add(_lastAmmPoolNs, Text.compare, id, now);
+          ignore hbRun(name, func() { tickAmmPool(id, now) });
+        };
+      };
+      if (hbReady("ammsnap", now, _lastAmmSnapNs, HB_AMM_NS)) { _lastAmmSnapNs := now; ignore hbRun("ammsnap", func() { tickAmmSnapshot(now) }) };
+    };
     // NOTE: _lastLiqNs is stamped by tickLiquidations ON COMPLETION, not here —
     // a stamp assigned in this message would commit even when the batch traps.
     // The CADENCE, though, is measured from dispatch: see _liqFailStreak.
@@ -7579,6 +9703,9 @@ persistent actor Uplands {
     if (hbReady("arrears", now, _lastArrearsNs, 0)) { _lastArrearsNs := now; ignore hbRun("arrears", func() { settleInsuranceArrears() }) };
     if (hbReady("ttlsweep", now, _lastTtlSweepNs, HB_TTLSWEEP_NS)) { _lastTtlSweepNs := now; ignore hbRun("ttlsweep", func() { ignore sweepStaleUserOrders(now) }) };
     if (hbReady("candles", now, _lastCandleFillNs, HB_CANDLEFILL_NS)) { _lastCandleFillNs := now; ignore hbRun("candles", func() { tickCandleFill(now) }) };
+    // H-36 (D4): the pre-registration store's autonomous expiry — a bounded
+    // pop-from-oldest step, no operator call anywhere in its path.
+    if (hbReady("prereg", now, _lastPreRegNs, preRegCadenceNs())) { _lastPreRegNs := now; ignore hbRun("prereg", func() { tickPreReg(now) }) };
     if (emailSalt.size() == 0) { ignore ensureEmailSalt() };   // one-time; no-op forever after
     // INLINE BY CHOICE (W3-08): two compares + a Map.size — audited
     // trap-free (no subtraction, no division, no indexing), and the shed
@@ -7693,6 +9820,69 @@ persistent actor Uplands {
   // it; this registry is the read-path- and fuel-path-consulted form.
   type SeasonArchive = { canisterId : Principal; firstSeq : Nat; lastSeq : ?Nat; season : Nat };
   let _seasonArchives = List.empty<SeasonArchive>();
+  // 1788474114: a CLOSED season's ledger gaps + shed re-baselines, keyed by
+  // season number — the tuples getLedgerGaps / getShedBaselines served while
+  // that season ran, captured by the season detach BEFORE performWorldWipe
+  // clears them for the new epoch. SeasonRecord carries neither and cannot
+  // grow a field in place (it lives inside the stable seasonRecords List;
+  // enhanced orthogonal persistence refuses stable-field additions/drops
+  // there), so this is a PARALLEL stable structure under a fresh name.
+  // Read by getSeasonGaps(N) / getSeasonShedBaselines(N): the sealed-season
+  // walks (`verify_ledger.mjs --season N`, ledger.js opts.season) consult
+  // them exactly where the live walk consults the live tuples — re-anchor
+  // CLAIMS (still proven only by the chain's own #gap events) and the fold's
+  // reset points. Kept across a full wipe like seasonRecords itself: the
+  // entries name no canister, so nothing degrades by keeping them.
+  let _seasonGaps = Map.empty<Nat, ([(Nat, Nat, Int)], [(Nat, Nat)])>();
+
+  // H-29 (F45): the per-season FROZEN owner map — season → owner principal
+  // text → that owner's margin-pool principals AS OF the season's close.
+  // Written by performWorldWipe(forSeason) BEFORE the pool registry is
+  // cleared; read by the season-archive federation (archiveReadPrincipals,
+  // below) IN PLACE OF the live registry, which knows nothing about who
+  // owned what in a closed season. A season with no entry here (closed
+  // before this map existed) federates the HUMAN principal only — never a
+  // pool principal the caller merely holds NOW. Additive stable state.
+  let _seasonPoolOwners = Map.empty<Nat, Map.Map<Text, [Principal]>>();
+
+  // The season a routed archive segment belongs to, or null for the current
+  // chain (active tip + this season's sealed segments) and unknown ids.
+  func seasonOfArchive(cid : Principal) : ?Nat {
+    for (sa in List.values(_seasonArchives)) {
+      if (Principal.equal(sa.canisterId, cid)) { return ?sa.season };
+    };
+    null
+  };
+
+  // The principals a caller may read from ONE archive segment: the human
+  // plus, for the current chain, the pools the live registry says they own;
+  // for a prior season's segment, ONLY the pools the frozen owner map
+  // recorded for them at that season's close. Pool principals are pure
+  // functions of the pool id, and until H-29 the id counter restarted at 1
+  // on every wipe — so a segment's userIndex still mapped poolPrincipal(k)
+  // to the PRIOR season's pool #k, and a caller who owned #k this season
+  // read the previous owner's #delta/#debtDelta rows through it. The
+  // counter no longer restarts (ids are unique for the lifetime of the
+  // archive set), and this map is the belt to that brace.
+  func archiveReadPrincipals(caller : Principal, season : ?Nat) : [Principal] {
+    switch (season) {
+      case null { selfAndOwnedPools(caller) };
+      case (?s) {
+        let ps = List.empty<Principal>();
+        List.add(ps, caller);
+        switch (Map.get(_seasonPoolOwners, Nat.compare, s)) {
+          case (?owners) {
+            switch (Map.get(owners, Text.compare, Principal.toText(caller))) {
+              case (?arr) { for (p in arr.vals()) { List.add(ps, p) } };
+              case null {};
+            };
+          };
+          case null {};
+        };
+        Iter.toArray(List.values(ps))
+      };
+    };
+  };
 
   // Every archive we're responsible for: prior seasons' sealed chains, the
   // current sealed chain, the active tip, and the pre-spawned successor.
@@ -7706,12 +9896,31 @@ persistent actor Uplands {
     Iter.toArray(List.values(out));
   };
 
-  // THIS season's chain only (the SeasonRecord's provenance snapshot).
+  // THIS season's sealed ledger only — the SeasonRecord's provenance
+  // snapshot (#54.4): the sealed segments plus the active tip, i.e. exactly
+  // the canisters that hold this season's events. NOT the season registry
+  // (every PRIOR season's segments — resetSeason once recorded
+  // allArchivePrincipals here, so season N's record spanned seasons 1..N),
+  // and NOT the pre-spawned successor: it holds no batch of this season and
+  // is handed to the NEXT epoch as its first archive (performWorldWipe).
+  // Read BEFORE the season detach (which moves these rows into the
+  // registry and clears them) — resetSeason pins that order.
+  //
+  // An EMPTY tip is not a segment of this season either (1788511319). The
+  // seal+swap installs the successor as archive0 anchored at shippedSeq,
+  // and until the next batch ships it has chained nothing — so a tip that
+  // sealed on the last pre-boundary drain meets resetSeason empty, and the
+  // record's extent (finalEventSeq == shippedSeq, in the clean and the
+  // honest-seal arm alike) ends BEFORE its anchor. It holds no event in
+  // [0, finalEventSeq): omit it here and let the detach carry it as the
+  // next epoch's first archive (performWorldWipe), exactly the successor
+  // shape. Seen live 2026-09-04 (exec-a): 3 canisters "sealed at seq 305",
+  // the third { firstSeq 305; lastSeq null } with a null certified head.
+  func activeTipEmpty() : Bool { shippedSeq <= _activeFirstSeq };
   func currentArchivePrincipals() : [Principal] {
     let out = List.empty<Principal>();
     for (s in List.values(_archivesSealed)) { List.add(out, s.canisterId) };
-    switch (archive0)     { case (?p) { List.add(out, p) }; case null {} };
-    switch (_archiveNext) { case (?p) { List.add(out, p) }; case null {} };
+    switch (archive0)     { case (?p) { if (not activeTipEmpty()) { List.add(out, p) } }; case null {} };
     Iter.toArray(List.values(out));
   };
 
@@ -7738,6 +9947,49 @@ persistent actor Uplands {
     for (s in List.values(_archivesSealed)) { if (Principal.equal(s.canisterId, cid)) { return true } };
     for (sa in List.values(_seasonArchives)) { if (Principal.equal(sa.canisterId, cid)) { return true } };
     false
+  };
+
+  // Task 1793569495 (engine, 2026-11-01: the first sealed segment
+  // srh6u-laaaa-aaaa6-qaapa-cai, seq 0..526_277, no longer EXISTS while
+  // getArchives still routes to it). The IC answers a call to a canister that
+  // does not exist with reject code DESTINATION_INVALID (IC0301
+  // CanisterNotFound, "Canister <id> not found") — from the management
+  // canister's canister_status and from a direct inter-canister call alike —
+  // and Motoko surfaces that code as Error.code = #destination_invalid. Every
+  // other way a segment fails to answer is another class: stopped is
+  // CANISTER_ERROR (IC0508), frozen is SYS_TRANSIENT (IC0207), a pre-filter
+  // segment's missing method is CANISTER_ERROR (IC0536), and a blackholed
+  // segment's refused status read is CANISTER_ERROR (IC0512 — not a
+  // controller). The message is the belt for a replica that files the class
+  // under another code; it must name THIS canister ("Canister <cid> not
+  // found" is the management canister's own wording), so no segment's own
+  // trap text can pass as the class. Shared by the federation (skip the
+  // segment, say so), the fuel pass (fund nothing, name the door) and
+  // adminDropMissingArchive (the ONLY state in which a routing row may go).
+  func isCanisterNotFound(cid : Principal, e : Error.Error) : Bool {
+    switch (Error.code(e)) {
+      case (#destination_invalid) { true };
+      case _ { Text.contains(Error.message(e), #text ("Canister " # Principal.toText(cid) # " not found")) };
+    };
+  };
+  func errorCodeText(e : Error.Error) : Text {
+    switch (Error.code(e)) {
+      case (#system_fatal)        { "SYS_FATAL" };
+      case (#system_transient)    { "SYS_TRANSIENT" };
+      case (#destination_invalid) { "DESTINATION_INVALID" };
+      case (#canister_reject)     { "CANISTER_REJECT" };
+      case (#canister_error)      { "CANISTER_ERROR" };
+      case (#system_unknown)      { "SYS_UNKNOWN" };
+      case (#future n)            { "future(" # Nat32.toText(n) # ")" };
+      case (#call_error c)        { "call_error(" # Nat32.toText(c.err_code) # ")" };
+    };
+  };
+  // The text the federation hands a reader for a segment it could not serve:
+  // the reject class and the IC's message, prefixed so the history views (and
+  // a CLI reader) tell a VANISHED canister from a stopped or frozen one.
+  func archiveUnavailableText(cid : Principal, e : Error.Error) : Text {
+    (if (isCanisterNotFound(cid, e)) "segment missing (canister not found) — " else "segment unreachable — ")
+      # errorCodeText(e) # ": " # Error.message(e)
   };
 
   func tickArchiveFuel() : async () {
@@ -7769,7 +10021,7 @@ persistent actor Uplands {
         // the refill amount can't underflow — explicit : Nat asserts it.
         let amount : Nat = high - st.cycles;
         ignore await fundArchive(cid, amount);
-      } catch (_) {
+      } catch (e0) {
         // canister_status rejected — for a SEALED archive this means it was
         // blackholed (we dropped controller rights at seal), so it can never be
         // watermarked again. deposit_cycles still works without those rights:
@@ -7778,6 +10030,20 @@ persistent actor Uplands {
         // surfaces — nothing to do here.)
         if (isSealedArchive(cid)) {
           let k = Principal.toText(cid);
+          // Task 1793569495: a sealed segment whose canister NO LONGER EXISTS
+          // rejects with the not-found class. Before this it read as
+          // "unreachable by status AND stats — presumed frozen" and was
+          // blind-funded weekly — 3T aimed at a canister that is not there
+          // (refunded on the reject, but a false diagnosis every pass). Name
+          // the real state and the door that retires the row; fund nothing.
+          if (isCanisterNotFound(cid, e0)) {
+            Map.add(_archiveObsDegraded, Text.compare, k, true);
+            logEvent("warn", "system", "ARCHIVE FUEL: sealed segment " # k
+              # " does NOT EXIST (canister_status: " # Error.message(e0)
+              # ") — its events are unreadable; adminDropMissingArchive(" # k
+              # ") retires the row and declares the gap; not funding", null);
+            continue archives;
+          };
           // W4-10: the segments that are immutable BY DESIGN were exactly the
           // ones never observed again — the chain table served the last
           // pre-blackhole `ok` forever. The segment's own stats() query needs
@@ -8033,10 +10299,7 @@ persistent actor Uplands {
   // and adjustments.
   //
   // Sweep policy, every HB_REAP_NS:
-  //   • Never touch #open/#partiallyFilled, nor any order a live #pending
-  //     settlement-window match still references (pendingMatches.makerOrderId
-  //     — the one legitimate reader of a closed order). Those reap on a
-  //     later sweep, after finalise/void.
+  //   • Never touch #open/#partiallyFilled.
   //   • AMM-owned quotes: deleted on first sight, no history — the vault's
   //     replaced ladder is nobody's order history.
   //   • User-owned: two-phase. First sight appends a compact record to the
@@ -8057,11 +10320,6 @@ persistent actor Uplands {
 
   func reapClosedOrders() {
     let amm = ammPrincipal();
-    // Maker order ids a live pending match still references.
-    let protected = Map.empty<Nat, Bool>();
-    for ((_, pm) in Map.entries(pendingMatches)) {
-      if (pm.status == #pending) { Map.add(protected, Nat.compare, pm.makerOrderId, true) };
-    };
     let toDelete = List.empty<Nat>();
     var marks : Nat = 0;
     label scan for ((id, o) in Map.entries(orderStore.orders)) {
@@ -8070,7 +10328,6 @@ persistent actor Uplands {
         case (#filled or #cancelled) {};
         case _ { continue scan };
       };
-      if (Option.isSome(Map.get(protected, Nat.compare, id))) { continue scan };
       if (Principal.equal(o.owner, amm)) {
         List.add(toDelete, id);
       } else if (Option.isSome(Map.get(_reapMarked, Nat.compare, id))) {
@@ -8098,8 +10355,7 @@ persistent actor Uplands {
     for (id in List.values(toDelete)) {
       OrderBook.removeClosedOrder(orderStore, id);
       ignore Map.delete(_reapMarked, Nat.compare, id);
-      // Belt-and-braces: the close paths already delete these side entries.
-      ignore Map.delete(orderSettlementWindows, Nat.compare, id);
+      // Belt-and-braces: the close paths already delete this side entry.
       ignore Map.delete(orderExpiry, Nat.compare, id);
     };
   };
@@ -8147,41 +10403,165 @@ persistent actor Uplands {
   var _activeFirstSeq : Nat = 0;                       // first seq the active archive holds
   var _archiveCapEvents : Nat = 10_000_000;            // ~1–2 GiB of index heap per archive
   transient var _archiveCapOverride : ?Nat = null;     // dev-only test pin
+  transient var _archiveMaxHopsOverride : ?Nat = null; // dev-only test pin (#54.5, archiveExecute's hop budget)
   transient var _spawnRetryAfterNs : Int = 0;          // failure cooldown (no spawn-per-tick loops)
   // W4-16: the spawn's principal, recorded the moment create_canister
   // replies — BEFORE the install await. The one-shot actor-class spawn knew
-  // its canister id only in its continuation, so an upgrade landing
-  // mid-spawn leaked a funded canister with no trace on-chain and no log.
-  // Stable: the whole point is surviving the lost continuation. The
-  // heartbeat reconciler stops-and-deletes a recorded orphan older than
-  // 5 minutes (never installed ⇒ holds no data; only principals WE recorded
-  // are ever touched — it cannot adopt someone else's canister).
+  // its canister id only in its continuation, so a continuation that never
+  // reached its assignment leaked a funded canister with no trace on-chain
+  // and no log. W4-16 told the trigger as an upgrade landing mid-spawn;
+  // #55 (d) measured that an upgrade cannot land inside an await on this
+  // toolchain (the Motoko runtime refuses it while a message is
+  // outstanding — the upgrade lands only once the message is done), and the
+  // triggers that are real are an install that throws (the catch arm below
+  // keeps the record on purpose) or traps, and a wipe racing the spawn —
+  // #55 "orphan slot overwritten", the busy guard below. Stable: the record
+  // must outlive its own install continuation, and an upgrade landing
+  // between a failed install and the reconciler's gate must not forget the
+  // orphan. The heartbeat reconciler stops-and-deletes a recorded orphan
+  // older than 5 minutes (never installed ⇒ holds no data; only principals
+  // WE recorded are ever touched — it cannot adopt someone else's canister).
   var _pendingSpawn : ?{ cid : Principal; atNs : Int } = null;
-  func spawnArchive(amt : Nat) : async Archive.Archive {
-    let created = await (with cycles = amt) ic00.create_canister({ settings = null });
-    let cid = created.canister_id;
-    _pendingSpawn := ?{ cid; atNs = Time.now() };
-    let fresh = await (system Archive.Archive)(#install cid)(Principal.fromActor(Uplands));
-    _pendingSpawn := null;
-    fresh;
-  };
-  func reconcilePendingSpawn() : async () {
-    switch (_pendingSpawn) {
+  // #55 "orphan slot overwritten": the slot is a BUSY GUARD, not just a
+  // record. The record alone cannot guard the create_canister await (the
+  // principal is unknown until it replies), so a transient latch covers the
+  // whole create+install span — transient because an upgrade cannot land
+  // inside an await on this toolchain (measured), and the STABLE record
+  // above is what survives everything else. Every spawn site asks
+  // spawnSlotBusy() first and skips the tick WITHOUT arming the 10-min
+  // failure cooldown: the slot clears by itself (the install completes, or
+  // the reconciler reaps the orphan at 5 min), and re-checking is free.
+  // Before this, a wipe zeroing the cooldown mid-install let the first beat
+  // re-spawn and OVERWRITE the record — a canister main controls, holding up
+  // to 3T cycles, listed nowhere (W4-16's exact leak, reopened).
+  transient var _spawnInFlight : Bool = false;
+  transient var _spawnRefusalLoggedFor : Text = "";   // one warn line per occupant, not per tick
+  // #55 follow-up test knob (dev-only, see setTestSpawnReconcileHold): extra
+  // rounds the reconciler yields BETWEEN its stop and delete awaits, so a
+  // test can replace the slot record inside the very window the
+  // compare-and-clear exists for. A real stop+delete is two rounds — no
+  // second shell can land a call inside it unaided. Re-read every round:
+  // clearing it ends the hold immediately. `_spawnReconcileParked` is the
+  // observable half: how many reconcilers sit in the hold right now, so the
+  // test swaps by PROTOCOL (probe until parked, swap, release) and not by
+  // timing. A COUNT, not a flag: the heartbeat runs the reconciler once a
+  // minute regardless of setTestTimersPaused, so a sibling can enter (and
+  // park, or fail its stop) while another is parked — measured on the
+  // seat venue — and a bool cleared by the sibling's exit lied to the probe.
+  transient var _testSpawnReconcileHold : Nat = 0;
+  transient var _spawnReconcileParked : Nat = 0;
+  func spawnSlotBusy(site : Text) : Bool {
+    // (occupant key, human detail) — the key is what dedupes the log line,
+    // so the age in the detail does not re-arm it every tick.
+    let holder : ?(Text, Text) = switch (_pendingSpawn) {
       case (?ps) {
-        if (Time.now() - ps.atNs > 300_000_000_000) {
-          logEvent("warn", "system", "SPAWN RECONCILER: orphaned archive spawn " # Principal.toText(ps.cid)
-            # " (created, never installed — lost continuation); stopping and deleting", null);
-          try {
-            await ic00.stop_canister({ canister_id = ps.cid });
-            await ic00.delete_canister({ canister_id = ps.cid });
-            _pendingSpawn := null;
-          } catch (e) {
-            logEvent("error", "system", "SPAWN RECONCILER: cleanup of " # Principal.toText(ps.cid)
-              # " failed (" # Error.message(e) # ") — recover by hand: adminFundCanister keeps it alive, ic00 delete reclaims it", null);
+        let ageSecs : Int = (Time.now() - ps.atNs) / 1_000_000_000;
+        let key = Principal.toText(ps.cid);
+        ?(key, key # " (recorded " # Int.toText(ageSecs) # "s ago; install in flight or an orphan awaiting the reconciler)");
+      };
+      case null { if (_spawnInFlight) { ?("in-flight", "a create_canister call in flight") } else { null } };
+    };
+    switch (holder) {
+      case (?(key, h)) {
+        if (_spawnRefusalLoggedFor != key) {
+          _spawnRefusalLoggedFor := key;
+          logEvent("warn", "system", "ARCHIVE SPAWN (" # site # "): refused — slot occupied by " # h, null);
+        };
+        true;
+      };
+      case null { _spawnRefusalLoggedFor := ""; false };
+    };
+  };
+  func spawnArchive(amt : Nat) : async Archive.Archive {
+    // Belt behind the sites' spawnSlotBusy() check: never a second
+    // create_canister while the slot is held.
+    if (spawnSlotBusy("belt")) {
+      let holder = switch (_pendingSpawn) { case (?ps) { Principal.toText(ps.cid) }; case null { "create in flight" } };
+      throw Error.reject("archive spawn refused: slot occupied by " # holder);
+    };
+    _spawnInFlight := true;
+    try {
+      let created = await (with cycles = amt) ic00.create_canister({ settings = null });
+      let cid = created.canister_id;
+      _pendingSpawn := ?{ cid; atNs = Time.now() };
+      let fresh = try {
+        await (system Archive.Archive)(#install cid)(Principal.fromActor(Uplands));
+      } catch (e) {
+        // The record stays: the reconciler reclaims the never-installed
+        // canister at 5 min. Name it here so the log carries the principal
+        // even when the caller's catch only prints the cause.
+        logEvent("warn", "system", "ARCHIVE SPAWN: install of " # Principal.toText(cid) # " failed ("
+          # Error.message(e) # ") — record kept for the reconciler", null);
+        throw e;
+      };
+      // Compare-and-clear: only the record THIS spawn wrote.
+      switch (_pendingSpawn) {
+        case (?cur) { if (Principal.equal(cur.cid, cid)) { _pendingSpawn := null } };
+        case null {};
+      };
+      fresh;
+    } finally {
+      _spawnInFlight := false;
+    };
+  };
+  // Single-flight latch for the reconciler (task 1788507866). The heartbeat
+  // runs reconcilePendingSpawn once a minute REGARDLESS of _timersPaused
+  // (W4-16's reaper must run on a paused venue too), and adminForceSpawnReconcile
+  // can land during that run — or the heartbeat during a forced one. Without
+  // this, the second entry read the SAME orphan, stopped it again (harmless)
+  // and its delete_canister failed "not found" after the first's delete —
+  // into the catch below, which logged a level-"error" "recover by hand" line
+  // for a canister that no longer existed (measured on a seat venue: two
+  // "orphaned archive spawn X" lines, one "cleanup of X failed"). Raised
+  // before the first await, released in finally; a second entry returns
+  // silently — not a value path, and the heartbeat retries in 60s. The
+  // dev-hold accounting (_spawnReconcileParked, a count) is untouched: the
+  // latch makes a parked sibling impossible, the count stays honest anyway.
+  transient var _spawnReconcileInFlight : Bool = false;
+  func reconcilePendingSpawn() : async () {
+    if (_spawnReconcileInFlight) { return };
+    _spawnReconcileInFlight := true;
+    try {
+      switch (_pendingSpawn) {
+        case (?ps) {
+          if (Time.now() - ps.atNs > 300_000_000_000) {
+            // The tail names the orphan's real states — an install that threw
+            // (spawnArchive's catch arm keeps the record) or trapped, or a dev
+            // hook that planted the record. #55 (d): an upgrade cannot land
+            // inside the install await, so the old tail's upgrade story named
+            // a state that cannot occur. The prefix up to the principal is
+            // pinned by test_archive_failover §S — never reword it.
+            logEvent("warn", "system", "SPAWN RECONCILER: orphaned archive spawn " # Principal.toText(ps.cid)
+              # " (created, never installed — the install threw or trapped, or a dev hook planted it); stopping and deleting", null);
+            var parkedHere = false;   // this reconciler's own share of _spawnReconcileParked
+            try {
+              await ic00.stop_canister({ canister_id = ps.cid });
+              // Dev-only hold (setTestSpawnReconcileHold): widen the window
+              // between the two awaits so a test can swap the record mid-flight.
+              // 0 on every other posture — the `if (IS_DEV)` is the gate, the
+              // hook cannot even set it there.
+              var hold = if (IS_DEV) _testSpawnReconcileHold else 0;
+              if (hold > 0) { parkedHere := true; _spawnReconcileParked += 1 };
+              while (hold > 0 and _testSpawnReconcileHold > 0) { await async {}; hold -= 1 };
+              if (parkedHere) { parkedHere := false; _spawnReconcileParked -= 1 };
+              await ic00.delete_canister({ canister_id = ps.cid });
+              // Compare-and-clear: only the record we READ (the awaits above
+              // yielded; a record written since describes a different canister).
+              switch (_pendingSpawn) {
+                case (?cur) { if (Principal.equal(cur.cid, ps.cid)) { _pendingSpawn := null } };
+                case null {};
+              };
+            } catch (e) {
+              if (parkedHere) { parkedHere := false; _spawnReconcileParked -= 1 };
+              logEvent("error", "system", "SPAWN RECONCILER: cleanup of " # Principal.toText(ps.cid)
+                # " failed (" # Error.message(e) # ") — recover by hand: adminFundCanister keeps it alive, ic00 delete reclaims it", null);
+            };
           };
         };
+        case null {};
       };
-      case null {};
+    } finally {
+      _spawnReconcileInFlight := false;
     };
   };
   func archiveCap() : Nat {
@@ -8192,6 +10572,16 @@ persistent actor Uplands {
     requireController(msg.caller);
     requireDevHook("setTestArchiveCap");
     _archiveCapOverride := cap;
+  };
+  // Dev-only (#54.5, test_archive_hop_isolation.sh §6): pin archiveExecute's
+  // per-request hop budget below the chain length, so a test can exercise
+  // the budget exit on a two-segment chain instead of rolling seven real
+  // segments. `null` restores ARCHIVE_MAX_HOPS. A zero pin is clamped to one
+  // hop (the walk always reads the active archive).
+  public shared (msg) func setTestArchiveMaxHops(hops : ?Nat) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestArchiveMaxHops");
+    _archiveMaxHopsOverride := hops;
   };
 
   // Dev-only: stop/start one of OUR archive segments (we spawned them, so we
@@ -8208,6 +10598,329 @@ persistent actor Uplands {
     try {
       if (stopped) { await ic00.stop_canister({ canister_id = cid }) }
       else { await ic00.start_canister({ canister_id = cid }) };
+      #ok
+    } catch (e) { #err(Error.message(e)) };
+  };
+
+  // Dev-only: rewrite one of OUR archive segments' controller list, so a test
+  // can make one upgrade hop fail for REAL (the IC refuses install_code from a
+  // non-controller) WITHOUT the blackhole-at-seal record — the #54.7 case
+  // adminUpgradeArchives must report as a failure, not a design skip
+  // (test_archive_chain.sh §7). Handing control to the caller keeps it
+  // reversible: the caller re-adds us with `icp canister settings update
+  // <cid> --add-controller <backend>`. Scoped to allArchivePrincipals — this
+  // is NOT a general update_settings passthrough.
+  public shared (msg) func setTestArchiveControllers(cid : Principal, controllers : [Principal]) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    requireDevHook("setTestArchiveControllers");
+    var own = false;
+    for (p in allArchivePrincipals().vals()) { if (Principal.equal(p, cid)) { own := true } };
+    if (not own) { return #err("not an archive segment of this exchange: " # Principal.toText(cid)) };
+    try {
+      await ic00.update_settings({ canister_id = cid; settings = { controllers = ?controllers } });
+      #ok
+    } catch (e) { #err(Error.message(e)) };
+  };
+
+  // Dev-only (#55, test_archive_failover.sh §S): manufacture a REAL orphan —
+  // a canister we create and never install, recorded in the spawn slot as if
+  // a continuation had been lost `ageSecs` ago. This is exactly what W4-16's
+  // reconciler exists to reap, so a test can watch the busy guard refuse a
+  // spawn while the slot is held and then watch the reaper clear it. Refuses
+  // while the slot is occupied (the guard applies to the hook too). Endowed
+  // with a third of the archive endowment: enough to exist, forfeited on
+  // delete (a test venue's cost).
+  public shared (msg) func setTestSpawnOrphan(ageSecs : Nat) : async { #ok : Principal; #err : Text } {
+    requireController(msg.caller);
+    requireDevHook("setTestSpawnOrphan");
+    if (_pendingSpawn != null or _spawnInFlight) { return #err("spawn slot occupied") };
+    _spawnInFlight := true;
+    try {
+      let created = await (with cycles = ARCHIVE_INITIAL_CYCLES / 3) ic00.create_canister({ settings = null });
+      let cid = created.canister_id;
+      _pendingSpawn := ?{ cid; atNs = Time.now() - ageSecs * 1_000_000_000 };
+      #ok(cid);
+    } catch (e) { #err(Error.message(e)) } finally { _spawnInFlight := false };
+  };
+
+  // Dev-only (#55): plant, re-age, or clear (null) the spawn-slot record
+  // directly — to age a manufactured orphan past the reconciler's 5-min gate
+  // without waiting, to plant a principal the reconciler CANNOT delete (the
+  // failed-cleanup path must keep the record for by-hand recovery), or to
+  // clear one. Scoped: never a routed archive segment or this canister —
+  // the reconciler would stop-and-delete whatever the record names, and
+  // this is NOT a way to point it at live data.
+  public shared (msg) func setTestPendingSpawn(cid : ?Principal, ageSecs : Nat) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    requireDevHook("setTestPendingSpawn");
+    switch (cid) {
+      case null { _pendingSpawn := null };
+      case (?c) {
+        if (Principal.equal(c, Principal.fromActor(Uplands))) { return #err("refusing to plant this canister as its own orphan") };
+        for (p in allArchivePrincipals().vals()) {
+          if (Principal.equal(p, c)) { return #err("is a routed archive segment of this exchange: " # Principal.toText(c)) };
+        };
+        _pendingSpawn := ?{ cid = c; atNs = Time.now() - ageSecs * 1_000_000_000 };
+      };
+    };
+    #ok;
+  };
+
+  // Dev-only (#55 follow-up): arm / probe / release the reconciler's hold
+  // between its stop and delete awaits (rounds per reconcile, capped; 0
+  // restores the real two-round cadence). Returns whether a reconciler is
+  // parked in the hold AT THIS CALL — the same call is the probe: a test
+  // re-arms until it reads true, then knows the reconciler has READ its
+  // record and passed the stop await, swaps the record, and releases with
+  // 0. Scoped like setTestReplayStepHold: the reconciler re-reads the knob
+  // every round, and IS_DEV gates the loop itself. A parked reconciler
+  // holds nothing but its own continuation — every other ingress lands
+  // normally, the heartbeat included. Live twin:
+  // tests/test_archive_failover.sh §S (interleave).
+  public shared (msg) func setTestSpawnReconcileHold(rounds : Nat) : async Bool {
+    requireController(msg.caller);
+    requireDevHook("setTestSpawnReconcileHold");
+    // ~22ms per round locally, so 30k rounds ≈ 11 min: a RUNAWAY ceiling, not
+    // a window. Measured on a seat venue: while a reconciler yields, ingress
+    // confirmation slows to 5-25s per CLI call with timers paused and 75-140s
+    // with the heartbeat live — a 6k cap (~2 min) let the hold expire under
+    // the swap. The test releases explicitly; the cap only bounds a test that
+    // never does.
+    _testSpawnReconcileHold := Nat.min(rounds, 30_000);
+    _spawnReconcileParked > 0;
+  };
+
+  // Ops/test: run the W4-16 spawn reconciler now (the heartbeat runs it
+  // once a minute; tests hold the timers). Controller-only like
+  // adminForceShipTick — it does nothing the heartbeat would not.
+  public shared (msg) func adminForceSpawnReconcile() : async () {
+    requireController(msg.caller);
+    await reconcilePendingSpawn();
+  };
+
+  // Ops repair (1788499923, #54 §54.4 + #55 "empty successor"): retire ONE
+  // pre-fix empty successor row from the season registry. Before task
+  // 1788465055 the season detach registered the pre-spawned successor as a
+  // season row — { firstSeq = 0; lastSeq = null; season = N } for a canister
+  // that never held an event: rendered "0 – growing" by getArchiveChain /
+  // getSeasonArchives(N), refilled by tickArchiveFuel forever, and one of
+  // archiveExecute's hop budget on every deep read. The registry is stable
+  // state, so an upgrade does not touch it, and a migration cannot do the
+  // per-row await below — hence an admin op, controller-gated on EVERY
+  // posture (it is a repair, not a dev hook). Refuses, in order: a principal
+  // that is not a registry row; a row with lastSeq set (a sealed segment —
+  // it holds events by construction); a canister the CURRENT chain still
+  // routes (belt: the registry is for closed seasons); and — after asking
+  // the canister itself — any segment whose certified head covers an event
+  // (a season TIP has lastSeq null too, and it is the prize-audit record).
+  // Only then: drop the row (a public table changes → ring log + #config on
+  // the tape, like the authority setters), then stop + delete the canister
+  // with the same ic00 pair resetExchange's wipe uses. A delete failure
+  // after the row is gone is reported as #err with the by-hand recovery —
+  // the row retirement stands (it was the fix); the canister is the leak.
+  public shared (msg) func adminRetireEmptySeasonSegment(cid : Principal) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    let cidT = Principal.toText(cid);
+    func rowOf(p : Principal) : ?SeasonArchive {
+      for (sa in List.values(_seasonArchives)) { if (Principal.equal(sa.canisterId, p)) { return ?sa } };
+      null
+    };
+    let sa = switch (rowOf(cid)) {
+      case null { return #err("not a season registry row: " # cidT) };
+      case (?r) { r };
+    };
+    switch (sa.lastSeq) {
+      case (?l) { return #err("row " # cidT # " is a sealed segment (season " # Nat.toText(sa.season) # ", lastSeq " # Nat.toText(l) # ") — it holds events; refusing") };
+      case null {};
+    };
+    switch (archive0) { case (?p) { if (Principal.equal(p, cid)) { return #err(cidT # " is the active archive of the current chain; refusing") } }; case null {} };
+    switch (_archiveNext) { case (?p) { if (Principal.equal(p, cid)) { return #err(cidT # " is the pre-spawned successor of the current chain; refusing") } }; case null {} };
+    for (s in List.values(_archivesSealed)) { if (Principal.equal(s.canisterId, cid)) { return #err(cidT # " is a sealed segment of the current chain; refusing") } };
+    // The canister's OWN certified head decides: null = it never chained an
+    // event. An unreadable segment is not provably empty — refuse.
+    let head = try {
+      let a = actor (cidT) : Archive.Archive;
+      await a.getCertifiedHead();
+    } catch (e) {
+      return #err("getCertifiedHead on " # cidT # " failed (" # Error.message(e) # ") — an unreadable segment is not provably empty; refusing");
+    };
+    switch (head.headSeq) {
+      case (?h) { return #err("row " # cidT # " holds events (certified headSeq " # Nat.toText(h) # ") — a season tip, not an empty successor; refusing") };
+      case null {};
+    };
+    // Re-resolve after the await (a wipe may have cleared the registry).
+    let cur = switch (rowOf(cid)) {
+      case null { return #err("row " # cidT # " left the registry while its head was being read; nothing done") };
+      case (?r) { r };
+    };
+    let kept = List.filter<SeasonArchive>(_seasonArchives, func(r) { not Principal.equal(r.canisterId, cid) });
+    List.clear(_seasonArchives);
+    for (r in List.values(kept)) { List.add(_seasonArchives, r) };
+    Map.remove(_archiveObs, Text.compare, cidT);
+    let v = cidT # " (season " # Nat.toText(cur.season) # ", firstSeq " # Nat.toText(cur.firstSeq) # ", never held an event)";
+    logEvent("info", "system", "SEASON REGISTRY: retired empty successor row " # v, null);
+    emitConfig(msg.caller, "adminRetireEmptySeasonSegment", v);
+    try {
+      await ic00.stop_canister({ canister_id = cid });
+      await ic00.delete_canister({ canister_id = cid });
+      logEvent("info", "system", "SEASON REGISTRY: empty successor " # cidT # " stopped and deleted", null);
+      #ok
+    } catch (e) {
+      logEvent("warn", "system", "SEASON REGISTRY: row " # cidT # " retired but the canister could not be deleted ("
+        # Error.message(e) # ") — delete it by hand: adminFundCanister keeps it alive, ic00 delete reclaims it", null);
+      #err("row " # cidT # " retired, but the canister was not deleted: " # Error.message(e) # " — delete it by hand");
+    };
+  };
+
+  // Dev-only (1788499923, tests/test_retire_empty_season_segment.sh): append
+  // a season registry row BY HAND. The pre-#54.4 detach registered the
+  // pre-spawned successor as { firstSeq 0; lastSeq null; season N } — a row
+  // a build carrying the 1788465055 fix can no longer produce, so the test
+  // for adminRetireEmptySeasonSegment seeds it here. Scoped to canisters WE
+  // spawned (allArchivePrincipals) and never a principal already in the
+  // registry — this is NOT a way to route foreign data. Naming the carried
+  // successor ALSO clears _archiveNext: that is exactly the pre-fix shape
+  // (registered, then nulled), and the chain must never adopt a canister a
+  // later retirement deletes.
+  public shared (msg) func setTestSeasonRow(cid : Principal, firstSeq : Nat, lastSeq : ?Nat, season : Nat) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    requireDevHook("setTestSeasonRow");
+    var own = false;
+    for (p in allArchivePrincipals().vals()) { if (Principal.equal(p, cid)) { own := true } };
+    if (not own) { return #err("not an archive segment of this exchange: " # Principal.toText(cid)) };
+    for (sa in List.values(_seasonArchives)) {
+      if (Principal.equal(sa.canisterId, cid)) { return #err("already a season registry row: " # Principal.toText(cid)) };
+    };
+    switch (_archiveNext) { case (?p) { if (Principal.equal(p, cid)) { _archiveNext := null } }; case null {} };
+    List.add(_seasonArchives, { canisterId = cid; firstSeq; lastSeq; season });
+    #ok;
+  };
+
+  // Ops repair (task 1793569495, engine 2026-11-01): DROP the routing row of a
+  // sealed segment of the CURRENT chain whose canister NO LONGER EXISTS. The
+  // engine's first sealed segment (srh6u…, seq 0..526_277) vanished — the
+  // cloud engine's owner can delete canisters it hosts; no backend path
+  // deletes a current-season segment — while getArchives kept routing to it:
+  // every history walk hit a dead hop, adminUpgradeArchives failed it on each
+  // run, and the fuel pass blind-funded a canister that was not there.
+  // adminRetireEmptySeasonSegment is the wrong door (it retires only a row
+  // that never held an event, and only in the season registry); this one
+  // retires a row that DID hold events, so it must be exactly as hard to
+  // misuse: controller-only on EVERY posture (a repair, not a dev hook), and
+  // the ONLY admissible state is one the management canister itself asserts
+  // INSIDE the call — never the argument, never a self-report. Refusals, in
+  // order: the active tip; the pre-spawned successor; a prior season's
+  // segment (its chain is closed, the live tape cannot declare its hole —
+  // out of this door's scope by design); a principal that is not a sealed
+  // row of the current chain; a canister whose canister_status SUCCEEDS (it
+  // exists — whatever else is wrong with it); a canister_status reject of any
+  // class but not-found (a blackholed segment refuses us as a non-controller
+  // — IC0512 — and is NOT missing; frozen and stopped are not missing
+  // either). Only the not-found class (isCanisterNotFound) passes.
+  //
+  // Then the chain declares its hole — the 3.0.0 `#gap` doctrine (W2-04,
+  // docs/archive-design.md), exactly the L2 shed's shape: the lost range
+  // [firstSeq, lastSeq+1) is recorded as a ledger-gap tuple (getLedgerGaps —
+  // the ops surface and the replay auditor's hop table; recordGap coalesces
+  // it with an adjacent shed), declared ON the tape as a hash-committed #gap
+  // event (the ONLY justification the verifiers accept for the routing
+  // list's coverage jump — verify_ledger.mjs pins the chain origin at 0, so a
+  // dropped FIRST segment needs exactly #gap [0, lastSeq+1) committed), and
+  // closed for replayers by a balance re-baseline (emitBalanceRebaseline):
+  // the lost range's #delta rows are gone, so a fold across it is wrong
+  // until an absolute re-attestation reopens the tape. Baselines that lay
+  // inside the lost range are compacted out (their rows exist nowhere). The
+  // action itself lands as #config on the tape beside its ring-log line
+  // (#47.4) — who dropped what, with the management canister's reject text.
+  // Additive candid: a new admin method; the reply names everything written.
+  public shared (msg) func adminDropMissingArchive(cid : Principal) : async { #ok : Text; #err : Text } {
+    requireController(msg.caller);
+    let cidT = Principal.toText(cid);
+    switch (archive0) { case (?p) { if (Principal.equal(p, cid)) { return #err(cidT # " is the active archive of the current chain; refusing") } }; case null {} };
+    switch (_archiveNext) { case (?p) { if (Principal.equal(p, cid)) { return #err(cidT # " is the pre-spawned successor of the current chain; refusing") } }; case null {} };
+    switch (seasonOfArchive(cid)) {
+      case (?s) { return #err(cidT # " is a sealed segment of a CLOSED season (season " # Nat.toText(s) # ") — a closed chain cannot declare a hole on the live tape; out of this door's scope, refusing") };
+      case null {};
+    };
+    func rowOf(p : Principal) : ?SealedArchive {
+      for (s in List.values(_archivesSealed)) { if (Principal.equal(s.canisterId, p)) { return ?s } };
+      null
+    };
+    switch (rowOf(cid)) {
+      case null { return #err("not a sealed segment of the current chain: " # cidT # " (getArchives lists no such row)") };
+      case (?_) {};
+    };
+    // THE verification: the management canister's own answer for this id.
+    // canister_status SUCCEEDS for a canister that exists (we spawned it, so
+    // we are its controller), rejects with the not-found class for one that
+    // does not, and rejects with another class for every other state.
+    let cause = try {
+      let st = await ic00.canister_status({ canister_id = cid });
+      return #err(cidT # " EXISTS (canister_status answered: " # Nat.toText(st.cycles) # " cycles) — a segment that exists is never dropped; refusing");
+    } catch (e) {
+      if (not isCanisterNotFound(cid, e)) {
+        return #err(cidT # ": canister_status rejected with " # errorCodeText(e) # " \"" # Error.message(e)
+          # "\" — not the not-found class (blackholed, frozen or stopped is not missing); refusing");
+      };
+      Error.message(e);
+    };
+    // Re-resolve after the await (a wipe or a season reset may have cleared the chain).
+    let row = switch (rowOf(cid)) {
+      case null { return #err("row " # cidT # " left the chain while its status was being read; nothing done") };
+      case (?r) { r };
+    };
+    let kept = List.filter<SealedArchive>(_archivesSealed, func(r) { not Principal.equal(r.canisterId, cid) });
+    List.clear(_archivesSealed);
+    for (r in List.values(kept)) { List.add(_archivesSealed, r) };
+    let keptBh = List.filter<Principal>(_archivesBlackholed, func(p) { not Principal.equal(p, cid) });
+    List.clear(_archivesBlackholed);
+    for (p in List.values(keptBh)) { List.add(_archivesBlackholed, p) };
+    Map.remove(_archiveObs, Text.compare, cidT);
+    Map.remove(_archiveObsDegraded, Text.compare, cidT);
+    Map.remove(_archiveBlindFundNs, Text.compare, cidT);
+    // The tape declares its hole. Synchronous from here to the baseline.
+    flushExitWindows(true);
+    drainLedgerJournal();
+    let gapFrom = row.firstSeq;
+    let gapTo : Nat = row.lastSeq + 1;
+    let lost : Nat = gapTo - gapFrom;
+    let (declFrom, declTo) = recordGap(gapFrom, gapTo);
+    _shedBaselines := Array.filter<(Nat, Nat)>(_shedBaselines, func((bf, bt)) { bf < gapFrom or bt > gapTo });
+    let v = cidT # " (seq " # Nat.toText(gapFrom) # ".." # Nat.toText(row.lastSeq) # ", " # Nat.toText(lost)
+      # " events) — canister_status: " # cause;
+    emitConfig(msg.caller, "adminDropMissingArchive", v);
+    emitEventRaw(Principal.fromActor(Uplands), null, #gap { fromSeq = declFrom; toSeq = declTo });
+    let (bFrom, bTo) = emitBalanceRebaseline();
+    let note = "LEDGER GAP [seq " # Nat.toText(gapFrom) # ".." # Nat.toText(gapTo) # ") recorded and chain-declared as #gap [seq "
+      # Nat.toText(declFrom) # ".." # Nat.toText(declTo) # "); a " # Nat.toText(bTo - bFrom : Nat)
+      # "-row balance re-baseline [seq " # Nat.toText(bFrom) # ".." # Nat.toText(bTo) # ") reopens the tape for replay";
+    logEvent("warn", "system", "ARCHIVE CHAIN: dropped MISSING sealed segment " # v # "; " # note, null);
+    #ok("dropped routing row " # v # "; #config + #gap on the tape; " # note);
+  };
+
+  // Dev-only (task 1793569495, tests/test_archive_fills_paged.sh §5): stop
+  // and DELETE one of OUR sealed segments while its routing row stays — the
+  // engine's 2026-11-01 shape, manufactured for real — so a test can assert
+  // the federation answers "unavailable", adminUpgradeArchives names the hop
+  // with the IC's "not found", the fuel pass stops funding it, and
+  // adminDropMissingArchive retires the row (and refused to while the
+  // canister existed). Scoped to the current chain's SEALED rows — the tip
+  // and the successor are refused (deleting the tip is a shipper failure,
+  // test_archive_failover's domain), and a principal that is not one of ours
+  // is refused: this is NOT a general delete_canister passthrough.
+  // Irreversible on the venue: the segment's events are gone (a #dev venue's
+  // cost; the suite deletes a churn segment holding only its own throwaway
+  // identity's rows).
+  public shared (msg) func setTestArchiveDeleted(cid : Principal) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    requireDevHook("setTestArchiveDeleted");
+    var own = false;
+    for (s in List.values(_archivesSealed)) { if (Principal.equal(s.canisterId, cid)) { own := true } };
+    if (not own) { return #err("not a sealed archive segment of this exchange's current chain: " # Principal.toText(cid)) };
+    try {
+      await ic00.stop_canister({ canister_id = cid });
+      await ic00.delete_canister({ canister_id = cid });
+      logEvent("warn", "system", "TEST HOOK: sealed archive segment " # Principal.toText(cid) # " stopped and DELETED (row kept) — setTestArchiveDeleted", null);
       #ok
     } catch (e) { #err(Error.message(e)) };
   };
@@ -8231,7 +10944,10 @@ persistent actor Uplands {
   // the L3 size-only shear cap so a test needn't generate 250k+ events or
   // wait 30s. All transient (reset on upgrade); null clears an override
   // (a trailing shearCap omitted by an older 4-arg caller decodes as null).
-  public shared (msg) func setTestShipFailover(fail : Bool, rollThreshold : ?Nat, hardCap : ?Nat, shedTo : ?Nat, shearCap : ?Nat) : async { #ok; #err : Text } {
+  // H-32 adds two trailing pins (older 5-arg callers decode them as null):
+  // `batchMax` shrinks SHIP_BATCH_MAX so the backlog-scaled burst is provable
+  // with tens of events, and `memPressure` pins the L3 shear's memory signal.
+  public shared (msg) func setTestShipFailover(fail : Bool, rollThreshold : ?Nat, hardCap : ?Nat, shedTo : ?Nat, shearCap : ?Nat, batchMax : ?Nat, memPressure : ?Bool) : async { #ok; #err : Text } {
     requireController(msg.caller);
     if (not IS_DEV) { return #err("setTestShipFailover is a dev-only hook (posture: play/production)") };
     _testShipFail := fail;
@@ -8239,6 +10955,8 @@ persistent actor Uplands {
     _testHardCap := hardCap;
     _testShedTo := shedTo;
     _testShearCap := shearCap;
+    _testShipBatchMax := batchMax;
+    _testShearMemPressure := memPressure;
     #ok;
   };
 
@@ -8298,6 +11016,7 @@ persistent actor Uplands {
   public shared (msg) func adminRebuildIndexes() : async { #ok : Text; #err : Text } {
     requireController(msg.caller);
     OrderBook.rebuildIndexes(orderStore);
+    OrderBook.rebuildUserTradeIndex(userTradeIndex, orderStore);   // H-31
     let mismatches = OrderBook.verifyAggregates(orderStore);
     logEvent("info", "system", "Book indexes rebuilt by controller — "
       # (if (mismatches.size() == 0) { "aggregates verify clean" }
@@ -8312,6 +11031,21 @@ persistent actor Uplands {
   // at production deploy (checklist), leave it off on dev (resets could not
   // delete blackholed archives — they would leak as orphans).
   var _blackholeAtSeal : Bool = false;
+  // #54.7: the segments the policy ACTUALLY blackholed, recorded the moment
+  // the controller drop succeeds. adminUpgradeArchives reads this to tell a
+  // by-design skip (we hold no controller rights, on purpose) from a real
+  // failed hop (frozen, mid-upgrade, incompatible wasm, controllers changed
+  // by hand) — the old reply labelled EVERY catch "skipped (blackholed)"
+  // although the policy defaults OFF on dev/play. Stable: the knowledge must
+  // outlive OUR upgrades, or every immutable segment would read as a failed
+  // hop after the first redeploy. Segments blackholed by builds before this
+  // one are not listed and report as failed (with the IC's refusal in the
+  // log) until an operator reconciles them by hand.
+  let _archivesBlackholed = List.empty<Principal>();
+  func isBlackholedArchive(cid : Principal) : Bool {
+    for (p in List.values(_archivesBlackholed)) { if (Principal.equal(p, cid)) { return true } };
+    false
+  };
   public shared (msg) func setBlackholeAtSeal(on : Bool) : async () {
     requireController(msg.caller);
     _blackholeAtSeal := on;
@@ -8343,10 +11077,22 @@ persistent actor Uplands {
   // archives still works — unlike a single-archive (archive0-only) federation.
   // `archiveId` must be one of our archives (active or sealed) or the call is
   // refused; and getEventsForPrincipals only ever returns the caller's OWN rows
-  // regardless, since we pass only the caller's principals.
+  // regardless, since we pass only the caller's principals — for a prior
+  // season's segment, the pools the FROZEN per-season owner map recorded for
+  // them (H-29: a pool principal the caller holds now proves nothing about
+  // who held it in a closed season).
+  //
+  // `unavailable` (task 1793569495, additive): null when the segment answered;
+  // ?cause when it could not be read — its canister no longer exists (the
+  // not-found reject class: the engine's 2026-11-01 shape, archiveUnavailableText
+  // says "segment missing"), or it is stopped/frozen/mid-upgrade. Before this
+  // the reject surfaced as a reject of THIS call, and the Account → Archive
+  // pager stayed parked on that source for good; now it skips the source and
+  // keeps walking the chain. An id that is not one of ours is refused the
+  // same way (total 0, the refusal named) — never trapped.
   public shared composite query ({ caller }) func getMyArchivedEvents(
     archiveId : Principal, offset : Nat, limit : Nat
-  ) : async { events : [Types.UserEvent]; total : Nat } {
+  ) : async { events : [Types.UserEvent]; total : Nat; unavailable : ?Text } {
     var known = false;
     switch (archive0) {
       case (?p) { if (Principal.equal(p, archiveId)) { known := true } };
@@ -8358,17 +11104,92 @@ persistent actor Uplands {
     // W4-14: prior seasons' segments stay readable — the detach used to
     // empty every source this `known` set is built from, so the whole
     // previous season answered {events = []; total = 0} AS A SUCCESS.
-    for (sa in List.values(_seasonArchives)) {
-      if (Principal.equal(sa.canisterId, archiveId)) { known := true };
-    };
-    if (not known) { return { events = []; total = 0 } };
-    let ps = List.empty<Principal>();
-    List.add(ps, caller);
-    for ((id, pool) in marginPools.entries()) {
-      if (Principal.equal(pool.owner, caller)) { List.add(ps, poolPrincipalOf(id)) };
-    };
+    let season = seasonOfArchive(archiveId);
+    if (Option.isSome(season)) { known := true };
+    if (not known) { return { events = []; total = 0; unavailable = ?"not an archive segment of this exchange" } };
     let full = actor (Principal.toText(archiveId)) : Archive.Archive;
-    await full.getEventsForPrincipals(Iter.toArray(List.values(ps)), offset, limit);
+    try {
+      let r = await full.getEventsForPrincipals(archiveReadPrincipals(caller, season), offset, limit);
+      { events = r.events; total = r.total; unavailable = null }
+    } catch (e) {
+      { events = []; total = 0; unavailable = ?archiveUnavailableText(archiveId, e) }
+    };
+  };
+
+  // One of ours? → ?season to read it under (null = the current chain, ?s =
+  // a prior season's segment, exactly getMyArchivedEvents' known-set and
+  // seasonOfArchive); null = unknown, refused.
+  func knownArchiveSeason(archiveId : Principal) : ?(?Nat) {
+    var known = false;
+    switch (archive0) {
+      case (?p) { if (Principal.equal(p, archiveId)) { known := true } };
+      case null {};
+    };
+    for (s in List.values(_archivesSealed)) {
+      if (Principal.equal(s.canisterId, archiveId)) { known := true };
+    };
+    let season = seasonOfArchive(archiveId);
+    if (Option.isSome(season)) { known := true };
+    if (known) { ?season } else { null };
+  };
+
+  // Kind-filtered twin of getMyArchivedEvents (task 1793489930). The history
+  // views' backfill walks the chain asking each segment for the caller's
+  // FILLS only (kinds = ["fill"] — the OQL `kind` vocabulary, [] = every
+  // kind), so a fill-less segment answers total = 0 in ONE hop instead of
+  // paging its non-fill rows out to be dropped in the browser. Same known
+  // set and per-segment principal resolution as getMyArchivedEvents; the
+  // archive side is getEventsForPrincipalsFiltered (ArchiveCanister.mo).
+  //
+  // `filtered` is the compatibility flag. A segment running pre-filter code
+  // — not yet walked by adminUpgradeArchives, or blackholed at seal and so
+  // never upgradable — has no getEventsForPrincipalsFiltered: the call
+  // REJECTS, and the catch falls back to the unfiltered pager and SAYS SO
+  // (`filtered = false`: `events`/`total` are then ALL kinds, `offset`
+  // counts in the all-kinds sequence, and the caller filters client-side
+  // exactly as before). A segment whose filtered read trapped for any other
+  // reason (a heavy user's gather-time pass before its backfill finished,
+  // over the query budget) degrades the same way. Production's sealed
+  // segments are served through the fallback until the operator's
+  // adminUpgradeArchives reaches them; the browser's parallel probing
+  // shortens the wait for those as well.
+  //
+  // `unavailable` (task 1793569495, additive): null when the segment
+  // answered; ?cause when it could not be read at all. A segment whose
+  // canister NO LONGER EXISTS rejects with the not-found class (the engine's
+  // first sealed segment vanished, 2026-11-01, while getArchives still routed
+  // to it) — no fallback can read it, so the answer is immediate: total 0,
+  // `unavailable = "segment missing …"`, and the history views SKIP the
+  // segment and keep paging the rest ("segment N unavailable" in their
+  // progress line) instead of the whole view failing on one dead hop. Any
+  // other reject still tries the unfiltered pager (a pre-filter segment); a
+  // segment that rejects THAT too (stopped, frozen, mid-upgrade) gets the
+  // same degraded answer naming the cause — one source's trouble, never a
+  // trap of the federation. An id that is not one of ours is refused the
+  // same way (total 0, the refusal named).
+  public shared composite query ({ caller }) func getMyArchivedEventsFiltered(
+    archiveId : Principal, kinds : [Text], offset : Nat, limit : Nat
+  ) : async { events : [Types.UserEvent]; total : Nat; filtered : Bool; unavailable : ?Text } {
+    let season = switch (knownArchiveSeason(archiveId)) {
+      case null { return { events = []; total = 0; filtered = true; unavailable = ?"not an archive segment of this exchange" } };
+      case (?s) { s };
+    };
+    let principals = archiveReadPrincipals(caller, season);
+    let full = actor (Principal.toText(archiveId)) : Archive.Archive;
+    try {
+      let r = await full.getEventsForPrincipalsFiltered(principals, kinds, offset, limit);
+      { events = r.events; total = r.total; filtered = true; unavailable = null }
+    } catch (e) {
+      if (isCanisterNotFound(archiveId, e)) {
+        return { events = []; total = 0; filtered = true; unavailable = ?archiveUnavailableText(archiveId, e) };
+      };
+      try {
+        let r = await full.getEventsForPrincipals(principals, offset, limit);
+        { events = r.events; total = r.total; filtered = false; unavailable = null }
+      } catch (e2) {
+        { events = []; total = 0; filtered = true; unavailable = ?archiveUnavailableText(archiveId, e2) }
+      };
+    };
   };
 
   // Must exceed the new canister's 30-day freezing-threshold RESERVE plus the
@@ -8404,6 +11225,24 @@ persistent actor Uplands {
 
   transient let SHIP_BATCH_MAX : Nat = 2_000;                     // ~400 KB candid — well under the 2 MiB message cap
   transient var _shipInFlight : Bool = false;
+  // H-32 (F12): the drain SCALES WITH BACKLOG. One batch per HB_SHIP_NS was a
+  // hard 200 ev/s ceiling whatever the queue held, so a healthy archive
+  // could be out-run by inflow alone and the queue climb through every
+  // admission tier to the L3 shear. Now, once a tick's ordinary batch and its
+  // Phase-B bookkeeping are done, the tick keeps sending — up to
+  // SHIP_BURST_MAX further batches, each an ordinary shipBatchTo with the
+  // same ack handling — while the queue is still above the SOFT admission
+  // tier (shipSoftTier: the pinned test band or SHED_SOFT_SHIP), the shipper
+  // is healthy (streak 0, no #full) and the epoch is unchanged. Below the
+  // soft tier the drain is the old one batch per tick (nothing changes for a
+  // quiet venue); above it a 375k backlog drains in ~3.5 min instead of ~31.
+  // The burst runs under the same single-flight and the same catch: a
+  // failure mid-burst counts the streak once and ends the burst.
+  transient let SHIP_BURST_MAX : Nat = 8;                         // + up to 8 × SHIP_BATCH_MAX per tick above the soft tier (1.8k ev/s)
+  transient var _testShipBatchMax : ?Nat = null;                  // dev pin (setTestShipFailover) so a test needs 30 events, not 2,001
+  func shipBatchMax() : Nat { switch (_testShipBatchMax) { case (?n) { n }; case null { SHIP_BATCH_MAX } } };
+  func shipSoftTier() : Nat { switch (_testShipShedBands) { case (?(soft, _, _, _)) { soft }; case null { SHED_SOFT_SHIP } } };
+  var _shipBurstBatches : Nat = 0;                                // telemetry: burst batches sent, lifetime (stable)
 
   // ── Layered archive-failure handling (July-2026 archive-backlog incident) ──
   // A wedged archive (Region full, a bug, a subnet fault) must NEVER let the
@@ -8439,14 +11278,34 @@ persistent actor Uplands {
   transient let EMERGENCY_ROLL_COOLDOWN_NS : Int = 60_000_000_000; // ≤ one L1 roll / min
   transient let USER_EVENTS_HARD_CAP_DEFAULT : Nat = 250_000;      // heap floor: L2 sheds above this (~230 MB worst case)
   transient let USER_EVENTS_SHED_TO_DEFAULT  : Nat = 200_000;      // …down to here (batch the drop)
-  // L3 shear: the SIZE-ONLY absolute ceiling — 1.5× the L2 cap. Admission
-  // (W1-08) throttles USER inflow but not internal emitters (liquidations,
-  // ticks), and L2 requires a failing shipper; if the queue is wedged above
-  // the L2 cap while the shipper reads "healthy", nothing else sheds. Strictly
+  // L3 shear: the absolute ceiling — 1.5× the L2 cap. Admission (W1-08)
+  // throttles USER inflow but not internal emitters (liquidations, ticks),
+  // and L2 requires a failing shipper; if the queue is wedged above the L2
+  // cap while the shipper reads "healthy", nothing else sheds. Strictly
   // above every admission tier (SHED_*_SHIP) and the L2 cap, so with healthy
-  // drain (~200 ev/s) only 10+ minutes of sustained pathological internal
-  // EXCESS reaches it. Worst-case heap at the shear ≈ 345 MB by the L2 ratio.
-  transient let SHIP_SHEAR_CAP_DEFAULT : Nat = 375_000;            // L3: size-only shed above this, no failStreak condition
+  // drain only sustained pathological internal EXCESS reaches it.
+  // H-32 (F12, D2): the shear is no longer SIZE-ONLY. #52.2 ratified it as
+  // "10+ minutes of internal-emitter excess", but the exit set is admitted
+  // at every floor and one principal's dust exits reached it in ~18 min with
+  // a HEALTHY archive — 175k events of everyone's history dropped with
+  // nothing wrong. The heap is what the shear protects, so it now fires on
+  // size AND a memory-pressure signal (shearMemoryPressure): wasm memory at
+  // SHEAR_MEM_PCT of the canister's wasm_memory_limit (the cached
+  // canister_status value, or the platform default until it is read), or a
+  // lowmemory() hook within SHEAR_LOWMEM_TTL_NS. A large-but-healthy backlog
+  // with room in the heap is DRAINED (the backlog-scaled burst above), not
+  // sheared. L2 (hard cap + failing shipper) is unchanged.
+  transient let SHIP_SHEAR_CAP_DEFAULT : Nat = 375_000;            // L3: shed above this on memory pressure, no failStreak condition
+  transient let SHEAR_MEM_PCT : Nat = 75;                          // …when wasm memory is at ≥ 75 % of the limit
+  transient let SHEAR_MEM_LIMIT_DEFAULT : Nat = 3_221_225_472;     // the IC's default wasm_memory_limit (3 GiB) until canister_status is read
+  transient let SHEAR_LOWMEM_TTL_NS : Int = 600_000_000_000;       // …or a lowmemory() hook in the last 10 min
+  transient var _testShearMemPressure : ?Bool = null;              // dev pin (setTestShipFailover)
+  func shearMemoryPressure() : Bool {
+    switch (_testShearMemPressure) { case (?b) { return b }; case null {} };
+    let limit = if (_wasmMemoryLimit > 0) { _wasmMemoryLimit } else { SHEAR_MEM_LIMIT_DEFAULT };
+    (Prim.rts_memory_size() * 100 >= limit * SHEAR_MEM_PCT)
+      or (_lowMemoryAtNs > 0 and Time.now() - _lowMemoryAtNs < SHEAR_LOWMEM_TTL_NS)
+  };
   // Dev-only test overrides (setTestShipFailover): tiny thresholds + forced
   // failures let an integration test exercise all three layers deterministically.
   transient var _testShipFail : Bool = false;
@@ -8461,6 +11320,101 @@ persistent actor Uplands {
   // No roll cooldown in dev-test mode, so a test can step the failover via
   // adminForceShipTick without pocket-ic having to advance 60s of wall-clock.
   func emergencyRollCooldown() : Int { switch (_testRollThreshold) { case (?_) { 0 }; case null { EMERGENCY_ROLL_COOLDOWN_NS } } };
+  // H-32: ONE batch to archive `a` — the slice of tickShipEvents that sends
+  // and applies an ack, factored out so the backlog-scaled drain below can
+  // send several per tick. Exactly the inline code it replaced: a transport
+  // failure (or the forced test failure) THROWS to the caller's catch, which
+  // counts the L1 streak; a graceful #err counts it here and returns
+  // #rejected; a sane ack drops the acked prefix and returns #acked (full =
+  // the archive reported its region at capacity — the Phase-B roll's cue).
+  func shipBatchTo(a : Principal, epoch : Nat) : async* { #acked : { full : Bool }; #stale; #rejected } {
+    let n = List.size(userEvents);
+    let k = if (n > shipBatchMax()) { shipBatchMax() } else { n };
+    let batch = Iter.toArray(List.range(userEvents, 0, k));
+    // Dev-only failure injection: simulate a wedged archive so a test can
+    // drive L1/L2 deterministically. Throws into the catch below, exactly
+    // like a real appendBatch trap.
+    if (_testShipFail) { throw Error.reject("test: forced ship failure") };
+    let res = await sinkOf(a).appendBatch(batch);
+    if (_captureEpoch != epoch) { return #stale }; // reset raced the ship — stale ack
+    // #ok and #full both ack a stored prefix. #full additionally means the
+    // archive's stable region is at capacity: force the Phase-B roll below
+    // (spawn the successor now if missing; seal without waiting for the
+    // event cap) — the July 2026 incident showed the byte wall can arrive
+    // millions of events before the count trigger.
+    var archiveFull = false;
+    // NOTE the streak reset moved OUT of the #ok/#full arms into the sane-ack
+    // branch below: a DIVERGENT ack (the impossible-state trip) must not read
+    // as healthy, or the L1 roll that is its only recovery could never fire.
+    let acked : ?Nat = switch (res) {
+      case (#ok(n)) { ?n };
+      case (#full(n)) {
+        archiveFull := true;
+        logEvent("info", "system", "History archive FULL at seq " # Nat.toText(n)
+          # " — sealing and rolling to a fresh successor", null);
+        ?n
+      };
+      case (#err(msg)) {
+        // A graceful reject (chain break, not-owner, …). Counts toward the L1
+        // roll streak: a persistently-rejecting archive is as good as wedged.
+        _shipFailStreak += 1;
+        logEvent("error", "system", "History archive append rejected: " # msg, null);
+        null
+      };
+    };
+    switch (acked) {
+      case (?nextExpected) {
+        let m = List.size(userEvents);
+        if (nextExpected > shippedSeq + m) {
+          // ── "IMPOSSIBLE STATE" TRIP (public issue #43 — defensive; unreachable today) ──
+          // The queue spans [shippedSeq, shippedSeq + m), and the batch sent was a
+          // PREFIX of it, so a sane ack satisfies nextExpected ≤ shippedSeq + m even
+          // after mid-await tail growth. An ack past that is an archive claiming
+          // events it was never sent. The one state that could produce it — a wipe
+          // zeroing the cursors while an old archive stayed attached (its appendBatch
+          // then skips the new epoch's events as "replays" and acks its OLD cursor) —
+          // is unreachable: performWorldWipe nulls archive0 in both reachable arms
+          // and both callers refuse on #production. If it ever fires anyway,
+          // advancing shippedSeq := nextExpected (what this code once did after
+          // clamping only the drop) would run the cursor permanently ahead of the
+          // queue: every later sane ack would read as stale, the queue could never
+          // drain, and resetSeason's unshipped-history arithmetic would trap. So
+          // REFUSE the divergent ack — advance nothing, drop nothing — record the
+          // divergent range on the ledger-gap ops surface (getLedgerGaps) so it is
+          // never absorbed silently, and count it as a ship FAILURE so the L1 roll
+          // seals this archive at its last SANE acked seq and re-anchors a fresh
+          // successor: the queue stays drainable, onto the fresh archive.
+          _ackDivergences += 1;
+          _shipFailStreak += 1;
+          // Dedupe: an unrecoverable divergence (spawn blocked → no roll) repeats
+          // every tick with the same range — never grow the gap list with copies.
+          let gN = _ledgerGaps.size();
+          if (gN == 0 or _ledgerGaps[gN - 1].0 != shippedSeq + m or _ledgerGaps[gN - 1].1 != nextExpected) {
+            ignore recordGap(shippedSeq + m, nextExpected);   // ops surface only — no chain declaration for a refused ack
+          };
+          logEvent("error", "system", "IMPOSSIBLE STATE: archive acked nextExpected "
+            # Nat.toText(nextExpected) # " but the queue spans [" # Nat.toText(shippedSeq)
+            # ".." # Nat.toText(shippedSeq + m) # ") — divergent ack REFUSED (divergence #"
+            # Nat.toText(_ackDivergences) # "; recorded as a ledger gap; counting toward the failover roll)", null);
+        } else {
+          _shipFailStreak := 0;   // a sane ack (#ok or #full) is a healthy response, not a failure
+          if (nextExpected > shippedSeq) {
+            // queue[0].seq == shippedSeq by construction, so the acked
+            // prefix is exactly the first (nextExpected − shippedSeq) —
+            // and the trip above guarantees drop ≤ m here.
+            let drop : Nat = nextExpected - shippedSeq;
+            let rest = List.empty<Types.UserEvent>();
+            for (e in List.range(userEvents, drop, m)) { List.add(rest, e) };
+            userEvents := rest;
+            shippedSeq := nextExpected;
+          };
+        };
+      };
+      case null {};
+    };
+    switch (acked) { case (?_) { #acked({ full = archiveFull }) }; case null { #rejected } };
+  };
+
 
   transient let ic00 = actor "aaaaa-aa" : actor {
     stop_canister   : shared { canister_id : Principal } -> async ();
@@ -8561,6 +11515,199 @@ persistent actor Uplands {
     emitEvent(caller, null, #config({ setter; value }));
   };
 
+  // ── H-32 (F12): the per-principal EXIT-SET tape inflow bound ─────────────
+  // The exit set is admitted at every shed floor (W1-05: a user who cannot
+  // de-lever is liquidated anyway), and the D2 decision (task 1788467594,
+  // 2026-09-05) KEEPS that: exits are never refused, at the gate or in the
+  // body. What it bounds is the TAPE — the four value-moving exits
+  // (withdraw, withdrawMarginPool, unstakeInsurance, withdrawLp) each write
+  // 2–11 permanent events, bounded only by `amount == 0`, and one registered
+  // principal issuing dust exits at ingress speed (~50 withdrawLp/s ≈ 550
+  // ev/s against a 200 ev/s drain) reached the L3 shear in ~18 minutes with
+  // a HEALTHY archive: everyone's unshipped history, dropped, by one user.
+  //
+  // The rule — dust-aggregation per principal, a WINDOW at a time:
+  //   • The FIRST exit of a window (any size) opens it and writes its tape
+  //     rows live, exactly as before. A well-spaced exit is always live.
+  //   • A GENUINE (non-dust) exit inside the window writes live too — its
+  //     count is bounded by balance / EXIT_DUST_USD, so it is no vector.
+  //   • A DUST exit inside the window EXECUTES in full (the balance moves,
+  //     the reply is #ok, the in-canister records land) but its tape rows are
+  //     COALESCED: the #delta rows it just journaled are pulled off the
+  //     journal and summed per (principal, token) into the window, and its
+  //     semantic row (#deposit/#withdrawal, #lpWithdraw, #insuranceUnstake)
+  //     is summed into one per kind. At the window's end the heartbeat
+  //     flushes the sums as ordinary chained events — the same rows, one
+  //     per (principal, token) and one per kind, "delayed to the window's
+  //     end", never dropped. The fold is unchanged (addition commutes;
+  //     nothing is applied twice — the rows are moved, not copied), so PoR /
+  //     replay reproduce every balance from the flushed tape exactly as from
+  //     the per-exit rows; only the per-exit STORY of dust exits inside one
+  //     window collapses to a sum, which is the record a burst deserves.
+  //   • Dust = the exit's value is under EXIT_DUST_USD (10 ICPUSD — the same
+  //     entry-door floor W3-10 gave the order path; exits stay UNFLOORED, the
+  //     bar only decides what coalesces) AND it does not empty the holding
+  //     (spend-all is genuine at any size, as the order path already treats
+  //     it). withdraw values a base token at markValueUsd; an unpriced token
+  //     is never dust (conservative for the user; it cannot be traded anyway).
+  // Per principal the inflow is now O(rows of one exit) per window live plus
+  // O(distinct (principal, token) pairs + kinds) per window flushed — ~22
+  // rows / 30 s from withdrawLp, 0.7 ev/s, against a drain that now bursts
+  // (SHIP_BURST_MAX below) — instead of ingress-rate × rows. A gate-level
+  // cooldown was rejected (a refused exit is the W1-05 finding); a body
+  // refusal likewise (D2: "never dropped, never refused").
+  //
+  // The flush points, all synchronous: the heartbeat drain (elapsed windows),
+  // shedOldestEvents BEFORE its re-baseline (every withheld row must precede
+  // the absolute rows or it would double-count after them), resetSeason's
+  // gate (the closed season's tape must carry them), adminReplayReset (the
+  // fold must be comparable). A world wipe CLEARS the windows with the
+  // journal — the genesis rows carry the live balances. Withheld rows are
+  // STABLE state (an upgrade must not lose them: a lost row is a permanent
+  // fold mismatch), which is why the map is a plain `let`.
+  transient let EXIT_COALESCE_WINDOW_NS : Int = 30_000_000_000;   // 30 s (3 ship ticks)
+  transient var _testExitCoalesceWindowNs : ?Int = null;         // dev pin (setTestExitCoalesceWindow)
+  func exitCoalesceWindowNs() : Int { switch (_testExitCoalesceWindowNs) { case (?n) { n }; case null { EXIT_COALESCE_WINDOW_NS } } };
+  transient let EXIT_DUST_USD : Nat = Types.MIN_ORDER_ICPUSD;
+  type ExitWindow = {
+    openedNs    : Int;                                    // the window's first exit (written live)
+    folded      : Nat;                                    // dust exits coalesced into it so far
+    deltas      : [(Principal, Types.TokenId, Int)];     // withheld #delta rows, summed per (principal, token)
+    withdrawals : [(Types.TokenId, Nat)];                // withdraw: token → summed amount
+    lp          : ?{ lpBurned : Nat; basket : [(Types.TokenId, Nat)] };   // withdrawLp sums
+    ins         : ?{ shares : Nat; payoutUsd : Nat };    // unstakeInsurance sums
+  };
+  type ExitSem = { #withdrawal : (Types.TokenId, Nat); #lp : (Nat, [(Types.TokenId, Nat)]); #ins : (Nat, Nat); #none };
+  let _exitWindows = Map.empty<Text, ExitWindow>();    // principal → its open window (STABLE: withheld rows)
+  var _exitCoalesced : Nat = 0;                         // telemetry: dust exits coalesced, lifetime (stable)
+  func freshExitWindow(now : Int) : ExitWindow {
+    { openedNs = now; folded = 0; deltas = []; withdrawals = []; lp = null; ins = null }
+  };
+  // Decide for an exit that has ALREADY executed: true = fold its tape rows
+  // into the caller's window (call foldDustExit next); false = write them
+  // live. Opens the window on the first exit, and on an elapsed one flushes
+  // it first — so a spaced repeat is live and the sums it displaced land
+  // ahead of it.
+  func exitFolds(caller : Principal, now : Int, dust : Bool) : Bool {
+    let key = Principal.toText(caller);
+    switch (Map.get(_exitWindows, Text.compare, key)) {
+      case (?w) {
+        if (now - w.openedNs >= exitCoalesceWindowNs()) {
+          flushExitWindow(key, w);
+          Map.add(_exitWindows, Text.compare, key, freshExitWindow(now));
+          false
+        } else { dust };
+      };
+      case null { Map.add(_exitWindows, Text.compare, key, freshExitWindow(now)); false };
+    };
+  };
+  func sumDeltaRow(rows : [(Principal, Types.TokenId, Int)], p : Principal, tok : Types.TokenId, d : Int) : [(Principal, Types.TokenId, Int)] {
+    var hit = false;
+    let merged = Array.map<(Principal, Types.TokenId, Int), (Principal, Types.TokenId, Int)>(rows, func((q, t, a)) {
+      if (not hit and Principal.equal(q, p) and t == tok) { hit := true; (q, t, a + d) } else { (q, t, a) }
+    });
+    if (hit) { merged } else { Array.concat(merged, [(p, tok, d)]) };
+  };
+  func sumTokenRow(rows : [(Types.TokenId, Nat)], tok : Types.TokenId, amt : Nat) : [(Types.TokenId, Nat)] {
+    var hit = false;
+    let merged = Array.map<(Types.TokenId, Nat), (Types.TokenId, Nat)>(rows, func((t, a)) {
+      if (not hit and t == tok) { hit := true; (t, a + amt) } else { (t, a) }
+    });
+    if (hit) { merged } else { Array.concat(merged, [(tok, amt)]) };
+  };
+  // Fold a dust exit's rows: the journal entries it appended since `j0` (the
+  // journal size the exit read BEFORE its first balance move) are moved off
+  // the journal into the window's sums — moved, so the drain never emits
+  // them — and its semantic summary is added. Synchronous with the exit's
+  // own message: nothing can interleave between the moves and this call.
+  func foldDustExit(caller : Principal, j0 : Nat, sem : ExitSem) {
+    let key = Principal.toText(caller);
+    let w = switch (Map.get(_exitWindows, Text.compare, key)) { case (?w) { w }; case null { return } };   // unreachable: exitFolds opened it
+    var deltas = w.deltas;
+    let n = List.size(accounts.journal);
+    if (n > j0) {
+      for ((p, tok, d) in List.range(accounts.journal, j0, n)) { deltas := sumDeltaRow(deltas, p, tok, d) };
+      List.truncate(accounts.journal, j0);
+    };
+    let withdrawals = switch (sem) { case (#withdrawal(tok, amt)) { sumTokenRow(w.withdrawals, tok, amt) }; case _ { w.withdrawals } };
+    let lp = switch (sem) {
+      case (#lp(burned, basket)) {
+        var b = switch (w.lp) { case (?l) { l.basket }; case null { [] } };
+        for ((tok, amt) in basket.vals()) { if (amt > 0) { b := sumTokenRow(b, tok, amt) } };
+        ?{ lpBurned = (switch (w.lp) { case (?l) { l.lpBurned }; case null { 0 } }) + burned; basket = b }
+      };
+      case _ { w.lp };
+    };
+    let ins = switch (sem) {
+      case (#ins(shares, payout)) {
+        switch (w.ins) { case (?i) { ?{ shares = i.shares + shares; payoutUsd = i.payoutUsd + payout } }; case null { ?{ shares; payoutUsd = payout } } }
+      };
+      case _ { w.ins };
+    };
+    Map.add(_exitWindows, Text.compare, key, { w with folded = w.folded + 1; deltas; withdrawals; lp; ins });
+    _exitCoalesced += 1;
+  };
+  // Emit a window's sums as ordinary chained events and close it. #delta rows
+  // go raw (the balance-bearing principal, like the drain); semantic rows go
+  // through emitEvent (owner-remapped, like the exits themselves). A sum of
+  // zero is fold-neutral and is not written.
+  func flushExitWindow(key : Text, w : ExitWindow) {
+    ignore Map.delete(_exitWindows, Text.compare, key);
+    if (w.folded == 0) { return };
+    let owner = Principal.fromText(key);
+    for ((p, tok, d) in w.deltas.vals()) { if (d != 0) { emitEventRaw(p, null, #delta { token = tok; amount = d }) } };
+    for ((tok, amt) in w.withdrawals.vals()) {
+      emitEvent(owner, null, #deposit { token = tok; amount = amt; timestamp = Time.now(); kind = #withdrawal });
+    };
+    switch (w.lp)  { case (?l) { emitEvent(owner, null, #lpWithdraw { lpBurned = l.lpBurned; basket = l.basket }) }; case null {} };
+    switch (w.ins) { case (?i) { emitEvent(owner, null, #insuranceUnstake { shares = i.shares; payoutUsd = i.payoutUsd }) }; case null {} };
+  };
+  // force = every window, elapsed or not (the shed / season / replay points).
+  func flushExitWindows(force : Bool) {
+    if (Map.size(_exitWindows) == 0) { return };
+    let now = Time.now();
+    let due = List.empty<(Text, ExitWindow)>();
+    for ((k, w) in Map.entries(_exitWindows)) {
+      if (force or now - w.openedNs >= exitCoalesceWindowNs()) { List.add(due, (k, w)) };
+    };
+    for ((k, w) in List.values(due)) { flushExitWindow(k, w) };
+  };
+  // Rows currently withheld across every open window (getCanisterInfo).
+  func exitRowsWithheld() : Nat {
+    var n : Nat = 0;
+    for ((_, w) in Map.entries(_exitWindows)) {
+      if (w.folded > 0) {
+        n += w.deltas.size() + w.withdrawals.size()
+          + (switch (w.lp) { case (?_) { 1 }; case null { 0 } })
+          + (switch (w.ins) { case (?_) { 1 }; case null { 0 } });
+      };
+    };
+    n
+  };
+  // The `withdraw` half (mixins/UserAccount.mo): the in-canister record and
+  // the leaderboard's external-flow baseline land unconditionally (they are
+  // capped/aggregated state, not the tape); only the tape row is subject to
+  // the window. `availBefore` is the withdrawable balance the exit read
+  // before its debit — spend-all is genuine at any size.
+  func recordWithdrawal(user : Principal, j0 : Nat, record : Types.DepositRecord, availBefore : Nat) {
+    UserStatus.appendDeposit(userDeposits, user, record);
+    recordExternalFlow(user, record.token, -(record.amount : Int));
+    let dust = record.amount < availBefore and (switch (markValueUsd(record.token, record.amount)) {
+      case (?v) { v < EXIT_DUST_USD };
+      case null { false };
+    });
+    if (exitFolds(user, record.timestamp, dust)) { foldDustExit(user, j0, #withdrawal(record.token, record.amount)) }
+    else { emitEvent(user, null, #deposit(record)) };
+  };
+  // Dev-only: pin the coalescing window (seconds; 0 = every later dust exit
+  // in the same message window flushes at the next drain) so a test proves
+  // the fold and the flush without a 30 s wait. null restores the constant.
+  public shared (msg) func setTestExitCoalesceWindow(secs : ?Nat) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestExitCoalesceWindow");
+    _testExitCoalesceWindowNs := switch (secs) { case (?s) { ?(s * 1_000_000_000 : Int) }; case null { null } };
+  };
+
   // Drain the Accounts ledger journal into #delta archive events (see
   // lib/Accounts.mo — every balance mutation lands there by construction).
   // Runs every heartbeat, BEFORE the shipper's dispatch, so ledger rows chase
@@ -8568,7 +11715,10 @@ persistent actor Uplands {
   // doesn't matter to a replayer (addition commutes); what matters is that
   // nothing is dropped, and the journal is cleared only after every entry is
   // in the capture queue (both are synchronous heap ops — no await between).
+  // H-32: the elapsed exit windows flush here too (flushExitWindows above) —
+  // their withheld rows are the same class of row, one beat later.
   func drainLedgerJournal() {
+    flushExitWindows(false);
     if (List.size(accounts.journal) > 0) {
       for ((p, tok, d) in List.values(accounts.journal)) {
         emitEventRaw(p, null, #delta { token = tok; amount = d });
@@ -8717,14 +11867,19 @@ persistent actor Uplands {
   // Record a gap, coalescing with the previous one if contiguous (one entry per
   // outage). A dropped range is final the moment it's dropped, so it is recorded
   // complete — no open/close state. Array rebuild is O(gaps); gaps are few.
-  func recordGap(from : Nat, to : Nat) {
+  // Returns the range AS NOW RECORDED — the whole coalesced outage when this
+  // drop extended the previous entry, else [from..to) itself — so the shed
+  // can declare THAT on the chain (1788469743, below at the emit site).
+  func recordGap(from : Nat, to : Nat) : (Nat, Nat) {
     let m = _ledgerGaps.size();
     if (m > 0 and _ledgerGaps[m - 1].1 == from) {
       let last : Nat = m - 1;
       let prev = _ledgerGaps[last];
       _ledgerGaps := Array.tabulate<(Nat, Nat, Int)>(m, func(i) { if (i == last) { (prev.0, to, prev.2) } else { _ledgerGaps[i] } });
+      (prev.0, to);
     } else {
       _ledgerGaps := Array.tabulate<(Nat, Nat, Int)>(m + 1, func(i) { if (i < m) { _ledgerGaps[i] } else { (from, to, Time.now()) } });
+      (from, to);
     };
   };
 
@@ -8739,6 +11894,7 @@ persistent actor Uplands {
       case (?n) { n };
       case null {
         if (Time.now() < _spawnRetryAfterNs) { return false };
+        if (spawnSlotBusy("failover")) { return false };   // #55: no cooldown — the slot clears itself
         let amt = switch (archiveSpawnCycles()) {
           case (?a) { a };
           case null { _spawnRetryAfterNs := Time.now() + 600_000_000_000; return false };
@@ -8780,10 +11936,51 @@ persistent actor Uplands {
   // The exchange keeps trading; the gap costs dropped history, not custody and
   // not reconstructability. The post-gap events re-anchor a fresh archive
   // (spawned this tick or by L1).
+  // One absolute re-attestation row per live ledger entry — balances, pool
+  // debt, vault LP shares, insurance shares: the resetExchange epoch-genesis
+  // pattern — appended to _shedBaselines as [bFrom, bTo). A folder ZEROES its
+  // accumulation at bFrom and folds on, so whatever history a hole in the
+  // readable tape cost, every balance stays reconstructable from the public
+  // tape alone. Shared by the L2 shed (shedOldestEvents) and
+  // adminDropMissingArchive (task 1793569495): both declare a hole and both
+  // must reopen the tape behind it. SYNCHRONOUS, and the caller runs
+  // flushExitWindows(true) + drainLedgerJournal() immediately before it with
+  // no await between — the baseline must equal the state the tape reaches AT
+  // ITS POSITION, so every already-journaled delta has to precede it.
+  func emitBalanceRebaseline() : (Nat, Nat) {
+    let bFrom = nextEventSeq;
+    for ((key, bal) in Map.entries(accounts.balances)) {
+      if (bal > 0) {
+        let (u, tok) = shadowKeyParts(key);
+        emitEventRaw(Principal.fromText(u), null, #delta { token = tok; amount = (bal : Int) });
+      };
+    };
+    for ((u, inner) in Map.entries(loans)) {
+      for ((tok, l) in Map.entries(inner)) {
+        if (l.principal > 0) {
+          emitEventRaw(Principal.fromText(u), null, #debtDelta { token = tok; amount = (l.principal : Int) });
+        };
+      };
+    };
+    for ((u, sh) in Map.entries(vaultLpBalances)) {
+      if (sh > 0) { emitEventRaw(Principal.fromText(u), null, #lpShareDelta { marketId = "VAULT"; amount = (sh : Int) }) };
+    };
+    for ((u, sh) in Map.entries(insuranceShares)) {
+      if (sh > 0) { emitEventRaw(Principal.fromText(u), null, #insShareDelta { amount = (sh : Int) }) };
+    };
+    let bTo = nextEventSeq;
+    let m = _shedBaselines.size();
+    _shedBaselines := Array.tabulate<(Nat, Nat)>(m + 1, func(i) { if (i < m) { _shedBaselines[i] } else { (bFrom, bTo) } });
+    (bFrom, bTo);
+  };
+
   func shedOldestEvents() {
     // Flush pending ledger rows first: the baseline below must equal the state
     // the tape reaches AT ITS POSITION, so every already-journaled delta has to
     // precede it in the queue (both ops are synchronous — no await between).
+    // H-32: the exit windows' withheld rows are the same class — forced out
+    // ahead of the drain so none can land AFTER the absolute rows below.
+    flushExitWindows(true);
     drainLedgerJournal();
     let n = List.size(userEvents);
     let shedTo = shipShedTo();
@@ -8811,7 +12008,7 @@ persistent actor Uplands {
     shippedSeq := gapTo;
     _activeFirstSeq := gapTo;          // the next archive anchors AFTER the gap
     _shedEvents += drop;
-    recordGap(gapFrom, gapTo);
+    let (declFrom, declTo) = recordGap(gapFrom, gapTo);
     // Compact away baselines the gap just swallowed — their seqs exist nowhere
     // (never shipped, now dropped), so no folder can ever reach them.
     _shedBaselines := Array.filter<(Nat, Nat)>(_shedBaselines, func((bf, bt)) { bf < gapFrom or bt > gapTo });
@@ -8826,32 +12023,28 @@ persistent actor Uplands {
     // with this exact range is hash-committed somewhere in the chain being
     // validated, which getLedgerGaps (an uncertified self-report) cannot
     // fake. The tuple list stays as the human/ops surface.
-    emitEventRaw(Principal.fromActor(Uplands), null, #gap { fromSeq = gapFrom; toSeq = gapTo });
-    let bFrom = nextEventSeq;
-    for ((key, bal) in Map.entries(accounts.balances)) {
-      if (bal > 0) {
-        let (u, tok) = shadowKeyParts(key);
-        emitEventRaw(Principal.fromText(u), null, #delta { token = tok; amount = (bal : Int) });
-      };
-    };
-    for ((u, inner) in Map.entries(loans)) {
-      for ((tok, l) in Map.entries(inner)) {
-        if (l.principal > 0) {
-          emitEventRaw(Principal.fromText(u), null, #debtDelta { token = tok; amount = (l.principal : Int) });
-        };
-      };
-    };
-    for ((u, sh) in Map.entries(vaultLpBalances)) {
-      if (sh > 0) { emitEventRaw(Principal.fromText(u), null, #lpShareDelta { marketId = "VAULT"; amount = (sh : Int) }) };
-    };
-    for ((u, sh) in Map.entries(insuranceShares)) {
-      if (sh > 0) { emitEventRaw(Principal.fromText(u), null, #insShareDelta { amount = (sh : Int) }) };
-    };
-    let bTo = nextEventSeq;
-    let m = _shedBaselines.size();
-    _shedBaselines := Array.tabulate<(Nat, Nat)>(m + 1, func(i) { if (i < m) { _shedBaselines[i] } else { (bFrom, bTo) } });
+    // 1788469743: declare the COALESCED outage [declFrom..gapTo), not just
+    // this shed's half. With nothing acked between sheds (successor spawn
+    // blocked, 10-min backoff) each later shed drops hardCap − shedTo events
+    // from the FRONT of the queue, and the earlier sheds' own #gap events sit
+    // ever closer to it — production L2 (250k/200k) drops the first
+    // declaration at shed 6, the L3 shear (375k/200k) at shear 3, and the
+    // baseline-bisect rule above then swallows its baseline too. From that
+    // point the tuple list and the archive list both say [a..z) while the
+    // durable chain declares only later halves: an HONEST tape no verifier
+    // could ever justify again (#55.4's contiguous merge has nothing left
+    // to merge — the dropped declaration is gone from the tape). Declaring
+    // the coalesced range means the NEWEST surviving declaration always
+    // spans from the last acked seq, whatever earlier ones were dropped;
+    // the verifiers match it directly (an overlapping earlier half, if it
+    // survived, is never merged with it — the merge is contiguous-only, so
+    // nothing over-approximates) and keep the contiguous merge for chains
+    // written before this change, which carry per-shed halves.
+    emitEventRaw(Principal.fromActor(Uplands), null, #gap { fromSeq = declFrom; toSeq = declTo });
+    let (bFrom, bTo) = emitBalanceRebaseline();
     logEvent("error", "system", "ARCHIVE FAILOVER L2: dropped " # Nat.toText(drop) # " unshipped events [seq "
       # Nat.toText(gapFrom) # ".." # Nat.toText(gapTo) # ") to bound the heap — archival is down; a LEDGER GAP is recorded"
+      # " (chain-declared as the coalesced outage [seq " # Nat.toText(declFrom) # ".." # Nat.toText(declTo) # "))"
       # " and a " # Nat.toText(bTo - bFrom : Nat) # "-row balance re-baseline [seq " # Nat.toText(bFrom) # ".."
       # Nat.toText(bTo) # ") reopens the tape for replay", null);
   };
@@ -8893,8 +12086,9 @@ persistent actor Uplands {
       // cold. The shear is the size-only absolute ceiling (1.5× this cap):
       // above it the heap bound wins unconditionally, shedding via the same
       // shedOldestEvents (identical gap-ledger + re-anchor semantics).
-      if (List.size(userEvents) >= shipShearCap()) {
-        // L3 shear: SIZE ALONE — no failStreak condition (see the block above).
+      if (List.size(userEvents) >= shipShearCap() and shearMemoryPressure()) {
+        // L3 shear: no failStreak condition (see the block above) — size AND
+        // memory pressure (H-32: a healthy backlog with heap room drains).
         shedOldestEvents();
       } else if (List.size(userEvents) >= shipHardCap() and _shipFailStreak >= shipRollThreshold()) {
         shedOldestEvents();
@@ -8907,9 +12101,29 @@ persistent actor Uplands {
         ignore (await emergencyRollArchive());
       };
       let epoch = _captureEpoch;
-      let a = switch (archive0) {
-        case (?a) { a };
-        case null {
+      let a = switch (archive0, _archiveNext) {
+        case (?a, _) { a };
+        case (null, ?next) {
+          // #54.4 / #55 "empty successor": a successor pre-spawned before a
+          // SEASON boundary survives the detach (performWorldWipe keeps the
+          // pointer — it never held an event of the closed season) and
+          // becomes the new epoch's first archive here, at the new tape's
+          // seq 0, instead of being registered as an empty season segment
+          // (a "0 – growing" row refilled forever, one archiveExecute hop
+          // per deep read) while the epoch spawned a fresh one anyway.
+          // Whoever nulled archive0 already anchored _activeFirstSeq (the
+          // season detach → 0; an L2 shed → the post-gap seq), and the
+          // archive itself anchors on the first seq it ever sees. No await
+          // here, so no epoch race. The carried pointer may also be the
+          // closed season's EMPTY tip (1788511319, performWorldWipe) — same
+          // property: it never chained an event, so it anchors here.
+          archive0 := ?next;
+          _archiveNext := null;
+          logEvent("info", "system", "History archive: pre-spawned successor "
+            # Principal.toText(next) # " carried across the season boundary as the new epoch's archive", null);
+          next;
+        };
+        case (null, null) {
           // First event of this epoch: spawn the sidecar. Main is its
           // controller (actor-class spawn), so resets can delete it.
           // Endowment via archiveSpawnCycles (see there): full amount when
@@ -8917,6 +12131,7 @@ persistent actor Uplands {
           // when merely low — attaching more than we hold TRAPS (not
           // throws), so the affordability check stays load-bearing.
           if (Time.now() < _spawnRetryAfterNs) { return };
+          if (spawnSlotBusy("initial")) { return };   // #55: no cooldown — the slot clears itself
           let spawnAmt = switch (archiveSpawnCycles()) {
             case (?amt) { amt };
             case null {
@@ -8950,89 +12165,11 @@ persistent actor Uplands {
           Principal.fromActor(fresh);
         };
       };
-      let n = List.size(userEvents);
-      let k = if (n > SHIP_BATCH_MAX) { SHIP_BATCH_MAX } else { n };
-      let batch = Iter.toArray(List.range(userEvents, 0, k));
-      // Dev-only failure injection: simulate a wedged archive so a test can
-      // drive L1/L2 deterministically. Throws into the catch below, exactly
-      // like a real appendBatch trap.
-      if (_testShipFail) { throw Error.reject("test: forced ship failure") };
-      let res = await sinkOf(a).appendBatch(batch);
-      if (_captureEpoch != epoch) { return }; // reset raced the ship — stale ack
-      // #ok and #full both ack a stored prefix. #full additionally means the
-      // archive's stable region is at capacity: force the Phase-B roll below
-      // (spawn the successor now if missing; seal without waiting for the
-      // event cap) — the July 2026 incident showed the byte wall can arrive
-      // millions of events before the count trigger.
       var archiveFull = false;
-      // NOTE the streak reset moved OUT of the #ok/#full arms into the sane-ack
-      // branch below: a DIVERGENT ack (the impossible-state trip) must not read
-      // as healthy, or the L1 roll that is its only recovery could never fire.
-      let acked : ?Nat = switch (res) {
-        case (#ok(n)) { ?n };
-        case (#full(n)) {
-          archiveFull := true;
-          logEvent("info", "system", "History archive FULL at seq " # Nat.toText(n)
-            # " — sealing and rolling to a fresh successor", null);
-          ?n
-        };
-        case (#err(msg)) {
-          // A graceful reject (chain break, not-owner, …). Counts toward the L1
-          // roll streak: a persistently-rejecting archive is as good as wedged.
-          _shipFailStreak += 1;
-          logEvent("error", "system", "History archive append rejected: " # msg, null);
-          null
-        };
-      };
-      switch (acked) {
-        case (?nextExpected) {
-          let m = List.size(userEvents);
-          if (nextExpected > shippedSeq + m) {
-            // ── "IMPOSSIBLE STATE" TRIP (public issue #43 — defensive; unreachable today) ──
-            // The queue spans [shippedSeq, shippedSeq + m), and the batch sent was a
-            // PREFIX of it, so a sane ack satisfies nextExpected ≤ shippedSeq + m even
-            // after mid-await tail growth. An ack past that is an archive claiming
-            // events it was never sent. The one state that could produce it — a wipe
-            // zeroing the cursors while an old archive stayed attached (its appendBatch
-            // then skips the new epoch's events as "replays" and acks its OLD cursor) —
-            // is unreachable: performWorldWipe nulls archive0 in both reachable arms
-            // and both callers refuse on #production. If it ever fires anyway,
-            // advancing shippedSeq := nextExpected (what this code once did after
-            // clamping only the drop) would run the cursor permanently ahead of the
-            // queue: every later sane ack would read as stale, the queue could never
-            // drain, and resetSeason's unshipped-history arithmetic would trap. So
-            // REFUSE the divergent ack — advance nothing, drop nothing — record the
-            // divergent range on the ledger-gap ops surface (getLedgerGaps) so it is
-            // never absorbed silently, and count it as a ship FAILURE so the L1 roll
-            // seals this archive at its last SANE acked seq and re-anchors a fresh
-            // successor: the queue stays drainable, onto the fresh archive.
-            _ackDivergences += 1;
-            _shipFailStreak += 1;
-            // Dedupe: an unrecoverable divergence (spawn blocked → no roll) repeats
-            // every tick with the same range — never grow the gap list with copies.
-            let gN = _ledgerGaps.size();
-            if (gN == 0 or _ledgerGaps[gN - 1].0 != shippedSeq + m or _ledgerGaps[gN - 1].1 != nextExpected) {
-              recordGap(shippedSeq + m, nextExpected);
-            };
-            logEvent("error", "system", "IMPOSSIBLE STATE: archive acked nextExpected "
-              # Nat.toText(nextExpected) # " but the queue spans [" # Nat.toText(shippedSeq)
-              # ".." # Nat.toText(shippedSeq + m) # ") — divergent ack REFUSED (divergence #"
-              # Nat.toText(_ackDivergences) # "; recorded as a ledger gap; counting toward the failover roll)", null);
-          } else {
-            _shipFailStreak := 0;   // a sane ack (#ok or #full) is a healthy response, not a failure
-            if (nextExpected > shippedSeq) {
-              // queue[0].seq == shippedSeq by construction, so the acked
-              // prefix is exactly the first (nextExpected − shippedSeq) —
-              // and the trip above guarantees drop ≤ m here.
-              let drop : Nat = nextExpected - shippedSeq;
-              let rest = List.empty<Types.UserEvent>();
-              for (e in List.range(userEvents, drop, m)) { List.add(rest, e) };
-              userEvents := rest;
-              shippedSeq := nextExpected;
-            };
-          };
-        };
-        case null {};
+      switch (await* shipBatchTo(a, epoch)) {
+        case (#stale) { return };           // reset raced the ship — stale ack
+        case (#acked(f)) { archiveFull := f.full };
+        case (#rejected) {};
       };
 
       // ── Phase-B growth (still under the ship single-flight) ─────
@@ -9044,7 +12181,10 @@ persistent actor Uplands {
       // epoch check destroys an orphan if a reset races us). A #full archive
       // spawns immediately regardless of count — the byte wall beat the
       // event trigger.
-      if ((activeCount * 10 >= cap * 9 or archiveFull) and _archiveNext == null and Time.now() >= _spawnRetryAfterNs) {
+      // (#55: the busy-slot check sits LAST so it only runs — and logs — when
+      // a spawn would otherwise have been attempted; a refusal arms no cooldown.)
+      if ((activeCount * 10 >= cap * 9 or archiveFull) and _archiveNext == null and Time.now() >= _spawnRetryAfterNs
+          and not spawnSlotBusy("successor")) {
         // Same adaptive endowment as the initial spawn: never attach cycles
         // we don't hold (traps), 0 on an engine-style zero balance.
         let succAmt = switch (archiveSpawnCycles()) {
@@ -9102,6 +12242,7 @@ persistent actor Uplands {
               let sealedCid = p;
               try {
                 await ic00.update_settings({ canister_id = sealedCid; settings = { controllers = ?[] } });
+                List.add(_archivesBlackholed, sealedCid);
                 logEvent("info", "system", "Sealed archive BLACKHOLED (controllers = []): "
                   # Principal.toText(sealedCid) # " — its history is now immutable", null);
               } catch (e) {
@@ -9112,6 +12253,24 @@ persistent actor Uplands {
           };
           case _ {};   // successor not ready — the spawn branch above is already retrying
         };
+      };
+      // ── H-32: backlog-scaled drain (SHIP_BURST_MAX above) ─────────
+      // Keep sending ordinary batches while the queue is above the soft
+      // admission tier and the shipper is healthy. archive0 is re-read each
+      // pass (the seal above may have swapped in the successor — it anchors
+      // on the first seq it sees). Phase-B bookkeeping is the next tick's:
+      // the archive cap is soft, and a burst overshoots it by at most
+      // SHIP_BURST_MAX × SHIP_BATCH_MAX events.
+      var burst : Nat = 0;
+      label drain while (burst < SHIP_BURST_MAX and not archiveFull and _shipFailStreak == 0
+                         and List.size(userEvents) > shipSoftTier() and _captureEpoch == epoch) {
+        let a2 = switch (archive0) { case (?p) { p }; case null { break drain } };
+        switch (await* shipBatchTo(a2, epoch)) {
+          case (#acked(f)) { if (f.full) { break drain } };
+          case _ { break drain };
+        };
+        burst += 1;
+        _shipBurstBatches += 1;
       };
     } catch (e) {
       // Sidecar unreachable / TRAPPED (Region full pre-fix, a bug, out of
@@ -9127,20 +12286,42 @@ persistent actor Uplands {
     };
   };
 
-  // Upgrade the spawned archive sidecar IN PLACE to the version embedded in this
-  // (freshly-deployed) main canister — additive code changes only. #upgrade
-  // preserves the sidecar's stable Region + indexes, so the 2M+ events survive;
-  // it would only fail closed (trap, sidecar unchanged) on incompatibility.
+  // Upgrade every archive segment we control IN PLACE to the version embedded
+  // in this (freshly-deployed) main canister — additive code changes only.
+  // #upgrade preserves each sidecar's stable Region + indexes, so the events
+  // survive; it fails closed (trap, sidecar unchanged) on incompatibility.
   // Controller-gated; the upgrade path that was deferred from Phase A′.
+  //
+  // #54.7: walks the WHOLE chain — prior seasons' sealed segments, this
+  // season's sealed segments, the active tip, the pre-spawned successor — and
+  // refuses only when that chain is EMPTY. Right after a season reset
+  // (archive0 nulled) or an L1/L2 seal with the spawn blocked, N sealed
+  // segments are still ours to upgrade, and the old `archive0 == null` gate
+  // refused them naming the wrong cause. Per hop, a catch is CLASSIFIED: a
+  // segment the blackhole-at-seal policy made immutable (seal-time record) is
+  // a skip by design — we dropped our own controller rights; anything else is
+  // a FAILURE, counted separately and logged with the principal and the IC's
+  // message, so the reply can no longer certify a failed hop as a design
+  // skip (the subnet runbook reads that reply and proceeds on it).
+  // Task 1793569495: the reply itself NAMES every failed hop with the IC's
+  // reject text. "F failed (see log)" sent the operator to a ring log the CLI
+  // reads only through getRecentEvents (bounded — the line can be gone by
+  // the time it is looked for); the engine's 2026-11-01 run said "1 failed"
+  // and the id had to be found by elimination. A not-found cause means the
+  // canister no longer exists — the reply names adminDropMissingArchive as
+  // the door that retires its row.
   public shared (msg) func adminUpgradeArchives() : async { #ok : Text; #err : Text } {
     requireController(msg.caller);
-    if (archive0 == null) { return #err("no archive sidecar spawned yet") };
+    let chain = allArchivePrincipals();
+    if (chain.size() == 0) { return #err("no archive segments to upgrade (chain empty: nothing spawned yet, or a wipe cleared it)") };
     var upgraded = 0;
-    var skipped = 0;
-    for (cid in allArchivePrincipals().vals()) {
+    var blackholed = 0;
+    var failed = 0;
+    var failures : Text = "";      // "<cid>: <reject text>; …" — the reply's own copy of the warn lines
+    var anyMissing = false;
+    for (cid in chain.vals()) {
       // The routing table stores principals / minimal sink types; recover the
-      // full class-typed ref for the actor-class upgrade. Blackholed sealed
-      // archives refuse (we are no longer a controller) — skip, by design.
+      // full class-typed ref for the actor-class upgrade.
       try {
         let full = actor (Principal.toText(cid)) : Archive.Archive;
         let fresh = await (system Archive.Archive)(#upgrade full)(Principal.fromActor(Uplands));
@@ -9154,11 +12335,27 @@ persistent actor Uplands {
           case null {};
         };
         upgraded += 1;
-      } catch (_) { skipped += 1 };
+      } catch (e) {
+        if (isBlackholedArchive(cid)) {
+          blackholed += 1;
+        } else {
+          failed += 1;
+          logEvent("warn", "system", "ARCHIVE UPGRADE: " # Principal.toText(cid) # " failed: " # Error.message(e), null);
+          if (isCanisterNotFound(cid, e)) { anyMissing := true };
+          failures #= (if (failures == "") "" else "; ") # Principal.toText(cid) # ": " # Error.message(e);
+        };
+      };
     };
-    logEvent("info", "system", "Archive chain upgraded in place (" # Nat.toText(upgraded)
-      # " upgraded, " # Nat.toText(skipped) # " skipped)", null);
-    #ok(Nat.toText(upgraded) # " archive(s) upgraded, " # Nat.toText(skipped) # " skipped (blackholed)");
+    let summary = Nat.toText(upgraded) # " archive(s) upgraded, " # Nat.toText(blackholed)
+      # " skipped (blackholed), " # Nat.toText(failed) # " failed"
+      # (if (failed > 0) {
+          " — " # failures
+          # " (each hop also a warn line on the ring log: getRecentEvents, 'ARCHIVE UPGRADE: <id> failed: <cause>'"
+          # (if (anyMissing) "; a 'not found' cause means the canister no longer exists — adminDropMissingArchive(<id>) retires its routing row and declares the gap" else "")
+          # ")"
+        } else { "" });
+    logEvent(if (failed > 0) "warn" else "info", "system", "Archive chain upgraded in place: " # summary, null);
+    #ok(summary);
   };
 
   // ── Ledger replay auditor ─────────────────────────────────────────
@@ -9182,6 +12379,13 @@ persistent actor Uplands {
   // tickShipEvents' guard.
   transient var _replayInFlight : Bool = false;
   transient var _replayFolded : Nat = 0;
+  // #54.2 test knob (dev-only, see setTestReplayStepHold): extra rounds the
+  // step yields between fetching a page and folding it, from the second
+  // page on. A seeded venue's whole fold is ~5 archive round-trips — well
+  // under one CLI call's latency — so without a hold no second shell can
+  // land a call INSIDE a live step. Re-read every round: clearing it ends
+  // the hold immediately.
+  transient var _testReplayStepHold : Nat = 0;
 
   func archiveForSeq(seq : Nat) : ?Principal {
     for (s in List.values(_archivesSealed)) {
@@ -9193,14 +12397,35 @@ persistent actor Uplands {
     };
   };
 
+  // #54.2: reset takes the same single-flight guard as step. Without it a
+  // reset landing INSIDE a multi-page step emptied the fold maps after page
+  // one was folded; the continuation folded the remaining pages into empty
+  // maps, finished `done = true`, and adminReplayReport raised the W4-09
+  // FALSE reserve alarm for every account active in page one. The refusal
+  // is LOUD per the posture-gate rule (no bare return on an `async ()`
+  // signature): a trap, no Candid change. The step's `finally` clears the
+  // flag when it returns; reset then, and the audit is exact.
   public shared (msg) func adminReplayReset() : async () {
     requireController(msg.caller);
+    if (_replayInFlight) {
+      Runtime.trap("adminReplayReset: a replay step is in flight — refused (the fold would be corrupted); wait for the step to return, then reset");
+    };
     Map.clear(_replayAcc);
     Map.clear(_replayDebt);
     Map.clear(_replayLp);
     Map.clear(_replayIns);
     _replayCursor := 0;
     _replayFolded := 0;
+    flushExitWindows(true);   // H-32: withheld exit rows enter the queue now, so the fold has every row to chase
+  };
+
+  // Dev-only: widen adminReplayStep's in-flight window (rounds per page,
+  // capped) so tests/test_w4_batch2.sh §1b can race a reset against a live
+  // step from a second shell. 0 restores the real cadence.
+  public shared (msg) func setTestReplayStepHold(rounds : Nat) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestReplayStepHold");
+    _testReplayStepHold := Nat.min(rounds, 2_000);   // ~11ms per round locally
   };
 
   // Fold up to maxEvents more tape positions. `done` = the cursor has caught
@@ -9240,6 +12465,15 @@ persistent actor Uplands {
           let a = actor (Principal.toText(cid)) : Archive.Archive;
           let page = await a.getEventsRange(_replayCursor, Nat.min(remaining, 200));
           if (page.size() == 0) { break go };
+          // Dev-only race window (#54.2): the page is fetched, the cursor
+          // still points at its start, nothing of it is folded yet — the
+          // state a reset used to corrupt. From the SECOND page on: page one
+          // folds in-round, so a second shell's call lands here with nothing
+          // to time (queries starve on a busy local replica; ingress does
+          // interleave). Re-reads the knob so clearing it ends the hold at
+          // the next round. Zero rounds on every other posture.
+          var hold = if (IS_DEV and _replayFolded > 0) _testReplayStepHold else 0;
+          while (hold > 0 and _testReplayStepHold > 0) { await async {}; hold -= 1 };
           for (e in page.vals()) {
             if (isBaselineStart(e.seq)) {
               Map.clear(_replayAcc);
@@ -9283,7 +12517,8 @@ persistent actor Uplands {
       cursor = _replayCursor;
       done = _replayCursor >= shippedSeq
         and List.size(userEvents) == 0
-        and List.size(accounts.journal) == 0;
+        and List.size(accounts.journal) == 0
+        and exitRowsWithheld() == 0;   // H-32: an open exit window still holds rows bound for the tape
     };
     } finally { _replayInFlight := false };
   };
@@ -9370,8 +12605,15 @@ persistent actor Uplands {
   // out-of-cycles freeze (the heartbeat stalls either way). The UI needs
   // these numbers to blame the right cause; it mis-reported "out of
   // cycles" when the order-map leak bricked updates at the 3 GiB default
-  // limit on 2026-06-10. ordersRetained is the leak telltale: orders are
-  // currently never deleted, so this counts every order ever placed.
+  // limit on 2026-06-10. ordersRetained is the leak telltale: the size of
+  // the hot order map — open and partially-filled orders plus the closed
+  // ones the reaper has not yet swept. It counted every order ever placed
+  // only before reapClosedOrders existed (the 2026-06-10 brick); now the
+  // heartbeat deletes closed orders every HB_REAP_NS (AMM quotes on first
+  // sight, user orders one sweep after their closed-order history record
+  // is appended), so the figure is RETAINED orders, and a value that climbs
+  // steadily while the heartbeat runs means the reaper is stalled or behind
+  // its per-sweep cap (REAP_SWEEP_CAP), not the pre-reaper leak returning.
   // The release this backend was built from — the trivially-queryable form
   // of getCanisterInfo.appVersion (bots, scripts, curl).
   public query func getAppVersion() : async Text { APP_VERSION };
@@ -9386,6 +12628,7 @@ persistent actor Uplands {
     lastHeartbeatNs : Int;
     nowNs           : Int;
     timersPaused    : Bool;
+    seasonSealing   : Bool;      // #54.1: the season-boundary latch (true only inside resetSeason's Bridge round-trip; a stranded true is cleared by any wipe or upgrade)
     memorySizeBytes      : Nat;
     heapLiveBytes        : Nat;
     wasmMemoryLimitBytes : Nat;
@@ -9395,8 +12638,17 @@ persistent actor Uplands {
     usersRegistered : Nat;
     journalUnshipped  : Nat;   // history events queued, not yet in the sidecar
     ledgerJournalPending : Nat; // balance deltas awaiting the #delta drain (upstream of the queue)
+    exitCoalesced     : Nat;   // H-32: dust exits whose tape rows were coalesced into a window, lifetime
+    exitRowsWithheld  : Nat;   // H-32: rows held in open exit windows, bound for the tape at the window's end
+    shipBurstBatches  : Nat;   // H-32: extra ship batches sent by the backlog-scaled drain, lifetime
     archivedEvents    : Nat;   // events durably acked by the sidecar
     archiveCanisterId : ?Text; // null until the sidecar is spawned (= the ACTIVE archive)
+    // #55: the W4-16 spawn slot — a canister we created whose install has not
+    // completed (or whose continuation was lost). Non-null for more than a
+    // few seconds is an ops signal: the reconciler reaps it at 5 min, and the
+    // busy guard refuses every spawn until it does. Listed here because an
+    // orphan "listed nowhere" was the whole complaint.
+    pendingSpawn      : ?{ cid : Text; atNs : Int };
     archivesSealed        : Nat; // full archives behind the active one (Phase-B chain)
     shipFailStreak    : Nat;   // consecutive archive-ship failures (L1 rolls at the threshold)
     emergencyRolls    : Nat;   // L1 failover rolls performed (a healthy exchange stays 0)
@@ -9433,6 +12685,7 @@ persistent actor Uplands {
       lastHeartbeatNs = _lastHeartbeatNs;
       nowNs           = Time.now();
       timersPaused    = _timersPaused;
+      seasonSealing   = _seasonSealing;
       memorySizeBytes      = Prim.rts_memory_size();
       heapLiveBytes        = Prim.rts_heap_size();
       wasmMemoryLimitBytes = _wasmMemoryLimit;
@@ -9442,6 +12695,9 @@ persistent actor Uplands {
       usersRegistered = Map.size(registeredUsers);
       journalUnshipped  = List.size(userEvents);
       ledgerJournalPending = List.size(accounts.journal);
+      exitCoalesced     = _exitCoalesced;
+      exitRowsWithheld  = exitRowsWithheld();
+      shipBurstBatches  = _shipBurstBatches;
       archivedEvents    = shippedSeq;
       archiveCanisterId = switch (archive0) {
         case (?p) { ?Principal.toText(p) };
@@ -9453,6 +12709,7 @@ persistent actor Uplands {
       shedEvents           = _shedEvents;
       ackDivergences       = _ackDivergences;
       ledgerGaps           = _ledgerGaps.size();
+      pendingSpawn         = switch (_pendingSpawn) { case (?ps) { ?{ cid = Principal.toText(ps.cid); atNs = ps.atNs } }; case null { null } };
       archiveCycles        = _archiveCycles;
       archiveLifetimeTopUp = _archiveLifetimeTopUp;
       bridgeCycles         = _bridgeCycles;
@@ -9490,6 +12747,23 @@ persistent actor Uplands {
   func requireAuth(caller : Principal) {
     if (Principal.isAnonymous(caller)) {
       Runtime.trap("Authentication required");
+    };
+  };
+
+  // H-30: registration (a deposit through the Bridge → creditAndRegister, or
+  // the #dev faucet) is the venue's anti-Sybil bound — email-bound and
+  // allowance-capped — so a method that writes a PERMANENT per-principal
+  // record (createMarginPool's registry rows, cancelAllAfter's switch) or
+  // spends cycles per caller (aiComplete's outcalls) must not be reachable by
+  // unlimited offline keypairs. inspect already refuses unregistered ingress
+  // to everything outside the pre-registration set; this is the body-level
+  // half — inter-canister callers bypass inspect by construction, and the
+  // doctrine says the body re-checks what the gate decided. Controllers
+  // exempt (ops/testing), as aiComplete's inline check always was.
+  func requireRegistered(caller : Principal) {
+    if (Principal.isController(caller)) { return };
+    if (Map.get(registeredUsers, Text.compare, Principal.toText(caller)) == null) {
+      Runtime.trap("Registration required — this method is available once you've made a deposit");
     };
   };
 
@@ -9565,19 +12839,123 @@ persistent actor Uplands {
   // CLASSIFY the new method — exit set or sheddable — instead of inheriting
   // a silent default. Queries never pass inspect, so a query tag here is
   // inert. Regenerate the list from candid/backend.did's non-query methods.
+  //
+  // THE EXIT SET, as data — the ONE place the set is named (#55 "exits still
+  // say refused"). inspect's switch below can only match literal tags (the
+  // compiler wants them), so it ROUTES a candidate tag to its name and lets
+  // isExitMethod decide; whyAmIRefused reports the same list as exitMethods
+  // and derives exitsAdmitted from the same caller policy minus the floor.
+  // Hygiene §6c ties the routing arms and this list together, so neither can
+  // grow without the other. Every method here EXITS state (cancels, closes,
+  // unstakes, withdraws): cheap when the caller has nothing to exit, and none
+  // is a spam vector worth the floor. cancelPoolOrder is here beyond the
+  // reporter's seven because a pool order locks pool collateral — cancelling
+  // it is the pool-side de-lever; repayPoolDebt (task 1788523828) for the
+  // same reason — retiring a pool's debt from its idle funds IS de-levering,
+  // and it is the one exit that leaves the position standing. cancelAllAfter
+  // is deliberately NOT here: arming a dead-man switch is protective but not
+  // an immediate exit.
+  // STABLE-FOSSIL (task 1788523828): the original list was a plain `let` —
+  // implicitly STABLE in a persistent actor (the W5-12 shape) — so the
+  // upgrade that added the ninth exit kept the FIRST-installed eight on every
+  // live venue: repayPoolDebt was shed at the gate on an upgraded venue whose
+  // fresh candid carried it (test_load_shed_exits, caught live on the seat
+  // venue). A stable field can be neither dropped nor flipped transient
+  // without a migration (IC0503), so it stays parked and UNREAD — hygiene
+  // §6c pins that nothing reads it; EXIT_METHOD_SET below, transient so the
+  // literal is what every upgrade installs, is the list the code reads.
+  let EXIT_METHODS : [Text] = []; // STABLE-FOSSIL: unread — the live list is EXIT_METHOD_SET
+  transient let EXIT_METHOD_SET : [Text] = [
+    "cancelMyOrder", "cancelAllMyOrders", "closePosition", "withdrawMarginPool",
+    "unstakeInsurance", "withdrawLp", "withdraw", "cancelPoolOrder", "repayPoolDebt",
+    "cancelStagedLpRequest",   // task 1788731609: releases the owner's own staged-LP reservation, as the staged-order cancels do
+  ];
+  func isExitMethod(name : Text) : Bool {
+    Array.find<Text>(EXIT_METHOD_SET, func m = m == name) != null
+  };
+  // THE PRE-REGISTRATION SET (H-30, F37/F43), as data — the ONE place it is
+  // named, the same shape as EXIT_METHOD_SET. An UNKNOWN principal (signed in,
+  // never deposited) reaches exactly these update methods and nothing else:
+  // the frontend's whole pre-deposit surface — profile + username on sign-in,
+  // preference sync, and the two Internet Identity verification legs. Every
+  // other update (order entry, createMarginPool, cancelAllAfter, aiComplete,
+  // the exit set…) needs registration, which is a deposit through the Bridge
+  // (creditAndRegister is inter-canister and bypasses inspect). The gate used
+  // to admit unknown principals to EVERYTHING outside production — 64
+  // permanent pool records per offline keypair, an armable dead-man switch
+  // per throwaway. inspect's switch below ROUTES the candidate tags to names
+  // exactly like the exit set; isPreRegistrationMethod decides; whyAmIRefused
+  // reports the same list (preRegistrationMethods / preRegistrationAdmitted);
+  // hygiene §6d ties the arms and the list together.
+  // STABLE-FOSSIL (task 1788533845): both original lists were plain `let`s —
+  // implicitly STABLE in a persistent actor (the W5-12 shape) — so on every
+  // venue that took H-30 as an UPGRADE the gate read whatever H-30's FIRST
+  // install wrote: a method later ADDED here stayed refused for unknown
+  // principals, and one later REMOVED stayed admitted (the anti-Sybil
+  // direction). Rehearsed live on the seat venue: an upgrade that added a
+  // name left whyAmIRefused reporting the old seven. A stable field can be
+  // neither dropped nor flipped transient without a migration (IC0503), so
+  // both stay parked and UNREAD — hygiene §6d pins that nothing reads them;
+  // the transient *_SET twins below, re-initialised from their literals on
+  // every upgrade, are the lists the code reads.
+  let PRE_REGISTRATION_METHODS : [Text] = []; // STABLE-FOSSIL: unread — the live list is PRE_REGISTRATION_METHOD_SET
+  transient let PRE_REGISTRATION_METHOD_SET : [Text] = [
+    "getMyProfile", "setUserPreferences", "getUserPreferences", "regenerateUsername",
+    "_internet_identity_sign_in_start", "_internet_identity_sign_in_finish",
+  ];
+  // #dev only: the faucet IS the dev registration path (addTestTokens marks
+  // its caller registered), so a not-yet-registered test identity must reach
+  // it. On #play/#production its body traps as a dev-only hook anyway; the
+  // gate mirrors that so the list stays honest per posture.
+  let DEV_PRE_REGISTRATION_METHODS : [Text] = []; // STABLE-FOSSIL: unread — the live list is DEV_PRE_REGISTRATION_METHOD_SET
+  transient let DEV_PRE_REGISTRATION_METHOD_SET : [Text] = ["addTestTokens"];
+  func isPreRegistrationMethod(name : Text) : Bool {
+    Array.find<Text>(PRE_REGISTRATION_METHOD_SET, func m = m == name) != null
+    or (IS_DEV and Array.find<Text>(DEV_PRE_REGISTRATION_METHOD_SET, func m = m == name) != null)
+  };
+  func effectivePreRegistrationMethods() : [Text] {
+    if (IS_DEV) { Array.concat(PRE_REGISTRATION_METHOD_SET, DEV_PRE_REGISTRATION_METHOD_SET) }
+    else { PRE_REGISTRATION_METHOD_SET }
+  };
+  // Would this caller pass inspect's CALLER policy — anonymous refused,
+  // registered admitted, unknown principals refused (H-30: they are admitted
+  // to the pre-registration set ONLY, by preRegistrationAdmitted below) —
+  // before the floor is consulted? This is exactly the exit set's verdict
+  // (the floor never applies to it), and the floor-gated verdict for every
+  // other update is `callerAdmitted and rank >= floor`. Both inspect and
+  // whyAmIRefused read it, so the diagnostic cannot disagree with the gate.
+  func callerAdmitted(caller : Principal, registered : Bool) : Bool {
+    if (Principal.isAnonymous(caller)) { false }
+    else { registered }
+  };
+  // Would a PRE-REGISTRATION-SET update from this caller pass? Registered
+  // callers take the ordinary (floor-gated) path; unknown principals are
+  // admitted on EVERY posture — production included, by the operator
+  // decision of 2026-09-05 (task 1788499950): a production user must reach
+  // getMyProfile / preferences / username / the II legs between sign-in and
+  // the first Bridge deposit, and the H-36 bounded pre-registration store
+  // (preRegTouch: hard cap, LRU eviction, heartbeat expiry, promotion on
+  // registration) is what makes admitting free keypairs there acceptable.
+  // The verdict is PreReg.admitted, posture-parameterised so PreReg.test.mo
+  // pins all three postures; this wrapper only feeds it the live posture.
+  // Shared with whyAmIRefused; hygiene §6d pins that no posture arm returns.
+  func preRegistrationAdmitted(caller : Principal, registered : Bool) : Bool {
+    PreReg.admitted(DEPLOY_MODE, Principal.isAnonymous(caller), registered)
+  };
   system func inspect({ caller : Principal; msg : {
     #_internet_identity_sign_in_finish : Any; #_internet_identity_sign_in_start : Any;
     #addTestTokens : Any; #adminBackfillArchiveDw : Any; #adminClearAiBan : Any; #adminClearFuelAmbiguous : Any;
     #adminForceShipTick : Any; #adminFundArchive : Any; #adminFundCanister : Any; #adminFundBridge : Any;
+    #adminPruneUnregisteredResidue : Any;
     #adminRebuildIndexes : Any; #adminRecomputeLeaderboard : Any; #adminRefreshXrcAnchors : Any;
     #adminReplayReport : Any; #adminReplayReset : Any; #adminReplayStep : Any;
-    #adminResetLiquidationBreaker : Any; #adminResetPlayAllowances : Any;
+    #adminDropMissingArchive : Any; #adminResetLiquidationBreaker : Any; #adminResetPlayAllowances : Any; #adminRetireEmptySeasonSegment : Any;
     #adminRetryFuelNotify : Any; #adminRunArchiveFuelPass : Any; #adminRunDeferredExpiry : Any; #adminRunDeferredSwaps : Any;
-    #adminRunLiquidationBatch : Any; #adminSpawnCanister : Any; #adminSweepExpiredOrders : Any;
+    #adminRunLiquidationBatch : Any; #adminRunStagedLp : Any; #adminSpawnCanister : Any; #adminSweepExpiredOrders : Any;
     #adminSweepStaleOrders : Any; #adminUpgradeArchives : Any; #adminVerifyBookAggregates : Any;
     #aiActionExecuted : Any; #aiComplete : Any; #aiConfigured : Any; #aiProvider : Any;
     #archiveSchema : Any; #bulkSetTestBalances : Any; #burnTreasuryIcpToCycles : Any;
-    #cancelAllAfter : Any; #cancelAllMyOrders : Any; #cancelMyOrder : Any; #cancelPoolOrder : Any;
+    #cancelAllAfter : Any; #cancelAllMyOrders : Any; #cancelMyOrder : Any; #cancelPoolOrder : Any; #cancelStagedLpRequest : Any;
     #closePosition : Any; #convertTreasuryToFuel : Any; #createAmmPool : Any;
     #createMarginPool : Any; #creditAndRegister : Any; #debugInspectByUsername : Any;
     #depositLp : Any; #donateToVault : Any; #enableAmm : Any; #execute : Any; #extMarketSwap : Any;
@@ -9587,52 +12965,60 @@ persistent actor Uplands {
     #getAmmPool : Any; #getAmmPools : Any; #getAmmPrincipal : Any; #getAmmRebalanceEnabled : Any;
     #getApiDoc : Any; #getAppVersion : Any; #getArbStats : Any; #getArbitrageur : Any;
     #getArchiveChain : Any; #getArchives : Any; #getBadgeCatalog : Any; #getBalance : Any;
-    #getBalances : Any; #getBridge : Any; #getCandles : Any; #getCanisterInfo : Any;
+    #getBalances : Any; #getBridge : Any; #getBridgeWiring : Any; #getCandles : Any; #getCanisterInfo : Any;
     #getDeployMode : Any; #getDepositAddress : Any;
-    #getFuelStatus : Any; #getHbHealth : Any; #getInsuranceFund : Any; #getLastAggregate : Any; #getLeaderboard : Any;
+    #getFuelStatus : Any; #getFundingAuthority : Any; #getHbHealth : Any; #getInsuranceFund : Any; #getLastAggregate : Any; #getLeaderboard : Any;
     #getLedgerGaps : Any; #getLiquidationSweepHealth : Any; #getMarginHeatmap : Any;
     #getMarginHeatmapHistory : Any; #getMarginHeatmaps : Any; #getMarginRiskSummary : Any;
+    #getMaxInstantWithdraw : Any; #getVaultImpairment : Any;
     #getMarketChanges : Any; #getMarketSpecs : Any; #getMarketStatus : Any; #getMarketTele : Any;
     #getMarkets : Any; #getMyAccountSummary : Any; #getMyAdjustments : Any; #getMyAiUsage : Any;
-    #getMyArchivedEvents : Any; #getMyAvailableBalance : Any; #getMyAvailableBalances : Any;
+    #getMyArchivedEvents : Any; #getMyArchivedEventsFiltered : Any; #getMyAvailableBalance : Any; #getMyAvailableBalances : Any;
     #getMyBidHeadroom : Any; #getMyCancelAllAfter : Any; #getMyClosedOrders : Any;
     #getMyDebt : Any; #getMyDeposits : Any; #getMyInsuranceStake : Any;
     #getMyLiquidationHistory : Any; #getMyLpBalance : Any; #getMyLpPosition : Any;
     #getMyMarginHealth : Any; #getMyMarginPools : Any;
     #getMyOrderStatus : Any; #getMyOrders : Any; #getMyOrdersOnMarket : Any;
-    #getMyPendingMatches : Any; #getMyPoolLiquidations : Any; #getMyPoolTransfers : Any;
+    #getMyPoolLiquidations : Any; #getMyPoolTransfers : Any;
     #getMyPositionEpisodes : Any; #getMyPositionFills : Any; #getMyPositions : Any;
-    #getMyProfile : Any; #getMyRecentSwap : Any; #getMyReleaseRejections : Any;
-    #getMyReservedBalance : Any; #getMyStagedOrderIds : Any; #getMyTradeHistory : Any;
+    #getMyProfile : Any; #getMyRecentSwap : Any; #getMyReleaseRejections : Any; #getPreRegStoreStats : Any;
+    #getMyReservedBalance : Any; #getMyStagedLpRequests : Any; #getMyStagedOrderIds : Any; #getMyTradeHistory : Any;
     #getMyTradeHistorySince : Any; #getMyTradesSinceId : Any; #getMyUnshippedEvents : Any;
     #getMyVaultLp : Any; #getMyVaultPosition : Any; #getMyVerification : Any;
     #getNettedVolumeUsd : Any; #getOrderBook : Any; #getOrderBookDepth : Any;
     #getPlayDepositAllowance : Any; #getPoolOrders : Any; #getPoolValue : Any;
     #getPoolValueHistory : Any; #getPriceFeedStats : Any; #getPriceSources : Any;
     #getPublicTradesSince : Any; #getRecentEvents : Any; #getRecentPublicTrades : Any;
-    #getRecentTrades : Any; #getReleaseInfo : Any; #getRuntimeEnv : Any; #getSeasonRecords : Any;
+    #getRecentTrades : Any; #getReleaseInfo : Any; #getRuntimeEnv : Any; #getSeasonArchives : Any; #getSeasonGaps : Any; #getSeasonRecords : Any; #getSeasonShedBaselines : Any;
     #getShedBaselines : Any; #getStagedIndexAudit : Any; #getTakeableDepth : Any; #getTestBalance : Any;
-    #devDriveLiqCycle : Any; #devGetGeptorInFlight : Any; #devPoisonGeptorInFlight : Any;
-    #devSweepCostProbe : Any; #devTickAutoFuel : Any;
+    #devBumpOracleEpoch : Any; #devDriveLiqCycle : Any; #devGetFanout : Any; #devGetGeptorInFlight : Any; #devGetReleaseRef : Any; #devPoisonGeptorInFlight : Any;
+    #devReleaseParkedReadings : Any; #devStallSource : Any;
+    #devSeedEmptyPools : Any; #devSeedPreRegFlood : Any; #devSweepCostProbe : Any; #devTradeHistoryCostProbe : Any; #devTickAutoFuel : Any; #devTickHeatmaps : Any; #devTickReap : Any; #devTickTier : Any;
     #getTradesSince : Any; #getTreasury : Any; #getUserBadges : Any; #getUserPreferences : Any;
     #getUserStatus : Any; #getVaultValue : Any; #getVaultValueHistory : Any;
     #getVaultWeights : Any; #getXrcAnchors : Any; #getXrcCanister : Any;
     #injectHistoricalTrades : Any; #openPosition : Any; #placeLimitOrder : Any;
     #placeLimitOrderExp : Any; #placeLimitOrderPO : Any; #placeLimitOrdersBulk : Any;
-    #placeMarketOrder : Any; #placeProtectedLimitOrder : Any; #playDepositAdmit : Any;
-    #playDepositReserve : Any; #previewOpenPosition : Any; #purgeZombieOrders : Any;
-    #quoteSwap : Any; #rebalanceAmm : Any; #regenerateUsername : Any; #replaceMyOrder : Any;
+    #placeMarketOrder : Any; #playDepositAdmit : Any;
+    #playDepositReservation : Any; #playDepositReserve : Any; #previewOpenPosition : Any; #purgeZombieOrders : Any;
+    #quoteSwap : Any; #rebalanceAmm : Any; #regenerateUsername : Any; #repayPoolDebt : Any; #replaceMyOrder : Any;
     #requoteAmm : Any; #resetExchange : Any; #resetSeason : Any; #schema : Any; #seedAmmPool : Any;
     #seedInsuranceFund : Any; #setAmmAutoInventory : Any; #setAmmConfig : Any;
     #setAmmRebalanceConfig : Any; #setAmmRebalanceEnabled : Any; #setAmmRefPrice : Any;
     #setAmmSkewConfig : Any; #setAnthropicApiKey : Any; #setArbitrageur : Any; #setAutoFuel : Any;
-    #setBlackholeAtSeal : Any; #setBridge : Any; #setFuelRoute : Any; #setGoogleApiKey : Any;
-    #setTestArbTakeableSpoof : Any; #setTestArchiveCap : Any; #setTestArchiveStopped : Any; #setTestBalance : Any;
+    #setBlackholeAtSeal : Any; #setBridge : Any; #setFuelRoute : Any; #setFundingAuthority : Any; #setGoogleApiKey : Any;
+    #setTestArbTakeableSpoof : Any; #setTestArchiveCap : Any; #setTestArchiveControllers : Any; #setTestArchiveDeleted : Any; #setTestArchiveMaxHops : Any; #setTestArchiveStopped : Any; #setTestBalance : Any;
+    #setTestSpawnOrphan : Any; #setTestPendingSpawn : Any; #adminForceSpawnReconcile : Any; #setTestSpawnReconcileHold : Any;
+    #setTestDeadmanDeadline : Any; #setTestDeadmanMaxFires : Any;
     #setTestDeferredExpiry : Any; #setTestDeferredFok : Any; #setTestEmailBinding : Any; #setTestFuelPendingSince : Any;
+    #setTestInsuranceStakedAt : Any;
     #setTestHbTrap : Any; #setTestLevelCap : Any; #setTestMinSources : Any;
     #setTestOrderCap : Any; #setTestOrderExpiry : Any; #setTestOrderTtl : Any;
-    #setTestPendingJump : Any; #setTestPlayDepositCap : Any; #setTestRefPriceUpdatedNs : Any;
+    #setTestPendingJump : Any; #setTestPlayDepositCap : Any; #setTestPreRegBounds : Any; #setTestRefPriceUpdatedNs : Any; #setTestReleasePacing : Any; #setTestReplayStepHold : Any;
+    #setTestBridgeOverride : Any; #setTestSeasonRow : Any; #setTestSeasonSealRace : Any; #setTestSeasonSealing : Any; #setTestStagedLpExpiry : Any;
     #setTestScorecard : Any; #setTestShedFloor : Any; #setTestShipFailover : Any; #setTestShipShedBands : Any;
+    #setTestExitCoalesceWindow : Any;
+    #setTestStagedShedBands : Any;
     #setTestTimersPaused : Any; #setTestXrcRate : Any; #setUserPreferences : Any;
     #setXrcCanister : Any; #skimArbitrageur : Any; #stakeInsurance : Any; #swap : Any;
     #transformHttpResponse : Any; #unstakeInsurance : Any; #whoami : Any; #whyAmIRefused : Any;
@@ -9641,9 +13027,53 @@ persistent actor Uplands {
     // Controller FIRST: in local dev the sole controller IS the anonymous
     // principal, so admin calls must pass before the anonymous reject below.
     if (Principal.isController(caller)) { return true };
-    if (Principal.isAnonymous(caller)) { return false };
+    // THE FUNDING AUTHORITY (task 1789609263): the controller-designated
+    // refill key is a NON-controller, typically never registered (it funds
+    // others, it never deposits), so without this arm the caller policy
+    // below would refuse it pre-consensus. It is routed to EXACTLY the two
+    // balance setters — nothing else the authority sends is admitted by this
+    // arm (the ordinary policy decides the rest, as for any principal). The
+    // arm reads no posture: on #production no authority can be designated
+    // (Funding.designable) and the mints trap anyway.
+    if (isFundingAuthority(caller)) {
+      switch (msg) {
+        case (#setTestBalance _ or #bulkSetTestBalances _) { return true };
+        case _ {};
+      };
+    };
     let key = Principal.toText(caller);
-    if (Map.get(registeredUsers, Text.compare, key) != null) {
+    let registered = Map.get(registeredUsers, Text.compare, key) != null;
+    // The caller policy is shared with whyAmIRefused (callerAdmitted above):
+    // anonymous refused; unknown principals decided below the floor block.
+    if (not callerAdmitted(caller, registered)) {
+      // Unknown principal (H-30): admitted to THE PRE-REGISTRATION SET only —
+      // the frontend's pre-deposit surface (PRE_REGISTRATION_METHOD_SET above,
+      // plus the faucet on #dev). Anonymous callers fall out of
+      // preRegistrationAdmitted (on every posture — production admits the set
+      // too, task 1788499950, behind H-36's bounded store); everything else an
+      // unregistered keypair sends is refused pre-consensus, so no offline
+      // keypair can mint pool records or arm a dead-man switch. Not floor-
+      // gated: unknown principals have no rank, and the whole admitted surface
+      // is six cheap methods.
+      // These arms only ROUTE tags to names (the compiler wants literal
+      // tags); hygiene §6d asserts the arms and the list enumerate one set.
+      if (not preRegistrationAdmitted(caller, registered)) { return false };
+      let preRegCandidate : ?Text = switch (msg) {
+        case (#getMyProfile _)                      ?"getMyProfile";
+        case (#setUserPreferences _)                ?"setUserPreferences";
+        case (#getUserPreferences _)                ?"getUserPreferences";
+        case (#regenerateUsername _)                ?"regenerateUsername";
+        case (#_internet_identity_sign_in_start _)  ?"_internet_identity_sign_in_start";
+        case (#_internet_identity_sign_in_finish _) ?"_internet_identity_sign_in_finish";
+        case (#addTestTokens _)                     ?"addTestTokens";
+        case _ null;
+      };
+      return switch (preRegCandidate) {
+        case (?name) { isPreRegistrationMethod(name) };
+        case null { false };
+      };
+    };
+    if (registered) {
       // L1 load shed (access-prioritization design): under load the tier floor
       // rises and lower tiers are refused AT THE GATE — their messages never
       // occupy the bounded ingress queue or cost replicated execution. Note
@@ -9658,30 +13088,35 @@ persistent actor Uplands {
       // the UI can classify. The congestion that raises the floor is exactly
       // when closing a position is urgent — a user who cannot voluntarily
       // de-lever is liquidated anyway, so shedding these converts load into
-      // forced liquidations. Every method here EXITS state (cancels, closes,
-      // unstakes, withdraws): each is cheap when the caller has nothing to
-      // exit, and none is a spam vector worth the floor. cancelPoolOrder is
-      // here beyond the reporter's seven because a pool order locks pool
-      // collateral — cancelling it is the pool-side de-lever. cancelAllAfter
-      // is deliberately NOT here: arming a dead-man switch is protective but
-      // not an immediate exit. DO NOT "simplify" this switch away — its
-      // absence was the finding.
-      switch (msg) {
-        case (#cancelMyOrder _ or #cancelAllMyOrders _ or #closePosition _
-           or #withdrawMarginPool _ or #unstakeInsurance _ or #withdrawLp _
-           or #withdraw _ or #cancelPoolOrder _) { return true };
-        case _ {};
+      // forced liquidations. The SET lives in EXIT_METHOD_SET above (one list,
+      // shared with whyAmIRefused); these arms only route the candidate tags
+      // to their names — the compiler needs literal tags here, and hygiene
+      // §6c asserts the arms and the list enumerate the same set. DO NOT
+      // "simplify" this switch away — its absence was the finding.
+      let exitCandidate : ?Text = switch (msg) {
+        case (#cancelMyOrder _)      ?"cancelMyOrder";
+        case (#cancelAllMyOrders _)  ?"cancelAllMyOrders";
+        case (#closePosition _)      ?"closePosition";
+        case (#withdrawMarginPool _) ?"withdrawMarginPool";
+        case (#unstakeInsurance _)   ?"unstakeInsurance";
+        case (#withdrawLp _)         ?"withdrawLp";
+        case (#withdraw _)           ?"withdraw";
+        case (#cancelPoolOrder _)    ?"cancelPoolOrder";
+        case (#repayPoolDebt _)      ?"repayPoolDebt";
+        case (#cancelStagedLpRequest _) ?"cancelStagedLpRequest";
+        case _ null;
+      };
+      switch (exitCandidate) {
+        case (?name) { if (isExitMethod(name)) { return true } };
+        case null {};
       };
       return levelRank(levelOfKey(key)) >= _shedFloor;
     };
-    // Unknown principal: allowed on dev AND play (a play user makes benign
-    // update calls — preference sync on sign-in — BEFORE their first bridge
-    // deposit registers them off-ingress via creditAndRegister), refused in
-    // production (same registration path, stricter gate). Play caveat,
-    // accepted for v1: unregistered spam isn't shed at this gate;
-    // method-scoping inspect would need the full msg variant enumeration.
-    // The staged caps + shed floor still bound registered flow.
-    not IS_PRODUCTION
+    // Unreachable: callerAdmitted is exactly `not anonymous and registered`,
+    // so every caller is either refused/routed above or registered. Kept as
+    // a literal so the verdict of this function is never an implicit fall-
+    // through.
+    true
   };
 
   // ── Mixin: AdminOps ──────────────────────────────────────────
@@ -9712,7 +13147,62 @@ persistent actor Uplands {
     Map.add(m, Text.compare, token, Option.get(Map.get(m, Text.compare, token), 0) + delta);
   };
 
-  include AdminOps(accounts, registeredUsers, requireController, IS_PRODUCTION, recordExternalFlow);
+  // The genesis-window latch, handed to the mixin as a READER (a Bool
+  // argument would freeze the include-time value; `_ammEverEnabled` flips
+  // later, on the first enableAmm). Decision 1788529484 / lib/Genesis.mo:
+  // bulkSetTestBalances is bound to the window on #play; setTestBalance is
+  // ratified live there and deliberately not.
+  func genesisLatched() : Bool { _ammEverEnabled };
+
+  // ── The FUNDING AUTHORITY (task 1789609263 — keychain hardening F17) ──
+  // The unattended subnet bot fleet refills its bots through setTestBalance,
+  // and until this field existed the only principal that could sign those
+  // refills was a CONTROLLER — on the subnet, the sole human-held controller
+  // of the live exchange, which therefore could not leave the keychain's
+  // unattended grant without silently breaking refills. A controller now
+  // designates ONE non-controller principal (the operator's `mdex-bots`
+  // key) that is admitted to EXACTLY the two balance setters and the scoped
+  // getTestBalance read (the mixin below asks `isFundingAuthority`; inspect
+  // routes the authority to those two tags and nothing else). #play/#dev
+  // only — the mints are dead on #production and so is the setter. Stable
+  // (additive, `?Principal` like _arbPrincipal): the designation survives
+  // upgrades; null clears it. The verdicts are lib/Funding.mo (pure,
+  // exhaustive on the posture; tests/Funding.test.mo). Every change lands
+  // on the tape as #config { setter = "setFundingAuthority"; value } —
+  // the seventh authority setter (task 1787199871's shape).
+  var _fundingAuthority : ?Principal = null;
+  func isFundingAuthority(p : Principal) : Bool {
+    switch (_fundingAuthority) { case (?a) { Principal.equal(a, p) }; case null { false } };
+  };
+
+  include AdminOps(accounts, registeredUsers, isFundingAuthority, IS_PRODUCTION, recordExternalFlow, preRegPromote, DEPLOY_MODE, genesisLatched);
+
+  // Designate (or clear, with null) the funding authority. Controller-only,
+  // never on #production (there is nothing to authorise there), never the
+  // anonymous principal (2vxsx-fae as the authority would open the mint to
+  // every unauthenticated caller — the exact surface the controller gate
+  // closes; Funding.designable is the verdict). A trap, not a typed #err:
+  // the signature is `()` (THE RULE at requireDevHook — refuse in whichever
+  // way the signature allows), matching setBridge / setArbitrageur.
+  public shared (msg) func setFundingAuthority(p : ?Principal) : async () {
+    requireController(msg.caller);
+    if (IS_PRODUCTION) { Runtime.trap("setFundingAuthority is not available on #production") };
+    switch (p) {
+      case (?a) {
+        if (not Funding.designable(DEPLOY_MODE, Principal.isAnonymous(a))) {
+          Runtime.trap("setFundingAuthority: the anonymous principal cannot be the funding authority");
+        };
+      };
+      case null {};
+    };
+    _fundingAuthority := p;
+    let v = switch (p) { case (?a) { Principal.toText(a) }; case null { "cleared" } };
+    logEvent("info", "system", "Funding authority " # (switch (p) { case (?_) { "set: " # v }; case null { "cleared" } }), null);
+    emitConfig(msg.caller, "setFundingAuthority", v);
+  };
+  // The operator's verification surface (the rollout task reads it back
+  // after designating; a fleet banner may too).
+  public query func getFundingAuthority() : async ?Principal { _fundingAuthority };
 
   // ── Deposit / adjustment history helpers ──────────────────────
   // Canonical implementation lives in lib/UserStatus.mo. Thin wrappers
@@ -9732,8 +13222,6 @@ persistent actor Uplands {
   };
 
   func appendAdjustments(user : Principal, adjs : [Types.OrderAdjustment]) {
-    // V2 only — `userAdjustments` is the fossil-parked pre-reason map and is
-    // never written again (see its declaration).
     UserStatus.appendAdjustments(userAdjustmentsV2, user, adjs);
   };
 
@@ -9747,8 +13235,59 @@ persistent actor Uplands {
   //      user-trade-history caches — otherwise the caller's resting limit
   //      order shows a stale `filled` value, and a fully-filled order is
   //      never removed from the Open Orders list.
+  // H-10 (F13): re-validate ONE user's resting orders against their current
+  // balances — the LiquidityManager walk (shrink/cancel per market, then the
+  // cross-market bid cap) and the adjustment records. Resting orders hold no reservation (W4-24's
+  // design: solvency is re-checked at match time), so this is the ONLY thing
+  // that keeps a resting book honest after a balance moves. Pre-fix every
+  // caller was a FILL path (adjustAffectedUsers below): a user who moved
+  // their whole balance out through fundMarginPool / stakeInsurance /
+  // depositLp kept a full-size resting book that could only ever cancel
+  // one order per sweep — the re-rest loop H-10 closes. Every user-reachable
+  // balance-reducing action now calls this after its debit; the fill paths
+  // call it through adjustAffectedUsers. Returns the number of adjustments.
+  func revalidateUserOrders(user : Principal, timestamp : Int) : Nat {
+    // H-34 / D5 (d): a margin POOL's resting exposure-increasing entries are
+    // funded at their fill by the vault, not by the pool's balance — the
+    // wallet adjuster (balance shrink + the 2.5× / cross-market bid caps,
+    // which openPosition already exempts pools from by design) would shrink
+    // every leveraged entry to the pool's cash on each debit. Pools get the
+    // balance shrink on their EXITS only (funded by holdings, as before);
+    // their entries are governed by the fill-time borrowCheck and by
+    // deriskPoolIfUnderInitial (settlePoolFills) — not by cash on hand.
+    let adjs = switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(user))) {
+      case (?poolId) {
+        LiquidityManager.adjustPoolOrders(orderStore, accounts, user, getAllMarketPairs(),
+          func(o : Types.Order, oBase : Types.TokenId) : Bool { poolOrderAddsExposure(poolId, o.side, oBase, OrderBook.remaining(o)) }, timestamp);
+      };
+      case null {
+        LiquidityManager.adjustUserOrders(orderStore, accounts, marginAccounts, marginPriceLookup, availableBalance, user, getAllMarketPairs(), timestamp);
+      };
+    };
+    // Task 1788520599 (the H-10 adjacent case): a POOL's adjustments are
+    // recorded under its OWNER. A pool principal is derived — no key signs
+    // as it — so rows keyed by it were written to nowhere (getMyAdjustments
+    // reads msg.caller only): when a pool's market entry spent the quote its
+    // resting limit entry needed, the entry shrank (this walk runs on every
+    // pool debit — fills via adjustAffectedUsers, withdrawMarginPool
+    // directly) but the owner never saw WHY. Same attribution
+    // recordReleaseRejection uses (ownerUserKey): the human whose Open
+    // Orders / Positions views poll gets the row, and the owner's version
+    // ticks so those views refresh. Order ids are global, so the rows
+    // resolve through getMyOrderStatus / getPoolOrders exactly as the
+    // pool's other handles do.
+    let (recordAs, isPool) : (Principal, Bool) = switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(user))) {
+      case (?poolId) {
+        switch (getMarginPool(poolId)) { case (?pool) { (pool.owner, true) }; case null { (user, false) } };
+      };
+      case null { (user, false) };
+    };
+    appendAdjustments(recordAs, adjs);
+    if (isPool and adjs.size() > 0) { bumpUserVersion(recordAs) };
+    adjs.size();
+  };
+
   func adjustAffectedUsers(affected : [Principal], timestamp : Int) {
-    let marketPairs = getAllMarketPairs();
     let seen = Map.empty<Text, Bool>();
     for (user in affected.vals()) {
       let key = Principal.toText(user);
@@ -9756,19 +13295,7 @@ persistent actor Uplands {
         case (?_) {};
         case null {
           Map.add(seen, Text.compare, key, true);
-          let adjs = LiquidityManager.adjustUserOrders(orderStore, accounts, marginAccounts, marginPriceLookup, availableBalance, user, marketPairs, timestamp);
-          // LiquidityManager cancels orders directly on the OrderBook;
-          // any that were cancelled may be protected makers with live
-          // pending matches. Void those so the reserved funds don't get
-          // orphaned — the user's balance triggered this cancellation,
-          // so refunding pending-match reserves is the correct outcome.
-          for (adj in adjs.vals()) {
-            if (adj.cancelled) {
-              voidPendingMatchesForMaker(adj.orderId);
-              ignore Map.delete(orderSettlementWindows, Nat.compare, adj.orderId);
-            };
-          };
-          appendAdjustments(user, adjs);
+          ignore revalidateUserOrders(user, timestamp);
           // Always bump: the user's filled amount / order status / balances
           // changed, and they have a new trade in their history.
           // `adjs.size() > 0` is orthogonal — it only signals that OTHER
@@ -9785,7 +13312,7 @@ persistent actor Uplands {
 
   // Force-cancel ALL of a user's working orders and release every reservation:
   // staged orders (deferredExecs), staged cross-swaps (deferredSwaps), and
-  // resting book orders (voiding any in-flight pending matches first). Used by
+  // resting book orders. Used by
   // the liquidation path (H2): a liquidatee's collateral parked in a staged
   // sell or a resting order must be freed back to spendable balance BEFORE the
   // seize, so the liquidator can reach it instead of writing the debt off as
@@ -9794,26 +13321,14 @@ persistent actor Uplands {
   // snapshotted before mutation since the cancels mutate the maps.
   func cancelAllUserOrders(user : Principal) : Bool {
     var changed = false;
-    // All three walks read the OWNER INDEXES (W1-04), so the cost is O(this
+    // Both staged walks read the OWNER INDEXES (W1-04), so the cost is O(this
     // user's staged entries) — it used to be three full-map scans, a second
     // O(global staged) term per LIQUIDATED USER on the same batch message as
     // softLockedReserved's (Menese #22.3: 76 M instructions per user at
     // S = 5,000; the batch trapped at N = 560 despite LIQ_BATCH_MAX).
     // ownerIdxIds snapshots to an array — the cancels below mutate the index.
-    //
-    // In-flight pending matches referencing the user (as taker OR maker). These
-    // genuinely MOVED balance→reserved, so unlike staged soft-locks they hide
-    // collateral from the zero-reserved seize lookup. Void them to refund the
-    // reserve back to spendable balance. (voidPendingMatch refunds both legs and
-    // releases the maker's pending-qty lock.)
-    for (id in ownerIdxIds(pmIdsByUser, user).vals()) {
-      switch (Map.get(pendingMatches, Nat.compare, id)) {
-        case (?pm) {
-          if (pm.status == #pending) { voidPendingMatch(id); changed := true };
-        };
-        case null {};
-      };
-    };
+    // (The pending-match void loop that led here is retired — task
+    // 1788516198; the pending owner index is an audit fixture now.)
     // Staged off-book orders.
     for (id in ownerIdxIds(deferredIdsByOwner, user).vals()) {
       switch (Map.get(deferredExecs, Nat.compare, id)) {
@@ -9823,6 +13338,7 @@ persistent actor Uplands {
           ignore Map.delete(deferredFok, Nat.compare, id);
           ignore Map.delete(deferredPostOnly, Nat.compare, id);
           ignore Map.delete(deferredBudget, Nat.compare, id);
+          ignore Map.delete(deferredSwapCtx, Nat.compare, id);
           ignore Map.delete(deferredExpiry, Nat.compare, id);
           clearMmShield(d.owner, d.marketId);
           changed := true;
@@ -9841,7 +13357,7 @@ persistent actor Uplands {
         case null {};
       };
     };
-    // Resting book orders — void any pending matches, then cancel.
+    // Resting book orders.
     let restingIds = List.empty<Nat>();
     for (o in OrderBook.getUserOpenOrders(orderStore, user).vals()) {
       List.add(restingIds, o.id);
@@ -9850,9 +13366,7 @@ persistent actor Uplands {
       switch (OrderBook.getOrder(orderStore, id)) {
         case (?o) {
           if (OrderBook.isOpen(o)) {
-            voidPendingMatchesForMaker(id);
             ignore OrderBook.cancelOrder(orderStore, id);
-            ignore Map.delete(orderSettlementWindows, Nat.compare, id);
             ignore Map.delete(orderExpiry, Nat.compare, id);
             changed := true;
           };
@@ -9932,6 +13446,14 @@ persistent actor Uplands {
       };
       case (_) { };
     };
+    // The seize (Liquidator.repayFromVault / writeOffLoan inside
+    // Liquidator.tryLiquidate) moved this principal's loan book: re-provision
+    // its pool now rather than on the next scan (task 1788480502). #healthy /
+    // #err touched nothing.
+    switch (outcome) {
+      case (#liquidated(_) or #insolvent(_)) { reprovisionPool(user) };
+      case (_) { };
+    };
     reconcilePoolPositions(user, now);   // Phase 3: if `user` is a pool, sync its positions to the post-seize state
     outcome;
   };
@@ -9998,6 +13520,7 @@ persistent actor Uplands {
   include UserAccount(
     accounts,
     orderStore,
+    userTradeIndex,   // H-31 — the history queries read the index, not the tape
     marginAccounts,
     marginPriceLookup,
     availableBalance,
@@ -10005,7 +13528,6 @@ persistent actor Uplands {
     userProfiles,
     userPreferences,
     userDeposits,
-    userAdjustments,
     userAdjustmentsV2,
     userStatuses,
     registeredUsers,
@@ -10014,6 +13536,10 @@ persistent actor Uplands {
     IS_PRODUCTION,    // isProduction — interlocks `withdraw` until custody exists
     drawUsername,     // names from the entropy pool, never from the principal
     appendDeposit,
+    recordWithdrawal, // H-32 — the withdrawal's tape row goes through the exit window
+    sealingRefusal,   // #54.1 — the faucet emits, so it refuses inside the seal window
+    preRegTouch,      // H-36 — pre-registration writes stamp/evict in the bounded store
+    preRegPromote,    // H-36 — the faucet registers, so it promotes
   );
 
   // ── Market Information ────────────────────────────────────────
@@ -10106,7 +13632,7 @@ persistent actor Uplands {
       };
       if (current.lastTradeTime > request.lastUserTradeTime) {
         if (userStatusOut == null) { userStatusOut := ?current };
-        newUserTradesOut := OrderBook.getUserTradesSince(orderStore, msg.caller, request.lastUserTradeTime, 200);
+        newUserTradesOut := OrderBook.getUserTradesSinceIndexed(userTradeIndex, msg.caller, request.lastUserTradeTime, 200);   // H-31
       };
     };
 
@@ -10143,28 +13669,60 @@ persistent actor Uplands {
   // killing: returns the largest quantity whose worst-case fill keeps health
   // at/above INITIAL. The per-unit collateral delta is linear in quantity, so
   // the bound is closed-form: q* = (coll − INITIAL·debt) / (−deltaPerUnit).
-  // #full = no constraint binds; #partial(q) = release only q; #none = even a
-  // minimal fill would breach (or the owner is already past the bound).
+  // #full = no constraint binds; #partial{qty; held} = release only qty (held
+  // = the exposure-reducing part the H-05 equity bound keeps for the next
+  // requote); #none = even a minimal fill would breach (or the owner is
+  // already past the bound).
   // LIVE — the surviving sibling of the deleted W5-23 family: called from
   // releaseDeferred with d.owner = the POOL principal openPosition stages.
   // Do not delete by association with the placement-time gates above.
   func clampToInitialMargin(
     user : Principal, baseToken : Types.TokenId, side : Types.Side,
     quantity : Nat, execPrice : Nat,
-  ) : { #full; #partial : Nat; #none : Text } {
+  ) : { #full; #partial : { qty : Nat; held : Nat }; #none : Text } {
+    // #partial carries TWO reductions (H-05): `qty` is what releases now;
+    // `held` is the exposure-reducing quantity the raw-equity bound keeps
+    // back for the next requote (re-parked by releaseDeferred, never dropped
+    // silently); whatever is left of `quantity` beyond the two is the
+    // re-levering excess the initial-margin bound REFUSED (#49.1 — it drops).
     if (not MarginEngine.hasAccount(marginAccounts, user)) { return #full };
-    let oracle = switch (marginPriceLookup(baseToken)) { case (?p) { p }; case null { return #full } };
-    if (oracle == 0) { return #full };
+    let now = Time.now();
+    // H-06 (F23): a MISSING or ZERO oracle used to return #full here — the
+    // one answer that waves a re-levering fill through with no margin check
+    // at all — and a present-but-STALE mark was scored as if fresh (every
+    // valuation below goes through the age-blind marginPriceLookup). The mark
+    // quality is decided ONCE here and applied below to the re-levering
+    // excess only: the exposure-reducing part keeps its pass-through (bounded
+    // by whatever mark exists — closing stays available on stale marks,
+    // H-05's doctrine), the rest fails CLOSED with the reason. The basket is
+    // included because the health that bounds the excess is basket-wide.
+    let oracle : Nat = switch (marginPriceLookup(baseToken)) { case (?p) { p }; case null { 0 } };
+    let markProblem : ?Text = if (oracle == 0) { ?("missing for " # baseToken) }
+      else if (not marginPriceFreshAt(baseToken, now)) { ?("stale for " # baseToken) }
+      else { switch (userStaleMarkAt(user, now)) { case (?t) { ?("stale for " # t # " (pool collateral/debt)") }; case null { null } } };
     let baseLtv = switch (Types.marginLTV(baseToken)) { case (?x) { x }; case null { 0 } };
     let qp = if (execPrice > 0) { execPrice } else { oracle };
     // Collateral delta per unit of base filled (signed), valued worst-case
     // (fill at the price ceiling/floor, base leg marked at oracle × LTV).
     let haircut : Int = Fixed.mul(oracle, baseLtv, false);
-    let deltaPerUnit : Int = switch (side) {
-      case (#buy)  { haircut - (qp : Int) };
-      case (#sell) { (qp : Int) - haircut };
+    let poolIdOf = Map.get(poolByPrincipal, Text.compare, Principal.toText(user));
+    let deltaPerUnit : Int = switch (poolIdOf, side) {
+      // H-34 / D5 (d): a POOL's re-levering excess is BORROWED at the fill
+      // (poolFundForFill), not swapped out of pre-borrowed funds — so per
+      // unit the debt side grows by the borrowed value (quote at the fill
+      // price for a long; base at the mark, valued UP, for a short) and the
+      // health line demands INITIAL_HEALTH_RATIO × that, while the collateral
+      // side gains the leg bought (base at ltv × mark; quote at 1.0). This is
+      // the fill-time borrowCheck's own inequality, so the release clamp and
+      // the fill agree; conservative: the whole excess is scored as borrowed
+      // (the pool's own free funds are not credited — they only make the
+      // fill's borrow smaller, never larger).
+      case (?_, #buy)   { haircut - (Fixed.mul(qp, Types.INITIAL_HEALTH_RATIO, true) : Int) };
+      case (?_, #sell)  { (qp : Int) - (Fixed.mul(oracle, Types.INITIAL_HEALTH_RATIO, true) : Int) };
+      // Wallet-era shape (no borrow at the fill): the collateral swap only.
+      case (null, #buy)  { haircut - (qp : Int) };
+      case (null, #sell) { (qp : Int) - haircut };
     };
-    if (deltaPerUnit >= 0) { return #full };   // risk-reducing/improving fill
     // DE-LEVER ESCAPE. The scoring above is purely the instantaneous
     // LTV-weighted COLLATERAL delta; it never sees the debt the fill retires
     // (deleveragePool runs after settlement). Closing a short means buying back
@@ -10188,8 +13746,22 @@ persistent actor Uplands {
     // clamp unreachable behind any opposite-side DUST — a $1 short let a #buy of
     // ANY size return #full. deLeverQty carries the free pass-through; the
     // headroom math clamps only the re-levering EXCESS.
+    // H-05 (F1): the escape was PRICE-BLIND — magnitude-qualified since #49.1
+    // but released the whole flattening quantity at ANY worst-case price. A
+    // pool at health 1.17 closing a short through a 25 % cap bought back at
+    // the edge, spent past its collateral and left a base residue no seize
+    // could cover: deleveragePool → tryLiquidate → #insolvent → absorbBadDebt
+    // against the insurance fund, then the LPs. The de-lever portion now
+    // releases only up to the quantity for which, at the effective limit
+    // (fees at the L0 taker ceiling included), the pool's RAW post-fill
+    // equity stays ≥ 0 — collateral_after − debt_after, no LTV haircut,
+    // rawEquityUsd — and the rest is HELD for the next requote (re-parked,
+    // walked, then dropped with a record). Closing stays always AVAILABLE
+    // (never refused at the API, never killed here): bounded in price by the
+    // #3a ladder-edge cap in releaseDeferred and in size by this line.
     var deLeverQty : Nat = 0;
-    switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(user))) {
+    var held : Nat = 0;
+    switch (poolIdOf) {
       case (?poolId) {
         let net = poolNetSize(poolId, baseToken);
         let reducesExposure = switch (side) {
@@ -10198,24 +13770,75 @@ persistent actor Uplands {
         };
         if (reducesExposure) {
           deLeverQty := Nat.min(quantity, Int.abs(net));
-          // Whole fill only flattens exposure (never crosses through flat) →
-          // genuine de-lever, no margin bound. "Closing is always allowed."
-          if (deLeverQty >= quantity) { return #full };
+          // Raw-equity loss per unit at the worst-case price: buying back
+          // above the mark (plus the buyer fee) / selling down below it (the
+          // seller fee comes off the proceeds). A favourable price is no
+          // loss — the fill only ever improves solvency, no bound.
+          let feeUp = Fixed.mulDiv(qp, TAKER_FEE_BPS, 10_000, true);
+          let lossPerUnit : Int = switch (side) {
+            case (#buy)  { ((qp + feeUp) : Int) - (oracle : Int) };
+            case (#sell) { (oracle : Int) - ((qp : Int) - (feeUp : Int)) };
+          };
+          // (No mark at all → no computable bound: the flattening quantity
+          // passes on size alone, exactly the pre-H-06 answer for that part.)
+          if (oracle > 0 and lossPerUnit > 0) {
+            BorrowEngine.accrueAll(loans, user, now);
+            let equity = rawEquityUsd(user);
+            // Largest quantity whose worst-case loss fits in today's equity;
+            // round DOWN (against the pool). Equity already ≤ 0: nothing is
+            // safe at an adverse price — the whole de-lever waits.
+            let safe : Nat = if (equity <= 0) { 0 } else { Fixed.div(Int.abs(equity), Int.abs(lossPerUnit), false) };
+            if (safe < deLeverQty) { held := deLeverQty - safe; deLeverQty := safe };
+          };
         };
       };
       case null { };
     };
+    // H-06: whatever exceeds the exposure-reducing part (and its equity hold)
+    // RE-LEVERS the pool — it increases debt and is health-checked below over
+    // the whole basket. On a missing / zero / stale mark that check is
+    // meaningless (a zero oracle even scores a #sell as "collateral-improving"
+    // through the deltaPerUnit shortcut just below), so the excess is refused
+    // BEFORE any shortcut can pass it: the de-lever part still releases (or
+    // holds), the rest dies with a record naming the feed to wait for.
+    switch (markProblem) {
+      case (?why) {
+        if (deLeverQty + held < quantity) {
+          if (deLeverQty > 0 or held > 0) { return #partial({ qty = deLeverQty; held }) };
+          return #none(
+            "Order blocked at release: oracle price " # why #
+            " — this fill would increase the pool's debt and cannot be margin-checked on that mark; " #
+            "place it again once the price refreshes."
+          );
+        };
+      };
+      case null {};
+    };
+    if (deltaPerUnit >= 0) {   // risk-reducing/improving fill (LTV-collateral metric): only the equity hold binds
+      return if (held == 0) { #full } else { #partial({ qty = quantity - held; held }) };
+    };
+    // Whole fill only flattens exposure (never crosses through flat) →
+    // genuine de-lever, no margin bound beyond the equity hold. "Closing is
+    // always allowed."
+    if (deLeverQty + held >= quantity) {
+      return if (held == 0) { #full } else { #partial({ qty = deLeverQty; held }) };
+    };
     // The re-levering portion that must clear the initial-margin bound.
-    let excessQty : Nat = quantity - deLeverQty;
-    let now = Time.now();
+    let excessQty : Nat = quantity - deLeverQty - held;
     BorrowEngine.accrueAll(loans, user, now);
     let h = BorrowEngine.getHealth(loans, marginAccounts, accounts, reservedBalance, user, marginPriceLookup);
-    if (h.debtUsd == 0) { return #full };  // no debt → no gate
+    // No debt → no gate, for a WALLET. A debt-free POOL is exactly the
+    // borrow-at-fill case (H-34): its first entry borrows at the fill, so the
+    // bound below (headroom = its whole collateral) is the one that matters.
+    if (h.debtUsd == 0 and Option.isNull(poolIdOf)) {
+      return if (held == 0) { #full } else { #partial({ qty = quantity - held; held }) };
+    };
     // required collateral rounded UP (conservative) → smaller headroom.
     let headroom : Int = (h.collateralUsd : Int) - (Fixed.mul(Types.INITIAL_HEALTH_RATIO, h.debtUsd, true) : Int);
     if (headroom <= 0) {
-      // At/below the initial floor: no re-levering, but flattening still passes.
-      if (deLeverQty > 0) { return #partial(deLeverQty) };
+      // At/below the initial floor: no re-levering, but flattening still passes
+      // (its equity-held part waits rather than dying with the excess).
+      if (deLeverQty > 0 or held > 0) { return #partial({ qty = deLeverQty; held }) };
       return #none(
         "Order blocked at release: margin health is already at/below the " #
         r2n(Types.INITIAL_HEALTH_RATIO) # " initial-margin requirement and this fill would lower it further. " #
@@ -10225,36 +13848,35 @@ persistent actor Uplands {
     // q* = headroom / |deltaPerUnit| (both >0 here); round DOWN (largest safe
     // EXCESS qty); the de-lever portion always passes and is added back.
     let maxExcess = Fixed.div(Int.abs(headroom), Int.abs(deltaPerUnit), false);
-    if (maxExcess >= excessQty) { return #full };
+    if (maxExcess >= excessQty) {
+      return if (held == 0) { #full } else { #partial({ qty = deLeverQty + excessQty; held }) };
+    };
     let allowed = deLeverQty + maxExcess;
-    if (allowed == 0) {
+    if (allowed == 0 and held == 0) {
       return #none("Order blocked at release: any fill at this price would breach the initial-margin requirement.");
     };
-    #partial(allowed);
+    #partial({ qty = allowed; held });
   };
 
   // ── Order Placement ───────────────────────────────────────────
 
-  // Build a ProtectionCtx bound to the current caller/timestamp. Legacy
-  // (non-protected) order-placement paths pass this so their takers
-  // correctly see and defer matches against protected makers — not just
-  // the new placeProtectedLimitOrder path.
-  func buildProtectionCtx(timestamp : Int) : MatchingEngine.ProtectionCtx = {
-    aggressorIsMaker = false;          // W4-22: only the AMM sweep re-homes resting orders
+  // Build a ProtectionCtx for the immediate paths. Reached from
+  // ammExecuteRebalance only (H-21 staged executeSwapCross's all-or-nothing
+  // legs, its other caller). `timestamp` stamps nothing since the
+  // deferred-fill hook it fed was retired (task 1788516198) — kept so the
+  // callers' shape is unchanged.
+  func buildProtectionCtx(_timestamp : Int) : MatchingEngine.ProtectionCtx = {
+    aggressorRole  = #taker;           // W4-22/H-24: only the AMM sweep re-homes resting orders
     onUnfundedMaker = onUnfundedMakerNotice;
-    quoteFee       = quoteFeeFor;        // general placement / immediate cross
+    quoteFee       = quoteFeeFor;        // the AMM rebalancer's taker legs
     creditTreasury;
     onSelfTrade    = cancelSelfMaker;
     // A margin pool is a sub-account: crossing your wallet against your own
     // pool is one party on both sides, however different the principals look.
     beneficialOwner  = archiveOwnerOf;
     onTradeFees    = recordTradeFees;
-    getMakerWindow = func(makerOrderId : Nat) : Nat {
-      Option.get(Map.get(orderSettlementWindows, Nat.compare, makerOrderId), 0)
-    };
-    getMakerPending = func(makerOrderId : Nat) : Nat {
-      Option.get(Map.get(pendingQtyByMaker, Nat.compare, makerOrderId), 0)
-    };
+    fundForFill    = poolFundForFill;     // H-34: a margin pool borrows its slice at the fill
+    fundableScorer = poolFundableScorer;   // 1788641149 / 1788652744: the FOK pre-check scores a pool by what the vault would lend it, re-scored per slice as settled (never borrows)
     availableBalance;
     // AMM quotes are indicative, not firm: a LIMIT taker crossing them rests
     // (the AMM fills it on its next requote, at its fresh price). A MARKET
@@ -10266,36 +13888,13 @@ persistent actor Uplands {
       Principal.equal(makerOwner, ammPrincipal())
     };
     isExpired = func(id : Nat) : Bool { orderExpired(id, Time.now()) };
-    onPendingFill = func(
-      makerOrderId   : Nat,
-      makerOwner     : Principal,
-      takerOwner     : Principal,
-      takerSide      : Types.Side,
-      takerOrderType : Types.OrderType,
-      fillQty        : Nat,
-      price          : Nat,
-    ) : ?Types.PendingMatch {
-      let window = Option.get(Map.get(orderSettlementWindows, Nat.compare, makerOrderId), 0);
-      // marketId taken from the maker order itself
-      let marketId = switch (OrderBook.getOrder(orderStore, makerOrderId)) {
-        case (?o) { o.marketId };
-        case null { return null };
-      };
-      createPendingMatch(
-        marketId, makerOrderId, makerOwner, takerOwner, takerSide,
-        takerOrderType, fillQty, price, window, timestamp
-      )
-    };
   };
 
-  // PlaceLimitResult — wraps the resting Order with the list of pending
-  // matches the crossing slice generated against protected makers. Pending
-  // matches finalise via the recurring timer after their settlement window
-  // (default 5s); the frontend uses this to show "Settling in 5s…"
-  // feedback so the user doesn't think the order vanished.
+  // PlaceLimitResult — the staged Order. (Its `pendingMatches` field, an
+  // inert stub since the PendingMatch machinery was retired in task
+  // 1788516198, was REMOVED at apiVersion 6.0.0 — candid/README.md.)
   public type PlaceLimitResult = {
-    order          : Types.Order;
-    pendingMatches : [Types.PendingMatch];
+    order : Types.Order;
   };
 
   // Shared limit-order body. `expiresAtNs` is the absolute self-expiry (?Int);
@@ -10409,16 +14008,18 @@ persistent actor Uplands {
     switch (parkDeferred(marketId, baseToken, caller, side, #limit, price, quantity, false, null, expiresAtNs, timestamp)) {
       case (?entry) {
         if (postOnly) { Map.add(deferredPostOnly, Nat.compare, entry.id, true) };
-        // Quote freshness shield: a staged limit from a level-4 quoter IS their
-        // repricing intent — stamp it so their resting quotes on this market
-        // are non-takeable until the pass that lands this intent (see
-        // isMMShieldedFresh / isMMShieldedStale).
-        if (levelOf(caller) == 4) {
+        // Quote freshness shield: a staged limit from a level-4 quoter that is
+        // a genuine repricing intent for this market (H-24: notional and
+        // proximity commensurate with their resting depth here — a dust limit
+        // far from the mid earns nothing) is stamped so their resting quotes
+        // on this market are non-takeable until this intent lands (see
+        // isMMShieldedFresh / isMMShieldedStale / landMmShield).
+        if (levelOf(caller) == 4 and isRepricingIntent(caller, marketId, price, quantity)) {
           Map.add(mmQuoteStamp, Text.compare, Principal.toText(caller) # "#" # marketId, timestamp);
           Map.add(mmOwnerStamp, Text.compare, Principal.toText(caller), timestamp);
         };
         bumpUserVersion(caller);
-        #ok({ order = deferredToOrder(entry); pendingMatches = [] });
+        #ok({ order = deferredToOrder(entry) });
       };
       case null { #err("Insufficient available balance to stage this order") };
     };
@@ -10437,6 +14038,7 @@ persistent actor Uplands {
   ) : async { #ok : PlaceLimitResult; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     deadmanTouch(msg.caller);
     placeLimitInner(msg.caller, marketId, side, price, quantity, null, false);
   };
@@ -10453,6 +14055,7 @@ persistent actor Uplands {
   ) : async { #ok : PlaceLimitResult; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     deadmanTouch(msg.caller);
     placeLimitInner(msg.caller, marketId, side, price, quantity, expiryFromSecs(expiresInSec), false);
   };
@@ -10475,6 +14078,7 @@ persistent actor Uplands {
   ) : async { #ok : PlaceLimitResult; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     deadmanTouch(msg.caller);
     placeLimitInner(msg.caller, marketId, side, price, quantity, expiryFromSecs(expiresInSec), true);
   };
@@ -10495,6 +14099,10 @@ persistent actor Uplands {
   ) : async [{ #ok : PlaceLimitResult; #err : Text }] {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) {
+      case (?e) { return Array.tabulate<{ #ok : PlaceLimitResult; #err : Text }>(items.size(), func(_) { #err(e) }) };
+      case null {};
+    };
     deadmanTouch(msg.caller);
     if (items.size() > STAGED_CAP_PER_OWNER) {
       return Array.tabulate<{ #ok : PlaceLimitResult; #err : Text }>(items.size(), func(_) {
@@ -10519,12 +14127,13 @@ persistent actor Uplands {
     switch (Map.get(deferredExecs, Nat.compare, orderId)) {
       case (?d) {
         if (not Principal.equal(d.owner, caller)) { return #err("Not your order") };
-        if (deferredCommitted(orderId, d.ts, Time.now())) { return #err(DEFERRED_COMMIT_ERR) };
+        switch (deferredCommitReason(d, Time.now())) { case (?e) { return #err(e) }; case null {} };
         ignore subReserved(d.owner, d.reservedTok, d.reservedAmt);
         removeDeferredExec(orderId);
         ignore Map.delete(deferredFok, Nat.compare, orderId);
         ignore Map.delete(deferredPostOnly, Nat.compare, orderId);
         ignore Map.delete(deferredBudget, Nat.compare, orderId);
+        ignore Map.delete(deferredSwapCtx, Nat.compare, orderId);
         ignore Map.delete(deferredExpiry, Nat.compare, orderId);
         clearMmShield(d.owner, d.marketId);
         return #ok({ marketId = d.marketId; side = d.side });
@@ -10543,12 +14152,7 @@ persistent actor Uplands {
       case (?order) {
         if (not Principal.equal(order.owner, caller)) { return #err("Not your order") };
         if (not OrderBook.isOpen(order)) { return #err("Order is not open") };
-        // Void in-flight pending matches BEFORE cancelling (same reasoning as
-        // cancelMyOrder — a pending match finalising against a cancelled order
-        // would corrupt state).
-        voidPendingMatchesForMaker(resolvedId);
         ignore OrderBook.cancelOrder(orderStore, resolvedId);
-        ignore Map.delete(orderSettlementWindows, Nat.compare, resolvedId);
         ignore Map.delete(orderExpiry, Nat.compare, resolvedId);
         #ok({ marketId = order.marketId; side = order.side });
       };
@@ -10566,6 +14170,7 @@ persistent actor Uplands {
   ) : async { #ok : PlaceLimitResult; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     deadmanTouch(msg.caller);
     switch (cancelOwnSpotOrder(msg.caller, cancelOrderId)) {
       case (#err(e)) { #err(e) };
@@ -10610,7 +14215,7 @@ persistent actor Uplands {
     for (id in ownerIdxIds(swapIdsByOwner, owner).vals()) {
       switch (Map.get(deferredSwaps, Nat.compare, id)) {
         case (?s) {
-          if ((inScope(s.sellMarket) or inScope(s.buyMarket)) and nowNs - s.ts >= DEFERRED_COMMIT_NS) {
+          if ((inScope(s.sellMarket) or inScope(s.buyMarket)) and swapCommitReason(s, nowNs) == null) {
             ignore subReserved(s.owner, s.sellToken, s.amount);
             removeDeferredSwap(id);
             count += 1;
@@ -10654,6 +14259,7 @@ persistent actor Uplands {
   // fires. Rationale and the designed upgrade path: the tickDeadman comment.
   public shared (msg) func cancelAllAfter(expiresInSec : ?Nat) : async { #ok : ?Int; #err : Text } {
     requireAuth(msg.caller);
+    requireRegistered(msg.caller);   // H-30: a switch per throwaway keypair was a permanent userStatuses row per fire
     ensureInit<system>();
     switch (expiresInSec) {
       case null {
@@ -10699,7 +14305,7 @@ persistent actor Uplands {
   // Heartbeat service: fire expired dead-man switches. Cheap — the map only
   // holds owners who explicitly armed it.
   //
-  // SCOPE DECISION (2026-08-20, GHSA-97xp follow-up, task 1787196310 —
+  // SCOPE DECISION (2026-08-20, GHSA-97xp / #52.1 follow-up, task 1787196310 —
   // ratified; do NOT reopen extend-all): the fire is
   // cancelAllOrdersFor(p, null) for the ARMED principal only, which walks the
   // RAW principal's staged/swap/resting orders — a margin pool's resting
@@ -10717,8 +14323,14 @@ persistent actor Uplands {
   func tickDeadman(now : Int) {
     if (Map.size(deadmanSwitches) == 0) { return };
     let due = List.empty<Principal>();
-    for ((p, e) in Map.entries(deadmanSwitches)) {
-      if (now >= e.deadlineNs) { List.add(due, p) };
+    let cap = deadmanMaxFires();
+    // H-30: collect at most `cap` due switches per pass (the rest fire next
+    // beat) — the walk stops as soon as the pass is full.
+    label collect for ((p, e) in Map.entries(deadmanSwitches)) {
+      if (now >= e.deadlineNs) {
+        List.add(due, p);
+        if (List.size(due) >= cap) { break collect };
+      };
     };
     for (p in List.values(due)) {
       ignore Map.delete(deadmanSwitches, Principal.compare, p);
@@ -10726,8 +14338,126 @@ persistent actor Uplands {
       logEventF("warn", "order", ?"order.deadman", ?Principal.toText(p),
         "Dead-man switch fired — no trading call within the armed window; cancelled "
         # Nat.toText(n) # " open order(s)", null);
-      bumpUserVersion(p);
+      // H-30: a version bump writes a userStatuses row that outlives the
+      // principal; a fire that cancelled nothing changed nothing the
+      // frontend's change-detection needs to see, so skip it — no permanent
+      // row per fired switch of a principal that never traded.
+      if (n > 0) { bumpUserVersion(p) };
     };
+  };
+
+  // Dev-only pins for the H-30 dead-man cohort test: the per-pass fire cap
+  // (so "N ≫ cap" is six switches at cap 2, not thousands) and a switch's
+  // deadline (so six switches armed sequentially are due in the SAME beat —
+  // the deterministic shape of setTestDeferredExpiry for orders).
+  public shared (msg) func setTestDeadmanMaxFires(cap : ?Nat) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestDeadmanMaxFires");
+    _testDeadmanMaxFires := switch (cap) { case (?0) { ?1 }; case c { c } };
+  };
+  // H-22: pin the release-pass pacing (null = the default constant; a 0 is
+  // clamped to 1 so a pass always makes progress) — test_release_pacing.sh
+  // drives small cohorts through several passes with it.
+  public shared (msg) func setTestReleasePacing(maxReleases : ?Nat, fillBudget : ?Nat) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestReleasePacing");
+    _testReleaseMaxPerPass := switch (maxReleases) { case (?0) { ?1 }; case c { c } };
+    _testReleaseFillBudget := switch (fillBudget) { case (?0) { ?1 }; case c { c } };
+  };
+  public shared (msg) func setTestDeadmanDeadline(user : Principal, deadlineNs : Int) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestDeadmanDeadline");
+    switch (Map.get(deadmanSwitches, Principal.compare, user)) {
+      case (?e) { Map.add(deadmanSwitches, Principal.compare, user, { deadlineNs; windowNs = e.windowNs }) };
+      case null {};
+    };
+  };
+
+  // H-30 operator prune: the residue UNREGISTERED principals could leave
+  // before the gate closed — empty margin pools (the 64-records-per-keypair
+  // finding), dead-man switches, and userStatuses rows (a fired switch used to
+  // bump every principal) — removed surgically, WITHOUT the season wipe
+  // (performWorldWipe was the only thing that cleared these). Registered
+  // players, controllers, internal principals and every pool that holds a
+  // balance, a loan or an order are untouched; history maps keyed by owner or
+  // pool (episodes, transfers, liquidation events) are left as they are —
+  // they are bounded and unreachable once the pool is gone. Bounded per call
+  // (PRUNE_MAX_POOLS examined); `more = true` means call it again. Controller-
+  // only; O(pools + userStatuses) in one message, operator-invoked, so a trap
+  // on a huge venue simply fails the call.
+  transient let PRUNE_MAX_POOLS : Nat = 5_000;
+  public shared (msg) func adminPruneUnregisteredResidue() : async {
+    pools : Nat; owners : Nat; userStatuses : Nat; deadmanSwitches : Nat;
+    poolsRemaining : Nat; more : Bool;
+  } {
+    requireController(msg.caller);
+    let isRegistered = func(p : Principal) : Bool {
+      Map.get(registeredUsers, Text.compare, Principal.toText(p)) != null
+    };
+    let prunableOwner = func(p : Principal) : Bool {
+      not isRegistered(p) and not Principal.isController(p) and not Principal.isAnonymous(p) and not isInternalPrincipal(p)
+    };
+    // (a) empty pools of unregistered owners.
+    let victims = List.empty<(Nat, Principal)>();
+    var examined = 0; var more = false;
+    label walk for ((id, pool) in Map.entries(marginPools)) {
+      if (examined >= PRUNE_MAX_POOLS) { more := true; break walk };
+      examined += 1;
+      if (prunableOwner(pool.owner)) {
+        let pp = poolPrincipalOf(id);
+        if (poolIsEmpty(pp) and poolOrdersOf(pp).size() == 0) { List.add(victims, (id, pool.owner)) };
+      };
+    };
+    let touchedOwners = Map.empty<Text, Bool>();
+    for ((id, owner) in List.values(victims)) {
+      let pp = poolPrincipalOf(id);
+      ignore Map.delete(marginPools, Nat.compare, id);
+      ignore Map.delete(poolByPrincipal, Text.compare, Principal.toText(pp));
+      ignore Map.delete(marginAccounts, Text.compare, Principal.toText(pp));
+      let ok = Principal.toText(owner);
+      let cnt = Option.get(Map.get(ownerPoolCount, Text.compare, ok), 0);
+      if (cnt <= 1) { ignore Map.delete(ownerPoolCount, Text.compare, ok) }
+      else { Map.add(ownerPoolCount, Text.compare, ok, (cnt - 1 : Nat)) };
+      Map.add(touchedOwners, Text.compare, ok, true);
+    };
+    // Rebuild the owner index for every touched owner from what survives.
+    for ((ok, _) in Map.entries(touchedOwners)) {
+      let keep = List.empty<Nat>();
+      switch (Map.get(poolIdsByOwner, Text.compare, ok)) {
+        case (?l) { for (id in List.values(l)) { if (Map.get(marginPools, Nat.compare, id) != null) { List.add(keep, id) } } };
+        case null {};
+      };
+      if (List.size(keep) == 0) { ignore Map.delete(poolIdsByOwner, Text.compare, ok) }
+      else { Map.add(poolIdsByOwner, Text.compare, ok, keep) };
+    };
+    // (b) dead-man switches of unregistered principals.
+    let dmVictims = List.empty<Principal>();
+    for ((p, _) in Map.entries(deadmanSwitches)) { if (prunableOwner(p)) { List.add(dmVictims, p) } };
+    for (p in List.values(dmVictims)) { ignore Map.delete(deadmanSwitches, Principal.compare, p) };
+    // (c) userStatuses rows of unregistered principals with nothing live — no
+    // balance (a funded-but-unregistered principal keeps its change-detection
+    // nonce), no order, no pool.
+    let usVictims = List.empty<Text>();
+    for ((k, _) in Map.entries(userStatuses)) {
+      let p = Principal.fromText(k);   // keys are written by Principal.toText
+      if (prunableOwner(p) and Map.get(poolByPrincipal, Text.compare, k) == null
+          and not Accounts.hasAnyBalance(accounts, p)
+          and OrderBook.getUserOpenOrders(orderStore, p).size() == 0 and stagedCountOf(p) == 0
+          and ownedPoolIds(p).size() == 0) {
+        List.add(usVictims, k);
+      };
+    };
+    for (k in List.values(usVictims)) { ignore Map.delete(userStatuses, Text.compare, k) };
+    let nPools = List.size(victims);
+    if (nPools + List.size(dmVictims) + List.size(usVictims) > 0) {
+      logEvent("info", "system", "Unregistered residue pruned by controller — " # Nat.toText(nPools) # " empty pool(s), "
+        # Nat.toText(List.size(dmVictims)) # " dead-man switch(es), " # Nat.toText(List.size(usVictims)) # " user-status row(s)", null);
+    };
+    {
+      pools = nPools; owners = Map.size(touchedOwners);
+      userStatuses = List.size(usVictims); deadmanSwitches = List.size(dmVictims);
+      poolsRemaining = Map.size(marginPools); more;
+    }
   };
 
   // ════════ Market-maker program P1 — accounting & introspection ════════
@@ -10739,7 +14469,10 @@ persistent actor Uplands {
   // 3.1.0 (#47.1, additive): timersPaused cross-referenced on the deadman
   // armed-status surfaces (getMyCancelAllAfter / getAccessPolicy /
   // whyAmIRefused).
-  transient let MM_API_VERSION : Text = "5.0.0";
+  // 5.1.0 (H-35, additive): getMyInsuranceStake gains unlockAtNs — the
+  // unstake-cooldown unlock instant (0 = unlocked); unstakeInsurance refuses
+  // before it, naming the same instant.
+  transient let MM_API_VERSION : Text = "6.0.0";
 
   // Fills with fees, by id cursor: every settled trade where the caller (or a
   // pool they own) was a party, with id > sinceTradeId, chrono-ascending, at
@@ -10753,9 +14486,10 @@ persistent actor Uplands {
   }] {
     let lim = Nat.min(limit, 200);
     if (lim == 0) { return [] };
+    if (Principal.isAnonymous(msg.caller)) { return [] };   // H-31: before touching the tape
     let merged = List.empty<Types.Trade>();
     for (p in selfAndOwnedPools(msg.caller).vals()) {
-      for (t in OrderBook.getUserTradesSinceId(orderStore, p, sinceTradeId, lim).vals()) {
+      for (t in OrderBook.getUserTradesSinceIdIndexed(userTradeIndex, p, sinceTradeId, lim).vals()) {   // H-31: O(own fills)
         List.add(merged, t);
       };
     };
@@ -10827,7 +14561,7 @@ persistent actor Uplands {
     minOrderNotionalUsd : Nat;   // quote-value floor per order (dust-exit exempt)
     priceBandFactor     : Nat;   // placement rejected beyond ref×F / ref÷F
     stagedCapPerOwner   : Nat;
-    openOrderCap        : Nat;   // resting cap per BENEFICIAL owner (pools count toward their owner): wallet limit orders evict oldest; swap-limit and margin placements reject at the cap
+    openOrderCap        : Nat;   // resting cap per BENEFICIAL owner (pools count toward their owner, on BOTH paths): wallet limit orders evict the wallet's oldest (pool orders never evicted); swap-limit and margin placements reject at the cap
     bulkMaxItems        : Nat;
     gtcTtlNs            : Int;   // resting orders sweep after this age
     geptorDelayNs       : Int;   // staging → release seal delay (Nagle window)
@@ -10879,30 +14613,37 @@ persistent actor Uplands {
     # "The quote token is \"ICPUSD\" (the unit of account); markets are \"<BASE>-ICPUSD\", e.g. \"BTC-ICPUSD\". "
     # "A #buy acquires the BASE token and pays quote; a #sell does the reverse. Mutations return {#ok; #err: Text} — read the err text, it says why.\n\n"
     # "## Other units (do NOT assume e8 everywhere)\n"
-    # "maxSlippage is a FRACTION at 10^8: 5000000 = 0.05 = 5%. Fee fields are in TENTH-bps: myMakerFeeTenthBps = 55 means 5.5 bps. "
+    # "maxSlippage is a FRACTION at 10^8: 5000000 = 0.05 = 5% (market orders accept 1%–25%; see Swaps). Fee fields are in TENTH-bps: myMakerFeeTenthBps = 55 means 5.5 bps. "
     # "priceBandFactor is a multiplicative FACTOR: placements must satisfy ref/F <= price <= ref*F. "
-    # "All timestamps are NANOSECONDS since epoch (Int); parameters named *InSec are plain seconds. getCandles intervals are milliseconds.\n\n"
+    # "All timestamps are NANOSECONDS since epoch (Int); parameters named *InSec are plain seconds. getCandles intervals are milliseconds. "
+    # "OQL (schema()/execute()/archiveExecute()) projects money columns as the raw e8 integers EXCEPT the pre-converted ones, served as human-unit floats (schema typeName Float): market.lastPrice/refPrice, position.size, every userEvent money field (amount, price, qty) and the leaderboard's profitUsd/capitalUsd/equityUsd; returnBps stays basis points.\n\n"
     # "## Matching is SEALED and STAGED (this trips up every new bot)\n"
     # "placeMarketOrder / placeLimitOrder* / swap RETURN IMMEDIATELY WITH NO FILLS. Your order is STAGED, then released ~0.5-2s later in a sealed batch. "
     # "To learn the outcome, POLL: getMyOrderStatus(orderId) gives phase #staged|#resting|#closed; getMarketChanges(cursor) gives book deltas + your fills + balances in one call; getMyTradesSinceId(sinceId) gives fills with fees. "
-    # "A staged order's id is REBORN as a fresh resting id at release; getMyOrderStatus returns releasedAsId to bridge it.\n\n"
+    # "A staged order's id is REBORN as a fresh resting id at release; getMyOrderStatus returns releasedAsId to bridge it. "
+    # "BREAKING at apiVersion 6.0.0: the retired protection-window surfaces are GONE — getMyPendingMatches, placeProtectedLimitOrder, the pendingMatches field of placeMarketOrder/placeLimitOrder* results, setAmmConfig's protectionWindowSec parameter and AmmPool.protectionWindowSec (the sealed release IS the anti-snipe; those were inert stubs through 5.x).\n\n"
+    # "## Vault LP is SEALED too (BREAKING at apiVersion 6.0.0)\n"
+    # "depositLp(marketId, baseAmount, quoteAmount) and withdrawLp(lpAmount) STAGE a request and return it (#ok = the StagedLpRequest: id, ts, expiresAt, waitingOn) — NOT the minted LP or the basket. The deposit legs / the shares are RESERVED at the request; the request settles at the first NAV whose basket marks ALL postdate it (the same price-postdates-entry rule your orders release on, so a stale mark can never be minted or redeemed against), through the same mint/redeem body the immediate doors ran, with the two-bucket instant cap and every refusal evaluated AT SETTLEMENT. "
+    # "POLL getMyStagedLpRequests(): `pending` lists your open requests with the markets still to postdate them; `recent` (newest first, last 8) carries each outcome — #minted(lp) | #redeemed(basket) | #cancelled(reason). A refusal at settlement (cap, concentration, dust) CANCELS with that reason and releases the reservation; a request no fresh marks reach within 5 minutes is cancelled and refunded, fail-closed; a season boundary (resetSeason, or resetExchange) cancels every request still pending the same way — #cancelled(\"season sealed before settlement; nothing settled, funds released\") in `recent` plus the vault tape row — BEFORE it wipes, so nothing is silently dropped at the boundary. One pending request per kind per principal. cancelStagedLpRequest(requestId) is the owner's cancel, under the staged-order commit rule — refused in the request's first 3 s and while a post-request price fetch for a market it waits on is in flight (StagedLpRequest.cancelRefusal says why; null = cancellable now) — and it releases the reservation and nothing else. seedAmmPool is controller-only (the seed scripts' immediate door).\n"
+    # "REDEMPTION IS AT NAV; INSTANT LIQUIDITY IS PRO-RATA. Every LP share redeems at NAV per share (the held basket plus the loan book net of known arrears, over supply — the same figure it was minted at), less the exit fee, paid IN KIND from what the vault physically holds; a loan cannot be handed out as inventory, so the most a withdrawal can redeem NOW is your pro-rata share of the vault's holdings. getMaxInstantWithdraw() (caller-scoped query) quotes it before you ask: withdrawableNowLp / withdrawableNowUsd, lpBalance and lockedLp, vaultHoldingsUsd against vaultLentOutUsd, exitFeeBps, and withdrawalPaused (non-null = the reason a settlement would refuse right now). A withdrawal above the cap is REFUSED at settlement naming the cap — never clamped, never queued; after a maximum exit your remaining shares are LOCKED (your cap reads zero however often you ask) until borrowers repay, which releases every LP's locks pro rata. The shares you keep stay yours and keep their claim on the loan book.\n\n"
     # "## Placing & managing orders\n"
     # "placeLimitOrder(marketId, side, price, quantity) is GTC; placeLimitOrderExp adds an expiry; placeLimitOrderPO is post-only (maker-or-kill at release, never pays taker). "
-    # "placeLimitOrdersBulk([...]) stages up to the per-owner cap in one batch. replaceMyOrder(cancelId, price, quantity) is an atomic cancel+place. "
+    # "placeLimitOrdersBulk([...]) stages up to the per-owner cap in one batch. The per-owner staged cap (getMarketSpecs.stagedCapPerOwner; your count is getAccessPolicy.myStagedCount / whyAmIRefused.stagedCount) counts staged orders AND staged cross-market swaps together — a token→token swap that stages holds a slot until it releases, expires or is cancelled. replaceMyOrder(cancelId, price, quantity) is an atomic cancel+place. "
     # "cancelMyOrder(id); cancelAllMyOrders(?marketId) with null = all markets. "
     # "COMMITMENT: a staged non-post-only order cannot be cancelled for its first 3s (anti-free-look) — the cancel errors with 'committed'; retry after release, or quote with post-only for instant cancel/replace. "
     # "Guards: price must be within getMarketSpecs.priceBandFactor of the market ref price; order value must exceed minOrderNotionalUsd (spend-all dust exempt); a self-trade cancels YOUR resting maker; "
     # "one price level holds at most " # Nat.toText(Types.MAX_ORDERS_PER_PRICE_LEVEL) # " resting orders per side (placement at a full level is rejected — quote one tick away; margin limit entries/exits included); "
-    # "the open-order cap (getMarketSpecs.openOrderCap) counts your account PLUS your margin pools — placeLimitOrder* evicts your oldest at the cap, while swap limit orders and margin limit placements are rejected at it. "
+    # "the open-order cap (getMarketSpecs.openOrderCap) counts your account PLUS your margin pools — placeLimitOrder* evicts your oldest WALLET orders at the cap (pool orders are position machinery and are never evicted; cancel those with cancelPoolOrder), while swap limit orders and margin limit placements are rejected at it. "
     # "PRICE CONVERGENCE: a protocol arbitrageur (public: getArbStats) imports/exports synthetic supply at the oracle mark and takes any order resting >~0.5% off the mark — quoting far off-mark is donating to it.\n\n"
     # "## Safety: arm the dead-man switch\n"
     # "cancelAllAfter(?expiresInSec): if you call no trading method within the window, ALL your resting orders auto-cancel. Re-armed by every trading call; null disarms. A crashed quoting bot's orders won't hang. Bounds are in getMarketSpecs. "
+    # "Registration (a deposit) is required to arm it, to create a margin pool, and for every update outside the pre-registration set (profile, preferences, username, Internet Identity verification) — whyAmIRefused.preRegistrationMethods lists that set. Fires are capped per heartbeat pass (a large due cohort drains over consecutive beats). "
     # "SCOPE: the sweep covers your SPOT-WALLET orders only — margin-pool-owned resting orders (openPosition/closePosition limit entries and exits) are position machinery and are NOT swept when the switch fires; manage those with cancelPoolOrder/closePosition. "
     # "The switch fires even while the venue's operational timer brake is set (maintenance pauses; trading and the dead-man sweep do not) — getMyCancelAllAfter / getAccessPolicy / whyAmIRefused cross-reference the brake as timersPaused.\n\n"
     # "## Market-making, fees, levels\n"
-    # "getAccessPolicy(): your fee level (L0-L4), fees, uptime status, caps. The maker fee reaches 0.0 bps at L4; two-sided quoting earns levels plus a snipe shield. "
-    # "whyAmIRefused(): why a call was rejected at the gate. getReleaseInfo(marketId): the armed seal deadline + oracle age, to phase-align your requotes. "
-    # "getBadgeCatalog(): every badge id with its name and machine-readable earning criteria (lifetime thresholds); getUserBadges(principal): YOUR OWN earned badges (self-or-controller — other accounts read as empty; privacy) — badges are permanent recognition and gate nothing.\n\n"
+    # "getAccessPolicy(): your fee level (L0-L4), fees, uptime status, caps. The maker fee reaches 0.0 bps at L4; two-sided quoting earns levels plus a snipe shield: at L4 your resting quotes on a market are non-takeable only while a genuine repricing intent for that market is in flight — a staged limit within 2% of the mark whose notional is at least 20% of what you have resting there — and the shield lapses the moment that intent lands, is killed or is cancelled; shielded quotes count for neither getTakeableDepth nor uptime. An uptime sample credits each side only with the depth your AVAILABLE balance could honour at that moment (quote for bids, base for asks) — quotes whose backing has moved away, or sits under a staged order's reservation, earn no uptime. "
+    # "whyAmIRefused(): why a call was rejected at the gate — admittedNow is the verdict for order entry and other sheddable updates; exitsAdmitted + exitMethods say that cancels, closes, unstakes and withdrawals are admitted at ANY load floor (the exit set is never shed), so a shed bot can always flatten — and a DUST exit (under 10 ICPUSD of value, not spend-all) repeated inside one principal's 30 s window still executes but has its history rows coalesced into one at the window's end (H-32: the tape inflow is bounded per principal; the exit never is). getReleaseInfo(marketId): the armed seal deadline + oracle age, to phase-align your requotes. "
+    # "getBadgeCatalog(): every badge id with its name and machine-readable earning criteria (lifetime thresholds); getUserBadges(principal): YOUR OWN earned badges (self-or-controller — other accounts read as empty; privacy) — badges are permanent recognition and gate nothing; a season reset (resetSeason) restarts every badge except the join badge (id 1, first deposit), which is a lifetime fact and keeps its original awardedNs.\n\n"
     # "## Deposits (#play) — verification required\n"
     # "Each PLAYER gets up to $100k of LIFETIME PLAY deposit allowance (fake money), mark-valued and consumed when each deposit is MADE (claims settle against that reservation, never re-priced), via the Bridge — keyed to a "
     # "Google-verified identity, not the principal (anti-Sybil). An unverified principal's deposits are REFUSED; getMyVerification() reports "
@@ -10910,18 +14651,28 @@ persistent actor Uplands {
     # "complete it; fund and verify through the browser. getPlayDepositAllowance() shows the remaining cap.\n\n"
     # "## Swaps\n"
     # "swap(request) converts token->token, routing through the ICPUSD books (two legs when neither side is ICPUSD). quoteSwap(from, to, amount, maxSlippage) "
-    # "gives an honest pre-trade estimate (fees included). A staged swap's result arrives later: poll getMyRecentSwap() and match its id against the returned swapOrderId.\n\n"
+    # "gives an honest pre-trade estimate (fees included) for the full amount; its availableFrom (spendable `from` balance) and clampedByReserve (true when funds reserved by "
+    # "open orders leave less than `amount` spendable) say up front how much of that amount can actually convert. "
+    # "maxSlippage (a 10^8 fraction) is accepted in the range 1%–25% (1000000..25000000) by every market-order endpoint; swap's #marketOrder REFUSES anything outside it — "
+    # "including 0 — with 'Slippage must be 1%–25%'. quoteSwap alone treats maxSlippage = 0 as its default of 5% (5000000, the UI's default), so a preview quoted with 0 must be "
+    # "executed with an explicit in-range value (e.g. 5000000) or swap refuses what the quote accepted. A staged swap's result arrives later: poll getMyRecentSwap() and match its id against the returned swapOrderId; "
+    # "its stopReason says why the walk stopped (filled | budgetExhausted | bookExhausted | slippage | unfunded | workBound). An ICPUSD-funded swap stages min(amount, AVAILABLE ICPUSD) — "
+    # "the reply's stagedBudget — since funds reserved by open orders cannot convert; a swap that stops short of the amount asked records an outcome saying how much converted and why.\n\n"
     # "## Margin (pools & positions)\n"
     # "Leverage lives in segregated POOLS (sub-accounts), never the wallet: createMarginPool, fundMarginPool, withdrawMarginPool; openPosition/closePosition "
-    # "(optional limitPrice = exact-price entry/exit); getMyMarginPools, getMyPositions, getMyMarginHealth, getMyPositionEpisodes (history). A pool's working "
-    # "orders rest under the POOL's principal — cancel via cancelMyOrder or cancelPoolOrder (both repay idle leverage).\n\n"
+    # "(optional limitPrice = exact-price entry/exit; a market close is never refused but is BOUNDED at release — in price to the AMM ladder edge, or ±2% of mid when the AMM is not quoting that side, and in size so the pool's post-fill equity stays ≥ 0 at the worst-case price; the remainder re-stages for up to 5 requotes, then drops with a getMyReleaseRejections record. A short's market close reserves its buy-back at the MARK, not at the slippage cap — the release-time price cap and equity bound, not the reservation, bound what fills — so a pool whose free ICPUSD covers the position at the mark stages ALL of it; if the free ICPUSD (or, for a long, free base) still covers less than the position, closePosition stages what it can and records the un-staged remainder — \"Staged N of M … is NOT staged\" in getMyReleaseRejections — close again for the rest. LEVERAGE IS BORROWED AT THE FILL, never at placement: openPosition only CHECKS that the vault could lend the shortfall at today's marks (refusing up front if not) and stages the whole size; a staged or resting entry holds NO vault debt and pays no interest, and each fill borrows exactly its own shortfall from the vault at that instant (the pool as TAKER when its staged entry releases, as MAKER when a resting entry is hit later) — so interest accrues from the fill, cancelling an unfilled entry repays nothing, and a resting entry can fail to fill if the vault cannot lend when it is hit (vault cap, pool health, or a stale mark): that slice does not settle, the remainder is cancelled — never partially settled, never re-rested — and ONE getMyReleaseRejections record names the vault's reason);getMyMarginPools, getMyPositions, getMyMarginHealth, getMyPositionEpisodes (history). A pool's working "
+    # "orders rest under the POOL's principal — cancel via cancelMyOrder or cancelPoolOrder (neither repays anything: an unfilled entry holds no borrow; debt a FILL left idle against free funds is the owner's to retire — next). "
+    # "DECISION (1788533844, 2026-09-06): idle debt is retired by the owner via repayPoolDebt; the liquidation pass never repays. repayPoolDebt(poolId, token, amount) pays min(amount, debt, free) in kind — free = the pool's available balance minus the earmark of its RESTING EXITS in that token (an entry borrows at its fill and holds nothing back), so no live exit is unfunded; the loan is accrued first, so paying ≥ the debt retires it whole. fundMarginPool is margin, not repayment (fund → place the previewed order keeps working; the owner's leverage is the owner's choice), and a top-up sitting idle is never turned into a repayment by the heartbeat.\n\n"
     # "## Market data\n"
-    # "getMarkets() (ids, last price, 24h), getOrderBookDepth(marketId, ?depth) (null = full book — RAW depth: genuine orders, but resting orders hold no reservation, so size flow with getTakeableDepth(marketId, side, capPrice), which nets out maker funding), getRecentTrades(marketId) (the last 100 trades — fixed cap, no count parameter), getCandles(marketId, intervalMs, page) "
+    # "getMarkets() (ids, last price, 24h), getOrderBookDepth(marketId, ?depth) (null = full book — RAW depth: genuine orders, but resting orders hold no reservation, so size flow with getTakeableDepth(marketId, side, capPrice), which nets out maker funding — a margin pool's leveraged resting entry counts for what the vault would lend it at the fill), getRecentTrades(marketId) (the last 100 trades — fixed cap, no count parameter), getCandles(marketId, intervalMs, page) "
     # "(candles with volume=0 are clock-fill price markers, not trades), getAmmPool(marketId) (ref price + AMM state). For polling bots getMarketChanges is the one-call cursor. "
     # "BREAKING at apiVersion 2.0.0: the public trade feeds (getRecentTrades / getAllTrades / getTradesSince) return DE-IDENTIFIED PublicTrade records — no account attribution. "
     # "Your OWN fills, with fees and ids, still come from getMyTradesSinceId / getMarketChanges; account-attributed history remains on the public archive tape (proof-of-reserves requires it). "
     # "DECISION (W4-21, #8.4a): the raw archive surface (getEventsRange) serves FULL fill records — orderId included — because chain verification hashes the complete canonical row; a redacted row could never re-derive the certified head. So the order.id <-> fill.orderId join IS derivable from the tape: de-identification applies to the live convenience queries (getRecentTrades / getAllTrades), never to the permanent record. That is the transparency doctrine, stated rather than implied.\n\n"
     # "DECISION (W6-10.1, R6): the same doctrine covers the pool<->owner join. fundMarginPool's debit and credit land as consecutive-seq #delta rows with matched magnitude on the raw tape, so the sub-account behind an owner is derivable by linear scan; #delta rows must fold per real principal for replay/PoR, so remapping them is not on the table. Semantic rows stay owner-remapped; there is no by-principal index over the raw tape.\n\n"
+    # "DECISION (D9, F18, 2026-09-05): the same doctrine covers the leaderboard's username<->principal join. getLeaderboard's PublicLeaderRow publishes profitUsd / capitalUsd / equityUsd / returnBps at EXACT e8 precision (the #public_ OQL leaderboard entity serves the same Usd columns as human-unit floats, e8 ÷ 10^8 and unbucketed — 1793551691; returnBps stays bps), and the quote leg of capitalUsd is the exact net public deposit/withdrawal flow — so one observed ICPUSD deposit on the tape joins its principal to the row whose capitalUsd moved by that amount. That linkage is derivable BY DESIGN: the tape is public and principal-attributed as a requirement of the transparency doctrine, so exact columns add no exposure the tape does not already carry, and bucketing them (USD to $10, returnBps to 10 bps) would degrade auditor fidelity while implying a privacy the venue does not offer. The columns stay exact; the row withholds the principal (name only, isMe computed per caller) so the join costs a fold of the public tape, never a one-query lookup. Consistent with W4-21 and W6-10.1.\n\n"
+    # "DECISION (F29-backend, 1788529484, 2026-09-06): the controller BOOTSTRAP mints on #play. setTestBalance and fundArbitrageur are RATIFIED as live-on-#play controller tools — an absolute SET (a repeat re-mints only what was spent), controller-only, recorded as external flow (capital, never leaderboard profit); the repeat-deploy mint is bounded by the deploy script's fail-closed seed probe (H-02) and seedInsuranceFund's genesis refusal (H-17); both are refused by posture on #production. bulkSetTestBalances is instead BOUND to the genesis window (the _ammEverEnabled latch injectHistoricalTrades and the repeat seedInsuranceFund already honour): on #play it traps 'genesis window closed' once a market has been enabled on this install — no bring-up or fleet path calls it after that point, so post-genesis it was pure attack surface (one call re-minting every seed account). getAmmEverEnabled() reads the latch; only a reinstall re-arms it. #dev is unrestricted. "
+    # "FUNDING AUTHORITY (task 1789609263, 2026-09-17): a controller may designate ONE non-controller principal via setFundingAuthority(?principal) (null clears; getFundingAuthority reads it back; every change lands on the tape as #config { setter = \"setFundingAuthority\" }) that is admitted to setTestBalance / bulkSetTestBalances and the scoped getTestBalance read on #play/#dev ONLY — the bot fleet's refill key, so the live controller key stops signing refills. Nothing else is admitted to it; whyAmIRefused.fundingAuthority tells a caller whether it holds the role; the anonymous principal can never be designated; refused by posture on #production like the mints themselves.\n\n"
     # "## Liquidation transparency (exact, 1% bands)\n"
     # "getMarginHeatmap(marketId): the exact liquidation surface — every non-empty 1% band relative to the mark, both sides, notionals rounded to $100; positions liquidating beyond "
     # "the ±30% window count in the totals only (read the remainder as totals minus the bucket sum). Band geometry is withheld on thinly-oracled markets (the mark itself is untrustworthy there). "
@@ -10932,7 +14683,8 @@ persistent actor Uplands {
     # "schema() describes the queryable entities; execute(queryJson) runs a query over markets/orders/your own pools+positions+balances; archiveExecute(...) reaches deep history. Owner-scoped entities (pool/position/balance/closedOrder) return only YOUR rows. NOTE: the deposit/withdrawal ledger is deliberately PUBLIC and principal-attributed — archiveExecute returns every user's D/W rows, by design (anti-mixer transparency), not just your own.\n\n"
     # "## Identity\n"
     # "Bots authenticate with a raw Ed25519 keypair (Internet Identity is browser-only). Your funded principal is the one that deposited. "
-    # "ALL update calls refuse anonymous callers at the gate — sign every mutation; queries work anonymously.\n\n"
+    # "ALL update calls refuse anonymous callers at the gate — sign every mutation; queries work anonymously. "
+    # "PRE-REGISTRATION STATE IS BOUNDED: a profile or preferences written before your first deposit lives in a hard-capped, least-recently-seen-evicted store that also ages out after " # Nat.toText(Int.abs(PREREG_GRACE_NS / 86_400_000_000_000)) # " idle days (getPreRegStoreStats: size, cap, counters — public); your first deposit makes the record permanent. A pre-deposit draft evicted under a flood simply gets a fresh username on the next getMyProfile. NOTE: getUserPreferences is an UPDATE call, not a query, until apiVersion 7.0.0 (Candid cannot flip a method's mode inside a major; the operator ruling of 2026-09-17 is recorded in candid/README.md) — sign it like a mutation and expect a consensus round.\n\n"
     # "## Note on liquidations\n"
     # "Liquidations settle off the EXTERNAL oracle price (an aggregate of major exchanges), not this venue's price — so local trading cannot trigger anyone's liquidation.\n"
   };
@@ -10946,6 +14698,7 @@ persistent actor Uplands {
     geptorDeadlineNs  : ?Int;
     geptorDelayNs     : Int;
     refPriceUpdatedNs : Int;
+    releaseRefNs      : Int;   // H-23: the DISPATCH clock of the standing mark — the gate a staged entry's ts must precede (D6: kept public)
   } {
     switch (Map.get(markets, Text.compare, marketId)) { case null { return null }; case _ {} };
     let refNs = switch (AMM.getPool(pools, marketId)) { case (?p) { p.refPriceUpdatedNs }; case null { 0 } };
@@ -10954,6 +14707,7 @@ persistent actor Uplands {
       geptorDeadlineNs  = Map.get(_geptorDeadline, Text.compare, marketId);
       geptorDelayNs     = GEPTOR_DELAY_NS;
       refPriceUpdatedNs = refNs;
+      releaseRefNs      = releaseRefOf(marketId).dispatchNs;
     };
   };
 
@@ -10964,63 +14718,52 @@ persistent actor Uplands {
     registered        : Bool;
     myRank            : Nat;
     shedFloor         : Nat;
-    admittedNow       : Bool;   // would an update call from you pass inspect right now
-    stagedCount       : Nat;
+    admittedNow       : Bool;   // would a SHEDDABLE update (order entry etc.) from you pass inspect right now
+    exitsAdmitted     : Bool;   // #55: would an EXIT-SET update (exitMethods) pass — the floor never applies to it, so this is the caller policy alone
+    exitMethods       : [Text]; // #55: the exit set inspect exempts (W1-05), from the same EXIT_METHOD_SET list the gate reads
+    preRegistrationAdmitted : Bool;    // H-30: would a PRE-REGISTRATION-SET update (preRegistrationMethods) from you pass — the only updates an unregistered principal reaches
+    preRegistrationMethods  : [Text];  // H-30: that set, from the same PRE_REGISTRATION_METHOD_SET list the gate reads (+ the faucet on #dev)
+    stagedCount       : Nat;    // staged orders + staged cross-swaps (H-13) — what stagedCap gates
     stagedCap         : Nat;
     openOrderCount    : Nat;
     openOrderCap      : Nat;
     deadmanArmed      : Bool;   // armed = SPOT-WALLET orders auto-cancel on expiry; pool-owned orders are NOT swept (2026-08-20 — see tickDeadman)
     timersPaused      : Bool;   // #47.1: the ops brake, cross-referenced beside the armed flag (the deadman still fires under it — see getMyCancelAllAfter)
+    fundingAuthority  : Bool;   // task 1789609263: you are the controller-designated FUNDING AUTHORITY — admitted to setTestBalance / bulkSetTestBalances (and the scoped getTestBalance read) on #play/#dev, nothing else
   } {
     let key = Principal.toText(msg.caller);
     let registered = Map.get(registeredUsers, Text.compare, key) != null;
     let rank = levelRank(levelOfKey(scorecardKeyOf(msg.caller)));
-    let admitted = if (Principal.isAnonymous(msg.caller)) { false }
-      else if (registered) { _shedFloor == 0 or rank >= _shedFloor }
-      else { not IS_PRODUCTION };
+    // Same predicates inspect uses: callerAdmitted is the exit-set verdict
+    // (the floor never applies to EXIT_METHOD_SET); the floor applies on top of
+    // it to registered callers only, exactly as the gate orders its checks.
+    let exitsAdmitted = callerAdmitted(msg.caller, registered);
+    let admitted = exitsAdmitted and (not registered or _shedFloor == 0 or rank >= _shedFloor);
     {
       registered;
       myRank         = rank;
       shedFloor      = _shedFloor;
       admittedNow    = admitted;
+      exitsAdmitted;
+      exitMethods    = EXIT_METHOD_SET;
+      preRegistrationAdmitted = preRegistrationAdmitted(msg.caller, registered);
+      preRegistrationMethods  = effectivePreRegistrationMethods();
       stagedCount    = stagedCountOf(msg.caller);
       stagedCap      = STAGED_CAP_PER_OWNER;
-      // GHSA-97xp: beneficial-owner count (self + owned pools), matching what
+      // GHSA-97xp / #52.1: beneficial-owner count (self + owned pools), matching what
       // the cap actually gates — the raw-principal count undercounted pool-
       // owned resting orders, exactly as stagedCount already resolved owners.
       openOrderCount = ownerOpenOrderCount(msg.caller);
       openOrderCap   = Option.get(_testOrderCap, USER_OPEN_ORDER_CAP);
       deadmanArmed   = Map.get(deadmanSwitches, Principal.compare, msg.caller) != null;
       timersPaused   = _timersPaused;
+      fundingAuthority = isFundingAuthority(msg.caller);
     };
   };
 
-  // Place a limit order flagged with a settlement window. The resulting
-  // resting order will trigger the pending-match flow whenever a taker
-  // crosses it: the maker can cancel within `windowSeconds` to abort the
-  // match. Semantics for immediate fills (i.e. if this order is
-  // marketable and crosses existing liquidity) are identical to
-  // placeLimitOrder — the protection only applies to the RESTING remnant
-  // that posts to the book. windowSeconds must be 1..30 inclusive.
-  public shared (msg) func placeProtectedLimitOrder(
-    marketId      : Types.MarketId,
-    side          : Types.Side,
-    price         : Nat,
-    quantity      : Nat,
-    windowSeconds : Nat,
-  ) : async { #ok : PlaceLimitResult; #err : Text } {
-    requireAuth(msg.caller);
-    ensureInit<system>();
-    if (windowSeconds == 0 or windowSeconds > 30) {
-      return #err("windowSeconds must be 1..30");
-    };
-    // Sealed-until-GEPTOR makes the explicit settlement window redundant — every
-    // order already releases only at a fresh-price moment (the anti-snipe the
-    // window existed to provide). windowSeconds is validated for API
-    // compatibility but no longer creates a pending-match window; the order is
-    // staged exactly like placeLimitOrder (GTC).
-    placeLimitInner(msg.caller, marketId, side, price, quantity, null, false);
-  };
+  // (placeProtectedLimitOrder — placeLimitOrder under another name with an
+  // ignored `windowSeconds`, an inert stub since task 1788516198 — was
+  // REMOVED at apiVersion 6.0.0; candid/README.md.)
 
   // ── Margin Phase 2: borrow / repay endpoints ─────────────────
   // The trader's borrowed token lands in their balance and becomes
@@ -11036,7 +14779,8 @@ persistent actor Uplands {
   // the Wallet is pure custody, never collateral, so users no longer borrow
   // against it. Leverage/short now happen only inside margin pools, which borrow
   // from the vault on the POOL principal via openPosition (BorrowEngine.borrow)
-  // and repay via the settlement deleverage. The BorrowEngine/Liquidator/
+  // and repay via the settlement deleverage — or, for debt left idle against
+  // free funds, the owner's repayPoolDebt. The BorrowEngine/Liquidator/
   // MarginEngine machinery below is unchanged — it just operates on pool
   // principals now. See docs/wallet-and-positions-design.md.
 
@@ -11078,7 +14822,18 @@ persistent actor Uplands {
                                     // (health.equityUsd is LTV-weighted — a risk
                                     // figure, not what the pool is worth)
     createdAt   : Int;              // pool creation time (Pools History)
+    // Task 1788730982 — the per-token figures the pools UI's Repay control
+    // previews with, so its "Will pay" IS repayPoolDebt's min(amount, debt,
+    // free) to the unit for every owed token (a short's debt is BASE; the
+    // USD total above cannot preview it) and AFTER the resting earmark
+    // (freeQuote above is available ICPUSD BEFORE it — an upper bound).
+    // One entry per token the pool owes, in the same order in both:
+    loans       : [TokenAmount];    // accrued principal + interest, in kind
+    repayable   : [TokenAmount];    // available − the resting-order earmark
+                                    // = the `free` repayPoolDebt pays from
   };
+
+  public type TokenAmount = { token : Types.TokenId; amount : Nat };
 
   public type PositionView = {
     poolId        : Nat;
@@ -11091,14 +14846,21 @@ persistent actor Uplands {
     unrealizedPnl : Int;
     realizedPnl   : Int;
     liqPrice      : ?Nat;
-    pctToLiq      : ?Nat;
+    pctToLiq      : ?Nat;           // unsigned |mark − liqPrice| / mark (10^8) — kept as is
+    liqDir        : ?MarginPools.LiqDir;  // #54.8 (additive): #down = liquidates as the mark
+                                          //   FALLS to liqPrice, #up = as it RISES; from the
+                                          //   health slope, not the size sign
+    isLiquidatable : Bool;          // #54.8 (additive): getHealth's verdict for the pool —
+                                    //   the row prints "liquidatable" on it, never on mark-vs-liqPrice
   };
 
   // Create an empty pool owned by the caller; opens a margin account on the
   // pool principal so it can borrow. Returns the new pool id.
   public shared (msg) func createMarginPool(name : Text, isolated : Bool) : async { #ok : Nat; #err : Text } {
     requireAuth(msg.caller);
+    requireRegistered(msg.caller);   // H-30: 64 permanent registry records per offline keypair otherwise
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     // Cap pools per owner — unbounded creation is a DoS amplifier (O(pools)
     // scans + a `loans` entry per borrowing pool that the liquidation heartbeat
     // walks). O(1) check against the per-owner counter.
@@ -11113,16 +14875,33 @@ persistent actor Uplands {
     if (name.size() > MAX_POOL_NAME_LEN) {
       return #err("Pool name too long (max " # Nat.toText(MAX_POOL_NAME_LEN) # " characters).");
     };
+    // H-19: no leading spreadsheet-formula character, no control character
+    // (the rule and its reasons live with MarginPools.nameRefusal). Creation-
+    // time only — names already stored are never revalidated; the frontend's
+    // CSV builders neutralise every exported cell regardless.
+    switch (MarginPools.nameRefusal(name)) { case (?e) { return #err(e) }; case null {} };
     let ownerKey = Principal.toText(msg.caller);
     let owned = Option.get(Map.get(ownerPoolCount, Text.compare, ownerKey), 0);
     if (owned >= MAX_POOLS_PER_OWNER) {
       return #err("Pool limit reached (" # Nat.toText(MAX_POOLS_PER_OWNER) # " per account). Reuse or close an existing pool.");
     };
+    #ok(registerPool(msg.caller, name, isolated))
+  };
+
+  // The registry writes of a new pool — ONE place (createMarginPool and the
+  // #dev bulk seeder devSeedEmptyPools share it), so the five maps a pool
+  // lives in (marginPools, poolByPrincipal, marginAccounts, ownerPoolCount,
+  // poolIdsByOwner) can never be written in a different order or subset.
+  // Caller-side checks (auth, seal, name length, per-owner cap) stay with the
+  // entry points.
+  func registerPool(owner : Principal, name : Text, isolated : Bool) : Nat {
+    let ownerKey = Principal.toText(owner);
+    let owned = Option.get(Map.get(ownerPoolCount, Text.compare, ownerKey), 0);
     let id = nextPoolId;
     nextPoolId += 1;
     let poolP = poolPrincipalOf(id);
     let pool : MarginPools.Pool = {
-      id; owner = msg.caller; name;
+      id; owner; name;
       mode = if (isolated) { #isolated } else { #cross };
       createdAt = Time.now();
     };
@@ -11131,8 +14910,21 @@ persistent actor Uplands {
     assertPoolMarginTarget(poolP);   // W5-23: registration precedes open, always
     ignore MarginEngine.open(marginAccounts, poolP, Time.now());
     Map.add(ownerPoolCount, Text.compare, ownerKey, owned + 1);
-    indexPoolOwner(msg.caller, id);
-    #ok(id)
+    indexPoolOwner(owner, id);
+    id
+  };
+
+  // Dev-only bulk seeder (H-30 verification): mints `n` registry-only pools
+  // owned by `owner` — no funding, no name, the per-owner cap bypassed — so a
+  // test can put thousands of EMPTY pools on the venue in one message and
+  // prove the heat/risk scans' HEAT_MAX_POOLS bound counts only pools that
+  // can carry a position, and that the per-user pool reads cost the same
+  // with them present. Returns Map.size(marginPools) afterwards.
+  public shared (msg) func devSeedEmptyPools(owner : Principal, n : Nat) : async Nat {
+    requireController(msg.caller);
+    requireDevHook("devSeedEmptyPools");
+    for (_ in Nat.range(0, n)) { ignore registerPool(owner, "", false) };
+    Map.size(marginPools)
   };
 
   // Fund a pool with ICPUSD from the caller's free wallet — the segregation
@@ -11140,6 +14932,7 @@ persistent actor Uplands {
   public shared (msg) func fundMarginPool(poolId : Nat, amount : Nat) : async { #ok; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     if (amount == 0) { return #err("Amount must be positive") };
     if (not ownsPool(msg.caller, poolId)) { return #err("Not your pool") };
     if (getAvailable(msg.caller, Types.QUOTE_TOKEN) < amount) {
@@ -11155,6 +14948,8 @@ persistent actor Uplands {
     };
     Accounts.addBalance(accounts, poolPrincipalOf(poolId), Types.QUOTE_TOKEN, amount);
     recordPoolTransfer(msg.caller, poolId, amount, #fund);
+    // H-10: the wallet's resting orders no longer have this quote behind them.
+    ignore revalidateUserOrders(msg.caller, Time.now());
     bumpUserVersion(msg.caller);
     #ok
   };
@@ -11167,7 +14962,8 @@ persistent actor Uplands {
     if (amount == 0) { return #err("Amount must be positive") };
     if (not ownsPool(msg.caller, poolId)) { return #err("Not your pool") };
     let poolP = poolPrincipalOf(poolId);
-    if (getAvailable(poolP, Types.QUOTE_TOKEN) < amount) {
+    let poolAvail = getAvailable(poolP, Types.QUOTE_TOKEN);
+    if (poolAvail < amount) {
       return #err("Insufficient free ICPUSD in pool (balance − reserved)");
     };
     BorrowEngine.accrueAll(loans, poolP, Time.now());
@@ -11185,13 +14981,69 @@ persistent actor Uplands {
         return #err("Withdrawal would drop pool health below the initial-margin requirement — reduce it or close positions first.");
       };
     };
+    let j0 = List.size(accounts.journal);   // H-32: the rows this exit appends start here
     if (not Accounts.subtractBalance(accounts, poolP, Types.QUOTE_TOKEN, amount)) {
       return #err("Pool balance subtraction failed");
     };
     Accounts.addBalance(accounts, msg.caller, Types.QUOTE_TOKEN, amount);
     recordPoolTransfer(msg.caller, poolId, amount, #withdraw);
+    // H-32: a dust withdrawal inside the caller's exit window has its two
+    // #delta rows coalesced into the window (no semantic row of its own);
+    // spend-all and ≥ EXIT_DUST_USD write live. The exit itself is done.
+    if (exitFolds(msg.caller, Time.now(), amount < EXIT_DUST_USD and amount < poolAvail)) {
+      foldDustExit(msg.caller, j0, #none);
+    };
+    // H-10: the POOL is the debited party here — its resting limit entries
+    // (the AMM sweep can take them) are re-validated against what it keeps.
+    ignore revalidateUserOrders(poolP, Time.now());
     bumpUserVersion(msg.caller);
     #ok
+  };
+
+  // Repay the pool's `token` debt from the pool's own FREE holding of that
+  // token — the owner's lever for retiring IDLE debt (task 1788523828, H-07's
+  // optional criterion). Every order-ending path already repays for the owner
+  // (a fill through settlePoolFills, a kill/cancel through deleveragePool), so
+  // ordinarily there is nothing here to pay; this is for debt that survives
+  // against free funds through a path that does not repay — an upgrade-era
+  // stranded loan, a balance written in by hand on #dev, a future path that
+  // forgets — and for a top-up the owner would rather turn into repayment
+  // than margin (fundMarginPool deliberately does NOT repay: a top-up is
+  // margin until the owner says otherwise; the liquidation batch does not
+  // reconcile idle debt either — see the note atop runLiquidationBatch).
+  // `amount` caps the repayment: pay = min(amount, debt, free), where free is
+  // available (balance − staged reservations) minus the earmark of the pool's
+  // RESTING orders in that token (poolRestingOrderNeeds — repaying that would
+  // unfund a resting leveraged entry, the F1 shape), so no live order is ever
+  // starved. Pass amount ≥ the debt to retire it whole: the loan is accrued
+  // to now first, so what is paid includes the in-message interest and the
+  // entry is deleted outright (nothing forgiven). In-kind only — base debt is
+  // paid in base; a base residue the pool holds no base for is
+  // deleveragePool's capped cash-settle case, not this one. Returns the amount
+  // paid; #err when nothing could be paid, and why. Cost: one
+  // poolRestingOrderNeeds walk over the pool's open orders (bounded by the
+  // per-owner open-order cap) + accrueAll + one repay + reprovisionPool — the
+  // same bill cancelPoolOrder pays. An EXIT method (inspect's exit set, never
+  // load-shed): retiring debt from idle funds is the pool-side de-lever that
+  // costs the owner nothing, cheaper than the close it would otherwise take.
+  public shared (msg) func repayPoolDebt(poolId : Nat, token : Types.TokenId, amount : Nat) : async { #ok : Nat; #err : Text } {
+    requireAuth(msg.caller);
+    ensureInit<system>();
+    if (amount == 0) { return #err("Amount must be positive") };
+    if (not ownsPool(msg.caller, poolId)) { return #err("Not your pool") };
+    let poolP = poolPrincipalOf(poolId);
+    let now = Time.now();
+    BorrowEngine.accrueAll(loans, poolP, now);
+    if (BorrowEngine.loanOf(loans, poolP, token) == 0) { return #err("No " # token # " debt on this pool") };
+    let (quoteNeed, baseNeed) = poolRestingOrderNeeds(poolP, token);
+    let earmark = if (token == Types.QUOTE_TOKEN) { quoteNeed } else { baseNeed };
+    let paid = repayPoolFromFree(poolP, token, earmark, ?amount, now);
+    if (paid == 0) {
+      return #err("No free " # token # " in the pool to repay with (balance − staged reservations − the earmark of its resting orders)");
+    };
+    reprovisionPool(poolP);
+    bumpUserVersion(msg.caller);
+    #ok(paid)
   };
 
   // Open or increase a position. side #buy = long, #sell = short, `sizeBase`
@@ -11206,6 +15058,7 @@ persistent actor Uplands {
   ) : async { #ok; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     if (sizeBase == 0) { return #err("Size must be positive") };
     switch (limitPrice) {
       case (?lp) { switch (priceBandCheck(marketId, side, lp)) { case (?e) { return #err(e) }; case null {} } };
@@ -11220,6 +15073,17 @@ persistent actor Uplands {
     // the borrow gating + entry would otherwise be sized off a frozen price.
     if (not marginPriceFresh(baseToken)) { return #err("oracle price stale for " # baseToken # " — try again shortly") };
     let poolP = poolPrincipalOf(poolId);
+    // H-06 (F23): ...and on a stale mark for ANY token the pool holds or owes.
+    // The borrow gate below (BorrowEngine.borrow → borrowCheck) values the
+    // whole collateral basket through the age-blind marginPriceLookup, so
+    // with only the traded token checked a frozen ETH mark still sized a BTC
+    // borrow off a stale price. Same basket-wide bar as withdrawMarginPool
+    // and the liquidator (userMarksFreshAt); the token is named so the
+    // trader knows which feed to wait for.
+    switch (userStaleMarkAt(poolP, Time.now())) {
+      case (?t) { return #err("oracle price stale for " # t # " (this pool's collateral/debt) — try again shortly") };
+      case null {};
+    };
     if (poolIsolated(pool)) {
       var otherMarket = false;
       forPoolPositions(poolId, func(_, pos) {
@@ -11246,9 +15110,9 @@ persistent actor Uplands {
     // Market: the price ceiling is the slippage cap; the order releases and fills
     // on the next GEPTOR (~1-2s). Limit: the user's price is the ceiling (no
     // slippage); the leftover RESTS on the book owned by the pool and fills when
-    // the market reaches it — exact entry. Leverage is pre-borrowed in both cases,
-    // sized at the ceiling; for a resting limit it stays reserved against the order
-    // and accrues carry until fill (cancel repays it). docs/limit-order-positions-design.md.
+    // the market reaches it — exact entry. Leverage is borrowed AT THE FILL in
+    // both cases (H-34 / D5 (d): exactly the filled quantity, no carry while
+    // staged or resting; a cancel has nothing to repay). docs/limit-order-positions-design.md.
     let (kind, execPrice) = switch (limitPrice) {
       case (?lp) {
         if (lp == 0) { return #err("Limit price must be positive") };
@@ -11259,7 +15123,7 @@ persistent actor Uplands {
         (#market, switch (side) { case (#buy) { Fixed.mul(refPrice, Fixed.SCALE + maxSlippage, true) }; case (#sell) { Fixed.mul(refPrice, Fixed.SCALE - maxSlippage, false) } })
       };
     };
-    // GHSA-97xp: margin placements rest on the SAME book as everyone else's,
+    // GHSA-97xp / #52.1: margin placements rest on the SAME book as everyone else's,
     // so the book-integrity guards bind here too (staging as the pool
     // principal used to evade all of them). Checked BEFORE the borrow so a
     // refusal never needs an unwind.
@@ -11290,44 +15154,45 @@ persistent actor Uplands {
     if (entryNotional < Types.MIN_ORDER_ICPUSD) {
       return #err("Position value below the " # Nat.toText(Types.MIN_ORDER_ICPUSD) # " base-unit minimum (10 ICPUSD)");
     };
-    // Borrow the shortfall (sized at the price ceiling) so the pool can place
-    // the leg. Track what THIS call borrowed so a staging failure below can
-    // unwind it exactly.
-    var borrowedTok : ?Types.TokenId = null;
-    var borrowedAmt : Nat = 0;
+    // H-34 / D5 option (d): NO placement-time borrow. The leverage is
+    // borrowed AT THE FILL, per slice, by poolFundForFill (the engine's
+    // fundForFill hook) — a staged or resting entry holds no vault debt and
+    // pays no carry. What stays here is the CHECK: the same borrowCheck the
+    // fill will run, sized at the price ceiling for the whole size, reserving
+    // nothing — so an entry the pool could not lever even at today's marks is
+    // refused up front with the vault's reason (the "≈6× rejected" UX), and
+    // an entry accepted here can still fail to fill later if the vault has
+    // run dry or the pool's health moved since — the correct outcome for a
+    // reservation the pool was never using (the operator's ruling), told
+    // through the one unfunded-maker notice.
     switch (side) {
       case (#buy) {
         let quoteNeeded = Fixed.mul(sizeBase, execPrice, true);
         let have = getAvailable(poolP, Types.QUOTE_TOKEN);
         if (have < quoteNeeded) {
-          switch (BorrowEngine.borrow(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), poolP, Types.QUOTE_TOKEN, quoteNeeded - have, now, marginPriceLookup)) {
+          switch (BorrowEngine.borrowCheck(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), poolP, Types.QUOTE_TOKEN, quoteNeeded - have, now, marginPriceLookup)) {
             case (#err(e)) { return #err("Borrow for long failed: " # e) };
-            case (#ok(_)) { borrowedTok := ?Types.QUOTE_TOKEN; borrowedAmt := quoteNeeded - have };
+            case (#ok(_)) {};
           };
         };
       };
       case (#sell) {
         let have = getAvailable(poolP, baseToken);
         if (have < sizeBase) {
-          switch (BorrowEngine.borrow(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), poolP, baseToken, sizeBase - have, now, marginPriceLookup)) {
+          switch (BorrowEngine.borrowCheck(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), poolP, baseToken, sizeBase - have, now, marginPriceLookup)) {
             case (#err(e)) { return #err("Borrow for short failed: " # e) };
-            case (#ok(_)) { borrowedTok := ?baseToken; borrowedAmt := sizeBase - have };
+            case (#ok(_)) {};
           };
         };
       };
     };
+    // parkDeferred's pool-ENTRY branch soft-locks the pool's OWN funds up to
+    // the size and parks the whole quantity — the rest is the fill's borrow.
     switch (parkDeferred(marketId, baseToken, poolP, side, kind, execPrice, sizeBase, false, null, null, now)) {
       case null {
-        // Unwind the borrow just taken — otherwise the pool is left holding
-        // borrowed funds and accruing interest with NO order to deploy them
-        // (the review's latent leak). Nothing touched the pool between the
-        // borrow and this failure, so repaying the exact amount succeeds;
-        // going through the engine keeps interest accounting consistent.
-        switch (borrowedTok) {
-          case (?t) { ignore BorrowEngine.repay(loans, accounts, ammPrincipal(), poolP, t, borrowedAmt, now, marginPriceLookup) };
-          case null {};
-        };
-        return #err("Could not stage the order (insufficient pool funds after borrow?)");
+        // Nothing was borrowed, so nothing to unwind: the staged-queue cap or
+        // a zero quantity refused the park; the loan book never moved.
+        return #err("Could not stage the order (staged-order cap reached, or nothing to stage)");
       };
       case (?_) {};
     };
@@ -11470,7 +15335,7 @@ persistent actor Uplands {
         switch (side) { case (#buy) { Fixed.mul(refPrice, Fixed.SCALE + maxSlippage, true) }; case (#sell) { Fixed.mul(refPrice, Fixed.SCALE - maxSlippage, false) } };
       };
     };
-    // GHSA-97xp mirror of openPosition's book-integrity guards (same order,
+    // GHSA-97xp / #52.1 mirror of openPosition's book-integrity guards (same order,
     // same messages): level cap + owner open-order cap on limit entries, min
     // notional on both kinds. sizeBase = 0 stays a pure capacity probe.
     switch (limitPrice) {
@@ -11521,6 +15386,13 @@ persistent actor Uplands {
         var estLiq : ?Nat = null;
         if (sizeBase > 0) {
           let borrowOk = if (needed > 0) {
+            // (Discarded query state: no reprovisionPool here — the real
+            // fill's borrow (poolFundForFill, H-34) hooks it; openPosition
+            // itself borrows nothing. No revalidateUserOrders on the simulated
+            // debit below either — task 1788520599: the REAL fill's debit is
+            // the engine's, and its affected set carries the pool principal
+            // into adjustAffectedUsers, which re-validates the pool's other
+            // resting entries in the same message.)
             switch (BorrowEngine.borrow(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), poolP, borrowTok, needed, now, marginPriceLookup)) {
               case (#ok(_)) { true }; case (#err(_)) { false };
             };
@@ -11549,7 +15421,8 @@ persistent actor Uplands {
 
   // Flatten the pool's position in `marketId` by staging the offsetting trade as
   // the pool. (Debt repayment from proceeds + realized-PnL booking are the
-  // Phase-3 settlement hook; residual debt can be repaid via repayAsset.)
+  // Phase-3 settlement hook; residual debt is repaid at the fill by
+  // settlePoolFills → deleveragePool, or by the owner via repayPoolDebt.)
   public shared (msg) func closePosition(poolId : Nat, marketId : Types.MarketId, maxSlippage : Nat, limitPrice : ?Nat) : async { #ok; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
@@ -11557,6 +15430,17 @@ persistent actor Uplands {
     let (baseToken, _) = switch (Map.get(markets, Text.compare, marketId)) {
       case (?m) { m }; case null { return #err("Market not found: " # marketId) };
     };
+    let poolP = poolPrincipalOf(poolId);
+    let now = Time.now();
+    // Accrue BEFORE sizing (task 1788516128): a SHORT's derived size is base
+    // held − base DEBT, and the debt read here was the principal at the LAST
+    // accrual touch (the 30 s liquidation sweep) — the buy-back then covered
+    // less than the pool owed at call time and the difference stayed on the
+    // book as base debt the pool held no base to pay. Same pattern as
+    // fundMarginPool/withdrawMarginPool. The interest that books AFTER this
+    // call — between now and the fill's settlement message — is settled by
+    // deleveragePool's capped base-residue cash settle.
+    BorrowEngine.accrueAll(loans, poolP, now);
     let size = poolNetSize(poolId, baseToken);
     if (size == 0) { return #err("No open position in " # marketId) };
     let refPrice = switch (AMM.getPool(pools, marketId)) {
@@ -11564,8 +15448,6 @@ persistent actor Uplands {
       case null { 0 };
     };
     if (refPrice == 0) { return #err("No price for " # marketId) };
-    let poolP = poolPrincipalOf(poolId);
-    let now = Time.now();
     let side : Types.Side = if (size > 0) { #sell } else { #buy };  // long→sell, short→buy
     // Market close (slippage cap) or limit close (take-profit; rests at the price).
     let (kind, execPrice) = switch (limitPrice) {
@@ -11579,10 +15461,18 @@ persistent actor Uplands {
         (#market, switch (side) { case (#buy) { Fixed.mul(refPrice, Fixed.SCALE + maxSlippage, true) }; case (#sell) { Fixed.mul(refPrice, Fixed.SCALE - maxSlippage, false) } })
       };
     };
-    // GHSA-97xp failure semantics for CLOSE: a user must ALWAYS be able to
+    // GHSA-97xp / #52.1 failure semantics for CLOSE: a user must ALWAYS be able to
     // deleverage. The market close is that guarantee — it never rests on the
     // book (fills within the slippage cap or re-defers), so it carries NO new
-    // guards; and NO close checks min notional (a dust position must never be
+    // guards HERE. H-05 (F1): "always available" is not "at any price": the
+    // release BOUNDS a pool's market close rather than refusing it — in price
+    // by the #3a ladder-edge / ±USERS_ONLY_CLAMP_PCT cap every taker gets
+    // (releaseDeferred, walksLadder), in size by clampToInitialMargin's raw-
+    // equity line (post-fill collateral − debt ≥ 0 at the worst-case price,
+    // fees included); the remainder re-stages for MAX_REDEFER requotes, then
+    // drops with a record. The 1–25 % maxSlippage is the user's CEILING, not
+    // the price the venue will let a colluding ask charge a thin pool.
+    // And NO close checks min notional (a dust position must never be
     // stranded against accruing interest — the exit-set doctrine). A LIMIT
     // close is a take-profit convenience that RESTS at execPrice, so the two
     // book-occupancy caps bind exactly as they do for a limit entry — a
@@ -11600,7 +15490,11 @@ persistent actor Uplands {
     };
     switch (parkDeferred(marketId, baseToken, poolP, side, kind, execPrice, Int.abs(size), false, null, null, now)) {
       case null { return #err("Could not stage the close") };
-      case (?_) {};
+      // Task 1788557389: a market close's #buy reserves at the MARK (parkDeferred
+      // → poolDeleverMark), so a pool whose free quote covers its short at the
+      // mark stages the WHOLE position; whatever still cannot stage (free
+      // quote/base below the size even at the mark) is recorded, never silent.
+      case (?e) { noteStagedShort(poolP, marketId, baseToken, side, Int.abs(size), e.qty, execPrice) };
     };
     bumpUserVersion(msg.caller);
     #ok
@@ -11632,8 +15526,9 @@ persistent actor Uplands {
   };
 
   // Cancel one of a pool's orders (staged or resting). Refunds the reservation
-  // and DELEVERAGES the pool — a resting limit-entry pre-borrowed its leverage,
-  // so cancelling must repay that now-idle borrow. Shared core: reached via the
+  // and DELEVERAGES the pool — under H-34 / D5 (d) a resting entry holds no
+  // borrow (leverage is taken at the fill), so the deleverage is a no-op for
+  // entries and only ever retires debt free funds could pay. Shared core: reached via the
   // explicit cancelPoolOrder(poolId, orderId) endpoint AND via cancelMyOrder,
   // which routes here when the order's owner turns out to be a pool the caller
   // owns (so every Cancel button works no matter which view rendered the row).
@@ -11643,12 +15538,13 @@ persistent actor Uplands {
     switch (Map.get(deferredExecs, Nat.compare, orderId)) {
       case (?d) {
         if (not Principal.equal(d.owner, poolP)) { return #err("Not this pool's order") };
-        if (deferredCommitted(orderId, d.ts, now)) { return #err(DEFERRED_COMMIT_ERR) };
+        switch (deferredCommitReason(d, now)) { case (?e) { return #err(e) }; case null {} };
         ignore subReserved(d.owner, d.reservedTok, d.reservedAmt);
         removeDeferredExec(orderId);
         ignore Map.delete(deferredFok, Nat.compare, orderId);
         ignore Map.delete(deferredPostOnly, Nat.compare, orderId);
         ignore Map.delete(deferredBudget, Nat.compare, orderId);
+        ignore Map.delete(deferredSwapCtx, Nat.compare, orderId);
         ignore Map.delete(deferredExpiry, Nat.compare, orderId);
         // #51.2: same invariant as every other staged-cancel path — an intent
         // that never lands must not go on shielding (a pool principal cannot
@@ -11661,15 +15557,25 @@ persistent actor Uplands {
       };
       case null {};
     };
-    switch (OrderBook.getOrder(orderStore, orderId)) {
+    // #55 ("pool cancel door"): a staged pool entry that RELEASED rests under
+    // a fresh id — resolve the handle getPoolOrders showed while it was
+    // staged through stagedReleasedAs, the same hop cancelMyOrder /
+    // cancelOwnSpotOrder / getMyOrderStatus take. Without it the id a client
+    // polled before release answered "Order not found for this pool" here
+    // while cancelMyOrder(sameId) cancelled it. Ownership is checked on the
+    // RESOLVED order: another pool's handle resolves to an order that pool
+    // principal does not own and is refused as "Not this pool's order".
+    let resolvedId = switch (OrderBook.getOrder(orderStore, orderId)) {
+      case (?_) { orderId };
+      case null { Option.get(Map.get(stagedReleasedAs, Nat.compare, orderId), orderId) };
+    };
+    switch (OrderBook.getOrder(orderStore, resolvedId)) {
       case (?order) {
         if (not Principal.equal(order.owner, poolP)) { return #err("Not this pool's order") };
         if (not OrderBook.isOpen(order)) { return #err("Order is not open") };
         let baseToken = switch (Map.get(markets, Text.compare, order.marketId)) { case (?(b, _)) { b }; case null { "" } };
-        voidPendingMatchesForMaker(orderId);
-        ignore OrderBook.cancelOrder(orderStore, orderId);
-        ignore Map.delete(orderSettlementWindows, Nat.compare, orderId);
-        ignore Map.delete(orderExpiry, Nat.compare, orderId);
+        ignore OrderBook.cancelOrder(orderStore, resolvedId);
+        ignore Map.delete(orderExpiry, Nat.compare, resolvedId);
         deleveragePool(poolId, baseToken, now);
         bumpUserVersion(caller);
         return #ok;
@@ -11696,11 +15602,26 @@ persistent actor Uplands {
 
   // Caller's pools with per-pool health + margin usage.
   public query (msg) func getMyMarginPools() : async [MarginPoolView] {
+    myMarginPoolsOf(msg.caller)
+  };
+  // H-30: owner index + Map.get — O(own pools ≤ 64), never a marginPools walk
+  // (the five per-user pool reads all resolve this way; W5-21 converted only
+  // selfAndOwnedPools). poolIdsByOwner is append-only per owner, pruned only
+  // by adminPruneUnregisteredResidue, which rebuilds it from marginPools.
+  func myMarginPoolsOf(caller : Principal) : [MarginPoolView] {
     let out = List.empty<MarginPoolView>();
-    for ((id, pool) in Map.entries(marginPools)) {
-      if (Principal.equal(pool.owner, msg.caller)) {
+    let now = Time.now();
+    for (id in ownedPoolIds(caller).vals()) {
+      switch (Map.get(marginPools, Nat.compare, id)) { case null {}; case (?pool) {
         let poolP = poolPrincipalOf(id);
+        // Accrue BEFORE any loan-derived read (1788515291's rule): the view's
+        // per-token `loans` must be the full claim repayPoolDebt will read
+        // after ITS accrual, not the figure at the last touch. A query's
+        // write is discarded with the message; from an update caller it is
+        // the same idempotent accrual every pool interaction performs.
+        BorrowEngine.accrueAll(loans, poolP, now);
         let h = BorrowEngine.getHealth(loans, marginAccounts, accounts, reservedBalance, poolP, marginPriceLookup);
+        let (owed, free) = poolLoanFigures(poolP);
         List.add(out, {
           id; name = pool.name; isolated = poolIsolated(pool);
           principal = Principal.toText(poolP);
@@ -11709,10 +15630,41 @@ persistent actor Uplands {
           freeQuote = getAvailable(poolP, Types.QUOTE_TOKEN);
           valueUsd = (rawHoldingsUsd(poolP) : Int) - (h.debtUsd : Int);
           createdAt = pool.createdAt;
+          loans = owed; repayable = free;
         });
-      };
+      } };
     };
     Iter.toArray(List.values(out))
+  };
+
+  // The Repay control's figures (task 1788730982): per token the pool owes,
+  // the accrued debt and the FREE holding repayPoolDebt would pay from —
+  // available (balance − staged reservations) minus the earmark of the pool's
+  // resting exits in that token, exactly repayPoolFromFree's `free` (the
+  // walk is poolRestingOrderNeeds, bounded by the per-owner open-order cap;
+  // its quoteNeed is the same on every call, so it is walked once for the
+  // quote leg and once per owed base token — a QUERY cost, never a beat's).
+  // Caller accrues first. Empty on a debt-free pool; both arrays align.
+  func poolLoanFigures(poolP : Principal) : ([TokenAmount], [TokenAmount]) {
+    let owed = List.empty<TokenAmount>();
+    let free = List.empty<TokenAmount>();
+    var quoteNeed : ?Nat = null;
+    for (d in BorrowEngine.getDebt(loans, poolP, marginPriceLookup).vals()) {
+      if (d.principal == 0) { continue };   // a surviving zero entry is not a debt
+      let earmark = if (d.token == Types.QUOTE_TOKEN) {
+        switch (quoteNeed) {
+          case (?q) { q };
+          case null { let (q, _) = poolRestingOrderNeeds(poolP, Types.QUOTE_TOKEN); quoteNeed := ?q; q };
+        };
+      } else {
+        let (q, b) = poolRestingOrderNeeds(poolP, d.token);
+        quoteNeed := ?q;
+        b;
+      };
+      List.add(owed, { token = d.token; amount = d.principal });
+      List.add(free, { token = d.token; amount = SafeMath.subOrZero(getAvailable(poolP, d.token), earmark) });
+    };
+    (Iter.toArray(List.values(owed)), Iter.toArray(List.values(free)));
   };
 
   // ── Position / pool history queries ──
@@ -11737,12 +15689,16 @@ persistent actor Uplands {
   // the POOL principal, so these never appear in getMyTradeHistory). Up to 200
   // per pool, unsorted across pools — the frontend merges and sorts.
   public query (msg) func getMyPositionFills() : async [Types.Trade] {
+    if (Principal.isAnonymous(msg.caller)) { return [] };   // H-31: before touching anything
+    myPositionFillsOf(msg.caller)
+  };
+  // H-31: one bounded pass over ownedPoolIds (≤ MAX_POOLS_PER_OWNER), each
+  // pool's fills off the per-principal index — O(pools × 200), never O(tape).
+  func myPositionFillsOf(caller : Principal) : [Types.Trade] {
     let out = List.empty<Types.Trade>();
-    for ((id, pool) in Map.entries(marginPools)) {
-      if (Principal.equal(pool.owner, msg.caller)) {
-        for (t in OrderBook.getUserTrades(orderStore, poolPrincipalOf(id), 200).vals()) {
-          List.add(out, t);
-        };
+    for (id in ownedPoolIds(caller).vals()) {   // H-30: owner index, not a walk
+      for (t in OrderBook.getUserTradesIndexed(userTradeIndex, poolPrincipalOf(id), 200).vals()) {
+        List.add(out, t);
       };
     };
     Iter.toArray(List.values(out))
@@ -11774,13 +15730,14 @@ persistent actor Uplands {
   // Liquidation events that hit the caller's pools (events are recorded under
   // the liquidated POOL principal, so getMyLiquidationHistory misses them).
   public query (msg) func getMyPoolLiquidations() : async [Types.LiquidationEvent] {
+    myPoolLiquidationsOf(msg.caller)
+  };
+  func myPoolLiquidationsOf(caller : Principal) : [Types.LiquidationEvent] {
     let out = List.empty<Types.LiquidationEvent>();
-    for ((id, pool) in Map.entries(marginPools)) {
-      if (Principal.equal(pool.owner, msg.caller)) {
-        switch (Map.get(liquidationEvents, Text.compare, Principal.toText(poolPrincipalOf(id)))) {
-          case (?l) { for (e in List.values(l)) { List.add(out, e) } };
-          case null { };
-        };
+    for (id in ownedPoolIds(caller).vals()) {   // H-30: owner index, not a walk
+      switch (Map.get(liquidationEvents, Text.compare, Principal.toText(poolPrincipalOf(id)))) {
+        case (?l) { for (e in List.values(l)) { List.add(out, e) } };
+        case null { };
       };
     };
     Iter.toArray(List.values(out))
@@ -11799,6 +15756,26 @@ persistent actor Uplands {
       };
     };
     sum;
+  };
+  // H-05 (F1): RAW equity — every collateral token at the mark with NO LTV
+  // haircut (what a liquidation can actually recover), reserved balances
+  // included, minus the accrued debt at the mark. This is the solvency line a
+  // voluntary close must never cross (below it the residual is socialised
+  // through absorbBadDebt). The LTV-weighted health ratio gates RISK-
+  // INCREASING fills and is the wrong yardstick here: a long's 0.9 haircut
+  // calls a sell at −9 % "collateral-improving" while the raw proceeds fall
+  // short of the debt they retire. Rounded against the pool (holdings down,
+  // debt up) like every other margin read.
+  func rawEquityUsd(p : Principal) : Int {
+    var sum : Nat = 0;
+    for (token in Types.MARGIN_COLLATERAL_TOKENS.vals()) {
+      let bal = Accounts.getBalance(accounts, p, token) + reservedBalance(p, token);
+      if (bal > 0) {
+        let px = if (token == Types.QUOTE_TOKEN) { Fixed.SCALE } else { switch (marginPriceLookup(token)) { case (?x) { x }; case null { 0 } } };
+        sum += Fixed.mul(bal, px, false);
+      };
+    };
+    (sum : Int) - (BorrowEngine.debtUsdTotal(loans, p, marginPriceLookup) : Int)
   };
 
   // Phase 4: one consolidated cross-section of the caller's whole financial
@@ -11858,6 +15835,19 @@ persistent actor Uplands {
         };
       };
     };
+    // Vault-LP term — DECISION D (operator, 2026-09-03, task 0288283668;
+    // GHSA-h888 clause 4 answered, not a defect): board equity = NAV per
+    // share (loans included net of arrears) — currentVaultValue is the held
+    // basket + the loan book − insurance arrears, and an LP is credited their
+    // pro-rata slice of exactly that. The loan book is a vault asset expected
+    // to be repaid; that it cannot be redeemed INSTANTLY is a liquidity /
+    // timing limit on exits, not a reduction of equity (excluding it would
+    // show ZERO equity to a fully-lent vault's LPs). Mint prices against the
+    // same NAV (depositLp), so a deposit or withdrawal stays score-neutral
+    // while the loan book is non-zero. Instant withdrawability is a SEPARATE
+    // liquidity limit — see task 1788465539 (NAV redemption + pro-rata
+    // instant-liquidity cap), which makes this credit fully realizable over
+    // time. Do not switch this term to a holdings-only basis.
     if (vaultLPSupply > 0) {
       let lpBal = getVaultLp(user);
       if (lpBal > 0) { net += Fixed.mulDiv(currentVaultValue().totalQuoteValue, lpBal, vaultLPSupply, false) };
@@ -12118,7 +16108,11 @@ persistent actor Uplands {
             let size = poolNetSize(pos.poolId, pos.baseToken);   // derived = what closePosition closes
             if (size != 0) {
               let mark = switch (AMM.getPool(pools, pos.marketId)) { case (?p) { p.refPrice }; case null { 0 } };
-              let liq = positionLiqPrice(pos.poolId, pos.marketId, pos.baseToken);
+              let pl = positionLiq(pos.poolId, pos.marketId, pos.baseToken);
+              let (liq, liqDir) : (?Nat, ?MarginPools.LiqDir) = switch (pl.liq) {
+                case (?l) { (?l.price, ?l.dir) };
+                case null { (null, null) };
+              };
               List.add(out, {
                 poolId = pos.poolId; marketId = pos.marketId; baseToken = pos.baseToken;
                 size; entryPrice = pos.entryPrice; markPrice = mark;
@@ -12126,6 +16120,7 @@ persistent actor Uplands {
                 unrealizedPnl = MarginPools.unrealizedPnl(size, pos.entryPrice, mark);
                 realizedPnl = pos.realizedPnl;
                 liqPrice = liq; pctToLiq = MarginPools.pctToLiq(mark, liq);
+                liqDir; isLiquidatable = pl.isLiquidatable;
               });
             };
           };
@@ -12442,9 +16437,17 @@ persistent actor Uplands {
         amount = icpE8s - ICP_LEDGER_FEE_E8S;
         fee = ?ICP_LEDGER_FEE_E8S;
         memo = ?FUEL_TPUP_MEMO;
-        // W3-02: engage the ledger's own dedup window too — with a stamp, an
-        // ambiguous transfer retried inside the window is deduplicated by
-        // the ledger itself (#TxDuplicate names the original block).
+        // W3-02: stamp the transfer. NOT a retry-dedup: the stamp is
+        // Time.now() per attempt, so a re-issued transfer carries a new
+        // stamp and is a NEW key to the ledger — its dedup window only
+        // collapses a byte-identical request (same stamp, memo, amount;
+        // #TxDuplicate names the original block), which a retry from here
+        // never is. Dedup of a retry is the W3-02 interlock, not the stamp:
+        // an AMBIGUOUS transport outcome arms _fuelAmbiguous and every
+        // further stage-2 spend is refused until an operator reconciles
+        // on-ledger (adminRetryFuelNotify(?block) / adminClearFuelAmbiguous),
+        // and _fuelPendingNotify holds one top-up in flight besides. The
+        // stamp stays so the ledger's TooOld/CreatedInFuture bounds apply.
         created_at_time = ?Nat64.fromNat(Int.abs(Time.now()));
       });
       switch (res) {
@@ -12692,8 +16695,14 @@ persistent actor Uplands {
   };
 
   public type MyInsuranceStake = {
-    shares   : Nat;
-    valueUsd : Nat; // current redeemable ICPUSD
+    shares     : Nat;
+    valueUsd   : Nat; // current redeemable ICPUSD
+    // H-35: when unstakeInsurance will accept a redemption of this holding —
+    // the latest stake's timestamp + INSURANCE_UNSTAKE_COOLDOWN_NS (ns since
+    // epoch); 0 when nothing locks it (no stake, or a holding minted before
+    // the cooldown existed). ADDITIVE (MM_API 5.1.0): every earlier client
+    // decodes the record without it.
+    unlockAtNs : Int;
   };
   public query (msg) func getMyInsuranceStake() : async MyInsuranceStake {
     let s = getInsuranceShares(msg.caller);
@@ -12701,7 +16710,7 @@ persistent actor Uplands {
     // not the plain s × V/S share value — the two agree only at V == S, and in
     // the normal V > S state (penalties accrue value without minting shares)
     // the plain form OVERSTATES what unstakeInsurance would actually pay.
-    { shares = s; valueUsd = insuranceRedeemValue(s) };
+    { shares = s; valueUsd = insuranceRedeemValue(s); unlockAtNs = insuranceUnlockAtNs(msg.caller) };
   };
 
   // Stake ICPUSD into the insurance pool (junior tranche). Mints shares at
@@ -12740,6 +16749,7 @@ persistent actor Uplands {
   public shared (msg) func stakeInsurance(amount : Nat) : async { #ok : Nat; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     if (amount == 0) { return #err("Amount must be positive") };
     if (getAvailable(msg.caller, Types.QUOTE_TOKEN) < amount) {
       return #err("Insufficient available ICPUSD (balance minus reserved)");
@@ -12831,6 +16841,13 @@ persistent actor Uplands {
     Accounts.addBalance(accounts, insurancePrincipal(), Types.QUOTE_TOKEN, amount);
     insuranceShareSupply += minted;
     addInsuranceShares(msg.caller, minted);
+    // H-35: (re)start the unstake cooldown for the WHOLE holding — a top-up
+    // restarts the clock (rationale at insuranceStakedAt). Stamped here, at
+    // the user mint only: addInsuranceShares is also the failure re-mint in
+    // unstakeInsurance and must not extend a lock.
+    Map.add(insuranceStakedAt, Text.compare, Principal.toText(msg.caller), Time.now());
+    // H-10: the staked quote no longer backs the caller's resting bids.
+    ignore revalidateUserOrders(msg.caller, Time.now());
     bumpUserVersion(msg.caller);
     emitEvent(msg.caller, null, #insuranceStake { amountUsd = amount; shares = minted });
     #ok(minted)
@@ -12848,6 +16865,22 @@ persistent actor Uplands {
     };
     // W5-23: the wallet-era debt guard (H1) that stood here was dead code —
     // only pool principals ever hold loans (enforced at MarginEngine.open).
+    // H-35 (F42, D3 (a)): the UNSTAKE COOLDOWN. The symmetry note below closed
+    // the virtual-offset arbitrage (#48.1) but named — and left open — the
+    // timing skim: the sweep is on a 30 s cadence and its next victims are
+    // readable, so "enter just before a penalty landed and leave just after"
+    // needed no offset asymmetry at all, only two messages. No exit fee
+    // (would tax every honest unstaker and break the redeem(mint(A)) == A and
+    // quote == payout pins) and no accrual index (the general model, deferred
+    // by D3): a holding is simply not redeemable until 10 min after its last
+    // stake. The refusal names the unlock time so a client can schedule the
+    // retry; getMyInsuranceStake().unlockAtNs quotes the same instant.
+    let unlockAt = insuranceUnlockAtNs(msg.caller);
+    if (Time.now() < unlockAt) {
+      return #err("Insurance stake is locked until " # Int.toText(unlockAt)
+        # " (ns since epoch): unstaking opens " # Int.toText(INSURANCE_UNSTAKE_COOLDOWN_NS / 60_000_000_000)
+        # " min after your latest stake — a top-up restarts the clock (H-35)");
+    };
     if (insuranceShareSupply == 0) { return #err("Pool is empty") };
     // SYMMETRIC with the mint. The virtual offset was added to stakeInsurance
     // (commit e66a27e, "closing the parity gap with the LP vault") but never to
@@ -12866,6 +16899,10 @@ persistent actor Uplands {
     // (Expression + cash clamp live in insuranceRedeemValue, shared with the
     // getMyInsuranceStake quote — #48.1.)
     let payout = insuranceRedeemValue(shares);
+    // H-32: dust = a payout under the bar that leaves shares behind (a full
+    // unstake is genuine at any size). Decided before the burn moves anything.
+    let dust = payout < EXIT_DUST_USD and shares < getInsuranceShares(msg.caller);
+    let j0 = List.size(accounts.journal);   // H-32: the rows this exit appends start here
     if (not subInsuranceShares(msg.caller, shares)) { return #err("Share subtraction failed") };
     insuranceShareSupply -= shares;
     if (not Accounts.subtractBalance(accounts, insurancePrincipal(), Types.QUOTE_TOKEN, payout)) {
@@ -12876,8 +16913,24 @@ persistent actor Uplands {
     };
     Accounts.addBalance(accounts, msg.caller, Types.QUOTE_TOKEN, payout);
     bumpUserVersion(msg.caller);
-    emitEvent(msg.caller, null, #insuranceUnstake { shares; payoutUsd = payout });
+    // H-32: a dust unstake inside the caller's exit window coalesces its two
+    // #delta rows and its #insuranceUnstake into the window; otherwise live.
+    if (exitFolds(msg.caller, Time.now(), dust)) { foldDustExit(msg.caller, j0, #ins(shares, payout)) }
+    else { emitEvent(msg.caller, null, #insuranceUnstake { shares; payoutUsd = payout }) };
     #ok(payout)
+  };
+
+  // Test-only (H-35): re-stamp a holder's latest-stake time so a suite can
+  // cross the 10 min unstake cooldown without waiting it out — the same
+  // re-stamp idiom as setTestRefPriceUpdatedNs / setTestFuelPendingSince.
+  // Writes the stamp only for a principal that HOLDS shares (the map stays a
+  // subset of insuranceShares); a no-op otherwise.
+  public shared (msg) func setTestInsuranceStakedAt(user : Principal, ns : Int) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestInsuranceStakedAt");
+    if (getInsuranceShares(user) > 0) {
+      Map.add(insuranceStakedAt, Text.compare, Principal.toText(user), ns);
+    };
   };
 
   // Admin: seed the pool from the treasury (genesis backstop / tests).
@@ -12891,8 +16944,50 @@ persistent actor Uplands {
     // minted by a controller. Matches the setTestBalance / resetExchange gate.
     if (IS_PRODUCTION) { Runtime.trap("seedInsurance is not available on #production — fund via the BACKED path (stakeInsurance)") };
     requireController(msg.caller);
+    // #55 (round 18): idempotent per venue. deploy.sh once gated this call on
+    // a variant it never returns, so every successful engine seed printed
+    // "failed" and invited a manual re-run — which minted a SECOND unbacked
+    // pool on top of the first. A pool that already holds value is already
+    // seeded: skip the mint, say so in the ring log, answer with the existing
+    // value (the return type is unchanged). Top-ups go through the BACKED
+    // path (stakeInsurance); a DRAINED pool (value 0 — a bad-debt write-off,
+    // or a wipe) may be re-seeded, which is the backstop refill, not a
+    // double-mint. Every suite that seeds twice does so across a
+    // resetExchange (performWorldWipe zeroes the pool balance), so it sees
+    // a mint each time.
+    let existing = insurancePoolValue();
+    // H-17 (F29-backend): the #55 skip answers the EXISTING value as a bare
+    // nat — exactly the shape deploy.sh's gate reads as "seeded" — so a
+    // repeated genesis seed on a LIVE venue (H-02's probe failing open, a
+    // manual re-run) still looked like a success. On #play the repeat is
+    // bound to the same genesis window as injectHistoricalTrades: once a
+    // market has been enabled on this install (_ammEverEnabled — survives
+    // upgrades AND season resets; only a reinstall re-arms it), a seed into
+    // a pool that already holds value is a double-mint attempt and is
+    // REFUSED loudly. A trap, not a typed #err: the signature is a bare Nat
+    // (THE RULE at requireDevHook — refuse in whichever way the signature
+    // allows), and a trap is what the CLI, deploy.sh's mdx_reply_nat gate
+    // and play_start.sh all read as a failure. The EMPTY-pool refill stays
+    // allowed post-genesis on purpose: play_start.sh step 6 and deploy.sh's
+    // cloud_seed seed insurance AFTER the first enableAmm, and every season
+    // reset zeroes the pool — that refill is the backstop, not a double-mint
+    // (it can add nothing that was not already gone). #dev keeps the #55
+    // skip for the suites. Ordering is load-bearing: this check sits BEFORE
+    // the skip, or the skip answers first and the refusal is dead code
+    // (hygiene §6m pins the order).
+    if (amountUsd > 0 and existing > 0 and DEPLOY_MODE == #play and _ammEverEnabled) {
+      Runtime.trap("seedInsuranceFund: genesis window closed — the insurance pool already holds $"
+        # Nat.toText(existing / 100_000_000) # " ICPUSD (" # Nat.toText(insuranceShareSupply)
+        # " shares) on a #play install that has gone live (a market has been enabled), and a repeat seed would double-mint unbacked supply. Top up via the BACKED path (stakeInsurance). Only a reinstall (a new venue) re-arms the window.");
+    };
+    if (amountUsd > 0 and existing > 0) {
+      logEvent("warn", "system", "INSURANCE SEED: skipped — pool already holds $"
+        # Nat.toText(existing / 100_000_000) # " ICPUSD (" # Nat.toText(insuranceShareSupply)
+        # " shares); a re-seed would double-mint. Top up via stakeInsurance.", null);
+      return existing;
+    };
     if (amountUsd > 0) {
-      let valueBefore = insurancePoolValue();
+      let valueBefore = existing;
       let minted =
         if (insuranceShareSupply == 0 or valueBefore == 0) { amountUsd }
         else { Fixed.mulDiv(amountUsd, insuranceShareSupply, valueBefore, false) };
@@ -12933,7 +17028,13 @@ persistent actor Uplands {
     requireController(msg.caller);
     requireDevHook("setTestDeferredExpiry");
     switch (Map.get(deferredExecs, Nat.compare, orderId)) {
-      case (?d) { Map.add(deferredExecs, Nat.compare, orderId, { d with expiresAt = expiresAtNs }) };
+      case (?d) {
+        // Task 1788552852: the re-put MOVES the id in the expiry index —
+        // the one site where an entry's expiresAt changes after staging.
+        expiryIdxDel(d.expiresAt, orderId);
+        Map.add(deferredExecs, Nat.compare, orderId, { d with expiresAt = expiresAtNs });
+        expiryIdxAdd(expiresAtNs, orderId);
+      };
       case null {};
     };
   };
@@ -12977,14 +17078,113 @@ persistent actor Uplands {
     Map.add(orderExpiry, Nat.compare, orderId, expiryNs);
   };
 
+  // H-23 probe: the market's release reference (dispatch / applied clocks of
+  // the standing mark). Controller + #dev only — the public surface for the
+  // same signal is getReleaseInfo.releaseRefNs.
+  public shared query (msg) func devGetReleaseRef(marketId : Types.MarketId) : async ?{ dispatchNs : Int; appliedNs : Int } {
+    requireDevHook("devGetReleaseRef");
+    if (not Principal.isController(msg.caller)) { Runtime.trap("controller-only probe") };
+    Map.get(releaseRefs, Text.compare, marketId);
+  };
+
   // Test-only: backdate a pool's refPriceUpdatedNs to simulate oracle staleness
   // (exercises the progressive-widening pull-back) without a real outcall.
+  // (H-23: touches the ARRIVAL clock only — the release reference is separate.)
   public shared (msg) func setTestRefPriceUpdatedNs(marketId : Types.MarketId, ns : Int) : async () {
     requireController(msg.caller);
     requireDevHook("setTestRefPriceUpdatedNs");
     switch (AMM.getPool(pools, marketId)) {
       case null {};
       case (?p) { AMM.putPool(pools, { p with refPriceUpdatedNs = ns }) };
+    };
+  };
+
+  // Slippage-band reference for a market order (placeMarketOrder and swap()'s
+  // direct #marketOrder path — H-12 made them share this anchor): the
+  // AMM/oracle MID (fair value) for any market with an enabled AMM pool — NOT
+  // the book's best order. findBestMatch re-anchors to a stranded far quote
+  // the instant the AMM ladder is pulled (oracle stall → quote expiry sweep),
+  // which inflates the cap and lets a market order execute well outside the
+  // true spread — the "trade spiking above the displayed ask depth" symptom.
+  // Anchoring to the mid keeps the band tied to fair value even when the
+  // ladder is momentarily gone; pure order-book markets (no enabled AMM) fall
+  // back to the best crossable order. 0 = no reference at all (no liquidity).
+  // The band quoteSwap previews is the same mid (its leg() ref), so the cap a
+  // swap parks with is the cap its preview showed — for a FOK swap that cap
+  // IS the execution band (FOK is excluded from the #3a ladder-edge clamp).
+  func slippageAnchor(marketId : Types.MarketId, side : Types.Side) : Nat {
+    let bookBest = switch (OrderBook.findBestMatch(orderStore, marketId, side)) {
+      case (?b) { b.price };
+      case null { 0 };
+    };
+    switch (AMM.getPool(pools, marketId)) {
+      case (?p) { if (p.enabled and p.refPrice > 0) { p.refPrice } else { bookBest } };
+      case null { bookBest };
+    };
+  };
+
+  // H-20 (F14 · MEDIUM, + F46 release-side): the ABSOLUTE cap a cross-swap
+  // leg executes under — `anchor × (1 ± maxSlippage)` on that market's
+  // slippageAnchor (the AMM/oracle mid when an enabled AMM prices the market,
+  // book-best only without one), handed to the engine as its priceCap so the
+  // walk never prints past it whatever the book's best resting order says.
+  // The engine's own band is anchored to findBestMatch, and that reference is
+  // exactly what a player controls when real liquidity is absent: a funded
+  // lowball bid (non-marketable, admitted down to mark/100) becomes the best
+  // bid the moment the AMM's bids are gone, and a sell leg banded off it
+  // printed at the attacker's price. Tightened to the #3a users-only band
+  // (±USERS_ONLY_CLAMP_PCT of the last mid) whenever the AMM is SIDELINED on
+  // the side the leg hits (ammSidelined): the release is users-only (oracle
+  // stall, the AMM non-takeable), or the AMM is live yet has no quote on
+  // that side (cash floor, _bidsGone, or the ladder consumed earlier in the
+  // same GEPTOR message — processDeferred runs before processDeferredSwaps)
+  // — the same clamp a staged spot market order gets in releaseDeferred. FOK
+  // cross-swaps (staged since H-21, gated by fokCrossGate at release) get
+  // the anchored band without the sidelined clamp (FOK is outside #3a, as
+  // for the direct path — the user's own slippage is the all-or-nothing
+  // band, off the mid). A #sell floor of 0 (maxSlippage ≥ 1)
+  // is a no-op floor. null = no reference at all (no liquidity).
+  func crossLegCap(marketId : Types.MarketId, side : Types.Side, maxSlippage : Nat, sidelinedClamp : Bool) : ?Nat {
+    let anchor = slippageAnchor(marketId, side);
+    if (anchor == 0) { return null };
+    var cap = switch (side) {
+      case (#buy)  { Fixed.mul(anchor, Fixed.SCALE + maxSlippage, false) };
+      case (#sell) { if (maxSlippage >= Fixed.SCALE) { 0 } else { Fixed.mul(anchor, Fixed.SCALE - maxSlippage, true) } };
+    };
+    if (sidelinedClamp) {
+      switch (AMM.getPool(pools, marketId)) {
+        case (?p) {
+          if (p.enabled and p.refPrice > 0) {
+            switch (side) {
+              case (#buy)  { cap := Nat.min(cap, Fixed.fromFloat(Fixed.toFloat(p.refPrice) * (1.0 + USERS_ONLY_CLAMP_PCT))) };
+              case (#sell) { cap := Nat.max(cap, Fixed.fromFloat(Fixed.toFloat(p.refPrice) * (1.0 - USERS_ONLY_CLAMP_PCT))) };
+            };
+          };
+        };
+        case null {};
+      };
+    };
+    ?cap
+  };
+
+  // H-20: is the AMM sidelined on the side a taker on `takerSide` hits —
+  // non-takeable for this release (users-only), or LIVE on the other side
+  // but quoting nothing on this one (cash floor, _bidsGone, the ladder
+  // consumed earlier in the same GEPTOR message)? An enabled AMM quoting
+  // NEITHER side is not sidelined — it is absent (unfunded, dormant), the
+  // market is a users-only book priced off the mid, and the mid-anchored
+  // band — the user's own slippage off fair value, the direct FOK path's
+  // posture — is the protection; the tight clamp exists for the asymmetric
+  // case, where "no bids" is a transient the AMM's own asks contradict
+  // (test_cross_swap_budget's unfunded-pool fixture walks a 25% band).
+  func ammSidelined(marketId : Types.MarketId, takerSide : Types.Side, usersOnly : Bool) : Bool {
+    if (usersOnly) { return true };
+    switch (AMM.getPool(pools, marketId)) {
+      case (?p) {
+        let otherSide : Types.Side = switch (takerSide) { case (#buy) { #sell }; case (#sell) { #buy } };
+        p.enabled and ammQuoteSpan(p, takerSide).count == 0 and ammQuoteSpan(p, otherSide).count > 0
+      };
+      case null { false };
     };
   };
 
@@ -12997,6 +17197,7 @@ persistent actor Uplands {
   ) : async { #ok : MatchingEngine.MatchResult; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     deadmanTouch(msg.caller);
 
     let (baseToken, _) = switch (Map.get(markets, Text.compare, marketId)) {
@@ -13052,22 +17253,7 @@ persistent actor Uplands {
     // live sibling clampToInitialMargin.
 
     let timestamp = Time.now();
-    // Slippage-band reference = the AMM/oracle MID (fair value) for any market
-    // with an enabled AMM pool — NOT the book's best order. findBestMatch
-    // re-anchors to a stranded far quote the instant the AMM ladder is pulled
-    // (oracle stall → quote expiry sweep), which inflates the cap and lets a
-    // market order execute well outside the true spread — the "trade spiking
-    // above the displayed ask depth" symptom. Anchoring to the mid keeps the
-    // band tied to fair value even when the ladder is momentarily gone; pure
-    // order-book markets (no AMM) fall back to the best crossable order.
-    let bookBest = switch (OrderBook.findBestMatch(orderStore, marketId, side)) {
-      case (?b) { b.price };
-      case null { 0 };
-    };
-    let refPrice = switch (AMM.getPool(pools, marketId)) {
-      case (?p) { if (p.enabled and p.refPrice > 0) { p.refPrice } else { bookBest } };
-      case null { bookBest };
-    };
+    let refPrice = slippageAnchor(marketId, side);
 
     // Sealed-until-GEPTOR: stage the WHOLE order off-book at the slippage cap.
     // It releases on the next post-posting GEPTOR, executing against crossing
@@ -13083,15 +17269,18 @@ persistent actor Uplands {
     // reservation/parked qty resolves to zero (available balance exhausted — the
     // buy pre-check above tests raw balance, not available). Propagate that as
     // #err like the sibling executeSwapDirect does: an unconditional #ok here told
-    // the caller it had a resting order when nothing was staged.
+    // the caller it had a resting order when nothing was staged. The cap is
+    // named FIRST (task 1788520988) so the null means the balance case only.
+    switch (stagedCapRefusal(msg.caller)) { case (?e) { return #err(e) }; case null {} };
     switch (parkDeferred(marketId, baseToken, msg.caller, side, #market, cap, quantity, noPartialFill, null, null, timestamp)) {
       case null { return #err("Could not stage the order") };
       case (?_) {};
     };
     bumpUserVersion(msg.caller);
     // Nothing has settled yet — report an empty fill; the staged order shows in
-    // the caller's Open Orders and clears within ~1s.
-    #ok({ trades = []; pendingMatches = []; remainingQty = quantity; totalFilled = 0; avgPrice = 0; affectedUsers = []; quoteSpent = 0 });
+    // the caller's Open Orders and clears within ~1s. No walk ran, so the stop
+    // reason is nominal: the work is deferred to the release (#workBound).
+    #ok({ trades = []; remainingQty = quantity; totalFilled = 0; avgPrice = 0; affectedUsers = []; quoteSpent = 0; stopReason = #workBound });
   };
 
   // ── Swap (cross-market routing) ──────────────────────────────
@@ -13118,11 +17307,29 @@ persistent actor Uplands {
       feeQuote     : Nat;   // total taker fee across quote legs (ICPUSD)
       exhausted    : Bool;  // consumedFrom < amount — book too thin within slippage
       impactBps    : Nat;   // worst leg's fill-VWAP deviation from its ref, in bps
+      // #55 silent "complete" (task 1788478363, the preview half): the walk
+      // above is a MARKET estimate for the full `amount` — deliberately, so a
+      // logged-out or unfunded caller still sees a real quote. But swap()
+      // stages min(amount, AVAILABLE) for an ICPUSD-funded swap (funds
+      // reserved by open orders cannot convert — SwapResult.stagedBudget), so
+      // a caller with a resting bid was previewed the ICP a $1,000 budget buys
+      // while only $399.40 could ever convert, and learned so only at
+      // staging. These two say so while typing: `availableFrom` is the
+      // caller's spendable `fromToken` (balance − reserved; 0 for anonymous
+      // and unfunded principals) and `clampedByReserve` is true exactly when
+      // a RESERVATION is what makes it short of `amount` — an unfunded
+      // caller (nothing reserved) is not "clamped", their preview is simply a
+      // market estimate. `exhausted` keeps its meaning ("book too thin"), the
+      // walk itself is untouched.
+      availableFrom    : Nat;
+      clampedByReserve : Bool;
     };
     #err : Text;
   } {
     if (amount == 0) { return #err("Amount must be positive") };
     if (fromToken == toToken) { return #err("Cannot swap same token") };
+    let availableFrom = getAvailable(msg.caller, fromToken);
+    let clampedByReserve = getReserved(msg.caller, fromToken) > 0 and availableFrom < amount;
     // W4-04: the sibling endpoints' range check — unguarded, SCALE − slip
     // Nat-underflows and TRAPS above 1e8, breaking the UI's quote preview
     // with an opaque trap instead of the structured #err.
@@ -13130,10 +17337,12 @@ persistent actor Uplands {
       return #err("Slippage must be 1%–25%");
     };
     let slip = if (maxSlippage == 0) { 5_000_000 } else { maxSlippage };   // default 5%, like the UI
-    // Quote-budget walks leave a sub-base-unit crumb per level (integer
-    // division) — a fill within 0.01% of the budget is COMPLETE, not partial.
-    let spentAll = func(spent : Nat, budget : Nat) : Bool {
-      budget <= spent + Nat.max(1, budget / 10_000);
+    // Quote-budget walks leave a sub-base-unit crumb (integer division) — a
+    // fill within ONE base unit's cost at the cap (budgetCrumb: price/SCALE +
+    // fee) of the budget is COMPLETE, not partial. The release judges the
+    // same residue (task 1788465056 shrank it from a flat 1 bps).
+    let spentAll = func(spent : Nat, budget : Nat, cap : Nat) : Bool {
+      budget <= spent + budgetCrumb(cap);
     };
     // One market leg at the slippage-capped price. Returns base, grossQuote,
     // the fee-inclusive spend (#quoteSpend legs — the engine's quoteSpent;
@@ -13143,7 +17352,7 @@ persistent actor Uplands {
     // fee0-carve under-quoted by the second-order fee crumb and execution
     // over-delivered past the preview).
     func leg(marketId : Types.MarketId, baseToken : Types.TokenId, side : Types.Side, budget : { #base : Nat; #quoteSpend : Nat })
-      : ?{ base : Nat; quote : Nat; spent : Nat; fee : Nat; impactBps : Nat } {
+      : ?{ base : Nat; quote : Nat; spent : Nat; fee : Nat; impactBps : Nat; cap : Nat } {
       switch (Map.get(markets, Text.compare, marketId)) { case null { return null }; case _ {} };
       let ref = switch (AMM.getPool(pools, marketId)) {
         case (?p) { if (p.refPrice > 0) { p.refPrice } else { 0 } };
@@ -13164,7 +17373,9 @@ persistent actor Uplands {
           });
         };
       };
-      let w = walkFillable(marketId, baseToken, side, cap, wBudget, #fundedPartial, null);
+      // H-09: WALK_SCAN_MAX visits — a truncated preview reports what it
+      // reached (consumedFrom < amount → `exhausted`), never traps.
+      let w = walkFillable(marketId, baseToken, side, cap, wBudget, WALK_SCAN_MAX, null);
       let impact : Nat = if (w.base > 0 and ref > 0) {
         let avg = Fixed.div(w.quote, w.base, true);
         let dev = SafeMath.subOrZero(avg, ref) + SafeMath.subOrZero(ref, avg);   // |avg − ref|
@@ -13176,7 +17387,7 @@ persistent actor Uplands {
         case (#quoteSpend(_)) { SafeMath.subOrZero(w.spent, w.quote) };
         case (#base(_))       { quoteFeeFor(msg.caller, w.quote, #takerDebit) };
       };
-      ?{ base = w.base; quote = w.quote; spent = w.spent; fee; impactBps = impact };
+      ?{ base = w.base; quote = w.quote; spent = w.spent; fee; impactBps = impact; cap };
     };
     if (fromToken == Types.QUOTE_TOKEN) {
       // Buy `toToken` with an ICPUSD budget: `amount` is the fee-INCLUSIVE
@@ -13185,7 +17396,7 @@ persistent actor Uplands {
       switch (leg(toToken # "-ICPUSD", toToken, #buy, #quoteSpend(amount))) {
         case null { #err("No market for " # toToken) };
         case (?l) {
-          #ok({ outAmount = l.base; consumedFrom = Nat.min(l.spent, amount); feeQuote = l.fee; exhausted = not spentAll(l.spent, amount); impactBps = l.impactBps });
+          #ok({ outAmount = l.base; consumedFrom = Nat.min(l.spent, amount); feeQuote = l.fee; exhausted = not spentAll(l.spent, amount, l.cap); impactBps = l.impactBps; availableFrom; clampedByReserve });
         };
       };
     } else if (toToken == Types.QUOTE_TOKEN) {
@@ -13193,7 +17404,7 @@ persistent actor Uplands {
         case null { #err("No market for " # fromToken) };
         case (?l) {
           let net = SafeMath.subOrZero(l.quote, l.fee);
-          #ok({ outAmount = net; consumedFrom = l.base; feeQuote = l.fee; exhausted = l.base < amount; impactBps = l.impactBps });
+          #ok({ outAmount = net; consumedFrom = l.base; feeQuote = l.fee; exhausted = l.base < amount; impactBps = l.impactBps; availableFrom; clampedByReserve });
         };
       };
     } else {
@@ -13209,8 +17420,9 @@ persistent actor Uplands {
                 outAmount = l2.base;
                 consumedFrom = l1.base;
                 feeQuote = l1.fee + l2.fee;
-                exhausted = l1.base < amount or not spentAll(l2.spent, net1);
+                exhausted = l1.base < amount or not spentAll(l2.spent, net1, l2.cap);
                 impactBps = Nat.max(l1.impactBps, l2.impactBps);
+                availableFrom; clampedByReserve;
               });
             };
           };
@@ -13222,6 +17434,7 @@ persistent actor Uplands {
   public shared (msg) func swap(request : Types.SwapRequest) : async { #ok : Types.SwapResult; #err : Text } {
     requireAuth(msg.caller);
     ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
     deadmanTouch(msg.caller);
 
     let from   = request.fromToken;
@@ -13312,11 +17525,14 @@ persistent actor Uplands {
   ) : { #ok : Types.SwapResult; #err : Text } {
     switch (mode) {
       case (#marketOrder({ maxSlippage })) {
-        // Best maker price at entry (incl. the AMM) — slippage-band reference.
-        let refPrice = switch (OrderBook.findBestMatch(orderStore, marketId, side)) {
-          case (?b) { b.price };
-          case null { 0 };
-        };
+        // Slippage-band reference at entry: the AMM/oracle mid for a market
+        // with an enabled AMM, book-best only without one (slippageAnchor —
+        // the placeMarketOrder anchor). H-12 (F46): this path used to read
+        // the book's best order with no mid fallback, so with the ladder
+        // pulled a swap parked with cap = strandedFar × (1 ± slip); a non-FOK
+        // swap was re-clamped by #3a at release, but a FOK swap skips #3a and
+        // executed at that raw far cap (tests/test_slippage_anchor.sh §4-5).
+        let refPrice = slippageAnchor(marketId, side);
         if (refPrice == 0) { return #err("No liquidity") };
 
         // Sealed-until-GEPTOR: stage the whole swap off-book; it clears against
@@ -13331,14 +17547,27 @@ persistent actor Uplands {
         // preview (quoteSwap) promises "spend ≤ amount".
         //
         // NON-FOK (the default): size the base qty at the BEST price with the
-        // worst-case taker fee carved out — the most `amount` can convert on a
-        // flat book — and stage `amount` as a quote-spend budget (deferredBudget
+        // CALLER'S taker fee carved out — the rate the release will charge
+        // (quoteFeeFor's earned-level ladder, the same eff probe the engine's
+        // per-slice budget shrink and quoteSwap's walker use), so on a flat
+        // book the qty is the most `amount` can convert — and stage `amount`
+        // as a quote-spend budget (deferredBudget
         // → the release engine's maxQuoteSpend). The engine stops every slice at
         // min(balance, remaining budget), so a walking book stops EXACTLY at the
         // budget: no overspend past `amount`, and no more cap-sizing residual
         // (up to amount×slip/(1+slip) used to come back unconverted on
         // below-cap fills — the two cross-swap buy legs shed the same residual
         // in task 1787204744; this is the third site, split as 1787209266).
+        // Sizing at the FLAT L0 rate (TAKER_FEE_BPS) was #55 "flat-rate
+        // sizing" (task 1788465038): the qty cap, not the budget, binds for a
+        // discounted L1–L4 caller, so amount×(L0−eff)/(1+L0) came back
+        // unconverted below the quoteSwap preview (0.03% at L3), with no
+        // rejection record. The RESERVATION (parkDeferred) reserves at the
+        // L0 ceiling when the caller has the headroom (over-reserves only),
+        // but its UNDER-FUNDED trim sizes at the earned rate too (task
+        // 1788475362) — otherwise a caller funded within (L0 − earned) bps
+        // of `amount` (e.g. exactly `amount`, the FOK path) was trimmed
+        // straight back to the L0-sized qty.
         //
         // FOK (noPartialFill) KEEPS cap-sizing and carries NO budget:
         // all-or-nothing promises the STATED qty, and best-price sizing plus a
@@ -13349,7 +17578,7 @@ persistent actor Uplands {
         // trade for an atomic order.
         let quantity = switch (side) {
           case (#buy)  {
-            let feeBps = if (isInternalPrincipal(caller)) { 0 } else { TAKER_FEE_BPS };
+            let feeBps = quoteFeeFor(caller, 10_000, #takerDebit);   // caller's earned rate; 0 for internal principals
             let sizeAt = if (noPartialFill) { cap } else { refPrice };
             Fixed.div(Fixed.mulDiv(amount, 10_000, 10_000 + feeBps, false), sizeAt, false)
           };
@@ -13359,13 +17588,40 @@ persistent actor Uplands {
           case (#buy)  { if (noPartialFill) { null } else { ?amount } };
           case (#sell) { null };
         };
+        // Task 1788520988: the cap refusal is named BEFORE parkDeferred, so the
+        // null below means what its text says (a reservation that resolved to
+        // zero — available balance exhausted), never a hit cap.
+        switch (stagedCapRefusal(caller)) { case (?e) { return #err(e) }; case null {} };
         switch (parkDeferred(marketId, baseToken, caller, side, #market, cap, quantity, noPartialFill, budget, null, timestamp)) {
-          case (?entry) { #ok({ fromAmount = 0; toAmount = 0; fullyFilled = false; swapOrderId = ?entry.id }) };
+          case (?entry) {
+            // A budgeted staging reports the budget it ACTUALLY staged —
+            // parkDeferred clamps `amount` to the caller's available ICPUSD
+            // (entry.reservedAmt is exactly that eff) — and opens the swap's
+            // release-side context so the final walk cycle can say what
+            // converted (task 1788465056, #55 silent "complete").
+            let staged : ?Nat = switch (budget) { case (?_) { ?entry.reservedAmt }; case null { null } };
+            switch (budget) {
+              case (?_) {
+                Map.add(deferredSwapCtx, Nat.compare, entry.id,
+                  { origId = entry.id; requested = amount; eff = entry.reservedAmt; spent = 0; received = 0 });
+              };
+              case null {};
+            };
+            #ok({ fromAmount = 0; toAmount = 0; fullyFilled = false; swapOrderId = ?entry.id; stagedBudget = staged })
+          };
           case null { #err("Insufficient available balance to stage this swap") };
         };
       };
       case (#limitOrder({ limitPrice })) {
         if (limitPrice == 0) { return #err("Limit price must be positive") };
+        // H-08: the same price band every sibling limit path applies
+        // (placeLimitInner, openPosition, the pool entries) — the 100×
+        // fat-finger band plus the 5% MARKETABLE_BAND_BPS collar on orders
+        // that would execute now. This branch parks a #limit entry that
+        // releases at its RAW limit price, so without the gate two accounts
+        // could print a trade at any price through swap(). Same order as
+        // placeLimitInner: zero check, band, then validateNewOrder.
+        switch (priceBandCheck(marketId, side, limitPrice)) { case (?e) { return #err(e) }; case null {} };
         let quantity = switch (side) {
           case (#buy)  { Fixed.div(amount, limitPrice, false) };
           case (#sell) { amount };
@@ -13375,14 +17631,16 @@ persistent actor Uplands {
           case (#err(e)) { return #err(e) };
           case (#ok) {};
         };
-        // GHSA-97xp: the per-owner open-order cap binds on the swap-limit
+        // GHSA-97xp / #52.1: the per-owner open-order cap binds on the swap-limit
         // path too — REJECT at the cap (placeLimit alone keeps the
         // evict-oldest contract; see openOrderCapCheck).
         switch (openOrderCapCheck(caller)) { case (?e) { return #err(e) }; case null {} };
 
-        // Sealed-until-GEPTOR: stage the limit swap off-book.
+        // Sealed-until-GEPTOR: stage the limit swap off-book. The cap is
+        // named first (task 1788520988), so the null is the balance case.
+        switch (stagedCapRefusal(caller)) { case (?e) { return #err(e) }; case null {} };
         switch (parkDeferred(marketId, baseToken, caller, side, #limit, limitPrice, quantity, false, null, null, timestamp)) {
-          case (?entry) { #ok({ fromAmount = 0; toAmount = 0; fullyFilled = false; swapOrderId = ?entry.id }) };
+          case (?entry) { #ok({ fromAmount = 0; toAmount = 0; fullyFilled = false; swapOrderId = ?entry.id; stagedBudget = null }) };
           case null { #err("Insufficient available balance to stage this swap") };
         };
       };
@@ -13402,92 +17660,49 @@ persistent actor Uplands {
   ) : { #ok : Types.SwapResult; #err : Text } {
     switch (mode) {
       case (#marketOrder({ maxSlippage })) {
-        // All-or-nothing keeps the immediate two-leg path against USER liquidity
-        // only (the AMM is non-takeable on the immediate path).
-        if (noPartialFill) {
-          let protectionCtx = buildProtectionCtx(timestamp);
-          // Resolve the BUY leg's liquidity and price BEFORE the sell leg
-          // commits (W2-03, #13.1). These two refusals used to sit BELOW the
-          // sell settlement and `return #err` with no rollback: the caller
-          // was told "nothing happened" while holding the sell proceeds (a
-          // retry double-sells), and the fill hooks — including the sole
-          // emitFillEvents call site — were skipped, so real settled fills
-          // never reached the hash-chained archive. Nothing in the sell leg
-          // can touch the buy market's book inside this message, so the
-          // pre-checked ask cannot vanish before the buy executes. The #err
-          // contract is literal again: #err ⇒ no balance moved.
-          let buyAsk = switch (OrderBook.findBestMatch(orderStore, buyMarket, #buy)) {
-            case null { return #err("No liquidity on " # buyMarket) };
-            case (?ask) { if (ask.price == 0) { return #err("Invalid price") }; ask };
-          };
-          let sellResult = MatchingEngine.executeMarketOrderProtected(
-            orderStore, accounts, sellMarket, sellToken, caller, #sell, amount, maxSlippage, false, timestamp, protectionCtx, null,
-          );
-          if (sellResult.totalFilled == 0) { return #err("No liquidity on " # sellMarket) };
-          let icpusdObtained = Fixed.mul(sellResult.totalFilled, sellResult.avgPrice, false);
-          let availIcpusd  = Accounts.getBalance(accounts, caller, Types.QUOTE_TOKEN);
-          let icpusdToSpend = Nat.min(icpusdObtained, availIcpusd);
-          // Budget-bound leg (task 1787204744, replacing the #48.5 cap-sizing):
-          // size the quantity at the BEST ask with the worst-case taker fee
-          // carved out — the most the proceeds could convert on a flat book —
-          // and pass `icpusdToSpend` as the engine's maxQuoteSpend (a
-          // cost+takerFee budget). The engine stops every slice at
-          // min(balance, remaining budget), so fills above the best ask stop
-          // EXACTLY at the proceeds: no dip into the caller's unrelated
-          // available ICPUSD (the test_cross_swap_budget bound), and no
-          // band-fraction residual on below-cap fills.
-          let buyQuantity = Fixed.div(Fixed.mulDiv(icpusdToSpend, 10_000, 10_000 + TAKER_FEE_BPS, false), buyAsk.price, false);
-          let buyResult = MatchingEngine.executeMarketOrderProtected(
-            orderStore, accounts, buyMarket, buyToken, caller, #buy, buyQuantity, maxSlippage, false, timestamp, protectionCtx, ?icpusdToSpend,
-          );
-          updateStatsAfterTrades(sellMarket, sellResult.trades);
-          updateStatsAfterTrades(buyMarket,  buyResult.trades);
-          refreshRolling24h(sellMarket, sellResult.trades, timestamp);
-          refreshRolling24h(buyMarket,  buyResult.trades,  timestamp);
-          let allAffected = List.empty<Principal>();
-          for (u in sellResult.affectedUsers.vals()) { List.add(allAffected, u) };
-          for (u in buyResult.affectedUsers.vals())  { List.add(allAffected, u) };
-          adjustAffectedUsers(Iter.toArray(List.values(allAffected)), timestamp);
-          // RETRY SEMANTICS (W2-03): #err on this path now guarantees nothing
-          // settled — safe to retry verbatim. #ok is the settlement report:
-          // fullyFilled=false means one or both legs filled partially (real
-          // balance movement, fills on the tape) — the residual is
-          // amount − fromAmount of `sellToken` still unsold and any ICPUSD
-          // proceeds not converted; retry by issuing a NEW swap for what the
-          // balances actually show, never by resubmitting the original.
-          // Budget truthfulness: the buy quantity is sized at the BEST ask, so
-          // on a walking book the engine stops at the proceeds budget with
-          // remainingQty > 0 — that is a COMPLETE conversion (all proceeds
-          // spent), not a partial. Judge the leg by budget exhaustion (crumb
-          // tolerance, quoteSwap's spentAll shape) as well as by quantity.
-          let buySpentAll = icpusdToSpend <= buyResult.quoteSpent + Nat.max(1, icpusdToSpend / 10_000);
-          return #ok({
-            fromAmount  = sellResult.totalFilled;
-            toAmount    = buyResult.totalFilled;
-            fullyFilled = sellResult.remainingQty == 0 and (buyResult.remainingQty == 0 or buySpentAll);
-            swapOrderId = null;
-          });
-        };
-
+        // H-21 (F19 + F38): there is NO immediate path any more. The
+        // noPartialFill = true two-leg branch that stood here ran both legs
+        // synchronously under buildProtectionCtx — the only player-reachable
+        // taker that settled inside the caller's own message (SPEC.md
+        // "Nothing matches synchronously": no fresh-price gate, no
+        // sweep-before-release, no tier ordering, no L4 shield) — and was
+        // not fill-or-kill either (both engine legs ran with
+        // noPartialFill = false). Every cross-swap stages below; the flag
+        // rides the swapFok side map and releaseCrossSwap enforces
+        // all-or-nothing at release (fokCrossGate), where the sealed model's
+        // protections apply to it like to everything else. H-20's two
+        // immediate-path anchor sites went with the branch.
+        //
         // Sealed-until-BOTH-fresh: stage the cross-swap. It releases when both
         // legs' markets have re-quoted past the request, then executes both legs
         // atomically against their fresh AMMs (processDeferredSwaps).
         if (getAvailable(caller, sellToken) < amount) {
           return #err("Insufficient available " # sellToken # " balance");
         };
+        // H-13 (F22a): the per-owner staged cap applies here exactly as in
+        // parkDeferred — same key (scorecardKeyOf, via stagedCountOf), same
+        // internal-principal exemption. Without it one account could soft-lock
+        // ~10k refundable cross-swaps that no cap and (pre-F22b) no shed-floor
+        // signal ever saw. Checked BEFORE the reservation so #err ⇒ nothing moved.
+        switch (stagedCapRefusal(caller)) { case (?e) { return #err(e) }; case null {} };
         addReserved(caller, sellToken, amount);
         let id = OrderBook.allocateId(orderStore);
         Map.add(deferredSwaps, Nat.compare, id, {
           id; owner = caller; sellMarket; sellToken; buyMarket; buyToken; amount; maxSlippage;
           ts = timestamp; expiresAt = timestamp + DEFERRED_EXPIRY_NS;
         });
+        incStagedCount(caller);
         ownerIdxAdd(swapIdsByOwner, caller, id);
         slAccBump(caller, sellToken, amount);
+        // H-21: all-or-nothing is a RELEASE-time property (fokCrossGate);
+        // the staging itself is identical — no book is read here, so a FOK
+        // request leaks nothing a plain staging does not.
+        if (noPartialFill) { Map.add(swapFok, Nat.compare, id, true) };
         // Arm a GEPTOR on BOTH legs' markets (Nagle-debounced).
         if (Map.get(_geptorDeadline, Text.compare, sellMarket) == null) { Map.add(_geptorDeadline, Text.compare, sellMarket, timestamp + GEPTOR_DELAY_NS) };
         if (Map.get(_geptorDeadline, Text.compare, buyMarket)  == null) { Map.add(_geptorDeadline, Text.compare, buyMarket,  timestamp + GEPTOR_DELAY_NS) };
         bumpUserVersion(caller);
-        #ok({ fromAmount = 0; toAmount = 0; fullyFilled = false; swapOrderId = ?id });
+        #ok({ fromAmount = 0; toAmount = 0; fullyFilled = false; swapOrderId = ?id; stagedBudget = null });
       };
       case (#limitOrder(_)) {
         #err("Cross-market limit orders not yet supported. Use market order or trade directly on each market.");
@@ -13535,7 +17750,10 @@ persistent actor Uplands {
     // the swept (re-homed) order's id on the aggressor side, so a swept
     // maker's fill lands HERE as maker — before that fix this both-ids case
     // was unreachable on the sweep path and swept makers were mis-binned as
-    // takers. Exchange-wide volume feeds threshold scaling.
+    // takers. H-24 (F25): the engine stamps that id only on slices against
+    // the AMM; a swept order filling ANOTHER USER's resting order carries 0
+    // and bins taker, so no user-vs-user fill ever counts two makers.
+    // Exchange-wide volume feeds threshold scaling.
     for (t in trades.vals()) {
       let v = Fixed.mul(t.quantity, t.price, false);
       bumpPartyVolume(t.buyer, v, t.buyOrderId != 0);
@@ -13669,6 +17887,8 @@ persistent actor Uplands {
     // so it doubles as the single fill-capture choke point (archive design
     // §1). Synchronous append only — no awaits on this path.
     for (t in newTrades.vals()) { emitFillEvents(t) };
+    // H-31: the per-principal trade index rides the same choke point.
+    for (t in newTrades.vals()) { OrderBook.indexUserTrade(userTradeIndex, t) };
     let mList = switch (Map.get(orderStore.tradesByMarket, Text.compare, marketId)) {
       case null { return };
       case (?l) { l };
@@ -13761,6 +17981,13 @@ persistent actor Uplands {
       for (t in List.range(orderStore.trades, keepFrom, gSize)) { List.add(keeper, t) };
       List.clear(orderStore.trades);
       for (t in List.values(keeper)) { List.add(orderStore.trades, t) };
+      // H-31: the index never retains what the tape evicted — drop every
+      // indexed fill older than the oldest kept trade (a prefix of each
+      // per-principal list; ids are monotone in tape order).
+      switch (List.first(orderStore.trades)) {
+        case (?oldest) { ignore OrderBook.pruneUserTradeIndex(userTradeIndex, oldest.id) };
+        case null { Map.clear(userTradeIndex) };
+      };
     };
   };
 
@@ -13784,12 +18011,13 @@ persistent actor Uplands {
         };
         // Ownership first, commitment second: a non-owner probe must read
         // "Not your order", not leak the entry's commit phase.
-        if (deferredCommitted(orderId, d.ts, Time.now())) { return #err(DEFERRED_COMMIT_ERR) };
+        switch (deferredCommitReason(d, Time.now())) { case (?e) { return #err(e) }; case null {} };
         ignore subReserved(d.owner, d.reservedTok, d.reservedAmt);
         removeDeferredExec(orderId);
         ignore Map.delete(deferredFok, Nat.compare, orderId);
         ignore Map.delete(deferredPostOnly, Nat.compare, orderId);
         ignore Map.delete(deferredBudget, Nat.compare, orderId);
+        ignore Map.delete(deferredSwapCtx, Nat.compare, orderId);
         ignore Map.delete(deferredExpiry, Nat.compare, orderId);
         clearMmShield(d.owner, d.marketId);
         bumpUserVersion(msg.caller);
@@ -13801,7 +18029,7 @@ persistent actor Uplands {
     switch (Map.get(deferredSwaps, Nat.compare, orderId)) {
       case (?s) {
         if (not Principal.equal(s.owner, msg.caller)) { return #err("Not your order") };
-        if (Time.now() - s.ts < DEFERRED_COMMIT_NS) { return #err(DEFERRED_COMMIT_ERR) };
+        switch (swapCommitReason(s, Time.now())) { case (?e) { return #err(e) }; case null {} };
         ignore subReserved(s.owner, s.sellToken, s.amount);
         removeDeferredSwap(orderId);
         bumpUserVersion(msg.caller);
@@ -13831,15 +18059,8 @@ persistent actor Uplands {
           };
         };
         if (not OrderBook.isOpen(order))                  { return #err("Order is not open") };
-        // Void any in-flight pending matches against this maker BEFORE
-        // cancelling the order itself — otherwise the pending matches
-        // would finalise against a cancelled order and corrupt state.
-        // This is also the mechanism by which protected-maker orders
-        // exercise their sniper-defence privilege.
-        voidPendingMatchesForMaker(resolvedId);
         ignore OrderBook.cancelOrder(orderStore, resolvedId);
-        // Drop the settlement-window + expiry metadata; order id is now dead.
-        ignore Map.delete(orderSettlementWindows, Nat.compare, resolvedId);
+        // Drop the expiry metadata; order id is now dead.
         ignore Map.delete(orderExpiry, Nat.compare, resolvedId);
         bumpUserVersion(msg.caller);
         #ok;
@@ -13930,28 +18151,26 @@ persistent actor Uplands {
   // to report filled / partly filled / couldn't-fill — a staged swap releases
   // asynchronously, so this is the only way the user learns what happened.
   public query (msg) func getMyRecentSwap() : async ?SwapOutcome {
-    Map.get(swapOutcomes, Principal.compare, msg.caller);
-  };
-
-  // ── Pending matches (Phase 1 queries) ──────────────────────────
-  // Returns the pending matches currently referring to the caller as
-  // either taker or maker. Lets clients render a "pending settlement"
-  // indicator and show funds currently in reserve.
-  public query (msg) func getMyPendingMatches() : async [Types.PendingMatch] {
-    let result = List.empty<Types.PendingMatch>();
-    for ((_, pm) in Map.entries(pendingMatches)) {
-      if (pm.status == #pending and
-          (Principal.equal(pm.takerPrincipal, msg.caller)
-           or Principal.equal(pm.makerPrincipal, msg.caller))) {
-        List.add(result, pm);
+    switch (Map.get(swapOutcomes, Principal.compare, msg.caller)) {
+      case (?o) {
+        ?{ id = o.id; ts = o.ts; fromToken = o.fromToken; fromAmount = o.fromAmount; toToken = o.toToken;
+           toAmount = o.toAmount; filled = o.filled; note = o.note;
+           stopReason = Map.get(swapOutcomeStops, Principal.compare, msg.caller) }
       };
+      case null { null };
     };
-    Iter.toArray(List.values(result));
   };
 
-  // Balance available for NEW orders (held minus reserved). Reserved is
-  // funds already committed to an in-flight pending match; if the match
-  // voids they're refunded, if it finalises they move to the counterparty.
+  // (getMyPendingMatches — the last public reader of the retired PendingMatch
+  // machinery, an inert `[]` stub since task 1788516198 — and its owner-index
+  // core myPendingMatchesOf were REMOVED at apiVersion 6.0.0 together with
+  // the pmIdsByUser index and devSweepCostProbe's pending fixture; the
+  // stable `pendingMatches` map itself was swept by the sixth one-shot
+  // migration, task 1788744109 — candid/README.md.)
+
+  // Balance available for NEW orders (held minus reserved). Reserved is the
+  // soft-lock of the caller's staged orders and staged cross-swaps (freed at
+  // release or cancel).
   public query (msg) func getMyAvailableBalance(token : Types.TokenId) : async Nat {
     getAvailable(msg.caller, token);
   };
@@ -13969,8 +18188,8 @@ persistent actor Uplands {
     Iter.toArray(List.values(out));
   };
 
-  // The reserved slice for the caller on a given token. Sum of all
-  // in-flight pending-match debits currently locked against them.
+  // The reserved slice for the caller on a given token. Sum of the
+  // soft-locks of their staged orders and staged cross-swaps.
   public query (msg) func getMyReservedBalance(token : Types.TokenId) : async Nat {
     getReserved(msg.caller, token);
   };
@@ -14032,23 +18251,23 @@ persistent actor Uplands {
     #ok;
   };
 
-  // Configure quoting parameters for an existing pool.
+  // Configure quoting parameters for an existing pool. (The sixth
+  // parameter, `protectionWindowSec` — accepted and ignored since the
+  // PendingMatch machinery was retired in task 1788516198 — and the inert
+  // `AmmPool.protectionWindowSec` field were REMOVED at apiVersion 6.0.0;
+  // candid/README.md. Callers pass five arguments now.)
   public shared (msg) func setAmmConfig(
     marketId : Types.MarketId,
     spreadBps : Nat,
     quoteDepthBase : Nat,
     numLevels : Nat,
     levelSpacingBps : Nat,
-    protectionWindowSec : Nat,
   ) : async { #ok; #err : Text } {
     requireController(msg.caller);
     switch (AMM.getPool(pools, marketId)) {
       case null { #err("No AMM pool for " # marketId) };
       case (?p) {
-        if (protectionWindowSec * 1_000_000_000 > MAX_PROTECTION_WINDOW_NS) {
-          return #err("protectionWindowSec exceeds 30s cap");
-        };
-        let updated = AMM.withConfig(p, spreadBps, quoteDepthBase, numLevels, levelSpacingBps, protectionWindowSec);
+        let updated = AMM.withConfig(p, spreadBps, quoteDepthBase, numLevels, levelSpacingBps);
         AMM.putPool(pools, updated);
         #ok;
       };
@@ -14065,6 +18284,32 @@ persistent actor Uplands {
   // depositLp would rewrite the caller to the canister's own principal and
   // charge/credit the VAULT instead of the depositor (the bug that made
   // depositLp mint LP to the canister and never debit the user).
+  // GHSA-h888: at zero LP supply, any un-reserved value in the AMM principal
+  // is OWNERLESS — VaultMath.mintAmount's zero-supply branch never reads
+  // vault value, so the next genesis deposit would capture it 1:1. Settle
+  // insurance arrears first (this is the last vault cash that can ever pay
+  // them), then route each leg's un-reserved remainder to the treasury, so
+  // zero supply implies zero value. Legs reserved against in-flight pending
+  // matches stay put — they are committed to the match flow. Called from the
+  // withdrawLp FINAL EXIT (supply hits 0 at the burn) and again before a
+  // genesis deposit's vault snapshot, because value can RE-ENTER the AMM
+  // principal after supply hit 0: loan-book repayments land in its balances
+  // (withdrawLp pays exits from holdings and leaves receivables behind).
+  func sweepZeroSupplyVaultToTreasury() {
+    vaultLockClear();   // no LPs, no locks (task 1788475756)
+    settleInsuranceArrears();
+    let amm = ammPrincipal();
+    let treasury = treasuryPrincipal();
+    for (token in ["BTC", "ETH", "SOL", "ICP", Types.QUOTE_TOKEN].vals()) {
+      let free = SafeMath.subOrZero(
+        Accounts.getBalance(accounts, amm, token), getReserved(amm, token));
+      if (free > 0) {
+        ignore Accounts.subtractBalance(accounts, amm, token, free);
+        Accounts.addBalance(accounts, treasury, token, free);
+      };
+    };
+  };
+
   func performLpDeposit(
     depositor   : Principal,
     marketId    : Types.MarketId,
@@ -14108,16 +18353,28 @@ persistent actor Uplands {
     // equivalent lives in withdrawMarginPool's inline projection, pinned by
     // tests/test_margin_collateral_escape.sh §1.
 
+    // GHSA-h888 residual: value can RE-ENTER the AMM principal after supply
+    // hit 0 (loan-book repayments). Sweep it to the treasury BEFORE the
+    // vault snapshot below, so a genesis deposit always anchors on a truly
+    // empty vault and captures nothing.
+    if (vaultLPSupply == 0) { sweepZeroSupplyVaultToTreasury() };
+
     // Snapshot the vault BEFORE the deposit so LP minting is priced
     // against the pre-deposit basket. (If we measured after, the
     // deposit would dilute itself.)
     let now = Time.now();
+    refreshVaultImpairment(false);   // mint on a fresh provision, never a cached one (task 1788475754) — priced as BOOKED, no accrual: an LP's own message never moves the NAV they were quoted at (1788736589)
     let vaultBefore = currentVaultValue();
     let depositValueUsd = Fixed.mul(baseAmount, pool.refPrice, false) + quoteAmount;
 
     // Oracle-freshness gate: never mint LP while a HELD vault leg is stale or
     // circuit-broken (this mint path is the only one that lacked the check).
     switch (vaultPricesStale(now, vaultBefore)) { case (?e) { return #err(e) }; case null {} };
+    // Locked shares (task 1788475756): a deposit mints UNLOCKED shares — the
+    // depositor's cash joins the unlocked shares' shared liquidity (F6) —
+    // and is a touch (the belt behind the mutation-time settle, task
+    // 1788727876) for the repayment detection while any lock exists.
+    if (vaultLockRawSum > 0) { settleVaultLocks(vaultHoldingsUsd(), vaultBefore.totalQuoteValue) };
 
     // First deposit into an EMPTY vault must be ≥ a minimum value. Together with
     // the virtual-share offset below, this removes the ERC-4626 first-depositor
@@ -14211,15 +18468,30 @@ persistent actor Uplands {
     vaultCostBasis += depositValueUsd;
     // Permanent history: minting LP shares is an acquisition event.
     emitEvent(depositor, null, #lpDeposit { marketId; baseAmount; quoteAmount; lpMinted = minted });
+    // H-10: both legs left the depositor's wallet — their resting bids (quote
+    // leg) and asks (base leg) are re-validated against what remains. Cheap
+    // for the seeding path (the canister itself rests nothing).
+    ignore revalidateUserOrders(depositor, Time.now());
     #ok(minted);
   };
 
+  // CONTROLLER-ONLY since apiVersion 6.0.0 (task 1788731608): the one
+  // IMMEDIATE mint door left. seed.sh / play_start.sh seed the vault through
+  // it under PAUSED timers (no GEPTOR fires, the marks were stamped moments
+  // before), so the sealed rule has nothing to wait on there; for everyone
+  // else the door is depositLp — STAGED, settling at a post-request mark —
+  // and an open immediate mint would be exactly the pre-6.0.0 sniping window
+  // the operator ruling closed (docs/amm-vault-design.md §5). requireAuth
+  // stays FIRST so anonymous is refused "Authentication required" before the
+  // controller check (locally anonymous IS a controller — the auth suite's
+  // rejection probe relies on the order).
   public shared (msg) func seedAmmPool(
     marketId : Types.MarketId,
     baseAmount : Nat,
     quoteAmount : Nat,
   ) : async { #ok : Nat /* lpMinted */; #err : Text } {
     requireAuth(msg.caller);
+    requireController(msg.caller);
     ensureInit<system>();
     performLpDeposit(msg.caller, marketId, baseAmount, quoteAmount)
   };
@@ -14298,8 +18570,14 @@ persistent actor Uplands {
         // fixture's synthetic price) keeps ammBreakerWidenBps widening quotes
         // around the freshly-asserted mark.
         ignore Map.delete(pendingPriceJumps, Text.compare, p.baseToken);
-        let u = AMM.withRefPrice(p, price, Time.now());
+        let now = Time.now();
+        let u = AMM.withRefPrice(p, price, now);
         AMM.putPool(pools, u);
+        // H-23: a synthetic mark is a fetch dispatched and applied now — so
+        // the sealed suites' "re-stamp to release" idiom keeps releasing
+        // entries staged before this call and nothing staged after it.
+        stampReleaseRef(marketId, now, now);
+        refreshVaultImpairment(true);   // a mark moved: accrue + re-provision the loan book (tasks 1788475754, 1788736589)
         #ok;
       };
     };
@@ -14364,7 +18642,7 @@ persistent actor Uplands {
   // Reading.ok so `aggregate` can filter it out rather than aborting
   // the whole refresh. Cycles are attached via `outcallCycles` (below) so
   // the attach auto-adapts to where the wasm runs; unused cycles are
-  // refunded. (Ported from PR #2 — JoshDFN's cloud-engine outcall fix.)
+  // refunded. (Ported from PR #2 — a contributor's cloud-engine outcall fix.)
 
   // Cycles attached to a management-canister HTTPS outcall, by call type.
   transient let OUTCALL_PRICE_CYCLES : Nat = 3_000_000_000;  // price-feed outcall (8 KB response cap)
@@ -14387,7 +18665,9 @@ persistent actor Uplands {
     if (Cycles.balance() >= cost) { cost } else { 0 };
   };
 
-  func fetchFromSource(src : PriceFeed.Source, asset : PriceFeed.Asset) : async PriceFeed.Reading {
+  // H-37: an `async*` computation, not a self-call — the per-source
+  // self-call is fetchAndRecord (below), which awaits this inline.
+  func fetchFromSource(src : PriceFeed.Source, asset : PriceFeed.Asset) : async* PriceFeed.Reading {
     let url = PriceFeed.buildUrl(src, asset);
     let req : HttpRequestArgs = {
       url;
@@ -14660,11 +18940,9 @@ persistent actor Uplands {
     // rate-limit budget → cycle drain on the paying subnet + unbounded growth of
     // the never-evicted aiCallLog/aiUsage maps. Registration is anti-Sybil bounded
     // (email-bound, allowance-capped deposit), so this caps distinct callers to
-    // real users. Controllers exempt (ops/testing).
-    if (not Principal.isController(msg.caller)
-        and Map.get(registeredUsers, Text.compare, Principal.toText(msg.caller)) == null) {
-      return #err("The AI assistant is available once you've made a deposit.");
-    };
+    // real users. Controllers exempt (ops/testing). H-30: the shared guard —
+    // one predicate for every registration-gated body.
+    requireRegistered(msg.caller);
     if (activeAiKey() == "") { return #err("The AI assistant is not configured on this deployment.") };
     // Suspension gate — repeated policy refusals (see aiNoteRefusal).
     switch (Map.get(aiBanUntil, Text.compare, Principal.toText(msg.caller))) {
@@ -15001,6 +19279,26 @@ persistent actor Uplands {
   // getLastAggregate; written whenever refreshMultiSourcePrice completes.
   let lastAggregates = Map.empty<Text, PriceFeed.Aggregate>();
 
+  // 1788471187: the last per-QUOTE signal per asset — the USD/USDT split
+  // aggregateByQuote reports beside the mark (issue #55 "oracle split").
+  // Until this map existed the basis and the divergence magnitude lived only
+  // in the `warn` oracle event, so the Status page could not tell a
+  // USDT-depeg divergence (pooled mark, USDT-dominated) from a healthy feed
+  // without tailing the event log. TRANSIENT on purpose: it is observability,
+  // not state to migrate — it refills on the first refresh after an upgrade
+  // (and `lastAggregates` stays a stable-layout type untouched, per the
+  // aggSampleNs note). Served as getPriceFeedStats().quoteSignals; written
+  // in refreshMultiSourcePrice right after lastAggregates (the same
+  // after-the-epoch-compare position hygiene §6y pins), cleared by the wipe.
+  public type QuoteSignal = {
+    mark      : PriceFeed.MarkBasis;   // #pooled | #usdGroup — which sample set priced the mark
+    diverged  : Bool;                  // depegBps > USDT_DEPEG_ALARM_BPS on the last refresh
+    depegBps  : Nat;                   // |USD − USDT| / USD, in bps (saturated when not finite)
+    usdCount  : Nat;                   // surviving USD-quoted sources
+    usdtCount : Nat;                   // surviving USDT-quoted sources
+  };
+  transient let _lastQuoteSignal = Map.empty<Text, QuoteSignal>();
+
   // ── Vault model (the AMM's bank account) ──
   // Replaces per-pool LP tracking with ONE pool of LP tokens
   // representing claims on the AMM's full multi-asset basket
@@ -15020,6 +19318,20 @@ persistent actor Uplands {
 
   let vaultLpBalances = Map.empty<Text, Nat>();
   var vaultLPSupply : Nat = 0;
+  // Task 1788475756 — per-LP LOCKED shares + the global lock-scale index
+  // (lib/VaultLock.mo carries the model and its derivation; the helpers sit
+  // under vaultLentOutUsd): principal text → raw lock, effective lock =
+  // raw × vaultLockScale / VaultLock.SCALE; the running Σ raw (so Λ is O(1));
+  // the index (10^24 = 1.0, renormalised into the raws below its floor); and
+  // the per-token loan-book UNITS at the last settle, which the lazy
+  // repayment detection diffs against. ADDITIVE stable fields with fresh
+  // names — an EOP-compatible upgrade: they initialise empty / 1.0 and the
+  // first touch fills them. Cleared with the vault (performWorldWipe) and at
+  // zero supply (sweepZeroSupplyVaultToTreasury).
+  let vaultLockRaw = Map.empty<Text, Nat>();
+  var vaultLockRawSum : Nat = 0;
+  var vaultLockScale : Nat = VaultLock.SCALE;
+  let vaultLockLoanSnap = Map.empty<Text, Nat>();
   // Cumulative USD that current LPs have deposited (the cost basis), at the
   // marked value when each deposit was made, scaled down proportionally on each
   // withdrawal. Tracks TRUE transferred value, never the fee-scaled mint amount,
@@ -15124,6 +19436,326 @@ persistent actor Uplands {
     sum;
   };
 
+  // ── Per-LP locked shares + the global lock-scale index (task 1788475756) ──
+  // The stateless cap of task 1788465539 held F1 for ONE call: after taking
+  // their share an LP's retained shares again claimed a pro-rata slice of the
+  // REMAINING cash, so repeated max exits drained the stayers' liquidity
+  // harmonically. Now an exit LOCKS the exiter's remaining shares (a max exit
+  // locks all of them — their cap is 0 until a repayment), every other LP's
+  // cap is unchanged by it (it rises by their slice of the retained fee),
+  // and a net repayment releases every lock by ONE common factor through the
+  // index — no per-LP loop. Model, formulas and rounding: lib/VaultLock.mo;
+  // rationale: docs/amm-vault-design.md §5.
+  //
+  // Repayment is detected as the per-token loan-book units that LEFT the
+  // book since the last settle, priced at the current marks (a mark move
+  // alone is R = 0; issuance and interest change no lock by construction).
+  // The settle runs SYNCHRONOUSLY at every loan-book MUTATION — reprovisionPool's
+  // sites: the borrow at the fill, every repayment, write-off and seize
+  // (task 1788727876; settleVaultLocksOnMutation below) — so a repayment is
+  // measured against a snapshot no later issuance can net away; and, as the
+  // belt, at every touch — withdrawLp (always, so a fresh lock is written
+  // against a fresh snapshot), performLpDeposit and the heartbeat beat (while
+  // any lock exists), and the getMaxInstantWithdraw view (computed, never
+  // persisted). No BorrowEngine hooks: the lib stays pure, the actor hooks.
+  transient let VAULT_LOCK_TOKENS : [(Text, Text)] = [
+    ("BTC", "BTC-ICPUSD"), ("ETH", "ETH-ICPUSD"), ("SOL", "SOL-ICPUSD"),
+    ("ICP", "ICP-ICPUSD"), (Types.QUOTE_TOKEN, ""),
+  ];
+  func vaultLockRepaidUsd() : Nat {
+    var r : Nat = 0;
+    for ((token, marketId) in VAULT_LOCK_TOKENS.vals()) {
+      let cur = BorrowEngine.totalOutstanding(loans, token);
+      let snap = Option.get(Map.get(vaultLockLoanSnap, Text.compare, token), 0);
+      if (snap > cur) {
+        let d : Nat = snap - cur;
+        r += if (token == Types.QUOTE_TOKEN) { d } else { Fixed.mul(d, poolRefPrice(marketId), false) };
+      };
+    };
+    r;
+  };
+  func vaultLockSnapshotNow() {
+    for ((token, _) in VAULT_LOCK_TOKENS.vals()) {
+      Map.add(vaultLockLoanSnap, Text.compare, token, BorrowEngine.totalOutstanding(loans, token));
+    };
+  };
+  func vaultLockClear() {
+    Map.clear(vaultLockRaw);
+    vaultLockRawSum := 0;
+    vaultLockScale := VaultLock.SCALE;
+  };
+  // Fold the index into the raws (each rounds UP — no lock shrinks).
+  func vaultLockRenorm() {
+    let entries = Iter.toArray(Map.entries(vaultLockRaw));
+    var sum : Nat = 0;
+    for ((key, raw) in entries.vals()) {
+      let r = VaultLock.renormRaw(raw, vaultLockScale);
+      if (r == 0) { Map.remove(vaultLockRaw, Text.compare, key) } else { Map.add(vaultLockRaw, Text.compare, key, r) };
+      sum += r;
+    };
+    vaultLockRawSum := sum;
+    vaultLockScale := VaultLock.SCALE;
+  };
+  // The persisting settle (update paths): apply the repayment, clear dead
+  // locks, renormalise, and re-snapshot the loan book. Every site but the
+  // write-off is a REPAYMENT (settleVaultLocksNet below, task 1788752774).
+  func settleVaultLocks(holdingsUsd : Nat, navUsd : Nat) { settleVaultLocksNet(holdingsUsd, navUsd, 0) };
+  // ...with `writtenOffUsd` — the USD that left the book WITHOUT cash
+  // arriving — netted out of the units-diff before the lib sees it: a loss
+  // moves no lock (every e_i is unchanged; only the post-state clamp can
+  // act), a cash-backed shrink scales them. The snapshot still moves by the
+  // FULL shrink, so the write-off is never re-measured as a repayment at the
+  // next settle. Rounding: the diff prices DOWN where the written-off USD
+  // was booked UP (BorrowEngine.debtUsd), so the net is a hair SMALLER than
+  // the cash that came — the conservative direction (a lock releases by
+  // base units less, never more). subOrZero for the same reason.
+  func settleVaultLocksNet(holdingsUsd : Nat, navUsd : Nat, writtenOffUsd : Nat) {
+    let repaidUsd = SafeMath.subOrZero(vaultLockRepaidUsd(), writtenOffUsd);
+    let s = VaultLock.settle(vaultLockScale, vaultLockRawSum, vaultLPSupply, holdingsUsd, navUsd, repaidUsd);
+    if (s.clear) { vaultLockClear() }
+    else {
+      vaultLockScale := s.scale;
+      if (VaultLock.needsRenorm(s.scale)) { vaultLockRenorm() };
+    };
+    vaultLockSnapshotNow();
+  };
+  // The query view: the index the next update would settle to (0 = every
+  // lock dead), nothing written.
+  func vaultLockViewScale(holdingsUsd : Nat, navUsd : Nat) : Nat {
+    if (vaultLockRawSum == 0) { return vaultLockScale };
+    let s = VaultLock.settle(vaultLockScale, vaultLockRawSum, vaultLPSupply, holdingsUsd, navUsd, vaultLockRepaidUsd());
+    if (s.clear) { 0 } else { s.scale };
+  };
+  func vaultLockOf(user : Principal, scale : Nat, lpBal : Nat) : Nat {
+    VaultLock.lockOf(Option.get(Map.get(vaultLockRaw, Text.compare, Principal.toText(user)), 0), scale, lpBal)
+  };
+  // Write one LP's effective lock at the current index (0 drops the entry).
+  func vaultLockWrite(user : Principal, newLock : Nat) {
+    let key = Principal.toText(user);
+    let oldRaw = Option.get(Map.get(vaultLockRaw, Text.compare, key), 0);
+    let newRaw = VaultLock.rawFor(newLock, vaultLockScale);
+    if (newRaw == 0) { Map.remove(vaultLockRaw, Text.compare, key) }
+    else { Map.add(vaultLockRaw, Text.compare, key, newRaw) };
+    vaultLockRawSum := SafeMath.subOrZero(vaultLockRawSum, oldRaw) + newRaw;
+  };
+  // The settle at a loan-book MUTATION (task 1788727876), called from
+  // reprovisionPool — the one hook every loan-book mutator already runs
+  // (poolFundForFill's borrow at the fill, deleveragePool's repay,
+  // repayPoolDebt, absorbBadDebt's write-off, tryLiquidate's seize,
+  // settleNettedPair's netted write-offs). Task 1788475756 detected
+  // repayment LAZILY at the LP touches only: between two touches a
+  // repayment of token T followed by a fresh borrow of T netted the
+  // per-token units to R = 0 and released no lock, although the per-LP
+  // truth (lib/VaultLock.mo header) unlocks the locked LPs by the
+  // repayment's share — six repay-then-reborrow rounds inside one beat left
+  // a fully locked LP at cap $0 on the measurement venue. Settled AT the
+  // repayment the release lands exactly. The BORROW site is hooked for the
+  // same reason in the other order: an issuance moves no lock (R = 0 by
+  // construction here) but it moves the SNAPSHOT, so the next repayment is
+  // measured from the post-issuance book instead of netting against the
+  // borrow. A no-op without locks; with locks: the five held balances at
+  // marks (twice), one totalOutstanding pass per token (three times) and
+  // the index arithmetic — measured (K = 6, one locked LP, 1.5 BTC pool
+  // orders) at +3.7 % on the borrow fill's requote message (132.8M → 137.7M
+  // cycles: the settle runs once per borrowed SLICE inside the pass) and
+  // +0.07 % on the repay fill's (133.6M → 133.7M), so no repayment-size
+  // floor was needed. Synchronous by construction (no
+  // await): it runs inside the matching pass and the settlement helpers.
+  // The lazy touches stay as the belt.
+  func settleVaultLocksOnMutation() {
+    if (vaultLockRawSum == 0) { return };
+    settleVaultLocks(vaultHoldingsUsd(), currentVaultValue().totalQuoteValue);
+  };
+  // The WRITE-OFF settle (task 1788752774): the units-diff cannot tell a
+  // loss from a repayment, and VaultLock.settle treated every shrink as
+  // cash arriving for the loan claimants — so `absorbBadDebt`'s uncovered
+  // residual (the slice the insurance fund could NOT pay) scaled the locks
+  // down and handed a fully locked LP instant cap out of the stayers' cash,
+  // ≈ U·λ_i/Lx, in the wrong (non-conservative) direction. Classification,
+  // by site: every OTHER mutator is cash-backed and keeps the plain settle —
+  // deleveragePool / repayPoolDebt (cash), tryLiquidate's seize
+  // (Liquidator.repayFromVault IS writeOffLoan, but the seized collateral
+  // lands in the basket in kind — H rises by what the debt fell, net of the
+  // penalty the fund is paid in cash), settleNettedPair (both legs in kind),
+  // and absorbBadDebt's COVERED slice (the fund pays the AMM in the same
+  // message). Only the uncovered write-off is a loss, and absorbBadDebt is
+  // the one site that knows its size, so it passes it here as an argument —
+  // no accumulator, no state: nothing can linger past the message.
+  func settleVaultLocksOnWriteOff(writtenOffUsd : Nat) {
+    if (vaultLockRawSum == 0) { return };
+    settleVaultLocksNet(vaultHoldingsUsd(), currentVaultValue().totalQuoteValue, writtenOffUsd);
+  };
+
+  // ── Per-loan impairment reserve (task 1788475754) ──────────────
+  // NAV marks the loan book net of EXPECTED loss, not at face value. Every
+  // margin pool with debt is read through the liquidator's own health metric
+  // (BorrowEngine.getHealth) and provisioned PD × LGD by VaultMath.expectedLoss
+  // (formula, band edges and rationale: lib/VaultMath.mo + docs/amm-vault-design
+  // §5). The per-pool scan — one getHealth per pool, bounded by HEAT_MAX_POOLS
+  // like the heat map and the risk summary — is CACHED in the three stable
+  // scalars below and refreshed wherever its inputs move: every mark update
+  // (setAmmRefPrice and both feed arms of applyFreshAggregate), every
+  // heartbeat beat with the risk summary, and SYNCHRONOUSLY at the top of
+  // performLpDeposit and withdrawLp so no LP enters or leaves on a stale
+  // provision. The netting against the insurance fund's first-loss and the
+  // loan-book clamp are applied LIVE at every NAV read
+  // (vaultImpairmentReserveUsd), so the reserve tracks the fund balance and
+  // the book instantly.
+  //
+  // Between those full scans the LOAN BOOK itself moves — a fill's repayment
+  // (deleveragePool), a fresh borrow (openPosition), a seize
+  // (tryLiquidate / settleNettedPair) or a write-off (absorbBadDebt) — and a
+  // staged fill lands on the mark update that releases it, AFTER that call's
+  // own scan ran. Rescanning every pool per fill is the wrong cost (bots fill
+  // constantly), so every mutation site calls reprovisionPool on the ONE pool
+  // it touched: one getHealth, the per-pool map (vaultProvisionByPool)
+  // updated, the aggregate adjusted by the delta (task 1788480502). A
+  // repayment therefore releases its provision in the same message that
+  // books it, and no query ever reads a provision for a loan that is gone.
+  //
+  // ACCRUAL (task 1788736589). The scan prices each pool's D through
+  // BorrowEngine.getHealth, which reads the principal as last BOOKED — the
+  // fill, a repayment, the 30 s sweep — so a WORLD-driven scan (a mark
+  // update: setAmmRefPrice and both feed arms; the heartbeat beat) first
+  // accrues the pool's loans to the scan instant (`accrue = true`): the
+  // provision then prices the liquidator's own debt figure at computedNs,
+  // never a figure the interest since has left behind (VaultMath.expectedLoss
+  // rounds in the vault's favour; an un-accrued D leaned the other way), and
+  // every scanned pool's lastAccrualNs moves to computedNs — the cadence the
+  // 30 s sweep already accrues at. An LP-driven scan (performLpDeposit /
+  // performLpWithdraw, the staged settlement included) does NOT accrue
+  // (`accrue = false`): an LP's own message must not move the NAV they were
+  // quoted at — the instant cap is lpAmount × NAV ≤ lpBal × H, exact, and a
+  // scan that booked the seconds of interest since getMaxInstantWithdraw
+  // inside the settlement itself would refuse a request at exactly the
+  // quoted cap by those seconds. On those paths D is at most one world tick
+  // stale — immaterial to PD × LGD. (The Earn card under-asks the cap by
+  // 0.01 % for the accrual a settlement STAMP books — 1788746837 — so
+  // nothing here is clamped or tolerated; the settlement check stays exact.)
+  // Cost: HEAT_MAX_POOLS × one accrueAll per full scan — one LoanState lookup
+  // + one ≤5-entry map rewrite per scanned pool, the same order as the
+  // getHealth it precedes (one valuation walk per pool).
+  func refreshVaultImpairment(accrue : Bool) {
+    var gross : Nat = 0; var debt : Nat = 0; var coll : Nat = 0; var n : Nat = 0; var scanned : Nat = 0;
+    let now = Time.now();   // ONE clock for the scan: every loan it accrues is stamped to computedNs
+    let accrueTo : ?Int = if (accrue) { ?now } else { null };
+    Map.clear(vaultProvisionByPool);
+    label scan for ((poolId, _) in Map.entries(marginPools)) {
+      let poolP = poolPrincipalOf(poolId);
+      if (poolIsEmpty(poolP)) { continue scan };   // H-30: registry-only pools do not count
+      if (scanned >= HEAT_MAX_POOLS) { break scan };
+      scanned += 1;
+      switch (poolProvisionOf(poolP, accrueTo)) {
+        case null { };
+        case (?pv) {
+          gross += pv.el; debt += pv.debtUsd; coll += pv.collUsd; n += 1;
+          Map.add(vaultProvisionByPool, Nat.compare, poolId, pv);
+        };
+      };
+    };
+    vaultImpairmentGrossUsd := gross;
+    vaultImpairedDebtUsd := debt;
+    vaultImpairedCollateralUsd := coll;
+    vaultImpairedLoans := n;
+    vaultImpairmentComputedNs := now;
+    vaultProvisionMapValid := true;
+  };
+
+  // One pool's provision at current marks: PD × LGD on the liquidator's own
+  // health figures (D rounded up, C = LTV-weighted collateral rounded down),
+  // carried WITH the D and C it was priced on so the aggregates can disclose
+  // them (task 1788733762). null for a pool with no debt or no expected loss.
+  // With `accrueTo = ?now` (task 1788736589) the pool's loans are accrued to
+  // `now` first — the 1a3ebb4 rule, "accrueAll before any loanOf-derived
+  // read" — so D is the liquidator's own debt figure at the scan instant,
+  // not the principal as last booked. Every caller is an UPDATE context, so
+  // the accrual PERSISTS (the point — and why the LP paths pass null, see
+  // refreshVaultImpairment). With null, D is the principal as last BOOKED
+  // (the fill, a repayment, the sweep, a world scan); a later loan-derived
+  // read sits the interest since above it.
+  func poolProvisionOf(poolP : Principal, accrueTo : ?Int) : ?PoolProvision {
+    switch (accrueTo) { case (?now) { BorrowEngine.accrueAll(loans, poolP, now) }; case null { } };
+    let h = BorrowEngine.getHealth(loans, marginAccounts, accounts, reservedBalance, poolP, marginPriceLookup);
+    if (h.debtUsd == 0) { return null };
+    let el = VaultMath.expectedLoss(h.debtUsd, h.collateralUsd);
+    if (el == 0) { return null };
+    ?{ el; debtUsd = h.debtUsd; collUsd = h.collateralUsd };
+  };
+
+  // Incremental re-provision of ONE principal's pool after its loan book
+  // moved (task 1788480502). A non-pool principal (no loans can exist on one —
+  // BorrowEngine.borrow is only ever called with a pool principal) is a no-op.
+  // With the transient map not yet rebuilt since the last upgrade / wipe, the
+  // stable gross may hold pools the map has not seen, so the honest move is
+  // the full scan — once; every later call is the O(1) delta. Deliberately
+  // does NOT stamp vaultImpairmentComputedNs: that remains "when the full
+  // scan last ran", which is what the disclosure promises. It is ALSO the
+  // one place every loan-book mutation passes through, so the vault lock
+  // index settles here too (task 1788727876) — after the provision, so the
+  // NAV it reads nets the reserve just refreshed.
+  func reprovisionPool(who : Principal) {
+    switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(who))) {
+      case null { };
+      case (?poolId) {
+        reprovisionPoolImpairment(poolId, who);
+        settleVaultLocksOnMutation();
+      };
+    };
+  };
+  // The write-off site's variant (task 1788752774): the same provision
+  // refresh, then the settle with the written-off USD netted out of the
+  // repayment it measures (settleVaultLocksOnWriteOff). Only absorbBadDebt
+  // calls it; every cash-backed mutator stays on reprovisionPool.
+  func reprovisionPoolAfterWriteOff(who : Principal, writtenOffUsd : Nat) {
+    switch (Map.get(poolByPrincipal, Text.compare, Principal.toText(who))) {
+      case null { };
+      case (?poolId) {
+        reprovisionPoolImpairment(poolId, who);
+        settleVaultLocksOnWriteOff(writtenOffUsd);
+      };
+    };
+  };
+  // The impairment half of reprovisionPool (task 1788480502): one getHealth
+  // for the pool, the cached gross / impaired figures adjusted by the delta.
+  func reprovisionPoolImpairment(poolId : Nat, who : Principal) {
+    if (not vaultProvisionMapValid) { refreshVaultImpairment(true); return };
+    let old = Map.get(vaultProvisionByPool, Nat.compare, poolId);
+    let fresh : ?PoolProvision = if (poolIsEmpty(who)) { null } else { poolProvisionOf(who, ?Time.now()) };
+    switch (old, fresh) {
+      case (null, null) { return };
+      case (?o, ?f) { if (o.el == f.el and o.debtUsd == f.debtUsd and o.collUsd == f.collUsd) { return } };
+      case _ { };
+    };
+    switch (old) {
+      case (?o) {
+        vaultImpairmentGrossUsd := SafeMath.subOrZero(vaultImpairmentGrossUsd, o.el);
+        vaultImpairedDebtUsd := SafeMath.subOrZero(vaultImpairedDebtUsd, o.debtUsd);
+        vaultImpairedCollateralUsd := SafeMath.subOrZero(vaultImpairedCollateralUsd, o.collUsd);
+        vaultImpairedLoans := SafeMath.subOrZero(vaultImpairedLoans, 1);
+      };
+      case null { };
+    };
+    switch (fresh) {
+      case (?f) {
+        vaultImpairmentGrossUsd += f.el;
+        vaultImpairedDebtUsd += f.debtUsd;
+        vaultImpairedCollateralUsd += f.collUsd;
+        vaultImpairedLoans += 1;
+        Map.add(vaultProvisionByPool, Nat.compare, poolId, f);
+      };
+      case null { Map.remove(vaultProvisionByPool, Nat.compare, poolId) };
+    };
+  };
+
+  // The reserve NAV deducts: the excess of the cached gross expected loss over
+  // the insurance fund's CASH (what absorbBadDebt can actually draw on — not
+  // insuranceOwedUsd, which is undelivered in exactly the cash-poor state
+  // where it would matter), never more than the loan book it impairs.
+  func vaultImpairmentReserveAgainst(loanBookUsd : Nat) : Nat {
+    VaultMath.impairmentReserve(vaultImpairmentGrossUsd, insurancePoolValue(), loanBookUsd)
+  };
+  func vaultImpairmentReserveUsd() : Nat { vaultImpairmentReserveAgainst(vaultLentOutUsd()) };
+
   // USD the vault physically HOLDS — NAV minus the loan book. This is the
   // capital it can actually deploy, so anything sizing AMM behaviour (target
   // inventory, quote depth, the cash floor) must use THIS and not
@@ -15160,12 +19792,21 @@ persistent actor Uplands {
     // Total value is therefore NOT Σ(basket × price); the difference is
     // exactly what is out on loan, which the Earn card already shows as
     // "Lent out" from getMarginRiskSummary.
-    let totalAssets = Fixed.mul(basket.btc, prices.btc, false)
-                   + Fixed.mul(basket.eth, prices.eth, false)
-                   + Fixed.mul(basket.sol, prices.sol, false)
-                   + Fixed.mul(basket.icp, prices.icp, false)
-                   + basket.icpusd
-                   + vaultLentOutUsd();
+    let lentUsd = vaultLentOutUsd();
+    let heldUsd = Fixed.mul(basket.btc, prices.btc, false)
+                + Fixed.mul(basket.eth, prices.eth, false)
+                + Fixed.mul(basket.sol, prices.sol, false)
+                + Fixed.mul(basket.icp, prices.icp, false)
+                + basket.icpusd;
+    // The loan book enters NET of its impairment reserve (task 1788475754):
+    // the expected loss on under-water and near-liquidation loans, beyond the
+    // insurance fund's first-loss, is deducted BEFORE it is realised — so an
+    // exiter cannot take face value for loans about to be written down, and
+    // stayers are not left holding the whole loss. reserve ≤ lentUsd by
+    // construction (VaultMath.impairmentReserve clamps), so this never
+    // underflows; it releases as loans repay or their health recovers.
+    let reserve = vaultImpairmentReserveAgainst(lentUsd);
+    let totalAssets = heldUsd + SafeMath.subOrZero(lentUsd, reserve);
     // …minus what the vault OWES the insurance fund. Penalties already earned
     // by stakers but not yet handed over are the vault's liability, not LP
     // value; leaving them in would overstate LP worth by exactly the amount
@@ -15311,10 +19952,44 @@ persistent actor Uplands {
   // asset the vault doesn't hold can't mis-value the mint, and the deposited leg's
   // own price existence is checked separately (pool.refPrice > 0). A circuit-
   // breaker pending-jump FREEZES refPrice, so a jump held longer than the stale
-  // window is caught here too; we deliberately do NOT block on a fresh pending
-  // jump, because legitimate seeding (real prices, multi-pool) routinely trips the
-  // breaker for a tick and that must not wedge deposits. Returns an error or null.
-  func vaultPricesStale(now : Int, vv : VaultValue) : ?Text {
+  // window is caught here too — and since M1 (below) an ACTIVE pend on a HELD
+  // leg blocks the mint outright, fresh or not. The "held" qualifier is what
+  // keeps legitimate seeding (real prices, multi-pool) from wedging when its own
+  // breaker trips for a tick: a leg the vault does not yet hold is never gated,
+  // and `vv` is the LP-tracked basket — at LP supply 0 performLpDeposit's
+  // GHSA-h888 sweep has already routed any raw AMM-principal balance to the
+  // treasury before this snapshot, so a genesis deposit always sees an empty
+  // basket and passes (tests/test_breaker_widening.sh §2 pins both shapes).
+  //
+  // BOTH SIDES are gated (task 1788513125). The per-leg check lives in
+  // vaultHeldLegMarkIssue and is shared: performLpDeposit refuses through this
+  // wrapper unconditionally, withdrawLp refuses through vaultWithdrawPaused
+  // ONLY while NAV != holdings. Why the asymmetry: withdrawLp redeems at
+  // valuePerLP = NAV / supply (NAV = held basket + loan book − impairment
+  // reserve − arrears, currentVaultValue on a FRESH provision), capped at the
+  // caller's pro-rata share of the HELD basket (VaultMath.withinInstantCap),
+  // and pays IN KIND — each leg is held × lpAmount/supply × keepBps ×
+  // NAV/holdings (VaultMath.redeemLeg). With no loans, no reserve and no
+  // arrears NAV == holdings, every leg is exactly the exiter's slice of it and
+  // the marks CANCEL: a mis-marked leg is handed to the exiter pro rata and
+  // the stayers keep exactly their slices, so that exit is price-neutral and
+  // must stay ungated — a vault with no loans can always be drained in kind
+  // (the property the GHSA-h888 final-exit sweep and the #54.6 zero-basket
+  // guard rely on). With the loan book (or reserve / arrears) non-zero the
+  // mark enters through NAV/holdings: the exiter's loan-book claim (a cash
+  // receivable, price-invariant) is paid out as an extra L/H slice of the
+  // held basket AT THE FROZEN MARK, so a leg whose market has moved ≥2.5%
+  // (pended) or whose mark is stale transfers ≈ jump × loan-book share ×
+  // exiter's slice between exiter and stayers — the same class M1 closed on
+  // the mint side, timeable by anyone watching the feed. So the redeem side
+  // runs the same three held-leg checks exactly when that ratio is not 1.
+  // Returns an error or null.
+  type VaultMarkIssue = {
+    asset : Text;
+    issue : { #unpriced; #noPool; #pended; #stale };
+  };
+
+  func vaultHeldLegMarkIssue(now : Int, vv : VaultValue) : ?VaultMarkIssue {
     let legs = [("BTC", "BTC-ICPUSD"), ("ETH", "ETH-ICPUSD"), ("SOL", "SOL-ICPUSD"), ("ICP", "ICP-ICPUSD")];
     for ((asset, market) in legs.vals()) {
       // Test the BALANCE, not the value. This used to read
@@ -15333,13 +20008,9 @@ persistent actor Uplands {
         // A held leg we cannot price must BLOCK the mint, not be valued at zero.
         switch (AMM.getPool(pools, market)) {
           case (?p) {
-            if (p.refPrice == 0) {
-              return ?("LP deposit paused: the vault holds " # asset # " but has no reference price for it — minting now would value that leg at zero");
-            };
+            if (p.refPrice == 0) { return ?{ asset; issue = #unpriced } };
           };
-          case null {
-            return ?("LP deposit paused: the vault holds " # asset # " but has no AMM pool to price it");
-          };
+          case null { return ?{ asset; issue = #noPool } };
         };
       };
       if (held) {
@@ -15349,18 +20020,16 @@ persistent actor Uplands {
         // pre-jump price. Refuse until the pend resolves (one oracle tick to
         // confirm/reject, 5-min TTL worst case). HELD legs only, so
         // first-seeding a market (whose own breaker trips for a tick) is
-        // unaffected — that leg isn't in `vv` yet. Withdrawals need no gate:
-        // withdrawLp redeems a pro-rata basket IN KIND, which is
-        // price-neutral by construction.
+        // unaffected — that leg isn't in `vv` yet.
         if (Map.get(pendingPriceJumps, Text.compare, asset) != null) {
-          return ?("LP deposit paused: a " # asset # " price move is awaiting circuit-breaker confirmation — retry shortly");
+          return ?{ asset; issue = #pended };
         };
         switch (AMM.getPool(pools, market)) {
           case (?p) {
             // Mint bar = quoting bar (LP_DEPOSIT_MAX_REF_AGE_NS = STALE_GRACE):
             // if the AMM would be widening for staleness, minting is paused too.
             if (p.refPriceUpdatedNs > 0 and now - p.refPriceUpdatedNs > LP_DEPOSIT_MAX_REF_AGE_NS) {
-              return ?("LP deposit paused: " # asset # " refPrice is stale");
+              return ?{ asset; issue = #stale };
             };
           };
           case null {};
@@ -15368,6 +20037,50 @@ persistent actor Uplands {
       };
     };
     null
+  };
+
+  // The refusal text for one side. The deposit spellings are pinned by
+  // tests/test_ghsa_round4.sh ("LP deposit paused"), test_breaker_widening.sh
+  // ("circuit-breaker") and test_market_walks_locked.sh ("refPrice is stale");
+  // the withdrawal side mirrors them word for word bar the verb.
+  func vaultMarkIssueText(side : { #deposit; #withdrawal }, mi : VaultMarkIssue) : Text {
+    let (head, act) = switch (side) {
+      case (#deposit)    { ("LP deposit paused: ", "minting") };
+      case (#withdrawal) { ("LP withdrawal paused: ", "redeeming") };
+    };
+    switch (mi.issue) {
+      case (#unpriced) { head # "the vault holds " # mi.asset # " but has no reference price for it — " # act # " now would value that leg at zero" };
+      case (#noPool)   { head # "the vault holds " # mi.asset # " but has no AMM pool to price it" };
+      case (#pended)   { head # "a " # mi.asset # " price move is awaiting circuit-breaker confirmation — retry shortly" };
+      case (#stale)    { head # mi.asset # " refPrice is stale" };
+    };
+  };
+
+  func vaultPricesStale(now : Int, vv : VaultValue) : ?Text {
+    switch (vaultHeldLegMarkIssue(now, vv)) {
+      case (?mi) { ?vaultMarkIssueText(#deposit, mi) };
+      case null { null };
+    };
+  };
+
+  // The redeem-side gate: null while an exit is price-neutral (NAV == holdings:
+  // no loan book, no impairment reserve, no arrears — the marks cancel in
+  // VaultMath.redeemLeg), else the first held-leg mark problem, phrased for a
+  // withdrawal. `navUsd` must be the SAME currentVaultValue().totalQuoteValue
+  // the caller redeems at and `holdingsUsd` the vaultHoldingsUsd it pays from
+  // (both mark the held legs with the identical poolRefPrice products, so they
+  // are byte-equal exactly when the loan book, reserve and arrears are all
+  // zero — no tolerance needed). A close that the pool can cover repays the
+  // loan IN FULL (deleveragePool accrues before it reads the debt — task
+  // 1788515291), so a vault whose loans have all been repaid is back at
+  // NAV == holdings and this gate disarms; only a pool that cannot cover its
+  // debt leaves a real (not dust) claim on the book.
+  func vaultWithdrawPaused(now : Int, vv : VaultValue, holdingsUsd : Nat) : ?Text {
+    if (vv.totalQuoteValue == holdingsUsd) { return null };
+    switch (vaultHeldLegMarkIssue(now, vv)) {
+      case (?mi) { ?vaultMarkIssueText(#withdrawal, mi) };
+      case null { null };
+    };
   };
 
   // Single ring buffer of vault snapshots — replaces the per-pool
@@ -15502,35 +20215,112 @@ persistent actor Uplands {
   // Reject the aggregate if sources disagree by more than this — it
   // signals a provider going rogue or stale (0.5% is conservative).
   transient let PRICE_MAX_STDDEV_BPS : Float = 50.0;
-  // How often the auto-refresh timer ticks. 30s aligns with the
+  // The nominal refresh interval (feeds only the intervalSec stats field —
+  // the heartbeat's HB_PRICE_NS is the real beat). 30s aligns with the
   // XRC minute-bucket cadence and is well below the AMM quote-
   // requote interval, so quotes always use fresh data.
   transient let PRICE_REFRESH_INTERVAL_NS : Int = 30_000_000_000;
-  // A pool's refPrice is considered stale if older than this, and the
-  // timer will refresh before the interval elapses. Keeps new pools
-  // from going one full interval without a price on startup.
+  // A pool's refPrice is considered stale if older than this; the round
+  // fetches only pools past it. NOTE the quantisation (task 1788503312,
+  // measured): 45 s on a 30 s beat means a pool is skipped at the beat
+  // after its refresh (~30 s old) and fetched at the one after (~60 s), so
+  // the PER-POOL cadence is 60 s, not 30 s — see STALE_GRACE_NS.
   transient let PRICE_STALE_AFTER_NS : Int = 45_000_000_000;
 
   // Counters — exposed via getPriceFeedStats for observability.
   transient var _priceRefreshSuccess : Nat = 0;
   transient var _priceRefreshFailure : Nat = 0;
-  transient var _priceRefreshInFlight : Bool = false;
-  // W4-13: bumped by performWorldWipe instead of clearing the flag above —
-  // the flag has exactly ONE owner (tickPriceRefresh sets/clears it in its
-  // finally), and a parked refresh discovers the epoch moved and abandons
-  // itself, the same shape as the ship path's _captureEpoch.
+  // W4-13: bumped by performWorldWipe; a parked refresh discovers the epoch
+  // moved and abandons itself, the same shape as the ship path's
+  // _captureEpoch. #55: captured at DISPATCH (openPriceFanout — the one
+  // place every caller's fetch goes through) and compared in
+  // finalizePriceFanout before its side-map writes — not in one caller after
+  // the writes had already happened. H-37: the fan-out no longer has a
+  // "refresh in flight" flag with an owner — `priceRefreshInFlight()` is
+  // DERIVED from the open fan-outs, so there is nothing to latch.
   transient var _oracleEpoch : Nat = 0;
+  // ── H-37 (F34): the fan-out accumulator ────────────────────────────
+  // One refresh = one PriceFanout: N per-source self-calls (fetchAndRecord)
+  // that each record into `st` as they land; the FIRST arrival to see a
+  // robust quorum applies the mark (or the last arrival, or the heartbeat's
+  // deadline sweep) — never the slowest provider. Before this the refresh
+  // awaited all eight futures in order, so one venue trickling its body set
+  // the cadence of every mark: staged orders missed DEFERRED_EXPIRY_NS and
+  // fell to the users-only pass, FOKs died, marks went a timeout stale.
+  // Decision logic: PriceFeed.fanoutRecord / fanoutClose (pure, unit-pinned).
+  //
+  // Per fan-out: the asset, the DISPATCH clock (the release reference every
+  // attached market's mark is stamped with — H-23), the oracle epoch captured
+  // at dispatch, the attached markets with the caller that attached each
+  // (the GEPTOR carries its arm time so the release can match the guard), and
+  // the per-market apply outcome written at finalization (the admin fetch
+  // reads its own). Transient: a fan-out is a few seconds of state, and an
+  // upgrade cannot land on an open one — an open fan-out has provider calls
+  // outstanding, and #55 (d) measured that an upgrade cannot land while a
+  // call is (the Motoko runtime refuses it; the upgrade lands only once the
+  // calls are done) — so nothing an upgrade can drop is still in flight: at
+  // most finalized entries awaiting their sweep, and the next tick
+  // re-dispatches anyway. The map is tiny (≤ one open fan-out per asset per
+  // caller kind); finalized entries are retained PRICE_FANOUT_RETAIN_NS for
+  // late arrivals, then swept.
+  type FanoutCaller  = { #tick; #geptor : Int; #admin };
+  type FanoutOutcome = { #applied : Nat; #pended; #rejected : Text; #abandoned : Text };
+  type PriceFanout = {
+    id           : Nat;
+    asset        : Text;
+    dispatchNs   : Int;
+    oracleEpoch  : Nat;
+    st           : PriceFeed.FanoutState;
+    var markets  : [(Types.MarketId, FanoutCaller)];
+    var outcomes : [(Types.MarketId, FanoutOutcome)];
+  };
+  transient let _priceFanouts = Map.empty<Nat, PriceFanout>();
+  transient var _fanoutSeq : Nat = 0;
+  // The per-refresh DEADLINE: an open fan-out this old is finalized on what
+  // has arrived (the apply gate still enforces the floor; below it the XRC
+  // fallback or a frozen mark, as for any thin sample). Well under
+  // DEFERRED_EXPIRY_NS (15s): a GEPTOR arms ~1s after staging, so a stalled
+  // provider now costs the release ~9s instead of the provider's timeout.
+  // The heartbeat drives it (no timers here — the heartbeat doctrine), so the
+  // effective bound is this plus one beat.
+  transient let PRICE_FANOUT_DEADLINE_NS : Int = 8_000_000_000;   // 8s
+  // A finalized fan-out stays this long for late arrivals (observability),
+  // an OPEN one this old is ABANDONED at the next dispatch (a finalization
+  // that trapped on every retry would otherwise pin the asset's guards).
+  transient let PRICE_FANOUT_RETAIN_NS : Int = 120_000_000_000;   // 120s
+  transient var _fanoutQuorumCount   : Nat = 0;
+  transient var _fanoutCompleteCount : Nat = 0;
+  transient var _fanoutDeadlineCount : Nat = 0;
+  transient var _fanoutDrainedCount  : Nat = 0;
+  transient var _fanoutLateReadings  : Nat = 0;   // readings that landed after finalization (attached, not applied)
+  transient var _fanoutAbandoned     : Nat = 0;   // epoch moved, or stale-open reaped
+  transient var _fanoutDropped       : Nat = 0;   // readings for a fan-out no longer retained
+  transient var _lastFanoutSweepNs   : Int = 0;
+  // #dev: stall a source (H-37's `devStallSource`). #never — its self-call
+  // records nothing (a provider that never answers; the deadline path);
+  // #park — it fetches, then parks the reading until devReleaseParkedReadings
+  // (a provider that answers AFTER the mark applied; the late-attach path);
+  // #hold — records nothing (as #never) and keeps the ADMIN fetch from
+  // draining its fan-out, so that fan-out closes only at the deadline sweep
+  // (the window a test stages into; devHoldsFanoutOpen). No spin, no cap
+  // needed: a stall a test forgot to clear costs each later admin fetch its
+  // fan-out staying open to the 8s sweep (16s at the 2x stale-open reap if a
+  // finalization ever trapped) — never longer, and the tick's dedup
+  // (`waiting`) expires with the same deadline. Cleared by the wipe.
+  transient let _devStalledSources = Map.empty<Text, { #never; #park; #hold }>();
+  transient let _devParkedReadings = List.empty<(Nat, PriceFeed.Reading)>();
   // Per-market GEPTOR fetch in-flight guard — the value is the ARM time (ns),
   // written by processGeptorDue in the CALLER's message and normally deleted
-  // by geptorFetchAndSweep's `finally` (a separate message). #52.6: because
-  // arm and release live in different messages, a failed self-call send or a
-  // pre-await callee trap leaves the arm committed with no release — so an
-  // entry counts as in-flight only while younger than GEPTOR_INFLIGHT_TTL_NS,
-  // and the next arm overwrites a stale one. 60s comfortably exceeds the
-  // slowest genuine fetch (an 8-way outcall fan-out that returns with the
-  // slowest source; the file's own notes put non-replicated outcall latency
-  // 2-10x replicated) and caps the failure-mode degradation at one minute —
-  // vs forever, on a transient map performWorldWipe does not clear.
+  // by the fan-out's finalization (finalizePriceFanout — a separate message:
+  // the per-source continuation that reached quorum, or the heartbeat's
+  // deadline sweep). #52.6: because arm and release live in different
+  // messages, a lost self-call or a finalization that traps leaves the arm
+  // committed with no release — so an entry counts as in-flight only while
+  // younger than GEPTOR_INFLIGHT_TTL_NS, and the next arm overwrites a stale
+  // one. 60s comfortably exceeds the fan-out's own bound (H-37:
+  // PRICE_FANOUT_DEADLINE_NS + one beat, then the 2x-deadline stale-open
+  // reap) and caps the failure-mode degradation at one minute — vs forever,
+  // on a transient map performWorldWipe does not clear.
   transient let _geptorInFlight = Map.empty<Text, Int>();
   transient let GEPTOR_INFLIGHT_TTL_NS : Int = 60_000_000_000; // 60s
   // Sudden-jump circuit breaker: count refreshes that were rejected
@@ -15859,7 +20649,10 @@ persistent actor Uplands {
     if (oldest > 0) { oldest } else { agg.timestamp };
   };
 
-  func applyFreshAggregate(marketId : Types.MarketId, baseToken : Types.TokenId, agg : PriceFeed.Aggregate, now : Int) : { #applied : Nat; #pended; #rejected : Text } {
+  // `dispatchNs`: the clock the fetch that produced `agg` was DISPATCHED on
+  // (captured before its first await) — written to releaseRefs alongside the
+  // mark by both writers below (H-23). The mark's own clock stays the sample.
+  func applyFreshAggregate(marketId : Types.MarketId, baseToken : Types.TokenId, agg : PriceFeed.Aggregate, now : Int, dispatchNs : Int) : { #applied : Nat; #pended; #rejected : Text } {
     switch (AMM.getPool(pools, marketId)) {
       case null { #rejected("No AMM pool for " # marketId) };
       case (?p) {
@@ -15902,6 +20695,8 @@ persistent actor Uplands {
             // clock: downstream staleness walls then bound the price's true
             // age instead of composing with the pipeline latency (W3-06).
             AMM.putPool(pools, AMM.withRefPrice(p, newPx, sampleNs));
+            stampReleaseRef(marketId, dispatchNs, now);   // H-23: the release reference moves with the mark
+            refreshVaultImpairment(true);   // a mark moved: accrue + re-provision the loan book (tasks 1788475754, 1788736589)
             return #applied(newPx);
           };
           return #pended;
@@ -15909,12 +20704,28 @@ persistent actor Uplands {
         // Primary below the floor — try the XRC fallback anchor.
         switch (xrcAnchorFresh(baseToken, now)) {
           case (?a) {
+            // MONOTONIC IN SAMPLE TIME for the fallback writer too (#55
+            // "fallback clock rewinds"). The anchor's OBSERVATION clock is
+            // its XRC pricing minute (xrcAnchorEffectiveNs), 30-90s behind
+            // wall clock by construction — so a fan-out that drops below the
+            // floor a second after an eight-source apply would otherwise
+            // move the mark to an OLDER single-source value and its clock
+            // back ~90s, after which a straggling primary sampled between
+            // the two passes the guard above: the overwrite W3-06 refuses,
+            // reached through the other writer. Same rule, same direction:
+            // a mark's clock never moves backwards, whoever writes it.
+            if (xrcAnchorEffectiveNs(a) <= p.refPriceUpdatedNs) {
+              return #rejected(baseToken # " primary feed below floor (" # Nat.toText(agg.sourceCount) # "/"
+                # Nat.toText(minSources()) # " sources) and the XRC anchor's pricing minute is at or before the current mark — refPrice frozen");
+            };
             if (acceptOrPendPrice(baseToken, p.refPrice, a.rateE8, xrcAnchorEffectiveNs(a))) {
               // W3-07: the fallback mark carries the ANCHOR's effective time
               // — an anchor of admissible age must not be re-stamped as
               // instantaneous, or the 180s anchor window COMPOSES with the
               // 300s margin staleness wall instead of being bounded by it.
               AMM.putPool(pools, AMM.withRefPrice(p, a.rateE8, xrcAnchorEffectiveNs(a)));
+              stampReleaseRef(marketId, dispatchNs, now);   // H-23: same reference, whichever writer
+              refreshVaultImpairment(true);   // a mark moved: accrue + re-provision the loan book (tasks 1788475754, 1788736589)
               logEvent("warn", "oracle",
                 baseToken # " refPrice set from the XRC FALLBACK anchor — primary feed below the source floor ("
                 # Nat.toText(agg.sourceCount) # "/" # Nat.toText(minSources()) # ")", ?marketId);
@@ -15931,51 +20742,270 @@ persistent actor Uplands {
     };
   };
 
-  // Fire parallel non-replicated outcalls for the given asset, collect
-  // readings, run `aggregate`. Returns the resulting Aggregate and also
-  // caches it. If `stddevBps` exceeds `maxStddevBps` the caller should
-  // NOT trust the price — set that field and let the caller decide.
-  func refreshMultiSourcePrice(asset : PriceFeed.Asset) : async PriceFeed.Aggregate {
-    // Fire every outcall before awaiting any: the first loop launches
-    // all futures (they run concurrently on the IC scheduler), the
-    // second loop awaits them in order. Array.map<..., async T> would
-    // be cleaner but doesn't type-check outside an async context — the
-    // closures it passes aren't themselves async bodies. For-loops in
-    // an async function body satisfy the send-capability requirement.
-    var futures : [async PriceFeed.Reading] = [];
-    for (src in PRICE_SOURCES.vals()) {
-      let f = fetchFromSource(src, asset);
-      let n = futures.size();
-      futures := Array.tabulate<async PriceFeed.Reading>(
-        n + 1,
-        func(i) { if (i < n) { futures[i] } else { f } }
-      );
+  // ── H-37 (F34): the fan-out — dispatch, record, finalize, sweep ──────
+  // The per-quote aggregation every decision and every apply prices on
+  // (W3-05; #55 "oracle split": the pooled trim stays primary while the USD
+  // group alone is below the floor). One function so the quorum test in
+  // PriceFeed.fanoutRecord judges the SAME sample the apply will use.
+  func fanoutAggregate(asset : PriceFeed.Asset, readings : [PriceFeed.Reading]) : PriceFeed.QuoteAggregate {
+    PriceFeed.aggregateByQuote(asset, readings, PRICE_SOURCES, Time.now(), USDT_DEPEG_ALARM_BPS, minSources());
+  };
+
+  func fanoutIsOpen(f : PriceFanout) : Bool { Option.isNull(f.st.finalized) };
+  func priceRefreshInFlight() : Bool {
+    for ((_, f) in Map.entries(_priceFanouts)) { if (fanoutIsOpen(f)) { return true } };
+    false;
+  };
+  // The newest OPEN fan-out for an asset (the periodic tick joins it rather
+  // than dispatching a second fleet for the same asset).
+  func openFanoutFor(asset : Text) : ?PriceFanout {
+    var best : ?PriceFanout = null;
+    for ((_, f) in Map.entries(_priceFanouts)) {
+      if (f.asset == asset and fanoutIsOpen(f)) {
+        switch (best) {
+          case (?b) { if (f.id > b.id) { best := ?f } };
+          case null { best := ?f };
+        };
+      };
     };
-    var readings : [PriceFeed.Reading] = [];
-    for (f in futures.vals()) {
-      let r = await f;
-      let n = readings.size();
-      readings := Array.tabulate<PriceFeed.Reading>(
-        n + 1,
-        func(i) { if (i < n) { readings[i] } else { r } }
-      );
+    best;
+  };
+  // The newest fan-out for an asset, open or not (devGetFanout; the late-
+  // attach guard: a late reading refreshes the cache only while its fan-out
+  // is still the asset's latest, so it never clobbers a fresher one).
+  func latestFanoutFor(asset : Text) : ?PriceFanout {
+    var best : ?PriceFanout = null;
+    for ((_, f) in Map.entries(_priceFanouts)) {
+      if (f.asset == asset) {
+        switch (best) {
+          case (?b) { if (f.id > b.id) { best := ?f } };
+          case null { best := ?f };
+        };
+      };
+    };
+    best;
+  };
+  func attachFanoutMarket(f : PriceFanout, marketId : Types.MarketId, caller : FanoutCaller) {
+    for ((m, c) in f.markets.vals()) {
+      switch (c, caller) {
+        case (#tick, #tick) { if (m == marketId) { return } };   // already waiting on this fleet
+        case _ {};
+      };
+    };
+    let n = f.markets.size();
+    f.markets := Array.tabulate<(Types.MarketId, FanoutCaller)>(n + 1, func(i) { if (i < n) { f.markets[i] } else { (marketId, caller) } });
+  };
+  // Release every guard an attached market holds on this fan-out: the
+  // shared in-flight stamp (the tick's or the admin fetch's — only if it is
+  // still OURS: a newer dispatch may have re-stamped the market, and the
+  // commit lock must hold for THAT fetch; task 1788535668's guarded delete)
+  // and the GEPTOR arm (only if it is still the arm that attached — after a
+  // TTL expiry a newer dispatch may own the entry, and a straggler must not
+  // release the newer flight's guard: the #52.6 shape).
+  func releaseFanoutGuards(f : PriceFanout) {
+    for ((m, c) in f.markets.vals()) {
+      switch (c) {
+        case (#tick)  { clearFetchInFlight(m, f.dispatchNs) };   // the guarded delete (task 1788535668): only OUR stamp
+        case (#admin) { clearFetchInFlight(m, f.dispatchNs) };   // the admin fetch stamps the same map (task 3088525590)
+        case (#geptor(armedAt)) {
+          switch (Map.get(_geptorInFlight, Text.compare, m)) {
+            case (?t) { if (t == armedAt) { ignore Map.delete(_geptorInFlight, Text.compare, m) } };
+            case null {};
+          };
+        };
+      };
+    };
+  };
+  func abandonFanout(f : PriceFanout, why : Text) {
+    ignore PriceFeed.fanoutClose(f.st, #deadline);
+    f.outcomes := Array.map<(Types.MarketId, FanoutCaller), (Types.MarketId, FanoutOutcome)>(
+      f.markets, func((m, _)) { (m, #abandoned(why)) });
+    releaseFanoutGuards(f);
+    _fanoutAbandoned += 1;
+  };
+  // Stale-open reap + retention prune, at every dispatch and every sweep.
+  func reapFanouts(now : Int) {
+    let doomed = List.empty<Nat>();
+    for ((id, f) in Map.entries(_priceFanouts)) {
+      if (fanoutIsOpen(f)) {
+        if (now - f.dispatchNs >= 2 * PRICE_FANOUT_DEADLINE_NS) {
+          abandonFanout(f, "fan-out abandoned: still open at twice the deadline");
+          logEvent("warn", "oracle", f.asset # " fan-out #" # Nat.toText(f.id)
+            # " abandoned — still open " # Nat.toText(Int.abs((now - f.dispatchNs) / 1_000_000_000)) # "s after dispatch (finalization never landed)", null);
+          List.add(doomed, id);
+        };
+      } else if (now - f.dispatchNs >= PRICE_FANOUT_RETAIN_NS) {
+        List.add(doomed, id);
+      };
+    };
+    for (id in List.values(doomed)) { ignore Map.delete(_priceFanouts, Nat.compare, id) };
+  };
+
+  // Open one fan-out for `asset` with `marketId` attached, or — when `join`
+  // and a fan-out for the asset is already open — attach to that one (no
+  // second fleet for the same asset; the joiner's release reference is the
+  // OPEN fan-out's dispatch clock, which is the conservative side of H-23:
+  // a mark can only ever be keyed to a dispatch that PRECEDES the readings).
+  // Returns the fan-out and whether it was CREATED (a created one must be
+  // fired — firePriceFanout, or the admin fetch's own awaited fleet); a join
+  // fires nothing. No sends here: state only, so it commits with the
+  // caller's arm/stamp.
+  func openPriceFanout(asset : PriceFeed.Asset, marketId : Types.MarketId, caller : FanoutCaller, dispatchNs : Int, join : Bool) : (PriceFanout, Bool) {
+    reapFanouts(dispatchNs);
+    if (join) {
+      switch (openFanoutFor(asset)) {
+        case (?f) { attachFanoutMarket(f, marketId, caller); return (f, false) };
+        case null {};
+      };
+    };
+    // W4-13 / #55: the epoch is captured HERE, before the first send, and
+    // compared in finalizePriceFanout before any side-map write.
+    let oracleEpoch = _oracleEpoch;
+    _fanoutSeq += 1;
+    let total = PRICE_SOURCES.size();
+    let f : PriceFanout = {
+      id = _fanoutSeq; asset; dispatchNs; oracleEpoch;
+      st = PriceFeed.fanoutNew(total, PriceFeed.robustQuorum(total, minSources()));
+      var markets = [(marketId, caller)];
+      var outcomes = [];
+    };
+    Map.add(_priceFanouts, Nat.compare, f.id, f);
+    (f, true);
+  };
+  // Fire the fleet: one self-call per source, fire-and-forget — each records
+  // into the fan-out as it lands. `async*` for send capability; awaited
+  // INLINE by its callers (never a message split).
+  func firePriceFanout(f : PriceFanout) : async* () {
+    for (src in PRICE_SOURCES.vals()) { ignore fetchAndRecord(src, f.asset, f.id) };
+  };
+
+  // The per-source self-call: fetch, then record into the fan-out. Its own
+  // message, so one provider's latency is one provider's latency — the
+  // continuation that lands quorum applies the mark for everyone waiting.
+  func fetchAndRecord(src : PriceFeed.Source, asset : PriceFeed.Asset, fanoutId : Nat) : async () {
+    if (IS_DEV) {
+      switch (Map.get(_devStalledSources, Text.compare, src.id)) {
+        case (?#never or ?#hold) { return };   // never answers — the deadline path (#hold: and the admin fetch leaves its fan-out to it)
+        case _ {};
+      };
+    };
+    let r = await* fetchFromSource(src, asset);
+    if (IS_DEV) {
+      switch (Map.get(_devStalledSources, Text.compare, src.id)) {
+        case (?#park) { List.add(_devParkedReadings, (fanoutId, r)); return };   // answers late — the attach path
+        case _ {};
+      };
+    };
+    recordFanoutReading(fanoutId, r);
+  };
+  // #dev only (false on #play/#production by the first line — the admin
+  // path there is byte-for-byte the drain): a `devStallSource #hold` is set
+  // on some source, so the admin fetch must leave its fan-out to the
+  // deadline sweep instead of draining it. Motoko cannot park an async on a
+  // timer, and parking it on self-messages spins the replica (the retired
+  // hold loop), so the window is the SWEEP's, not the caller's.
+  func devHoldsFanoutOpen() : Bool {
+    if (not IS_DEV) { return false };
+    for ((_, m) in Map.entries(_devStalledSources)) {
+      switch (m) { case (#hold) { return true }; case _ {} };
+    };
+    false;
+  };
+
+  func recordFanoutReading(fanoutId : Nat, r : PriceFeed.Reading) {
+    switch (Map.get(_priceFanouts, Nat.compare, fanoutId)) {
+      case null { _fanoutDropped += 1 };   // no longer retained — nothing to attach to
+      case (?f) {
+        switch (PriceFeed.fanoutRecord(f.st, r, func(rs) { fanoutAggregate(f.asset, rs).agg }, PRICE_MAX_STDDEV_BPS)) {
+          case (#wait) {};
+          case (#finalize(reason)) { finalizePriceFanout(f, reason, Time.now()) };
+          case (#late) { _fanoutLateReadings += 1; attachLateReading(f) };
+        };
+      };
+    };
+  };
+
+  // A reading that landed after the mark applied: refresh the cached
+  // aggregate (getLastAggregate — the Status page's per-source health) and
+  // its quote signal with the full fleet, keeping the finalization's clock;
+  // the two are one observability surface and must keep partitioning each
+  // other (usdCount + usdtCount == sourceCount — test_oracle_quote_signal
+  // pins it), so both move or neither. The mark is NOT re-applied and no
+  // guard moves. Only while this fan-out is still the asset's latest and its
+  // epoch is live (the same compare as the finalizer).
+  func attachLateReading(f : PriceFanout) {
+    if (_oracleEpoch != f.oracleEpoch) { return };
+    switch (latestFanoutFor(f.asset)) {
+      case (?l) { if (l.id != f.id) { return } };
+      case null { return };
+    };
+    let byQ = fanoutAggregate(f.asset, f.st.readings);
+    let ts = switch (Map.get(lastAggregates, Text.compare, f.asset)) {
+      case (?a) { a.timestamp };
+      case null { byQ.agg.timestamp };
+    };
+    Map.add(lastAggregates, Text.compare, f.asset, { byQ.agg with timestamp = ts });
+    Map.add(_lastQuoteSignal, Text.compare, f.asset, {
+      mark = byQ.mark; diverged = byQ.diverged; depegBps = byQ.depegBps;
+      usdCount = byQ.usdCount; usdtCount = byQ.usdtCount;
+    });
+  };
+
+  // Finalize: aggregate what arrived, write the observability side maps,
+  // apply the mark for every attached market (the shared accept gate —
+  // floor, breaker, XRC fallback), run the GEPTOR's post-apply sequence for
+  // the markets a GEPTOR attached, release the guards. Runs in whichever
+  // message reached the decision (a per-source continuation, the heartbeat
+  // sweep, or the admin fetch) — synchronous, no awaits.
+  func finalizePriceFanout(f : PriceFanout, reason : PriceFeed.FanoutReason, now : Int) {
+    let asset = f.asset;
+    let oracleEpoch = f.oracleEpoch;
+    // W4-13 / #55: a wipe bumped the epoch while this fan-out was parked —
+    // the readings belong to a dead venue. Abandon BEFORE the side-map
+    // writes below (lastAggregates, _lastQuoteSignal, _lastOracleSrc).
+    if (_oracleEpoch != oracleEpoch) {
+      f.outcomes := Array.map<(Types.MarketId, FanoutCaller), (Types.MarketId, FanoutOutcome)>(
+        f.markets, func((m, _)) { (m, #abandoned("oracle epoch moved during the fetch — result abandoned")) });
+      releaseFanoutGuards(f);
+      _fanoutAbandoned += 1;
+      return;
+    };
+    switch (reason) {
+      case (#quorum)   { _fanoutQuorumCount += 1 };
+      case (#complete) { _fanoutCompleteCount += 1 };
+      case (#deadline) { _fanoutDeadlineCount += 1 };
+      case (#drained)  { _fanoutDrainedCount += 1 };
     };
     // W3-05: per-quote aggregation. The venue's mark is USD-DENOMINATED;
     // USD- and USDT-quoted venues aggregate separately, and when the two
-    // groups diverge past the threshold the mark follows the USD group and
-    // the divergence is logged as the depeg signal — pooled, a USDT depeg
-    // moved the blend, the (USDT-side) anchor moved with it, and the
-    // dispersion gate saw agreement. The XRC anchor is USD-quoted too, so
-    // anchor and mark sit on the same side.
-    let byQ = PriceFeed.aggregateByQuote(asset, readings, PRICE_SOURCES, Time.now(), USDT_DEPEG_ALARM_BPS);
+    // groups diverge past the threshold the divergence is logged as the
+    // depeg signal — pooled, a USDT depeg moved the blend, the (USDT-side)
+    // anchor moved with it, and the dispersion gate saw agreement. The XRC
+    // anchor is USD-quoted too, so anchor and mark sit on the same side.
+    // The mark follows the USD group only when that group is robust on its
+    // own (≥ minSources() — the same floor applyFreshAggregate enforces);
+    // otherwise the pooled trim keeps the mark and the divergence is a
+    // signal only (issue #55 "oracle split").
+    let byQ = fanoutAggregate(asset, f.st.readings);
     let agg = byQ.agg;
     if (byQ.diverged) {
+      let basis = switch (byQ.mark) {
+        case (#usdGroup) { "the mark follows the USD group" };
+        case (#pooled) {
+          "the USD group alone (" # Nat.toText(byQ.usdCount) # " src) is below the floor ("
+            # Nat.toText(minSources()) # "), so the pooled trim keeps the mark";
+        };
+      };
       logEvent("warn", "oracle", asset # " USD/USDT venue groups diverge by "
         # Nat.toText(byQ.depegBps) # "bps (USD " # Nat.toText(byQ.usdCount) # " src, USDT "
-        # Nat.toText(byQ.usdtCount) # " src) — possible USDT depeg; the mark follows the USD group",
+        # Nat.toText(byQ.usdtCount) # " src) — possible USDT depeg; " # basis,
         ?(asset # "-" # Types.QUOTE_TOKEN));
     };
     Map.add(lastAggregates, Text.compare, asset, agg);
+    Map.add(_lastQuoteSignal, Text.compare, asset, {
+      mark = byQ.mark; diverged = byQ.diverged; depegBps = byQ.depegBps;
+      usdCount = byQ.usdCount; usdtCount = byQ.usdtCount;
+    });
     // Event log: only note when the feed crosses the can-it-price boundary.
     // "Can price" is the SAME floor applyFreshAggregate enforces — sources ≥
     // minSources AND a usable price AND dispersion within the stddev gate —
@@ -16004,7 +21034,76 @@ persistent actor Uplands {
         logEvent("info", "oracle", asset # " price feed healthy — " # Nat.toText(agg.sourceCount) # "/" # Nat.toText(total) # " sources ($" # r2(agg.price) # ")", mkt);
       };
     };
-    agg;
+    // Apply for every attached market. The shared accept gate owns the
+    // floor, the breaker and the XRC fallback (docs/oracle-xrc-fallback-
+    // design.md §3.1); the release reference is THIS fan-out's dispatch
+    // clock, whichever caller attached the market (H-23).
+    var outcomes : [(Types.MarketId, FanoutOutcome)] = [];
+    var geptorSwept = false;
+    for ((mkt, caller) in f.markets.vals()) {
+      let verdict = applyFreshAggregate(mkt, asset, agg, now, f.dispatchNs);
+      let outcome : FanoutOutcome = switch (verdict) {
+        case (#applied(px)) { #applied(px) };
+        case (#pended)      { #pended };
+        case (#rejected(e)) { #rejected(e) };
+      };
+      let n = outcomes.size();
+      outcomes := Array.tabulate<(Types.MarketId, FanoutOutcome)>(n + 1, func(i) { if (i < n) { outcomes[i] } else { (mkt, outcome) } });
+      switch (caller) {
+        case (#tick) {
+          switch (verdict) {
+            case (#applied(_)) { _priceRefreshSuccess += 1 };
+            // Pended by the circuit breaker (acceptOrPendPrice logs the
+            // edge-triggered event) or rejected below the floor with no
+            // fresh anchor (health edges logged above).
+            case (#pended)      { _priceRefreshFailure += 1 };
+            case (#rejected(_)) { _priceRefreshFailure += 1 };
+          };
+        };
+        case (#geptor(_)) {
+          // The GEPTOR's post-apply sequence, applied or not (a fetch below
+          // the floor still requotes at the standing mark — the periodic
+          // tick is the fallback): requote this market, then release any
+          // staged cross-swap whose OTHER leg is already fresh too.
+          // H-22 (F28): this message carries the fetched mark. While the
+          // market's release breaker ("amm:<mkt>") holds a streak the
+          // release pass is left to that breaker's own message — a trap in
+          // it must never discard the mark applied above. Same for the
+          // cross-swap pass under the finaliser's streak.
+          switch (AMM.getPool(pools, mkt)) {
+            case (?p) { if (p.enabled and p.refPrice > 0) { AMM.putPool(pools, ammRequote(p, hbStreakOf("amm:" # mkt) == 0)) } };
+            case null {};
+          };
+          geptorSwept := true;
+        };
+        case (#admin) {};
+      };
+    };
+    f.outcomes := outcomes;
+    if (geptorSwept and hbStreakOf("finalise") == 0) { processDeferredSwaps(now) };
+    releaseFanoutGuards(f);
+  };
+
+  // The heartbeat's sweep (every beat while a fan-out exists; ABOVE the
+  // pause gate — it completes fetches already dispatched, exactly as the
+  // awaits it replaces completed under a pause): finalize open fan-outs past
+  // the deadline, reap the stale, prune the retained.
+  func sweepPriceFanouts(now : Int) {
+    let due = List.empty<PriceFanout>();
+    for ((_, f) in Map.entries(_priceFanouts)) {
+      if (fanoutIsOpen(f) and now - f.dispatchNs >= PRICE_FANOUT_DEADLINE_NS and now - f.dispatchNs < 2 * PRICE_FANOUT_DEADLINE_NS) {
+        List.add(due, f);
+      };
+    };
+    for (f in List.values(due)) {
+      if (PriceFeed.fanoutClose(f.st, #deadline)) { finalizePriceFanout(f, #deadline, now) };
+    };
+    reapFanouts(now);
+  };
+
+  func fanoutOutcomeFor(f : PriceFanout, marketId : Types.MarketId) : ?FanoutOutcome {
+    for ((m, o) in f.outcomes.vals()) { if (m == marketId) { return ?o } };
+    null;
   };
 
   public shared (msg) func fetchAndSetRefPrice(marketId : Types.MarketId) : async { #ok : Nat; #err : Text } {
@@ -16018,11 +21117,46 @@ persistent actor Uplands {
     // (BTC-ICPUSD → BTC; ETH-ICPUSD → ETH; ICP-ICPUSD → ICP).
     // Shared accept gate: same floor/breaker/fallback as GEPTOR + the tick
     // (this admin path used to accept a single source too).
-    let agg = await refreshMultiSourcePrice(baseToken);
-    switch (applyFreshAggregate(marketId, baseToken, agg, Time.now())) {
-      case (#applied(px)) { #ok(px) };
-      case (#pended)      { #err("Price jump > " # debugShowInt(Float.toInt(PRICE_JUMP_BPS)) # "bps; pending confirmation") };
-      case (#rejected(e)) { #err(e) };
+    // H-37: the admin fetch dispatches its OWN fan-out (never joins — its
+    // futures are its own) and waits for every self-call to return; the mark
+    // may already have applied at quorum inside one of them. A fan-out still
+    // open after its whole fleet returned (a source that recorded nothing)
+    // is closed here as #drained — unless a #dev `devStallSource #hold` is
+    // set (devHoldsFanoutOpen), in which case it is left to the heartbeat's
+    // deadline sweep and this call reports it open (the staged 8s window).
+    let dispatchNs = Time.now();   // H-23: before the fan-out's first send
+    let (f, _) = openPriceFanout(baseToken, marketId, #admin, dispatchNs, false);
+    // The in-flight stamp (task 3088525590): this fetch is a dispatch the
+    // commit lock must see (fetchInFlightSince) — a staged owner cannot
+    // free-look against an operator's manual fetch any more than against a
+    // GEPTOR's. Released by the fan-out's finalizer through the guarded delete
+    // (only while it is still THIS fetch's stamp — task 1788535668's rule).
+    Map.add(_fetchInFlight, Text.compare, marketId, dispatchNs);
+    var futures : [async ()] = [];
+    for (src in PRICE_SOURCES.vals()) {
+      let fut = fetchAndRecord(src, baseToken, f.id);
+      let n = futures.size();
+      futures := Array.tabulate<async ()>(n + 1, func(i) { if (i < n) { futures[i] } else { fut } });
+    };
+    for (fut in futures.vals()) {
+      try { await fut } catch (_) { /* a lost self-call: the reading never lands; #drained covers it */ };
+    };
+    if (not devHoldsFanoutOpen()) {
+      if (PriceFeed.fanoutClose(f.st, #drained)) { finalizePriceFanout(f, #drained, Time.now()) };
+    };
+    if (fanoutIsOpen(f)) {
+      // Only under the #dev hold: the sweep closes it (deadline) — and the
+      // stamp with it; the outcome is read from devGetFanout, not from here.
+      return #err("fan-out #" # Nat.toText(f.id) # " left OPEN for the deadline sweep (devStallSource #hold is set) — no outcome yet for " # marketId);
+    };
+    switch (fanoutOutcomeFor(f, marketId)) {
+      case (?#applied(px)) { #ok(px) };
+      case (?#pended)      { #err("Price jump > " # debugShowInt(Float.toInt(PRICE_JUMP_BPS)) # "bps; pending confirmation") };
+      case (?#rejected(e)) { #err(e) };
+      // The oracle epoch moved while the fetch was parked (a wipe landed):
+      // the result was abandoned unwritten in the finalizer — nothing to apply.
+      case (?#abandoned(why)) { #err(why) };
+      case null { #err("fan-out #" # Nat.toText(f.id) # " finalized without an outcome for " # marketId) };
     };
   };
 
@@ -16061,13 +21195,55 @@ persistent actor Uplands {
     panicCancels    : Nat;   // AMM quote cancels triggered by stale feed
     jumpThresholdBps : Float;
     maxRefPriceAgeSec : Nat;
+    // 1788471187: the USD/USDT split behind each asset's mark — additive
+    // (a grown RETURN record is Candid-compatible; old clients skip the
+    // fields). `quoteSignals` is empty until the first refresh after an
+    // upgrade; `depegAlarmBps` is the threshold `diverged` was judged at.
+    depegAlarmBps   : Nat;
+    quoteSignals    : [(Text, QuoteSignal)];
+    // H-37 (F34): the fan-out's shape and its finalization census —
+    // additive. `fanoutQuorum` is the survivors that finalize early (a
+    // majority of `fanoutSources`, never below minSources);
+    // `fanoutDeadlineSec` the per-refresh bound; the counts say HOW each
+    // fan-out closed (quorum / every source reported / the deadline sweep /
+    // an awaiting caller drained its fleet); `fanoutLateReadings` are
+    // readings that landed after the mark applied (attached, never applied);
+    // `fanoutOpen` is the in-flight count `refreshInFlight` derives from.
+    fanoutSources       : Nat;
+    fanoutQuorum        : Nat;
+    fanoutDeadlineSec   : Nat;
+    fanoutOpen          : Nat;
+    fanoutQuorumCount   : Nat;
+    fanoutCompleteCount : Nat;
+    fanoutDeadlineCount : Nat;
+    fanoutDrainedCount  : Nat;
+    fanoutLateReadings  : Nat;
+    fanoutAbandoned     : Nat;
+    // 1788558580: the STAGING window the deadline protects — DEFERRED_EXPIRY_NS
+    // in whole seconds (a staged entry older than this with no fresh mark is
+    // released users-only). Additive; test_oracle_fanout_deadline pins its
+    // staging-relative bound against this instead of grepping the source.
+    stagingWindowSec    : Nat;
   };
 
   public query func getPriceFeedStats() : async PriceFeedStats {
+    var open = 0;
+    for ((_, f) in Map.entries(_priceFanouts)) { if (fanoutIsOpen(f)) { open += 1 } };
     {
       successCount      = _priceRefreshSuccess;
       failureCount      = _priceRefreshFailure;
-      refreshInFlight   = _priceRefreshInFlight;
+      refreshInFlight   = priceRefreshInFlight();
+      fanoutSources       = PRICE_SOURCES.size();
+      fanoutQuorum        = PriceFeed.robustQuorum(PRICE_SOURCES.size(), minSources());
+      fanoutDeadlineSec   = Int.abs(PRICE_FANOUT_DEADLINE_NS / 1_000_000_000);
+      fanoutOpen          = open;
+      fanoutQuorumCount   = _fanoutQuorumCount;
+      fanoutCompleteCount = _fanoutCompleteCount;
+      fanoutDeadlineCount = _fanoutDeadlineCount;
+      fanoutDrainedCount  = _fanoutDrainedCount;
+      fanoutLateReadings  = _fanoutLateReadings;
+      fanoutAbandoned     = _fanoutAbandoned;
+      stagingWindowSec    = Int.abs(DEFERRED_EXPIRY_NS / 1_000_000_000);
       intervalSec       = Int.abs(PRICE_REFRESH_INTERVAL_NS / 1_000_000_000);
       minSources        = PRICE_MIN_SOURCES;
       maxStddevBps      = PRICE_MAX_STDDEV_BPS;
@@ -16075,16 +21251,19 @@ persistent actor Uplands {
       panicCancels      = _ammPanicCancels;
       jumpThresholdBps  = PRICE_JUMP_BPS;
       maxRefPriceAgeSec = Int.abs(AMM_MAX_REFPRICE_AGE_NS / 1_000_000_000);
+      depegAlarmBps     = USDT_DEPEG_ALARM_BPS;
+      quoteSignals      = Iter.toArray(Map.entries(_lastQuoteSignal));
     };
   };
 
   // ── Auto-refresh tick ──
-  // Runs on a recurring timer. Walks every enabled pool; if that pool's
-  // refPrice is missing or older than PRICE_STALE_AFTER_NS, fires a
-  // multi-source refresh for its base token. Pools are processed
-  // sequentially (inner outcalls still fan out in parallel per pool)
-  // to keep total cycles spend predictable and avoid flooding the
-  // subnet with 9+ concurrent outcalls when 3+ pools refresh.
+  // Runs on the heartbeat. Walks every enabled pool; if that pool's
+  // refPrice is missing or older than PRICE_STALE_AFTER_NS, dispatches a
+  // fan-out for its base token (or joins the asset's open one). H-37: the
+  // tick no longer awaits anything — every pool's fleet is in flight at
+  // once and each applies on its own quorum/deadline, so one pool's slow
+  // provider no longer holds the next pool's refresh (the old sequential
+  // walk held a refresh-in-flight flag across all of them).
   //
   // Refresh failures (not enough sources, too much disagreement) are
   // counted but DO NOT wipe the last-known-good refPrice. The AMM
@@ -16092,55 +21271,40 @@ persistent actor Uplands {
   // this is the right failure mode because the alternative (going to
   // 0 or disabling) creates stale-depth attacks of its own.
   func tickPriceRefresh() : async () {
-    if (_timersPaused) { return };
-    if (_priceRefreshInFlight) { return };
-    _priceRefreshInFlight := true;
-    let oracleEpoch = _oracleEpoch;
-    try {
-      let now = Time.now();
-      let ids = Iter.toArray(
-        Iter.map<(Text, AMM.Pool), Text>(Map.entries(pools), func((k, _)) { k })
-      );
-      for (id in ids.vals()) {
-        switch (Map.get(pools, Text.compare, id)) {
-          case null {};
-          case (?p) {
-            if (p.enabled) {
-              let age = now - p.refPriceUpdatedNs;
-              if (p.refPrice == 0 or age >= PRICE_STALE_AFTER_NS) {
-                let agg = await refreshMultiSourcePrice(p.baseToken);
-                // W4-13: a wipe bumped the epoch while this refresh was
-                // parked in its fan-out — the result belongs to a dead
-                // venue. Abandon rather than write.
-                if (_oracleEpoch != oracleEpoch) { return };
-                // Shared accept gate: quality floor + jump breaker + XRC
-                // fallback (docs/oracle-xrc-fallback-design.md §3.1).
-                switch (applyFreshAggregate(id, p.baseToken, agg, Time.now())) {
-                  case (#applied(_)) { _priceRefreshSuccess += 1 };
-                  // Pended by the circuit breaker (acceptOrPendPrice logs the
-                  // edge-triggered event) or rejected below the floor with no
-                  // fresh anchor (health edges logged by refreshMultiSourcePrice).
-                  case (#pended)      { _priceRefreshFailure += 1 };
-                  case (#rejected(_)) { _priceRefreshFailure += 1 };
-                };
+    if (timersHeld()) { return };
+    let now = Time.now();
+    let ids = Iter.toArray(
+      Iter.map<(Text, AMM.Pool), Text>(Map.entries(pools), func((k, _)) { k })
+    );
+    for (id in ids.vals()) {
+      switch (Map.get(pools, Text.compare, id)) {
+        case null {};
+        case (?p) {
+          if (p.enabled) {
+            let age = now - p.refPriceUpdatedNs;
+            if (p.refPrice == 0 or age >= PRICE_STALE_AFTER_NS) {
+              // A pool already waiting on an open fleet for this asset needs
+              // no second one (the tick's own dedup — the per-asset join).
+              let waiting = switch (Map.get(_fetchInFlight, Text.compare, id)) {
+                case (?d) { now - d < PRICE_FANOUT_DEADLINE_NS };
+                case null { false };
+              };
+              if (not waiting) {
+                // H-23: the dispatch clock is this pool's release reference if
+                // the mark applies, and the in-flight stamp lets the commit lock
+                // cover this fetch too. A JOIN takes the open fan-out's clock.
+                let (f, created) = openPriceFanout(p.baseToken, id, #tick, now, true);
+                Map.add(_fetchInFlight, Text.compare, id, f.dispatchNs);
+                if (created) { await* firePriceFanout(f) };
               };
             };
           };
         };
       };
-    } catch (_) {
-      _priceRefreshFailure += 1;
-    } finally {
-      // `finally`, not a bare statement after the try/catch. Motoko's `catch`
-      // only intercepts thrown Errors, not traps, and an early `return` skips a
-      // trailing statement entirely — either path used to leave this transient
-      // flag latched TRUE, which silently disables the periodic price refresh
-      // until the next upgrade. tickShipEvents already uses this idiom.
-      _priceRefreshInFlight := false;
     };
   };
 
-  // (tickPriceRefresh is now dispatched by the heartbeat, not a timer.)
+  // (tickPriceRefresh is dispatched by the heartbeat, not a timer.)
 
   // Force an immediate requote — useful for admin testing / manual
   // intervention if an external price feed failed.
@@ -16150,18 +21314,24 @@ persistent actor Uplands {
     switch (AMM.getPool(pools, marketId)) {
       case null { #err("No AMM pool for " # marketId) };
       case (?p) {
-        let updated = ammRequote(p);
+        let updated = ammRequote(p, true);
         AMM.putPool(pools, updated);
         #ok(updated.activeBidIds.size() + updated.activeAskIds.size());
       };
     };
   };
 
-  public query func getAmmPools() : async [AMM.Pool] {
+  // Both hand out the stored AMM.Pool directly: the fossil
+  // protectionWindowSec was dropped from the persisted record by the sixth
+  // one-shot migration (task 1788744109), so the apiVersion 6.0.0
+  // projection (AMM.PoolView minus the field, AMM.toView) collapsed back
+  // into Pool. AMM.PoolView is now an alias of Pool — kept because it is the
+  // published Candid's record name, so the contract is byte-identical.
+  public query func getAmmPools() : async [AMM.PoolView] {
     AMM.allPools(pools);
   };
 
-  public query func getAmmPool(marketId : Types.MarketId) : async ?AMM.Pool {
+  public query func getAmmPool(marketId : Types.MarketId) : async ?AMM.PoolView {
     AMM.getPool(pools, marketId);
   };
 
@@ -16340,114 +21510,117 @@ persistent actor Uplands {
   // so the old setVaultTargetWeights / setVaultIncentiveK admin knobs are gone.)
 
   // ── Phase 3: LP deposit / withdraw ──────────────────────────
-  // `seedAmmPool` (above) is the general deposit path: any user can
-  // call it to add liquidity at the current pool ratio and receive
-  // proportional LP tokens. The withdraw path below burns LP tokens
-  // and returns the depositor's pro-rata share of the pool's current
-  // base + quote holdings (which will differ from what they deposited
-  // if the pool has rebalanced through trading since).
+  // The public doors are `depositLp` / `withdrawLp` further down — STAGED
+  // requests since apiVersion 6.0.0 (task 1788731608, the operator ruling of
+  // task 1788503312): the reply is the request, and the mint / redemption
+  // settles through performLpDeposit / performLpWithdraw at the first NAV
+  // whose basket marks ALL postdate it. `seedAmmPool` (above, controller-
+  // only) is the one immediate door, for the seed scripts.
   //
-  // A pending match that hasn't finalised yet is NOT counted in the
-  // pool's withdrawable balance — those funds are locked until the
-  // match resolves. We error out if the LP holder's share of reserved
+  // Funds reserved against the AMM principal are NOT counted in the
+  // pool's withdrawable balance (none are today — the one reserver, the
+  // pending-match path, is retired). We error out if the LP holder's share of reserved
   // funds exceeds available balance, asking them to try again later.
 
-  // Alias — the `seed` terminology is misleading after the first call.
-  public shared (msg) func depositLp(
-    marketId : Types.MarketId,
-    baseAmount : Nat,
-    quoteAmount : Nat,
-  ) : async { #ok : Nat; #err : Text } {
-    requireAuth(msg.caller);
-    ensureInit<system>();
-    // Call the helper directly (NOT `await seedAmmPool` — that self-call
-    // would make the depositor the canister itself).
-    performLpDeposit(msg.caller, marketId, baseAmount, quoteAmount)
-  };
-
-  // Burns LP and returns the depositor's pro-rata share of the entire
-  // vault basket — BTC, ETH, ICP, AND ICPUSD — at the current ratio,
-  // net of LP_EXIT_FEE_BPS (retained by the vault for remaining LPs).
-  // No marketId argument: with the unified vault there's only one LP
-  // pool. If the basket can't be sent because some leg is reserved
-  // against in-flight pending matches, the call refuses cleanly so
-  // the caller can retry.
-  public shared (msg) func withdrawLp(
-    lpAmount : Nat,
-  ) : async { #ok : VaultBasket; #err : Text } {
-    requireAuth(msg.caller);
-    ensureInit<system>();
+  // The redemption itself: burns LP and pays its NAV value — held basket +
+  // loan book − arrears, per share, the same figure deposits mint at — IN
+  // KIND from the entire held basket (BTC, ETH, SOL, ICP, ICPUSD at the
+  // current ratio), net of LP_EXIT_FEE_BPS (retained by the vault for
+  // remaining LPs). Capped by the caller's pro-rata share of the HELD basket
+  // (their instant liquidity; getMaxInstantWithdraw quotes it) — a request
+  // past the cap is refused naming the cap, and the un-redeemed shares stay
+  // the caller's, redeemable as the vault's margin loans repay. No marketId
+  // argument: with the unified vault there's only one LP pool. If the
+  // basket can't be sent because some leg is reserved, the call refuses
+  // cleanly so the caller can retry. Task 1788503312 factored it out of the
+  // then-immediate withdrawLp (performLpDeposit's shape); since 6.0.0 it is
+  // reached ONLY from settleStagedLp, at the request's post-request marks.
+  // Await-free (hygiene §8b; its own helpers are listed there).
+  func performLpWithdraw(owner : Principal, lpAmount : Nat) : { #ok : VaultBasket; #err : Text } {
     if (lpAmount == 0) { return #err("Amount must be positive") };
     if (vaultLPSupply == 0) { return #err("Vault is empty") };
-    let have = getVaultLp(msg.caller);
+    let have = getVaultLp(owner);
     if (have < lpAmount) { return #err("Insufficient LP balance") };
+    // Shares a staged withdrawal has reserved cannot be redeemed twice: the
+    // settlement pass releases the reservation just before it calls here.
+    let reservedLp = lpReservedOf(owner);
+    if (reservedLp > 0 and have < reservedLp + lpAmount) {
+      return #err("Insufficient unreserved LP balance: " # r6n(reservedLp) # " LP are reserved by your staged withdrawal (see getMyStagedLpRequests) — it settles at the next fresh mark");
+    };
     // W5-23: the wallet-era debt guard (C2) that stood here was dead code —
-    // only pool principals ever hold loans, and a pool cannot be msg.caller.
+    // only pool principals ever hold loans, and a pool cannot be owner.
     // The invariant at MarginEngine.open enforces that permanently.
 
     let amm = ammPrincipal();
-    // Pro-rata basket via mulDiv (held × lpAmount / supply), rounded DOWN,
-    // then scaled by (1 − LP_EXIT_FEE_BPS): the withheld slice stays in the
-    // vault, accruing to remaining LPs. (The burn below still removes the FULL
-    // lpAmount and its full cost-basis slice, so the fee shows up as a gain
-    // for those who stay, not as phantom basis.)
+    // REDEEMED AT NAV, PAID FROM HOLDINGS, CAPPED BY LIQUIDITY (operator
+    // decision 2026-09-03, task 1788465539 — replaces the "loan-book
+    // undershoot"). Every share redeems at valuePerLP = NAV / supply, the SAME
+    // figure a deposit is minted at: NAV = held basket + loan book − insurance
+    // arrears (currentVaultValue). So a deposit-then-withdraw round trip is
+    // exactly −fee by construction on every axis — the loan book is neither
+    // forfeited to the stayers (the pre-2026-09-03 defect: an exiter at 50%
+    // utilisation received half of NAV per share, permanently) nor paid out
+    // before it is collected, and the arrears liability is deducted ONCE,
+    // inside NAV (GHSA-3j44's separate W spreading is subsumed: mint and
+    // redeem read the same number).
     //
-    // PAID FROM HOLDINGS, NOT FROM NAV. currentVaultValue counts the loan book
-    // as an asset (it is one — see vaultLentOutUsd), but a loan cannot be paid
-    // out in kind, so an exit takes a slice of what the vault physically HOLDS
-    // and leaves its share of the receivable behind for whoever stays. While
-    // utilisation is non-zero that makes valuePerLP an upper bound on what a
-    // redemption actually returns — the standard liquidity mismatch of any
-    // lending vault, and deliberately the SAFE direction: the vault can never
-    // pay out value it has not yet collected. Making exits whole against NAV
-    // would need a redemption queue or a utilisation haircut, which is a
-    // product decision, not an accounting one.
+    // A loan cannot be handed out in kind, so what the vault can pay INSTANTLY
+    // is bounded by what it physically HOLDS — and that liquidity is shared
+    // PRO RATA: a caller's instant cap is their own share of the held basket
+    // (VaultMath.withinInstantCap: lpAmount × NAV ≤ lpBal × H, exact). A
+    // request past the cap is refused, naming the cap and the reason; nothing
+    // is clamped or queued. The shares the caller does not redeem stay theirs,
+    // keep earning exactly like every other share (one share class), and
+    // become redeemable as repayments raise holdings — the constraint is the
+    // TIMING of withdrawals, not a loss of equity. No first-come drain of the
+    // cash is possible: the first exiter can take only their share of it.
+    // The basket legs are the held quantities scaled by payout / holdings
+    // (VaultMath.redeemLeg, one mulDiv, floor) — with zero utilisation and no
+    // arrears that is exactly the classic pro-rata basket × keepBps.
     let btcHeld    = Accounts.getBalance(accounts, amm, "BTC");
     let ethHeld    = Accounts.getBalance(accounts, amm, "ETH");
     let solHeld    = Accounts.getBalance(accounts, amm, "SOL");
     let icpHeld    = Accounts.getBalance(accounts, amm, "ICP");
     let icpusdHeld = Accounts.getBalance(accounts, amm, Types.QUOTE_TOKEN);
     let keepBps : Nat = 10_000 - LP_EXIT_FEE_BPS;
-    // THE ARREARS HAIRCUT IS APPLIED ACROSS THE WHOLE BASKET, NOT THE CASH LEG.
-    // currentVaultValue haircuts NAV by insuranceOwedUsd (penalties the vault
-    // owes the insurance fund), so the MINT prices against the reduced figure —
-    // but redemption read gross holdings and ignored that liability. That FLIPS
-    // the sign of the loan-book asymmetry documented above: the loan book makes
-    // redemption <= fair (safe), whereas ignoring a liability the mint counted
-    // makes it > fair. A deposit-then-withdraw round trip while arrears were
-    // outstanding came out net-positive, funded by the LPs who stayed.
-    //
-    // The predecessor fix (62c53e6) deducted the exiter's arrears share from the
-    // CASH leg alone, but `settleInsuranceArrears` pays min(W, cash) so the
-    // reachable persistent-arrears state has cash ≈ 0 — the cash-leg deduction
-    // then lands on an empty leg and vanishes (GHSA-3j44 / #48.3). And that
-    // share, subtracted BEFORE netLeg's own ×(lpAmount/supply), was prorated by
-    // the exiter's fraction f a SECOND time (W·f² not W·f).
-    //
-    // Instead spread the FULL arrears W across the whole HELD basket: the payout
-    // is the post-fee holdings value keepBps·H minus W, pro-rated to the exiter
-    // by netLeg's ×f. holdingsUsd is what the vault physically HOLDS (no loan
-    // book — a redemption is paid in kind and cannot include a receivable), the
-    // same value redemption already pays from, so mint (NAV) and redeem now
-    // agree on the arrears axis while the intentional loan-book undershoot is
-    // preserved. Each exiter bears exactly W·f: basket value = f·(keepBps·H − W),
-    // so f·W is left behind for the stayers — the mirror of the mint-side NAV
-    // haircut. This makes the round trip <= 0 BY CONSTRUCTION (payout <= f·NAV),
-    // not by tuning, and no longer depends on the cash leg being non-empty.
-    let holdingsUsd = Fixed.mul(btcHeld, poolRefPrice("BTC-ICPUSD"), false)
-                    + Fixed.mul(ethHeld, poolRefPrice("ETH-ICPUSD"), false)
-                    + Fixed.mul(solHeld, poolRefPrice("SOL-ICPUSD"), false)
-                    + Fixed.mul(icpHeld, poolRefPrice("ICP-ICPUSD"), false)
-                    + icpusdHeld;
-    // keepBps·H − W, clamped at 0 (arrears exceeding post-fee holdings zero the
-    // payout: the exiter's holdings share is fully consumed by what it owes).
-    let arrearsNum : Nat = SafeMath.subOrZero(
-      Fixed.mulDiv(holdingsUsd, keepBps, 10_000, false), insuranceOwedUsd);
-    // held × (lpAmount/supply) × arrearsNum / H. With W = 0, arrearsNum = keepBps·H
-    // and H cancels → held × f × keepBps, exactly the pre-arrears net basket.
+    let holdingsUsd = vaultHoldingsUsd();
+    // Redeem on a FRESH provision (task 1788475754): an exiter must not escape
+    // an expected loss the cache has not yet seen.
+    refreshVaultImpairment(false);   // priced as BOOKED, no accrual: an LP's own message never moves the NAV they were quoted at (1788736589)
+    let vv = currentVaultValue();
+    let navUsd = vv.totalQuoteValue;
+    // MARK GATE (task 1788513125), the mirror of performLpDeposit's
+    // vaultPricesStale: while NAV != holdings the exiter's loan-book claim is
+    // paid as an extra slice of the held basket at the CURRENT marks, so a
+    // held leg that is unpriced, pended by the circuit breaker, or stale
+    // would settle that slice at a price the market has left. Refused before
+    // the cap is even quoted (the cap text prices at the same marks). At
+    // NAV == holdings the marks cancel and the exit stays ungated — see
+    // vaultWithdrawPaused for the argument.
+    switch (vaultWithdrawPaused(Time.now(), vv, holdingsUsd)) { case (?e) { return #err(e) }; case null {} };
+    // LOCKED SHARES (task 1788475756): settle the lazy repayment detection
+    // first — and refresh the snapshot the lock written below is measured
+    // against — then cap by the caller's UNLOCKED shares' slice of the cash
+    // the unlocked shares hold (VaultLock.withinCap: lpAmount × NAV × (S − Λ)
+    // ≤ (lpBal − ℓ) × H × S, exact). With no locks that is the stateless cap
+    // above, byte for byte; after this caller's own max exit it is 0 until a
+    // repayment, however often they call.
+    settleVaultLocks(holdingsUsd, navUsd);
+    let myLock = vaultLockOf(owner, vaultLockScale, have);
+    let lockedTotal = VaultLock.totalLock(vaultLockRawSum, vaultLockScale, vaultLPSupply);
+    if (not VaultLock.withinCap(lpAmount, have, myLock, vaultLPSupply, lockedTotal, holdingsUsd, navUsd)) {
+      let capLp   = VaultLock.capLp(have, myLock, vaultLPSupply, lockedTotal, holdingsUsd, navUsd);
+      let capUsd  = VaultLock.capUsd(have, myLock, vaultLPSupply, lockedTotal, holdingsUsd, keepBps);
+      let myNav   = VaultMath.navValue(have, vaultLPSupply, navUsd);
+      let myHeld  = VaultLock.capUsd(have, myLock, vaultLPSupply, lockedTotal, holdingsUsd, 10_000);
+      let myLent  = SafeMath.subOrZero(myNav, myHeld);
+      return #err("Withdrawal exceeds your instant liquidity: $" # r2n(myLent) # " of your $" # r2n(myNav)
+        # " vault value is lent out to margin pools and becomes withdrawable as those loans repay. Withdrawable now: $"
+        # r2n(capUsd) # " net of the exit fee (" # r6n(capLp) # " of your " # r6n(have)
+        # " LP). Your remaining shares keep their full value and keep earning.");
+    };
     func netLeg(held : Nat) : Nat {
-      if (holdingsUsd == 0) { return 0 };
-      Fixed.mulDiv(Fixed.mulDiv(held, lpAmount, vaultLPSupply, false), arrearsNum, holdingsUsd, false);
+      VaultMath.redeemLeg(held, lpAmount, vaultLPSupply, navUsd, holdingsUsd, keepBps);
     };
     let basket : VaultBasket = {
       btc    = netLeg(btcHeld);
@@ -16456,10 +21629,25 @@ persistent actor Uplands {
       icp    = netLeg(icpHeld);
       icpusd = netLeg(icpusdHeld);
     };
+    // ZERO-BASKET GUARD (#54.6) — the mirror of performLpDeposit's zero-mint
+    // refusal. Three inputs floor EVERY leg to 0: dust (one LP unit against a
+    // large vault), holdingsUsd == 0 with tokens held, and the arrears
+    // saturation NAV == 0 (insuranceOwedUsd ≥ H + L — the cascade state the
+    // fund exists for). Pre-guard the burn still went through: the exiter's
+    // shares (worth f·NAV on the Earn card) were removed for a basket of
+    // nothing, the cost basis rescaled, and a permanent #lpWithdraw row with
+    // an all-zero basket was written. Refuse instead, before anything mutates:
+    // the caller keeps shares that still carry NAV, so nothing is trapped — this
+    // fires ONLY on an exactly-zero basket, never on a small one (a minimum
+    // notional on exits is the rejected alternative).
+    if (basket.btc == 0 and basket.eth == 0 and basket.sol == 0
+     and basket.icp == 0 and basket.icpusd == 0) {
+      return #err("Withdrawal too small: at the current vault value this would pay out 0 of every basket token, so you would burn LP shares and receive nothing for them. Withdraw more, or wait for the vault's insurance arrears to clear.");
+    };
 
-    // Guard: refuse to send funds reserved against pending matches.
-    // The AMM may be holding inventory that's locked into a pending
-    // taker-fill flow; sending it now would underflow at finalisation.
+    // Guard: refuse to send funds reserved against the AMM principal
+    // (defensive — nothing reserves against it since the pending-match
+    // path was retired; a reservation here would mean a new mover).
     func availOf(token : Text, held : Nat) : Nat {
       let r = getReserved(amm, token); if (held > r) { held - r } else { 0 }
     };
@@ -16468,15 +21656,25 @@ persistent actor Uplands {
      or basket.sol    > availOf("SOL",              solHeld)   
      or basket.icp    > availOf("ICP",              icpHeld)   
      or basket.icpusd > availOf(Types.QUOTE_TOKEN,  icpusdHeld)) {
-      return #err("AMM has reserved funds in pending matches; retry shortly");
+      return #err("AMM has reserved funds; retry shortly");
     };
 
+    // H-32: dust = the redeemed NAV is under the bar and shares remain (a full
+    // exit is genuine at any size). Decided before the burn moves anything;
+    // the journal mark j0 is read before the first leg below.
+    let dust = lpAmount < have and VaultMath.navValue(lpAmount, vaultLPSupply, navUsd) < EXIT_DUST_USD;
+    let j0 = List.size(accounts.journal);
     // Burn LP first so concurrent withdraws can't double-spend.
     let supplyBefore = vaultLPSupply;
-    if (not subVaultLp(msg.caller, lpAmount)) {
+    if (not subVaultLp(owner, lpAmount)) {
       return #err("LP burn failed");
     };
     vaultLPSupply := if (vaultLPSupply > lpAmount) { vaultLPSupply - lpAmount } else { 0 };
+    // LOCK the exiter's remaining shares (task 1788475756): Δℓ = (S − Λ)·x·
+    // NAV/(S·H) − x on the PRE-exit figures, so every other LP's cash
+    // entitlement is exactly what it was (the fee the vault keeps lands on
+    // their unlocked shares) and a max exit leaves this caller fully locked.
+    vaultLockWrite(owner, VaultLock.lockAfterExit(have, myLock, lpAmount, supplyBefore, lockedTotal, holdingsUsd, navUsd));
     // Remove the withdrawer's proportional slice of the cost basis (basis ×
     // (supply − lpAmount)/supply) so an honest proportional exit is neutral for
     // the remaining LPs.
@@ -16486,32 +21684,415 @@ persistent actor Uplands {
     // available-balance guard above already covered it.
     if (basket.btc > 0) {
       ignore Accounts.subtractBalance(accounts, amm, "BTC", basket.btc);
-      Accounts.addBalance(accounts, msg.caller, "BTC", basket.btc);
+      Accounts.addBalance(accounts, owner, "BTC", basket.btc);
     };
     if (basket.eth > 0) {
       ignore Accounts.subtractBalance(accounts, amm, "ETH", basket.eth);
-      Accounts.addBalance(accounts, msg.caller, "ETH", basket.eth);
+      Accounts.addBalance(accounts, owner, "ETH", basket.eth);
     };
     if (basket.sol > 0) {
       ignore Accounts.subtractBalance(accounts, amm, "SOL", basket.sol);
-      Accounts.addBalance(accounts, msg.caller, "SOL", basket.sol);
+      Accounts.addBalance(accounts, owner, "SOL", basket.sol);
     };
     if (basket.icp > 0) {
       ignore Accounts.subtractBalance(accounts, amm, "ICP", basket.icp);
-      Accounts.addBalance(accounts, msg.caller, "ICP", basket.icp);
+      Accounts.addBalance(accounts, owner, "ICP", basket.icp);
     };
     if (basket.icpusd > 0) {
       ignore Accounts.subtractBalance(accounts, amm, Types.QUOTE_TOKEN, basket.icpusd);
-      Accounts.addBalance(accounts, msg.caller, Types.QUOTE_TOKEN, basket.icpusd);
+      Accounts.addBalance(accounts, owner, Types.QUOTE_TOKEN, basket.icpusd);
     };
 
-    // Permanent history: burning LP for the basket is a redemption event.
-    emitEvent(msg.caller, null, #lpWithdraw {
-      lpBurned = lpAmount;
-      basket = [("BTC", basket.btc), ("ETH", basket.eth), ("SOL", basket.sol),
+    // GHSA-h888: the exit-fee slice stays behind "for the remaining LPs" —
+    // but on the FINAL exit there are none, and value left in the vault at
+    // zero supply is captured 1:1 by the next genesis deposit
+    // (VaultMath.mintAmount's zero-supply branch never reads vault value; the
+    // :14184 guard only covers the mirror case supply>0/value==0). Supply
+    // hitting 0 right here IS the final-exit detection — the burn above
+    // removed the full supply exactly when this exiter held all of it.
+    // Settle insurance arrears first (this residue is the last vault cash
+    // that can ever pay them), then route what remains to the treasury, so
+    // supply → 0 implies value → 0 and the existing (0,0) genesis anchor
+    // stays safe. Reserved legs stay put (the available-balance guard
+    // above kept them out of the basket for the same reason). The mirror
+    // sweep in performLpDeposit catches value that RE-ENTERS after this one
+    // (loan repayments, failed matches un-reserving the legs left here).
+    // H-32: a dust redemption inside the caller's exit window coalesces its
+    // up-to-ten #delta legs and its #lpWithdraw into the window — decided and
+    // folded BEFORE the zero-supply sweep below, whose treasury rows are the
+    // sweep's, not the exit's, and stay live. Otherwise the rows write live.
+    let basketRows : [(Types.TokenId, Nat)] = [("BTC", basket.btc), ("ETH", basket.eth), ("SOL", basket.sol),
                 ("ICP", basket.icp), (Types.QUOTE_TOKEN, basket.icpusd)];
-    });
+    let folds = exitFolds(owner, Time.now(), dust);
+    if (folds) { foldDustExit(owner, j0, #lp(lpAmount, basketRows)) };
+    if (vaultLPSupply == 0) { sweepZeroSupplyVaultToTreasury() };
+
+    // Permanent history: burning LP for the basket is a redemption event.
+    if (not folds) {
+      emitEvent(owner, null, #lpWithdraw { lpBurned = lpAmount; basket = basketRows });
+    };
     #ok(basket);
+  };
+
+  // ── Sealed LP requests — the staged path (task 1788503312) ──────────
+  // State + types sit beside deferredSwaps; the model is in
+  // docs/amm-vault-design.md §5 "Sealed LP requests". The markets a request
+  // waits on: every HELD basket leg's market (the set vaultHeldLegMarkIssue
+  // gates) plus, for a deposit, its own market (its base leg is priced at
+  // that mark whether or not the vault holds the asset yet). ICPUSD has no
+  // mark. Recomputed at every pass — the held set can move while it waits.
+  transient let VAULT_LEG_MARKETS : [(Text, Text)] = [("BTC", "BTC-ICPUSD"), ("ETH", "ETH-ICPUSD"), ("SOL", "SOL-ICPUSD"), ("ICP", "ICP-ICPUSD")];
+  func stagedLpMarkets(kind : StagedLpKind, vv : VaultValue) : [Text] {
+    let out = List.empty<Text>();
+    for ((asset, market) in VAULT_LEG_MARKETS.vals()) {
+      if (vaultAssetBalance(vv, asset) > 0) { List.add(out, market) };
+    };
+    switch (kind) {
+      case (#deposit(d)) {
+        var present = false;
+        for (m in List.values(out)) { if (m == d.marketId) { present := true } };
+        if (not present) { List.add(out, d.marketId) };
+      };
+      case (#withdraw(_)) {};
+    };
+    List.toArray(out);
+  };
+  // The markets that have NOT yet postdated the request. A market is fresh
+  // for R once a fetch DISPATCHED after R.ts has applied its mark
+  // (releaseRefs — H-23's dispatch clock, never refPriceUpdatedNs; #dev's
+  // setAmmRefPrice stamps it like a fetch, so the sealed suites' re-stamp
+  // idiom releases these too). Empty = settles on the next pass.
+  func stagedLpWaitingOn(r : StagedLpStored, vv : VaultValue) : [Text] {
+    let out = List.empty<Text>();
+    for (m in stagedLpMarkets(r.kind, vv).vals()) {
+      if (releaseRefOf(m).dispatchNs <= r.ts) { List.add(out, m) };
+    };
+    List.toArray(out);
+  };
+  // A breaker pend on any market the request waits on: that mark is frozen
+  // awaiting its confirmation tick, so the request WAITS (never cancels).
+  func stagedLpPended(r : StagedLpStored, vv : VaultValue) : ?Text {
+    for (m in stagedLpMarkets(r.kind, vv).vals()) {
+      switch (Map.get(markets, Text.compare, m)) {
+        case (?(baseToken, _)) { if (Map.get(pendingPriceJumps, Text.compare, baseToken) != null) { return ?baseToken } };
+        case null {};
+      };
+    };
+    null;
+  };
+  // Owner cancel (task 1788731609): the staged-order commit rule, verbatim —
+  // refused inside DEFERRED_COMMIT_NS of the request's ts, and past the
+  // window while a price fetch DISPATCHED AFTER ts is still in flight for
+  // ANY market the request waits on (fetchInFlightSince — the H-23 fetch-
+  // bound lock deferredCommitReason / swapCommitReason read: a GEPTOR arm,
+  // the tick's or the admin fetch's stamp, within the arm's TTL). "Stage,
+  // watch a faster external feed, cancel if unfavourable" is the free ~1-2 s
+  // option the rule closes; the request itself arms a GEPTOR, so on a live
+  // feed the lock holds until that fetch lands — and then the request
+  // settles. The market set is stagedLpMarkets (every held leg + the
+  // deposit's own), NOT the still-to-postdate subset: a fresher mark on an
+  // already-postdated market still moves the settlement NAV, so a fetch in
+  // flight on it is the same free look. Past expiresAt the TTL owns the
+  // request (the pass cancels it before anything can settle) — cancellable,
+  // as an expired staged order is. Returns the refusal text; null = cancellable.
+  transient let STAGED_LP_COMMIT_ERR : Text =
+    "Staged LP request is committed for settlement (settles at the next fresh mark) — cancellable in a few seconds";
+  func stagedLpCancelReason(r : StagedLpStored, vv : VaultValue, now : Int) : ?Text {
+    if (now - r.ts < DEFERRED_COMMIT_NS) { return ?STAGED_LP_COMMIT_ERR };
+    if (now >= r.expiresAt) { return null };
+    for (m in stagedLpMarkets(r.kind, vv).vals()) {
+      if (fetchInFlightSince(m, r.ts, now)) {
+        return ?("Staged LP " # stagedLpKindText(r.kind) # " is committed for settlement — a price fetch for " # m
+          # " dispatched after it was staged is in flight; cancellable once that fetch lands, its guard lapses, or the request expires");
+      };
+    };
+    null;
+  };
+  func stagedLpView(r : StagedLpStored, vv : VaultValue, now : Int) : StagedLpRequest {
+    { id = r.id; kind = r.kind; ts = r.ts; expiresAt = r.expiresAt; waitingOn = stagedLpWaitingOn(r, vv); cancelRefusal = stagedLpCancelReason(r, vv, now) };
+  };
+  func stagedLpKindText(kind : StagedLpKind) : Text {
+    switch (kind) { case (#deposit(_)) { "deposit" }; case (#withdraw(_)) { "withdrawal" } };
+  };
+  func joinMarkets(ms : [Text]) : Text {
+    var t = "";
+    for (m in ms.vals()) { t := if (t == "") { m } else { t # ", " # m } };
+    t;
+  };
+  // The request ARMS the price: a GEPTOR on each market it waits on (Nagle-
+  // debounced, exactly as a cross-swap arms both its legs), so settlement is
+  // one fetch away (~1-2 s), not the 60 s per-pool feed cadence. Re-armed by
+  // the pass while the request waits, at most once per STAGED_LP_REARM_NS
+  // per request — a failing feed costs one fan-out per 15 s per market.
+  func armStagedLpGeptor(id : Nat, ms : [Text], now : Int) {
+    switch (Map.get(_stagedLpLastArm, Nat.compare, id)) {
+      case (?t) { if (now - t < STAGED_LP_REARM_NS) { return } };
+      case null {};
+    };
+    Map.add(_stagedLpLastArm, Nat.compare, id, now);
+    for (m in ms.vals()) {
+      if (Map.get(_geptorDeadline, Text.compare, m) == null) { Map.add(_geptorDeadline, Text.compare, m, now + GEPTOR_DELAY_NS) };
+    };
+  };
+  func lpReservedOf(owner : Principal) : Nat {
+    Option.get(Map.get(vaultLpReserved, Text.compare, Principal.toText(owner)), 0);
+  };
+  // Release what a request holds — the deposit legs' soft lock or the
+  // withdrawal's share reservation. Called right before settlement (the
+  // helper re-checks availability itself) and on cancellation (the refund:
+  // the funds never left the wallet, the shares never left the balance).
+  func releaseStagedLpReservation(r : StagedLpStored) {
+    switch (r.kind) {
+      case (#deposit(d)) {
+        switch (Map.get(markets, Text.compare, d.marketId)) {
+          case (?(baseToken, _)) { if (d.baseAmount > 0) { ignore subReserved(r.owner, baseToken, d.baseAmount) } };
+          case null {};
+        };
+        if (d.quoteAmount > 0) { ignore subReserved(r.owner, Types.QUOTE_TOKEN, d.quoteAmount) };
+      };
+      case (#withdraw(w)) {
+        let k = Principal.toText(r.owner);
+        let rest = SafeMath.subOrZero(lpReservedOf(r.owner), w.lpAmount);
+        if (rest > 0) { Map.add(vaultLpReserved, Text.compare, k, rest) }
+        else { ignore Map.delete(vaultLpReserved, Text.compare, k) };
+      };
+    };
+  };
+  func removeStagedLp(r : StagedLpStored) {
+    ignore Map.delete(stagedLpRequests, Nat.compare, r.id);
+    ignore Map.delete(_stagedLpLastArm, Nat.compare, r.id);
+    let k = Principal.toText(r.owner);
+    switch (r.kind) {
+      case (#deposit(_))  { if (Map.get(stagedLpDepositOf,  Text.compare, k) == ?r.id) { ignore Map.delete(stagedLpDepositOf,  Text.compare, k) } };
+      case (#withdraw(_)) { if (Map.get(stagedLpWithdrawOf, Text.compare, k) == ?r.id) { ignore Map.delete(stagedLpWithdrawOf, Text.compare, k) } };
+    };
+  };
+  // The owner's notice: the newest LP_OUTCOMES_KEEP outcomes, read back by
+  // getMyStagedLpRequests (the Earn card polls it after staging).
+  func recordLpOutcome(r : StagedLpStored, outcome : { #minted : Nat; #redeemed : VaultBasket; #cancelled : Text }, now : Int) {
+    let k = Principal.toText(r.owner);
+    let prev = Option.get(Map.get(lpRequestOutcomes, Text.compare, k), []);
+    let o : LpRequestOutcome = { id = r.id; kind = r.kind; ts = r.ts; settledNs = now; outcome };
+    let keep = List.empty<LpRequestOutcome>();
+    List.add(keep, o);
+    var j = 0;
+    while (j < prev.size() and j + 1 < LP_OUTCOMES_KEEP) { List.add(keep, prev[j]); j += 1 };
+    Map.add(lpRequestOutcomes, Text.compare, k, List.toArray(keep));
+    bumpUserVersion(r.owner);
+  };
+  // Fail-closed: nothing settled, the reservation is released, the public
+  // tape carries the row (getRecentEvents, category `vault`) and the owner's
+  // outcome list the reason. No permanent UserEventKind row: no value moved
+  // — and a new arm on that variant is a BREAKING Candid change for a return
+  // type (proved with mops check-candid, task 1788503312).
+  func cancelStagedLp(r : StagedLpStored, reason : Text, now : Int) {
+    removeStagedLp(r);
+    releaseStagedLpReservation(r);
+    recordLpOutcome(r, #cancelled(reason), now);
+    logEvent("warn", "vault", "staged LP " # stagedLpKindText(r.kind) # " #" # Nat.toText(r.id) # " cancelled — " # reason, null);
+  };
+  // Settle a READY request through the immediate path's own helper on the
+  // fresh marks: the impairment-netted NAV, the lazy lock settle and the
+  // two-bucket instant cap are all evaluated HERE, at settlement, exactly as
+  // a call made at this instant would see them — a refusal (cap exceeded,
+  // concentration cap, zero-mint dust, a leg gone unpriced) CANCELS with that
+  // text; nothing is clamped or retried. The permanent #lpDeposit /
+  // #lpWithdraw rows are the helpers' own.
+  func settleStagedLp(r : StagedLpStored, now : Int) {
+    removeStagedLp(r);
+    releaseStagedLpReservation(r);
+    switch (r.kind) {
+      case (#deposit(d)) {
+        switch (performLpDeposit(r.owner, d.marketId, d.baseAmount, d.quoteAmount)) {
+          case (#ok(minted)) { recordLpOutcome(r, #minted(minted), now) };
+          case (#err(e)) {
+            recordLpOutcome(r, #cancelled(e), now);
+            logEvent("warn", "vault", "staged LP deposit #" # Nat.toText(r.id) # " refused at settlement — " # e, null);
+          };
+        };
+      };
+      case (#withdraw(w)) {
+        switch (performLpWithdraw(r.owner, w.lpAmount)) {
+          case (#ok(b)) { recordLpOutcome(r, #redeemed(b), now) };
+          case (#err(e)) {
+            recordLpOutcome(r, #cancelled(e), now);
+            logEvent("warn", "vault", "staged LP withdrawal #" # Nat.toText(r.id) # " refused at settlement — " # e, null);
+          };
+        };
+      };
+    };
+  };
+  // The pass — inside every releasing requote (the GEPTOR's fresh-mark
+  // requote, requoteAmm) and from the finaliser: expired → cancelled +
+  // refunded (the TTL backstop); every waited-on market postdating the
+  // request and no pend → settle; otherwise re-arm the stale markets.
+  func processStagedLp(now : Int) {
+    if (Map.size(stagedLpRequests) == 0) { return };
+    var vv = currentVaultValue();
+    let snapshot = Iter.toArray(Map.values(stagedLpRequests));
+    for (r in snapshot.vals()) {
+      let waiting = stagedLpWaitingOn(r, vv);
+      if (now >= r.expiresAt) {
+        let ttlSec = Nat.toText(Int.abs(STAGED_LP_TTL_NS / 1_000_000_000));
+        let why = if (waiting.size() > 0) {
+          "no fresh marks for " # joinMarkets(waiting) # " within " # ttlSec # " s — the price feed stalled"
+        } else {
+          "a circuit-breaker pend held the basket marks for " # ttlSec # " s"
+        };
+        cancelStagedLp(r, why # "; nothing settled, funds released", now);
+      } else if (waiting.size() == 0) {
+        if (stagedLpPended(r, vv) == null) {
+          settleStagedLp(r, now);
+          vv := currentVaultValue();   // the held set moved
+        };
+      } else {
+        armStagedLpGeptor(r.id, waiting, now);
+      };
+    };
+  };
+
+  // THE LP deposit door (apiVersion 6.0.0 — task 1788731608 renamed the
+  // 5.1.0 `stageLpDeposit` onto it, no alias kept): funds reserved now,
+  // minted at the first NAV whose basket marks all postdate this call. The
+  // reply is the REQUEST (poll getMyStagedLpRequests for the outcome). The
+  // request-time refusals are the cheap ones; everything the settlement-time
+  // state decides is decided then. Await-free (hygiene §8b) — the settlement
+  // itself runs in the heartbeat / requote continuation, never here.
+  public shared (msg) func depositLp(
+    marketId : Types.MarketId,
+    baseAmount : Nat,
+    quoteAmount : Nat,
+  ) : async { #ok : StagedLpRequest; #err : Text } {
+    requireAuth(msg.caller);
+    ensureInit<system>();
+    switch (sealingRefusal()) { case (?e) { return #err(e) }; case null {} };
+    if (baseAmount == 0 and quoteAmount == 0) { return #err("Nothing to deposit") };
+    let pool = switch (AMM.getPool(pools, marketId)) {
+      case null { return #err("No AMM pool for " # marketId) };
+      case (?p) { p };
+    };
+    if (pool.refPrice == 0) {
+      return #err("Pool refPrice not set; call setAmmRefPrice first so deposit value can be priced");
+    };
+    let k = Principal.toText(msg.caller);
+    switch (Map.get(stagedLpDepositOf, Text.compare, k)) {
+      case (?id) { return #err("A staged LP deposit (#" # Nat.toText(id) # ") is already pending — it settles at the next fresh mark") };
+      case null {};
+    };
+    if (baseAmount > 0 and getAvailable(msg.caller, pool.baseToken) < baseAmount) {
+      return #err("Insufficient available " # pool.baseToken # " (staged orders reserve balance)");
+    };
+    if (quoteAmount > 0 and getAvailable(msg.caller, Types.QUOTE_TOKEN) < quoteAmount) {
+      return #err("Insufficient available " # Types.QUOTE_TOKEN # " (staged orders reserve balance)");
+    };
+    let now = Time.now();
+    if (baseAmount > 0) { addReserved(msg.caller, pool.baseToken, baseAmount) };
+    if (quoteAmount > 0) { addReserved(msg.caller, Types.QUOTE_TOKEN, quoteAmount) };
+    let id = nextStagedLpId;
+    nextStagedLpId += 1;
+    let r : StagedLpStored = { id; owner = msg.caller; kind = #deposit({ marketId; baseAmount; quoteAmount }); ts = now; expiresAt = now + STAGED_LP_TTL_NS };
+    Map.add(stagedLpRequests, Nat.compare, id, r);
+    Map.add(stagedLpDepositOf, Text.compare, k, id);
+    let vv = currentVaultValue();
+    armStagedLpGeptor(id, stagedLpMarkets(r.kind, vv), now);
+    bumpUserVersion(msg.caller);
+    #ok(stagedLpView(r, vv, now));
+  };
+
+  // THE LP withdrawal door (apiVersion 6.0.0 — the 5.1.0 `stageLpWithdraw`
+  // renamed onto it, no alias kept): shares reserved now, redeemed at the
+  // first NAV whose basket marks all postdate this call (the instant cap is
+  // evaluated then). getMaxInstantWithdraw is unmoved until settlement. A
+  // member of EXIT_METHOD_SET (inspect admits it at every load floor —
+  // staging an exit IS the exit a shed LP needs), and await-free (§8b).
+  public shared (msg) func withdrawLp(lpAmount : Nat) : async { #ok : StagedLpRequest; #err : Text } {
+    requireAuth(msg.caller);
+    ensureInit<system>();
+    if (lpAmount == 0) { return #err("Amount must be positive") };
+    if (vaultLPSupply == 0) { return #err("Vault is empty") };
+    let k = Principal.toText(msg.caller);
+    switch (Map.get(stagedLpWithdrawOf, Text.compare, k)) {
+      case (?id) { return #err("A staged LP withdrawal (#" # Nat.toText(id) # ") is already pending — it settles at the next fresh mark") };
+      case null {};
+    };
+    let have = getVaultLp(msg.caller);
+    let reservedLp = lpReservedOf(msg.caller);
+    if (have < reservedLp + lpAmount) { return #err("Insufficient LP balance") };
+    let now = Time.now();
+    Map.add(vaultLpReserved, Text.compare, k, reservedLp + lpAmount);
+    let id = nextStagedLpId;
+    nextStagedLpId += 1;
+    let r : StagedLpStored = { id; owner = msg.caller; kind = #withdraw({ lpAmount }); ts = now; expiresAt = now + STAGED_LP_TTL_NS };
+    Map.add(stagedLpRequests, Nat.compare, id, r);
+    Map.add(stagedLpWithdrawOf, Text.compare, k, id);
+    let vv = currentVaultValue();
+    armStagedLpGeptor(id, stagedLpMarkets(r.kind, vv), now);
+    bumpUserVersion(msg.caller);
+    #ok(stagedLpView(r, vv, now));
+  };
+
+  // Owner cancel under the staged-order commit rule (task 1788731609;
+  // stagedLpCancelReason above): committed for its first DEFERRED_COMMIT_NS
+  // and, past that, while a post-request fetch for any market it waits on
+  // is in flight; otherwise it cancels exactly as the TTL backstop does —
+  // reservation released (the refund is the reservation ONLY: a withdrawal's
+  // locked shares are never touched, the funds never left the wallet), the
+  // owner's #cancelled outcome, the public `vault` tape row. Ownership
+  // first, commitment second (cancelMyOrder's rule: a non-owner probe must
+  // not learn the request's commit phase). An EXIT (inspect's
+  // EXIT_METHOD_SET): it releases the owner's own reservation and nothing
+  // else — the argument that put the staged-order cancels in the set — and
+  // for the same reason it carries no season latch (sealingRefusal).
+  public shared (msg) func cancelStagedLpRequest(requestId : Nat) : async { #ok; #err : Text } {
+    requireAuth(msg.caller);
+    let r = switch (Map.get(stagedLpRequests, Nat.compare, requestId)) {
+      case null { return #err("Staged LP request not found") };
+      case (?r) { r };
+    };
+    if (not Principal.equal(r.owner, msg.caller)) { return #err("Not your staged LP request") };
+    let now = Time.now();
+    switch (stagedLpCancelReason(r, currentVaultValue(), now)) { case (?e) { return #err(e) }; case null {} };
+    cancelStagedLp(r, "cancelled by owner", now);
+    #ok;
+  };
+
+  // Caller-scoped: the pending requests (with the markets still to postdate
+  // them) and the newest LP_OUTCOMES_KEEP outcomes.
+  public query (msg) func getMyStagedLpRequests() : async StagedLpView {
+    let k = Principal.toText(msg.caller);
+    let vv = currentVaultValue();
+    let now = Time.now();
+    let pending = List.empty<StagedLpRequest>();
+    for (slot in [Map.get(stagedLpDepositOf, Text.compare, k), Map.get(stagedLpWithdrawOf, Text.compare, k)].vals()) {
+      switch (slot) {
+        case (?id) {
+          switch (Map.get(stagedLpRequests, Nat.compare, id)) {
+            case (?r) { List.add(pending, stagedLpView(r, vv, now)) };
+            case null {};
+          };
+        };
+        case null {};
+      };
+    };
+    { pending = List.toArray(pending); recent = Option.get(Map.get(lpRequestOutcomes, Text.compare, k), []) };
+  };
+
+  // Ops/test: run the staged-LP pass now (normally driven by the releasing
+  // requotes and the finaliser) — with timers paused it is the only driver.
+  public shared (msg) func adminRunStagedLp() : async () {
+    requireController(msg.caller);
+    processStagedLp(Time.now());
+  };
+
+  // Test hook (#dev): force a staged LP request's TTL so the outage backstop
+  // (cancel + refund) is pinned without waiting out five minutes.
+  public shared (msg) func setTestStagedLpExpiry(requestId : Nat, expiresAtNs : Int) : async () {
+    requireController(msg.caller);
+    requireDevHook("setTestStagedLpExpiry");
+    switch (Map.get(stagedLpRequests, Nat.compare, requestId)) {
+      case (?r) { Map.add(stagedLpRequests, Nat.compare, requestId, { r with expiresAt = expiresAtNs }) };
+      case null {};
+    };
   };
 
   // ── LP position & pool-value queries ────────────────────────
@@ -16635,18 +22216,140 @@ persistent actor Uplands {
     };
   };
 
+  // The caller's instant liquidity (task 1788465539). withdrawLp redeems at
+  // NAV but pays from what the vault physically HOLDS, so the most a caller
+  // can take NOW is their pro-rata share of the held basket (net of the exit
+  // fee); the remainder of their NAV is their share of the loan book, which
+  // becomes withdrawable as margin loans repay. The vault-level figures let a
+  // PROSPECTIVE depositor see, before depositing, what fraction of a deposit
+  // of V would be instantly withdrawable: (vaultHoldingsUsd + V) ×
+  // (1 − exitFeeBps/10⁴) / (vaultNavUsd + V) — their cash becomes part of the
+  // pool's shared liquidity (F6, informed consent). All USD at 10^8;
+  // lentOutFraction is 0..1 at 10^8 (vault loan book / vault assets);
+  // exitFeeBps is in bps.
+  public type MaxInstantWithdraw = {
+    withdrawableNowUsd : Nat;   // net of the exit fee — what withdrawLp would pay today at most
+    withdrawableNowLp  : Nat;   // the largest lpAmount withdrawLp accepts right now
+    totalNavUsd        : Nat;   // the caller's shares at NAV (gross, before the exit fee)
+    lpBalance          : Nat;
+    lentOutFraction    : Nat;   // vault loan book / (held + loan book), 0..1 at 10^8
+    vaultHoldingsUsd   : Nat;   // what the vault physically holds, at marks
+    vaultLentOutUsd    : Nat;   // the loan book (principal, at marks)
+    vaultNavUsd        : Nat;   // held + (loan book − impairment reserve) − insurance arrears
+    exitFeeBps         : Nat;
+    // Task 1788475754 — the mark-down disclosed, not hidden: the vault-level
+    // expected-loss reserve NAV already deducts, and the caller's pro-rata
+    // share of it (how much lower their NAV is than the loan book's face).
+    vaultImpairmentReserveUsd : Nat;
+    provisionedLossUsd        : Nat;
+    // Task 1788513125 — the redeem-side mark gate, disclosed: the exact text
+    // withdrawLp would refuse with RIGHT NOW (a held leg unpriced / pended /
+    // stale while NAV != holdings), else null. The figures above keep
+    // quoting through a pause (they are the marks the pause is about), so a
+    // client shows "withdrawals paused: …" beside them instead of letting the
+    // user submit into the refusal. Additive; older clients ignore it.
+    withdrawalPaused          : ?Text;
+    // Task 1788475756 — locked shares, disclosed: the caller's LOCKED shares
+    // (their loan-book claim, redeemable as repayments release it), the
+    // vault-wide total Λ, and the NAV those locked shares carry — so a
+    // prospective depositor predicts their own instant fraction as
+    // (H + V) × keep / (NAV − vaultLockedNavUsd + V): only UNLOCKED shares
+    // share the cash. Additive; older clients ignore them.
+    lockedLp                  : Nat;
+    vaultLockedLp             : Nat;
+    vaultLockedNavUsd         : Nat;
+  };
+
+  public query (msg) func getMaxInstantWithdraw() : async MaxInstantWithdraw {
+    let bal = getVaultLp(msg.caller);
+    let holdingsUsd = vaultHoldingsUsd();
+    let lentUsd = vaultLentOutUsd();
+    let vv = currentVaultValue();
+    let navUsd = vv.totalQuoteValue;
+    let keepBps : Nat = 10_000 - LP_EXIT_FEE_BPS;
+    let assets = holdingsUsd + lentUsd;
+    let reserve = vaultImpairmentReserveAgainst(lentUsd);
+    // The lock state as the next update would settle it (task 1788475756).
+    let lockScale = vaultLockViewScale(holdingsUsd, navUsd);
+    let myLock = vaultLockOf(msg.caller, lockScale, bal);
+    let lockedTotal = VaultLock.totalLock(vaultLockRawSum, lockScale, vaultLPSupply);
+    {
+      withdrawableNowUsd = VaultLock.capUsd(bal, myLock, vaultLPSupply, lockedTotal, holdingsUsd, keepBps);
+      withdrawableNowLp  = if (vaultLPSupply == 0) { 0 } else { VaultLock.capLp(bal, myLock, vaultLPSupply, lockedTotal, holdingsUsd, navUsd) };
+      totalNavUsd        = VaultMath.navValue(bal, vaultLPSupply, navUsd);
+      lpBalance          = bal;
+      lentOutFraction    = if (assets == 0) { 0 } else { Fixed.div(lentUsd, assets, false) };
+      vaultHoldingsUsd   = holdingsUsd;
+      vaultLentOutUsd    = lentUsd;
+      vaultNavUsd        = navUsd;
+      exitFeeBps         = LP_EXIT_FEE_BPS;
+      vaultImpairmentReserveUsd = reserve;
+      provisionedLossUsd        = if (vaultLPSupply == 0) { 0 } else { Fixed.mulDiv(bal, reserve, vaultLPSupply, true) };
+      withdrawalPaused          = vaultWithdrawPaused(Time.now(), vv, holdingsUsd);
+      lockedLp                  = myLock;
+      vaultLockedLp             = lockedTotal;
+      vaultLockedNavUsd         = VaultLock.lockedNavUsd(lockedTotal, vaultLPSupply, navUsd);
+    };
+  };
+
+  // The impairment reserve in full (task 1788475754): what NAV deducts for
+  // expected loss on the loan book, how it was arrived at, and when the
+  // per-pool scan last ran. Aggregate only — like getMarginRiskSummary it
+  // identifies nobody. All USD at 10^8; ratios at 10^8.
+  public type VaultImpairment = {
+    reserveUsd            : Nat;   // = min(loanBook, max(0, gross − insurance)) — what NAV deducts
+    grossExpectedLossUsd  : Nat;   // Σ per-pool PD × LGD (VaultMath.expectedLoss), at marks
+    insuranceFirstLossUsd : Nat;   // the fund's cash, netted against the gross first
+    loanBookUsd           : Nat;   // face value the reserve is deducted from
+    impairedLoans         : Nat;   // pools carrying a non-zero provision
+    // The inputs the gross was priced on (task 1788733762): Σ debt (D, up)
+    // and Σ haircut collateral (C, down) of those pools, exactly as the scan
+    // read them — D accrued to computedNs on a world-driven scan (task
+    // 1788736589; as booked on an LP-driven one). A later read of a pool
+    // accrues interest past this D, so recompute the gross from THESE (one
+    // pool: expectedLoss(D, C) exactly).
+    impairedDebtUsd       : Nat;
+    impairedCollateralUsd : Nat;
+    stressBps             : Nat;   // IMPAIRMENT_STRESS in bps (1500)
+    maintenanceRatio      : Nat;   // PD is 0 at/above this health
+    computedNs            : Int;   // when the per-pool scan last ran (0 = never / wiped)
+  };
+
+  public query func getVaultImpairment() : async VaultImpairment {
+    let lentUsd = vaultLentOutUsd();
+    {
+      reserveUsd            = vaultImpairmentReserveAgainst(lentUsd);
+      grossExpectedLossUsd  = vaultImpairmentGrossUsd;
+      insuranceFirstLossUsd = insurancePoolValue();
+      loanBookUsd           = lentUsd;
+      impairedLoans         = vaultImpairedLoans;
+      impairedDebtUsd       = vaultImpairedDebtUsd;
+      impairedCollateralUsd = vaultImpairedCollateralUsd;
+      stressBps             = VaultMath.IMPAIRMENT_STRESS / 10_000;
+      maintenanceRatio      = Types.MAINTENANCE_HEALTH_RATIO;
+      computedNs            = vaultImpairmentComputedNs;
+    };
+  };
+
   // ── Testing endpoints ────────────────────────────────────────
 
   // Test-only: wipe all transient exchange state. This is more
   // aggressive than the old implementation (which only cleared
   // OrderBook) — integration tests rely on a true clean slate,
-  // otherwise residual AMM pools / pending matches / reservations
+  // otherwise residual AMM pools / reservations
   // from a prior test leak into the next one.
   //
   // What survives: user accounts (balances), userProfiles, username
-  // history. What gets wiped: orders, trades, rolling stats, AMM
-  // pools, LP balances, pending matches, reservations, settlement
-  // windows, counterparty stats, last-oracle aggregates.
+  // history. What gets wiped: everything performWorldWipe (below) clears
+  // — orders and the tape, rolling stats, AMM pools, LP balances and the
+  // vault, staged queues and their reservations, margin, levels / badges,
+  // the event log, last-oracle aggregates, the archive chain. The former
+  // "counterparty stats" entry is gone from this list because the field
+  // itself was consumed and dropped by the fossil sweep of 2026-09-03, and
+  // the retired PendingMatch machinery's fossil maps (pendingMatches,
+  // pendingByMaker, pendingQtyByMaker, orderSettlementWindows) by the sixth
+  // one-shot migration, task 1788744109 (header note) — there is nothing
+  // left to clear.
   public shared (msg) func resetExchange() : async () {
     // Hard no-op on a value-bearing deploy: zeroing the AMM / pool / insurance /
     // treasury balances (below) would wipe custody-backed value while the Bridge
@@ -16665,24 +22368,49 @@ persistent actor Uplands {
   //   resetSeason (forSeason=true) — competition boundary: the chain is
   //     SEALED and recorded, wallets go to zero, the play allowance re-arms.
   // Everything not gated on forSeason is common: books, tape, AMM, LP,
-  // vault, insurance, margin, badges, scorecards, queues, counters.
+  // vault, insurance, margin, badges (all but the lifetime join badge —
+  // it rides with registeredUsers, which neither arm clears), scorecards,
+  // queues, counters.
   func performWorldWipe(forSeason : Bool) : async* () {
+    _seasonSealing := false;   // the seal window ends with the world it guarded (resetExchange clears a stranded latch too)
+    // Pending staged LP requests are CANCELLED on the tape, never silently
+    // dropped (operator decision B, task 1788731610; docs/amm-vault-design.md
+    // §5 "Season boundary"): each one runs the TTL backstop's own body
+    // (cancelStagedLp — reservation released, the owner's #cancelled outcome,
+    // the public `vault` row) with a reason naming the boundary. Two orders
+    // are load-bearing. (1) The ring log and the outcome lists are cleared
+    // FIRST, so the cancellations are what the new epoch's ring and the
+    // owners' `recent` lists open with — the rule resetSeason's own boundary
+    // lines already follow ("written AFTER the wipe, which clears the ring
+    // log"); clearing them after the pass would be the silent drop under
+    // another name. (2) The pass runs BEFORE the stores it releases into
+    // (reservedBalances, vaultLpReserved) are cleared below, so the release
+    // is the real path over live maps, not a no-op over emptied ones. The
+    // seal never waits on this: no await, no feed dependency — a bounded
+    // loop over a store capped at 2 × LPs.
+    Map.clear(eventLog);
+    nextEventId := 0;
+    Map.clear(lpRequestOutcomes);
+    if (Map.size(stagedLpRequests) > 0) {
+      let boundaryNow = Time.now();
+      let boundaryReason = (if (forSeason) { "season sealed before settlement" } else { "exchange reset before settlement" })
+        # "; nothing settled, funds released";
+      for (r in Iter.toArray(Map.values(stagedLpRequests)).vals()) { cancelStagedLp(r, boundaryReason, boundaryNow) };
+    };
     OrderBook.resetAll(orderStore);
+    Map.clear(userTradeIndex);   // H-31: the tape is gone, so is its index
     Map.clear(pools);
     Map.clear(poolValueHistory);
     Map.clear(userLpBalances);
     Map.clear(vaultLpBalances);
     vaultLPSupply := 0;
+    vaultLockClear();                // locked shares die with the LPs (task 1788475756)
+    Map.clear(vaultLockLoanSnap);
     vaultValueHistory := [];
     lastVaultSnapshotNs := 0;
-    Map.clear(pendingMatches);
-    Map.clear(pendingByMaker);
-    Map.clear(pmIdsByUser);
-    Map.clear(pendingQtyByMaker);
     Map.clear(reservedBalances);
-    Map.clear(orderSettlementWindows);
-    Map.clear(counterpartyStats);
     Map.clear(lastAggregates);
+    Map.clear(_lastQuoteSignal);
     Map.clear(rollingStats);
     Map.clear(rebalanceConfigs);
     // Staged / deferred queues + outcome state. Without this, orders or swaps
@@ -16690,10 +22418,24 @@ persistent actor Uplands {
     // both test flakiness and a genuine "ghost" swap/order after a reset.
     Map.clear(deferredExecs);
     Map.clear(deferredSwaps);
+    // Staged LP requests: every pending one was CANCELLED on the tape at the
+    // top of this wipe (task 1788731610), so these are belts over emptied
+    // maps — all but lpRequestOutcomes, which the pass above cleared and then
+    // re-filled with the boundary's own cancellations (the owner's visible
+    // verdict; a clear here would be the silent drop the decision retired).
+    Map.clear(stagedLpRequests);
+    Map.clear(stagedLpDepositOf);
+    Map.clear(stagedLpWithdrawOf);
+    Map.clear(vaultLpReserved);
+    Map.clear(_stagedLpLastArm);
+    Map.clear(releaseRefs);   // H-23: a reset venue's first mark stamps a fresh reference
     Map.clear(deferredIdsByOwner);
+    Map.clear(deferredIdsByMarket);
+    Map.clear(deferredIdsByExpiry);
     Map.clear(swapIdsByOwner);
     Map.clear(softLockedAcc);
     Map.clear(deferredFok);
+    Map.clear(swapFok);
     Map.clear(deferredPostOnly);
     Map.clear(deferredBudget);
     Map.clear(deadmanSwitches);
@@ -16702,7 +22444,8 @@ persistent actor Uplands {
     Map.clear(orderExpiry);
     Map.clear(_reapMarked); // order ids restart after resetAll — stale marks would skip history appends
     Map.clear(_geptorDeadline);
-    Map.clear(eventLog);
+    // eventLog + nextEventId: cleared at the TOP of this wipe, ahead of the
+    // staged-LP cancel pass whose rows open the new epoch's ring.
     Map.clear(_evictAgg);
     Map.clear(_lastOracleSrc);
     Map.clear(_floorEngaged);
@@ -16716,8 +22459,6 @@ persistent actor Uplands {
     // Back to manual inventory so tests get explicit setAmmConfig/setAmmSkewConfig
     // control; production re-enables via setAmmAutoInventory(true) after seeding.
     _ammAutoInventory := false;
-    nextEventId := 0;
-    nextPendingMatchId := 1;
     _priceRefreshSuccess := 0;
     _priceRefreshFailure := 0;
     // W4-13: do NOT clear tickPriceRefresh's flag — it has one owner. Bump
@@ -16763,8 +22504,8 @@ persistent actor Uplands {
     // from a prior session survive a reset as empty zombies — getMyMarginPools
     // lists them, the liquidation tick scans them, and pool ids keep climbing.
     // Zero every pool PRINCIPAL's balances BEFORE dropping the registry: pool
-    // principals are DERIVED from pool ids, so with ids restarting at 1 the
-    // next session's pool #1 would otherwise inherit this session's leftovers.
+    // principals are DERIVED from pool ids, and a dead pool's leftovers must
+    // not sit on a principal nothing routes to any more.
     for ((pid, _) in Map.entries(marginPools)) {
       let pp = poolPrincipalOf(pid);
       Accounts.setBalance(accounts, pp, "BTC", 0);
@@ -16773,19 +22514,55 @@ persistent actor Uplands {
       Accounts.setBalance(accounts, pp, "ICP", 0);
       Accounts.setBalance(accounts, pp, "ICPUSD", 0);
     };
+    if (forSeason) {
+      // H-29 (F45): freeze THIS season's pool ownership BEFORE the registry
+      // dies — the season-archive federation reads this map, not the live
+      // registry, when it answers for a closed season's segments. Keyed by
+      // the season number the detach below registers the segments under.
+      let seasonNo = List.size(seasonRecords) + 1;
+      let owners = Map.empty<Text, [Principal]>();
+      for ((pid, pool) in Map.entries(marginPools)) {
+        let k = Principal.toText(pool.owner);
+        let prev = switch (Map.get(owners, Text.compare, k)) { case (?a) { a }; case null { [] } };
+        Map.add(owners, Text.compare, k, Array.concat(prev, [poolPrincipalOf(pid)]));
+      };
+      Map.add(_seasonPoolOwners, Nat.compare, seasonNo, owners);
+    };
     Map.clear(marginPools);
     Map.clear(poolPositions);
-    // In-flight episode accumulators MUST clear with the positions: pool ids
-    // restart at 1 below, so a stale accumulator keyed "poolId#market" from the
-    // previous session would collide with a recycled id and poison the first
-    // episode's realized PnL (startRealized from a dead pool).
+    // In-flight episode accumulators MUST clear with the positions: a stale
+    // accumulator keyed "poolId#market" from a dead pool has no owner to
+    // settle to, and a pool id is never reused (below), so nothing would ever
+    // consume it.
     Map.clear(episodeAcc);
     Map.clear(poolByPrincipal);
     Map.clear(ownerPoolCount);
-    nextPoolId := 1;
+    // Margin-heat surfaces (task 1788490347): the transient `_heatmaps`
+    // cache, the STABLE `heatHistory` ring, the LP risk summary and the
+    // market-side aggregates are all derived from the pools/positions wiped
+    // above, yet none of them cleared with the world. The next tickHeatmaps
+    // recomputes each market from a refPrice of 0, caches a mark-0 snapshot
+    // and — because columns enter the ring only while markPrice > 0 —
+    // appends nothing, so getMarginHeatmapHistory kept answering up to 4h
+    // of PRE-wipe columns beside a post-wipe snapshot, and an incremental
+    // `sinceNs` poller never saw the boundary. Plain clears: heatHistory is
+    // stable but its schema does not move (no field drop, no class flip).
+    Map.clear(_heatmaps);
+    Map.clear(heatHistory);
+    _riskSummary := EMPTY_RISK_SUMMARY;
+    _marketSideAgg := Map.empty<Text, MarketSideAgg>();
+    // H-29 (F45): nextPoolId is deliberately NOT reset. poolPrincipal is a
+    // pure function of the id, and every archive segment — the sealed
+    // season chains above all — indexes ledger rows by that principal
+    // forever. Restarting the counter at 1 made the next epoch's pool #k
+    // wear the prior season's pool #k principal, so its new owner read the
+    // old owner's #delta/#debtDelta rows through the season federation. The
+    // counter is a stable var in a 64-bit id space: ids are unique for the
+    // lifetime of the archive set. (Never fold an epoch into poolPrincipal
+    // instead — it re-keys live pools and breaks poolByPrincipal.)
     // Progressive-level state (levels/scorecard/badges/uptime/shields/staged
     // counters/shed floor) all start from scratch on a reset — same rationale
-    // as the pool registry.
+    // as the pool registry. One exception: the join badge (below).
     Map.clear(feeLevels);
     Map.clear(makerVolCur);
     Map.clear(makerVolPrev);
@@ -16795,7 +22572,27 @@ persistent actor Uplands {
     exVolPrev := 0;
     Map.clear(lifetimeVol);
     Map.clear(lifetimeMakerVol);
+    // Badges restart with the season — ALL BUT BADGE_JOIN. The join badge is
+    // a LIFETIME fact (operator decision, task 1788515790 option (a)): "first
+    // deposit" happens once per principal, and the fact it records —
+    // `registeredUsers` — already survives every wipe (neither arm clears
+    // it). Clearing the badge while keeping the registration made it
+    // flicker: gone at the wipe, re-granted with a NEW stamp by tickTier's
+    // backfill one HB_TIER_NS later (444 re-awards on a 444-user seat
+    // venue). Harvest the join stamps, clear the map, put them back with
+    // their ORIGINAL awardedNs — the backfill then finds nothing to do (it
+    // stays as the safety net for dev registration paths). Same under
+    // resetExchange: registeredUsers survives that arm too, so the badge
+    // mirrors it there as well.
+    let joinStamps = List.empty<(Text, Int)>();
+    for ((k, m) in Map.entries(badges)) {
+      switch (Map.get(m, Nat.compare, BADGE_JOIN)) {
+        case (?ts) { List.add(joinStamps, (k, ts)) };
+        case null {};
+      };
+    };
     Map.clear(badges);
+    for ((k, ts) in List.values(joinStamps)) { ignore grantBadge(k, BADGE_JOIN, ts) };
     Map.clear(uptimeStats);
     Map.clear(mmQuoteStamp);
     Map.clear(mmOwnerStamp);
@@ -16807,6 +22604,8 @@ persistent actor Uplands {
     // (both are injected by tests; the real anchor loop is production-only).
     Map.clear(xrcAnchors);
     _minSourcesOverride := null;
+    Map.clear(_devStalledSources);      // H-37: stalled-source pins and parked readings are test state too
+    List.clear(_devParkedReadings);
     // Leaderboard: reset the scoreboard to zero. resetExchange deliberately
     if (forSeason) {
       // Season semantics: every wallet restarts at ZERO. The two "surviving
@@ -16850,7 +22649,6 @@ persistent actor Uplands {
       // archives (resetExchange keeps these — its wallets survive, so its
       // history must too).
       Map.clear(userDeposits);
-      Map.clear(userAdjustments);
       Map.clear(userAdjustmentsV2);
       Map.clear(userClosedOrders);
     };
@@ -16877,8 +22675,17 @@ persistent actor Uplands {
     _tierBadgeCursor := null;       // restart the join-badge backfill scan
     nettedVolumeUsd := 0;
     Map.clear(insuranceShares);
+    Map.clear(insuranceStakedAt);   // H-35: the cooldown stamps die with the holdings they lock
     insuranceShareSupply := 0;
     uncoveredBadDebtUsd := 0;
+    // The impairment cache dies with the loan book it provisioned (task 1788475754).
+    vaultImpairmentGrossUsd := 0;
+    vaultImpairedDebtUsd := 0;
+    vaultImpairedCollateralUsd := 0;
+    vaultImpairedLoans := 0;
+    vaultImpairmentComputedNs := 0;
+    Map.clear(vaultProvisionByPool);   // per-pool split (task 1788480502) — rebuilt by the next full scan
+    vaultProvisionMapValid := false;
     // #49.4: the penalty receivable dies with the world too. Self-healing
     // without this (settleInsuranceArrears lapses it at supply-zero on the
     // next tick), but the wipe must not depend on a timer to finish zeroing
@@ -16905,6 +22712,13 @@ persistent actor Uplands {
     // affordances (mainnet never deletes archives; resetExchange itself is
     // a dev-only concept). userClosedOrders is deliberately KEPT (it's the
     // user's own record, like deposits/adjustments).
+    // 1788511319: the season detach below decides whether the tip chained
+    // anything of the closed season — read that BEFORE the cursor reset on
+    // the next lines, or `shippedSeq <= _activeFirstSeq` reads 0 <= anchor
+    // and every tip looks empty (test_season_seal §3 caught exactly that:
+    // the record named the tip, the registry routed nothing). No await
+    // separates this read from the detach; hygiene §6o'' pins the order.
+    let tipEmptyAtBoundary = activeTipEmpty();
     userEvents := List.empty<Types.UserEvent>();
     nextEventSeq := 0;
     shippedSeq := 0;
@@ -16914,6 +22728,7 @@ persistent actor Uplands {
     // shadows reset too — live ledgers are wiped, so shadow and live agree
     // at empty and the new epoch's first drain emits nothing stale.
     List.clear(accounts.journal);
+    Map.clear(_exitWindows);   // H-32: withheld exit rows die with the tape too — the genesis rows below carry the live balances
     Map.clear(_debtShadow);
     Map.clear(_lpShadow);
     Map.clear(_insShadow);
@@ -16939,6 +22754,14 @@ persistent actor Uplands {
     // _ackDivergences is deliberately NOT reset: it is a lifetime tripwire for
     // an impossible state whose only conceivable producer is wipe-adjacent —
     // zeroing it here could erase the evidence of the very trip it exists for.
+    // 1788474114: a season boundary PRESERVES the closed season's gap tuples
+    // and shed re-baselines BEFORE the clears below empty them for the new
+    // epoch (see _seasonGaps). Keyed by the season number the record built
+    // by resetSeason carries (it appends that record after this wipe returns,
+    // so List.size(seasonRecords) + 1 here == rec.season there).
+    if (forSeason) {
+      Map.add(_seasonGaps, Nat.compare, List.size(seasonRecords) + 1, (_ledgerGaps, _shedBaselines));
+    };
     _ledgerGaps := [];
     _shedBaselines := [];
     _captureEpoch += 1;
@@ -16956,15 +22779,44 @@ persistent actor Uplands {
         List.add(_seasonArchives, { canisterId = sl.canisterId; firstSeq = sl.firstSeq; lastSeq = ?sl.lastSeq; season = seasonNo });
       };
       switch (archive0) {
-        case (?p) { List.add(_seasonArchives, { canisterId = p; firstSeq = _activeFirstSeq; lastSeq = null; season = seasonNo }) };
+        case (?p) {
+          if (tipEmptyAtBoundary and _archiveNext == null) {
+            // 1788511319 "empty tip": the seal+swap on the LAST drain before
+            // the boundary left the fresh successor as archive0 with nothing
+            // chained (anchored at shippedSeq, and shippedSeq never moved).
+            // It holds no event of the closed season, so a registry row for
+            // it is the #55 "0 – growing" row under another name (seen live
+            // 2026-09-04: { firstSeq 305; lastSeq null }, null certified
+            // head). Carry it as the successor instead — the same #54.4
+            // shape as a pre-spawned one — and the record built before this
+            // wipe (currentArchivePrincipals) already omitted it.
+            _archiveNext := ?p;   // carried: the new epoch's first archive
+            logEvent("info", "system", "Season boundary: the active archive " # Principal.toText(p)
+              # " chained no event of the closed season (anchored at seq " # Nat.toText(_activeFirstSeq)
+              # " == the shipped extent) — carried into the new epoch as its first archive, not registered as a season row", null);
+          } else {
+            if (tipEmptyAtBoundary) {
+              // Unreachable by the seal path (a successor is spawned only at
+              // ≥90% of a NON-empty tip) — a #full ack on an empty archive
+              // is the one producer, and it means spawn sizing is broken.
+              // Registered as before; adminRetireEmptySeasonSegment retires it.
+              logEvent("warn", "system", "Season boundary: the active archive " # Principal.toText(p)
+                # " chained no event but a successor is already pending — registered as an EMPTY season row; retire it with adminRetireEmptySeasonSegment", null);
+            };
+            List.add(_seasonArchives, { canisterId = p; firstSeq = _activeFirstSeq; lastSeq = null; season = seasonNo });
+          };
+        };
         case null {};
       };
-      switch (_archiveNext) {
-        case (?p) { List.add(_seasonArchives, { canisterId = p; firstSeq = 0; lastSeq = null; season = seasonNo }) };
-        case null {};
-      };
+      // The pre-spawned successor (_archiveNext) is deliberately NOT
+      // registered and NOT nulled (#54.4 / #55 "empty successor"): it holds
+      // no batch of the closed season, so a registry row for it was a
+      // canister that never received an event — rendered "0 – growing",
+      // refilled by the fuel loop forever, one archiveExecute hop on every
+      // deep read — while the next epoch spawned a fresh archive anyway.
+      // The pointer survives the detach and tickShipEvents adopts it as
+      // the new epoch's archive0 at seq 0 (the (null, ?next) arm there).
       archive0 := null;
-      _archiveNext := null;
       List.clear(_archivesSealed);
       _activeFirstSeq := 0;
     } else if (not IS_PRODUCTION) {
@@ -16980,6 +22832,10 @@ persistent actor Uplands {
       _archiveNext := null;
       List.clear(_archivesSealed);
       List.clear(_seasonArchives);
+      Map.clear(_seasonPoolOwners);   // H-29: the owner map dies with the registry it keys
+      // Blackholed corpses cannot be deleted (they leak as orphans, below)
+      // and leave every routing list here — the seal-time record goes too.
+      List.clear(_archivesBlackholed);
       _activeFirstSeq := 0;
       for (cid in doomed.vals()) {
         try {
@@ -17028,6 +22884,45 @@ persistent actor Uplands {
     Iter.toArray(List.values(seasonRecords));
   };
 
+  // #55 (1788468754): ONE closed season's routing table — the same row shape
+  // as getArchives, read from the W4-14 season registry. getArchives serves
+  // the CURRENT season only (the detach in performWorldWipe clears it) and
+  // SeasonRecord carries bare principals, so before this the cross-segment
+  // chain walk + per-segment certificate check over a finished season had no
+  // table to route by: the prize-audit record was verifiable in principle and
+  // not in practice. Rows come back in detach order: the sealed segments,
+  // then the season's active tip (lastSeq null — it ends where the record's
+  // finalEventSeq says). Seasons closed before #54.4 landed may ALSO carry
+  // the successor pre-spawned before their boundary (a canister that never
+  // held an event; lastSeq null, firstSeq 0) — the detach no longer
+  // registers one (it is carried into the next epoch instead), but the
+  // verifiers (`verify_ledger.mjs --season N`, ledger.js opts.season) keep
+  // telling the two apart by their certified heads and anchor the walked
+  // head to SeasonRecord.chainHead; adminRetireEmptySeasonSegment(cid)
+  // retires such a row for good (1788499923). Query-only, #play-safe; an
+  // unknown season is [].
+  public query func getSeasonArchives(season : Nat) : async [{ canisterId : Text; firstSeq : Nat; lastSeq : ?Nat }] {
+    let out = List.empty<{ canisterId : Text; firstSeq : Nat; lastSeq : ?Nat }>();
+    for (sa in List.values(_seasonArchives)) {
+      if (sa.season == season) {
+        List.add(out, { canisterId = Principal.toText(sa.canisterId); firstSeq = sa.firstSeq; lastSeq = sa.lastSeq });
+      };
+    };
+    Iter.toArray(List.values(out));
+  };
+
+  // 1788474114: the closed season's gap tuples and shed re-baselines — the
+  // same shapes as getLedgerGaps / getShedBaselines, preserved by the season
+  // detach (see _seasonGaps). An unknown season, or one that closed before
+  // this existed, answers [] — the verifiers then fall back to inferring
+  // re-anchors from the season table's list jumps, as before.
+  public query func getSeasonGaps(season : Nat) : async [(Nat, Nat, Int)] {
+    switch (Map.get(_seasonGaps, Nat.compare, season)) { case (?(g, _)) { g }; case null { [] } };
+  };
+  public query func getSeasonShedBaselines(season : Nat) : async [(Nat, Nat)] {
+    switch (Map.get(_seasonGaps, Nat.compare, season)) { case (?(_, b)) { b }; case null { [] } };
+  };
+
   // The Phase N → N+1 competition boundary. What resetExchange is to a dev
   // slate, this is to a season: same wipe, but wallets zero, the play
   // allowance re-arms, profiles/usernames/verified bindings survive, and the
@@ -17051,6 +22946,11 @@ persistent actor Uplands {
         # " is ahead of nextEventSeq " # Nat.toText(nextEventSeq)
         # " — impossible state (see getCanisterInfo ackDivergences); inspect the tape by hand before sealing a season");
     };
+    // H-32: a dust exit's coalesced rows still sit in its principal's window
+    // — the closed season's tape must carry them, so force every window out
+    // NOW; the gate below then reads them as unshipped history (drain + retry,
+    // exactly like the journal gate after it).
+    flushExitWindows(true);
     if (nextEventSeq != shippedSeq) {
       return #err("unshipped history: " # Nat.toText(nextEventSeq - shippedSeq)
         # " event(s) still in transit to the archive — run adminForceShipTick until it returns 0, then retry");
@@ -17078,20 +22978,75 @@ persistent actor Uplands {
     // stranding half the pair on either side is what created the divergence.
     // The Bridge refuses while any claim/admission is in flight, and a
     // refusal ABORTS the reset before anything is wiped.
-    switch (_bridgePrincipal) {
+    //
+    // #55.2: the Bridge is resolved here EXACTLY as at every other
+    // Bridge-facing site — effectiveBridge: the setBridge override, else the
+    // PUBLIC_CANISTER_ID:bridge env icp injects on every deploy. The raw
+    // `_bridgePrincipal` switch that stood here took `case null` on every
+    // scripted venue (no shipped script calls setBridge — deploy.sh,
+    // cold_start.sh and play_start.sh all say so), so the W4-12 wipe fired
+    // only in a suite run that happened to wire the override earlier, and
+    // the Bridge kept every confirmed−claimed balance across the boundary:
+    // #25.2 verbatim, on the fix that closed it.
+    //
+    // #54.1: the three gates above were evaluated BEFORE this await and the
+    // record is built from state read AFTER it. Latch the ingress side first
+    // (see _seasonSealing), then re-check after the await. The Bridge call
+    // deliberately stays AFTER the gates: calling it first would leave the
+    // pair half-wiped on every gate refusal.
+    _seasonSealing := true;
+    switch (effectiveBridge<system>()) {
       case (?bp) {
         let br = actor (Principal.toText(bp)) : actor { adminSeasonWipe : () -> async { #ok; #err : Text } };
         try {
           switch (await br.adminSeasonWipe()) {
-            case (#err(e)) { return #err("Bridge refused the season wipe: " # e) };
+            case (#err(e)) { _seasonSealing := false; return #err("Bridge refused the season wipe: " # e) };
             case (#ok) {};
           };
         } catch (e) {
+          _seasonSealing := false;
           return #err("Bridge unreachable for the season wipe — aborting the reset: " # Error.message(e));
         };
       };
-      case null {};   // unwired (pure dev sandbox) — nothing to keep coherent
+      case null {};   // neither setBridge nor the env names a Bridge (pure dev sandbox) — nothing to keep coherent
     };
+    if (_testSeasonSealRace) {
+      // #dev one-shot (setTestSeasonSealRace): an emitting message "lands" in
+      // the window. It is emitted from inside resetSeason so the latch cannot
+      // refuse it — the honest-seal arm below then engages on real state.
+      _testSeasonSealRace := false;
+      emitConfig(msg.caller, "setTestSeasonSealRace", "landed-in-window");
+    };
+    // RE-CHECK the gates now that the await has yielded. The Bridge's half is
+    // already wiped, so a failure here cannot abort — it seals HONESTLY: the
+    // record's extent is the archive's certified extent (shippedSeq) and its
+    // head is the head the archive certified (the prevHash of the first
+    // unshipped event — the chain hash of the last shipped one), never a seq
+    // or hash of an event the wipe is about to delete unshipped. The dropped
+    // rows are counted in the operator log (the ledger-gap surface dies with
+    // the epoch below, and SeasonRecord's shape is #54.4's to extend).
+    let landed : Nat = if (nextEventSeq >= shippedSeq) { nextEventSeq - shippedSeq } else { 0 };
+    let journalLanded = List.size(accounts.journal);
+    let (finalSeq, head) : (Nat, ?Blob) = if (shippedSeq > nextEventSeq) {
+      logEvent("error", "system", "Season seal re-check: IMPOSSIBLE STATE — shippedSeq "
+        # Nat.toText(shippedSeq) # " ran ahead of nextEventSeq " # Nat.toText(nextEventSeq)
+        # " inside the Bridge round-trip; sealing at the tape's own extent (inspect the record by hand)", null);
+      (nextEventSeq, _chainHead)
+    } else if (landed > 0) {
+      let archiveHead : ?Blob = switch (List.first(userEvents)) {
+        case (?e) { e.prevHash };
+        case null { _chainHead };   // unreachable: landed > 0 means the queue holds them
+      };
+      (shippedSeq, archiveHead)
+    } else { (nextEventSeq, _chainHead) };
+    // The operator-log line is written AFTER the wipe (which clears the ring
+    // log with the world) — composed here while the seqs still exist.
+    let dropNote : ?Text = if (landed > 0 or journalLanded > 0) {
+      ?("Season seal re-check FAILED after the Bridge wipe: "
+        # Nat.toText(landed) # " event(s) [seq " # Nat.toText(shippedSeq) # ".." # Nat.toText(nextEventSeq)
+        # ") and " # Nat.toText(journalLanded) # " ledger journal row(s) landed inside the seal window and were DROPPED unshipped"
+        # " — sealed honestly at the archive's certified extent (finalEventSeq " # Nat.toText(finalSeq) # ")")
+    } else { null };
     // Capture the boundary BEFORE the wipe destroys it.
     let top = List.empty<SeasonTopRow>();
     label t for (r in leaderRows.vals()) {
@@ -17112,19 +23067,44 @@ persistent actor Uplands {
     let rec : SeasonRecord = {
       season        = List.size(seasonRecords) + 1;
       endedNs       = Time.now();
-      finalEventSeq = nextEventSeq;
+      finalEventSeq = finalSeq;    // the archive's certified extent (== shippedSeq) whether the re-check passed or sealed honestly
       totalRanked   = leaderRows.size();
-      archives      = allArchivePrincipals();
-      chainHead     = _chainHead;
+      // #54.4: THIS season's sealed ledger only. allArchivePrincipals stood
+      // here — it spans the season REGISTRY, so season N's record listed
+      // seasons 1..N. currentArchivePrincipals reads the current chain
+      // (sealed + active tip; the pre-spawned successor is the next
+      // epoch's), and it is correct ONLY because it is read HERE, before
+      // performWorldWipe(true) detaches that chain into the registry — the
+      // ORDER is the invariant (hygiene pins it), not the call.
+      archives      = currentArchivePrincipals();
+      chainHead     = head;
       finalTop      = Iter.toArray(List.values(top));
     };
     await* performWorldWipe(true);
     List.add(seasonRecords, rec);
+    switch (dropNote) { case (?t) { logEvent("error", "system", t, null) }; case null {} };
     logEvent("info", "system", "Season " # Nat.toText(rec.season) # " closed: "
       # Nat.toText(rec.archives.size()) # " archive canister(s) sealed at event seq "
       # Nat.toText(rec.finalEventSeq) # ", " # Nat.toText(rec.finalTop.size())
       # " ranked player(s) recorded", null);
     #ok(rec);
+  };
+
+  // #54.1 test hooks. setTestSeasonSealing holds the latch open so a suite
+  // can assert which entry paths refuse under it (and that the exit set does
+  // not); setTestSeasonSealRace arms the one-shot in-window emit so the next
+  // resetSeason exercises the honest-seal arm on real state. Both #dev-only.
+  public shared (msg) func setTestSeasonSealing(on : Bool) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    if (not IS_DEV) { return #err("setTestSeasonSealing is a dev-only hook (posture: play/production)") };
+    _seasonSealing := on;
+    #ok
+  };
+  public shared (msg) func setTestSeasonSealRace(armed : Bool) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    if (not IS_DEV) { return #err("setTestSeasonSealRace is a dev-only hook (posture: play/production)") };
+    _testSeasonSealRace := armed;
+    #ok
   };
 
   // Season-boundary repair: re-arm the play allowance for EVERYONE, without
@@ -17150,8 +23130,8 @@ persistent actor Uplands {
   };
 
   // Admin: purge 0-qty zombie orders (residue from a historical matching
-  // engine bug — a taker whose entire quantity went into pending matches
-  // used to leave a 0-qty #open record in the book indexes, which would
+  // engine bug — a taker whose entire quantity went into the since-retired
+  // pending matches used to leave a 0-qty #open record in the book indexes, which would
   // block subsequent matches at that price level by appearing as the
   // best maker with availableForFill == 0). Safe to call repeatedly;
   // returns count of orders cleaned up.
@@ -17397,6 +23377,13 @@ persistent actor Uplands {
     case _                { 0.0 };
   };
 
+  // SIGNED e8 → human USD float, for the OQL projections served PRE-CONVERTED
+  // (the leaderboard's profitUsd / equityUsd; its capitalUsd is a Nat and goes
+  // through Fixed.toFloat). Same scale as Fixed.toFloat with the sign kept — a
+  // loss is a negative dollar figure. tests/frontend_display_integrity §C
+  // whitelists this helper by name and checks its body still divides.
+  func oqlUsd(i : Int) : Float = Float.fromInt(i) / 100_000_000.0;
+
   // ── History (archive) OQL proxy ──────────────────────────────────
   // OQL can't run INSIDE the archive: its dynamically-spawned actor-class
   // compilation doesn't receive the --implicit-package=core flag OQL requires
@@ -17459,10 +23446,21 @@ persistent actor Uplands {
   };
 
   // Result of the History OQL surface: the OQL result plus the archive
-  // segments this pass could NOT read. `degraded` empty ⇒ the read was
-  // complete; non-empty ⇒ rows are real but may be missing that segment's
-  // range, and the UI should say so rather than render silence as history.
-  type ArchiveOqlResult = { rows : [[OQL.Executor.Cell]]; hasMore : Bool; degraded : [Text] };
+  // segments this pass did NOT read, split by cause:
+  //   `degraded`  — segments the walk TRIED and could not read (stopped,
+  //                 frozen, mid-upgrade): rows may be missing that
+  //                 segment's range.
+  //   `unvisited` — segments the walk never reached because a BUDGET exit
+  //                 fired first (the ARCHIVE_MAX_HOPS hop cap, or the
+  //                 ARCHIVE_OQL_CAP/ARCHIVE_DW_CAP row caps): older history
+  //                 beyond them is served per-archive, not here.
+  //   `complete`  — both lists empty ⇒ the read covered the whole chain.
+  // #54.5 (OhShii round 18): before `unvisited`, a budget-truncated walk
+  // carried an empty `degraded` and the UI rendered it as complete history.
+  // The UI must say which of the two happened rather than render silence
+  // as history (W1-03), and the two need different wording: one is a
+  // fault, the other is the design's fan-out bound.
+  type ArchiveOqlResult = { rows : [[OQL.Executor.Cell]]; hasMore : Bool; degraded : [Text]; unvisited : [Text]; complete : Bool };
 
   // Run an OQL query over the CALLER's recent archived history. A COMPOSITE
   // QUERY so it can call the archive sidecar's query methods while staying a
@@ -17481,36 +23479,49 @@ persistent actor Uplands {
       case (?why) { Runtime.trap("OQL: rejected — " # why) };
       case null {};
     };
-    let ps = List.empty<Principal>();
-    List.add(ps, caller);
-    for ((id, pool) in marginPools.entries()) {
-      if (Principal.equal(pool.owner, caller)) { List.add(ps, poolPrincipalOf(id)) };
-    };
-    let principals = Iter.toArray(List.values(ps));
+    // The caller's principal set for the CURRENT chain (human + the pools the
+    // live registry says they own). Prior seasons' segments get their own set
+    // per hop below (archiveReadPrincipals, H-29): the frozen owner map, so a
+    // pool id's principal is read only by whoever owned it in THAT season.
+    let principals = archiveReadPrincipals(caller, null);
     let evs = List.empty<Types.UserEvent>();
     // Fan-out budget per request (GHSA-5rcg): the chain length is a growth
     // term, and without a hop cap a sparse-history caller's every request
     // visited all of it. 6 hops ≈ the active archive + five sealed segments.
-    let ARCHIVE_MAX_HOPS : Nat = 6;
+    let ARCHIVE_MAX_HOPS : Nat = switch (_archiveMaxHopsOverride) {
+      case (?h) { if (h == 0) { 1 } else { h } };   // dev pin (setTestArchiveMaxHops)
+      case null { 6 };
+    };
     var hops : Nat = 0;
     // Visit the chain newest-first: the active archive, then sealed archives
     // newest → oldest, stopping as soon as the caps are met — recent history
     // costs one hop, deep history only pages further back when the recent
     // archives didn't fill the budget.
-    let visit = List.empty<Principal>();
-    switch (archive0) { case (?p) { List.add(visit, p) }; case null {} };
+    // Each visit carries the principal set THAT segment may answer for.
+    let visit = List.empty<(Principal, [Principal])>();
+    switch (archive0) { case (?p) { List.add(visit, (p, principals)) }; case null {} };
     let sealedArr = Iter.toArray(List.values(_archivesSealed));
     var si : Int = (sealedArr.size() : Int) - 1;
-    while (si >= 0) { List.add(visit, sealedArr[Int.abs(si)].canisterId); si -= 1 };
+    while (si >= 0) { List.add(visit, (sealedArr[Int.abs(si)].canisterId, principals)); si -= 1 };
     // W4-14: prior seasons, newest first, after the current chain — deep
     // history pages further back only when the caps aren't met yet.
     let seasonArr = Iter.toArray(List.values(_seasonArchives));
     var sj : Int = (seasonArr.size() : Int) - 1;
-    while (sj >= 0) { List.add(visit, seasonArr[Int.abs(sj)].canisterId); sj -= 1 };
+    while (sj >= 0) {
+      let sa = seasonArr[Int.abs(sj)];
+      List.add(visit, (sa.canisterId, archiveReadPrincipals(caller, ?sa.season)));
+      sj -= 1;
+    };
     var ownAdded = 0;
     var dwAdded = 0;
     let degraded = List.empty<Text>();
-    label chain for (cid in List.values(visit)) {
+    // #54.5: every segment the walk stops SHORT of is reported in `unvisited`
+    // — a budget exit must never masquerade as a complete read. `visited`
+    // counts entries of `visitArr` the loop actually attempted.
+    let visitArr = Iter.toArray(List.values(visit));
+    var visited : Nat = 0;
+    label chain for ((cid, hopPrincipals) in visitArr.vals()) {
+      visited += 1;
       // NO frozen-observation skip here (removed 2026-08-15). It used to
       // `continue chain` on `obs.frozen`, which conflated "the fuel pass
       // last SAW it under its freezing limit" with "it cannot answer now":
@@ -17528,7 +23539,7 @@ persistent actor Uplands {
         if (ownAdded < ARCHIVE_OQL_CAP) {
           var off = 0;
           label pages loop {
-            let page = await full.getEventsForPrincipals(principals, off, 200);
+            let page = await full.getEventsForPrincipals(hopPrincipals, off, 200);
             for (e in page.events.vals()) { List.add(evs, e); ownAdded += 1 };
             if (page.events.size() < 200 or ownAdded >= ARCHIVE_OQL_CAP or off + 200 >= page.total) { break pages };
             off += 200;
@@ -17545,7 +23556,7 @@ persistent actor Uplands {
             let page = await full.getDepositWithdrawals(dwOff, 200);
             for (e in page.vals()) {
               var mine = false;
-              for (p in principals.vals()) { if (Principal.equal(p, e.user)) { mine := true } };
+              for (p in hopPrincipals.vals()) { if (Principal.equal(p, e.user)) { mine := true } };
               if (not mine and dwAdded < ARCHIVE_DW_CAP) { List.add(evs, e); dwAdded += 1 };
             };
             dwPages += 1;
@@ -17580,33 +23591,70 @@ persistent actor Uplands {
       case (#ok q)  { OQL.Executor.runWith(archiveRegistry, oqlClampWindow(q), archiveAccess) };
     };
     _archiveRows := [];
-    { result with degraded = Iter.toArray(List.values(degraded)) }
+    let unvisited = Array.tabulate<Text>(visitArr.size() - visited, func (i) { Principal.toText(visitArr[visited + i].0) });
+    let degradedArr = Iter.toArray(List.values(degraded));
+    { result with degraded = degradedArr; unvisited; complete = degradedArr.size() == 0 and unvisited.size() == 0 }
   };
 
-  // Controller-only: catch the archive's deposit/withdrawal index up over the
-  // pre-index backlog (the events that predate the index). Loops the sidecar's
-  // backfillDwIndex (200k tape positions/round) up to `maxRounds` rounds; call
-  // again if not yet `done`. Idempotent — the cursor only moves forward.
+  // Controller-only: catch EVERY archive segment's deposit/withdrawal index up
+  // over its pre-index backlog (the events that predate the index) — prior
+  // seasons' sealed chains, this season's sealed chain, the active tip and
+  // the pre-spawned successor (allArchivePrincipals, the set
+  // adminUpgradeArchives walks). Each segment heals itself after an upgrade
+  // (ArchiveCanister's postupgrade timer scans both cursors — task
+  // 1793495003), so this is the EXPLICIT driver: for an operator who wants a
+  // backlog gone now, or a chain-wide report of where every cursor stands.
+  // Per segment it loops the sidecar's backfillDwIndex (200k tape
+  // positions/round) up to `maxRounds` rounds — `maxRounds = 0` is REPORT
+  // ONLY (a zero-length scan per segment; cursors unchanged). Call again if a
+  // segment is still lagging. Idempotent — cursors only move forward. A
+  // segment that refuses the call (blackholed at seal, out of cycles) is
+  // counted and named, never fatal to the walk. Before 1793495003 this looped
+  // archive0 ONLY, so a sealed segment's dwIndex was never backfilled by
+  // anything and its getDepositWithdrawals silently under-reported.
   public shared (msg) func adminBackfillArchiveDw(maxRounds : Nat) : async { #ok : Text; #err : Text } {
     requireController(msg.caller);
-    switch (archive0) {
-      case (?p) {
-        let full = actor (Principal.toText(p)) : Archive.Archive;
-        var rounds = 0;
-        var cursor = 0;
-        var total = 0;
-        var dwCount = 0;
-        var done = false;
-        label loop_ while (rounds < maxRounds) {
-          let r = await full.backfillDwIndex(200_000);
-          cursor := r.cursor; total := r.total; dwCount := r.dwCount; done := r.done;
-          rounds += 1;
+    let chain = allArchivePrincipals();
+    if (chain.size() == 0) { return #err("no archive segments (chain empty: nothing spawned yet, or a wipe cleared it)") };
+    let reportOnly = maxRounds == 0;
+    let budget : Nat = if (reportOnly) { 1 } else { maxRounds };
+    let scanPerRound : Nat = if (reportOnly) { 0 } else { 200_000 };
+    var complete = 0;
+    var lagging = 0;
+    var failed = 0;
+    var rounds = 0;
+    var dwIndexed = 0;
+    let notes = List.empty<Text>();
+    for (cid in chain.vals()) {
+      let full = actor (Principal.toText(cid)) : Archive.Archive;
+      var segRounds = 0;
+      var cursor = 0;
+      var total = 0;
+      var segDw = 0;
+      var done = false;
+      try {
+        label loop_ while (segRounds < budget) {
+          let r = await full.backfillDwIndex(scanPerRound);
+          cursor := r.cursor; total := r.total; segDw := r.dwCount; done := r.done;
+          segRounds += 1;
           if (done) { break loop_ };
         };
-        #ok("rounds=" # Nat.toText(rounds) # " cursor=" # Nat.toText(cursor) # "/" # Nat.toText(total) # " dwIndexed=" # Nat.toText(dwCount) # " done=" # (if done "true" else "false"))
+        rounds += segRounds;
+        dwIndexed += segDw;
+        if (done) { complete += 1 } else {
+          lagging += 1;
+          List.add(notes, Principal.toText(cid) # " cursor=" # Nat.toText(cursor) # "/" # Nat.toText(total));
+        };
+      } catch (e) {
+        failed += 1;
+        List.add(notes, Principal.toText(cid) # " failed: " # Error.message(e));
       };
-      case null { #err("archive sidecar not spawned") };
     };
+    var detail = "";
+    for (n in List.values(notes)) { detail #= (if (detail == "") { "; " } else { ", " }) # n };
+    #ok("segments=" # Nat.toText(chain.size()) # " complete=" # Nat.toText(complete) # " lagging=" # Nat.toText(lagging)
+      # " failed=" # Nat.toText(failed) # " rounds=" # Nat.toText(rounds) # " dwIndexed=" # Nat.toText(dwIndexed)
+      # (if (reportOnly) { " (report only)" } else { "" }) # detail)
   };
 
   // Row-level per-user scoping (upstream OQL main). Auth is PER ENTITY now: a
@@ -17884,7 +23932,15 @@ persistent actor Uplands {
       // profit = equity − HODL baseline, so buy-and-hold scores exactly $0.
       // Exposed so the AI assistant (whose only read tool is OQL) can answer
       // "who is top of the leaderboard?" from the real ranking instead of
-      // improvising from balances. *Usd fields are e8-scaled; returnBps bps.
+      // improvising from balances. The *Usd columns are served in HUMAN USD
+      // (Float: e8 ÷ 10^8 — the account snapshot's and candles' convention),
+      // NOT the e8 integers getLeaderboard publishes: a live model handed the
+      // raw integers rendered a $10,000 account as $10,000,000 even with the
+      // prompt's UNITS rule naming these columns (task 1793551691), so the
+      // schema line now reads profitUsd:Float and the prompt lists the
+      // leaderboard among the already-human projections. returnBps stays an
+      // integer (basis points). The candid getLeaderboard is untouched — the
+      // D9 decision in getApiDoc still holds: exact, unbucketed columns.
       // `user` (the principal) is deliberately NOT projected — this entity is
       // #public_, and pairing it with `username` here would republish exactly
       // the mapping PublicLeaderRow exists to withhold. Name only.
@@ -17892,9 +23948,9 @@ persistent actor Uplands {
         .sample({ rank = 0; user = ""; username = ""; profitUsd = 0; capitalUsd = 0; equityUsd = 0; returnBps = 0; feeLevel = 0; badgeCount = 0 })
         .payload("rank",       func r = r.rank)
         .payload("username",   func r = r.username)
-        .payload("profitUsd",  func r = r.profitUsd)
-        .payload("capitalUsd", func r = r.capitalUsd)
-        .payload("equityUsd",  func r = r.equityUsd)
+        .payload("profitUsd",  func r = oqlUsd(r.profitUsd))
+        .payload("capitalUsd", func r = Fixed.toFloat(r.capitalUsd))
+        .payload("equityUsd",  func r = oqlUsd(r.equityUsd))
         .payload("returnBps",  func r = r.returnBps)
         .payload("feeLevel",   func r = r.feeLevel)
         .payload("badgeCount", func r = r.badgeCount)
@@ -17965,6 +24021,57 @@ persistent actor Uplands {
     stagedGlobal : Nat;          // Map.size(deferredExecs) at probe time — the S the numbers were taken at
     stagedOwn : Nat;             // the sampled principal's own staged count at probe time
     sampledPrincipal : Text;
+    // H-09: the bounded book walks, measured on the first priced pool's BUY
+    // side at the band-clamped cap (ref × 1.25) — the widest walk a public
+    // caller can open. `walkScanned`/`walkTruncated` are the depth walk's.
+    walkMarket : Text;           // "" when no pool carries a price (walk numbers are 0)
+    walkDepth : Nat64;           // getTakeableDepth-shaped: #all, WALK_SCAN_MAX
+    walkSwap : Nat64;            // quoteSwap-shaped: #quoteSpend(huge), WALK_SCAN_MAX
+    walkFokGate : Nat64;         // FOK-gate-shaped: #base(huge), FOK_GATE_ITER_BUDGET
+    walkScanned : Nat;
+    walkTruncated : Bool;
+    // H-30: the five per-user pool reads, measured for the sampled principal
+    // at `poolsTotal` pools on the venue — the test adds thousands of pools
+    // owned by SOMEONE ELSE and asserts these do not move.
+    myMarginPools : Nat64;        // getMyMarginPools core
+    myPositionFills : Nat64;      // getMyPositionFills core
+    myPoolLiquidations : Nat64;   // getMyPoolLiquidations core
+    myArchivePrincipals : Nat64;  // archiveReadPrincipals(_, null) — getMyArchivedEvents + archiveExecute leg (1) on the current chain
+    // 1788523970: the NEGATIVE CONTROL — the naive marginPools walk (owner
+    // compare per entry) the five reads were converted away from. Scales
+    // with poolsTotal by construction; test_h30_unregistered sizes the
+    // reads' tolerance from how far THIS moves under 6,000 unrelated pools,
+    // so GC-increment noise on a cold read (a fixed slice, ~20k instr) can
+    // never be mistaken for a walk and a real walk can never hide in it.
+    poolsWalk : Nat64;
+    poolsTotal : Nat;             // Map.size(marginPools) at probe time
+    // (The 1788513124 pending owner-index measurement — pendingMyRead,
+    // pendingMyReadSaturated, pendingSynthAtProbe, pendingGlobal, pendingOwn,
+    // pendingSynthLeak, pendingSynthOwnSeen — was REMOVED at apiVersion
+    // 6.0.0 with getMyPendingMatches, the query it measured.)
+    // H-22: the release pass's pre-pass collect + priority sort for the walk
+    // market (stagedForMarketTopK since task 1788550465) at the live staged depth, and at
+    // releaseSynthAtProbe (= RELEASE_PROBE_SYNTH, the L1 shed floor)
+    // synthetic entries added in query state; plus the effective pass caps
+    // (the constants, or the dev pin while one is set).
+    releaseSort : Nat64;
+    releaseSortSynth : Nat64;
+    releaseSynthAtProbe : Nat;
+    releaseMaxPerPass : Nat;
+    releaseFillBudget : Nat;
+    // Task 1788552852: the two sibling pre-loop terms, same rule. swapSort =
+    // the cross-swap pass's whole-map collect + ts sort (deferredSwapsByTs)
+    // at the live swap depth, then with swapSynthAtProbe synthetic swaps
+    // added in query state (ids ≥ 4e12). expiryScan = the expiry pass's
+    // due-cohort collect (expiredDeferredBatch) at the live staged depth,
+    // then with the releaseSynthAtProbe entries above added — NONE of them
+    // due, the every-tick common case where the scan finds nothing.
+    swapSort : Nat64;
+    swapSortSynth : Nat64;
+    swapSynthAtProbe : Nat;
+    expiryScan : Nat64;
+    expiryScanSynth : Nat64;
+    expirySynthAtProbe : Nat;
   } {
     requireDevHook("devSweepCostProbe");
     if (not Principal.isController(msg.caller)) { Runtime.trap("controller-only probe") };
@@ -18037,6 +24144,121 @@ persistent actor Uplands {
     let r0 = Prim.performanceCounter(0);
     repointOrderIdentity(hotOld, hotOld + 1);
     let r1 = Prim.performanceCounter(0);
+    // H-09 (same W5-19 rule): the three walk shapes on the live book, at the
+    // widest cap a public caller can open, so "bounded by WALK_SCAN_MAX"
+    // stays a measured number (test_walk_scan_budget.sh pins it over a
+    // 2,048-entry junk band).
+    var walkMarket : Text = ""; var walkBase : Types.TokenId = ""; var walkRef : Nat = 0;
+    label wm for ((mid, pool) in Map.entries(pools)) {
+      if (pool.refPrice > 0) { walkMarket := mid; walkBase := pool.baseToken; walkRef := pool.refPrice; break wm };
+    };
+    var wDepth : Nat64 = 0; var wSwap : Nat64 = 0; var wGate : Nat64 = 0;
+    var wScanned : Nat = 0; var wTrunc = false;
+    if (walkMarket != "") {
+      let cap = depthQueryCap(walkMarket, #buy, Fixed.mulDiv(walkRef, 10_000 + DEPTH_QUERY_BAND_BPS, 10_000, true));
+      let huge : Nat = 1_000_000_000_000_000_000;   // 1e10 base units / ICPUSD — never the binding bound
+      let w0 = Prim.performanceCounter(0);
+      let dw = fokFillableDepth(walkMarket, walkBase, #buy, cap, null, WALK_SCAN_MAX, null);
+      let w1 = Prim.performanceCounter(0);
+      ignore walkFillable(walkMarket, walkBase, #buy, cap,
+        #quoteSpend({ budget = huge; feeOf = func(c : Nat) : Nat { quoteFeeFor(p, c, #takerDebit) };
+                      effBps = quoteFeeFor(p, 10_000, #takerDebit) }),
+        WALK_SCAN_MAX, null);
+      let w2 = Prim.performanceCounter(0);
+      ignore fokFillableDepth(walkMarket, walkBase, #buy, cap, ?huge, FOK_GATE_ITER_BUDGET, null);
+      let w3 = Prim.performanceCounter(0);
+      wDepth := w1 - w0; wSwap := w2 - w1; wGate := w3 - w2;
+      wScanned := dw.scanned; wTrunc := dw.truncated;
+    };
+    // H-30: the five per-user pool reads for the sampled principal.
+    let h0 = Prim.performanceCounter(0);
+    ignore myMarginPoolsOf(p);
+    let h1 = Prim.performanceCounter(0);
+    ignore myPositionFillsOf(p);
+    let h2 = Prim.performanceCounter(0);
+    ignore myPoolLiquidationsOf(p);
+    let h3 = Prim.performanceCounter(0);
+    ignore archiveReadPrincipals(p, null);
+    let h4 = Prim.performanceCounter(0);
+    // 1788523970: the negative control — one full marginPools walk, the
+    // shape every per-user read above must NOT have.
+    var walkOwned : Nat = 0;
+    for ((_, pool) in Map.entries(marginPools)) { if (Principal.equal(pool.owner, p)) { walkOwned += 1 } };
+    let h5 = Prim.performanceCounter(0);
+    ignore walkOwned;
+    // (The 1788513124 pending owner-index read — live, then saturated with
+    // synthetic matches seeded through the retired recordPendingMatchIndex —
+    // was REMOVED at apiVersion 6.0.0 with the query it measured.)
+    // H-22 (the same W5-19 rule): the release pass's only N-dependent term
+    // is the pre-pass collect + priority selection of the market's staged
+    // entries (stagedForMarketTopK, task 1788550465: the market index + a
+    // top-k heap at k = releaseMaxPerPass()) — everything after it is
+    // bounded by the pass caps. Measured at the live S, then with
+    // RELEASE_PROBE_SYNTH synthetic entries for the walk market added in
+    // query state (ids ≥ 3e12, beside the W1-07 and pending synth ranges;
+    // indexed under the market like parkDeferred would, so the collect
+    // actually sees them) — the L1 shed floor's staged depth, the most a
+    // pass can ever be asked to rank. The release reference is `now + 1` so
+    // every entry counts as DUE and is ranked — the expensive path; the
+    // not-due path is a counter. Seeded in id order = ts order, as a live
+    // venue stages (allocateId is monotone, ts = Time.now() at staging,
+    // IC time is monotone across messages): the heap's cost is
+    // order-sensitive, and descending ts (every entry older than all before
+    // it — impossible live) would measure a sift-down per entry instead of
+    // the ≤ ~k-per-tier a live pass can see.
+    let rs0 = Prim.performanceCounter(0);
+    if (walkMarket != "") { ignore stagedForMarketTopK(walkMarket, now + 1, releaseMaxPerPass()) };
+    let rs1 = Prim.performanceCounter(0);
+    // Task 1788552852: the expiry pass's collect at the live depth (before
+    // the release synth is seeded) …
+    let ex0 = Prim.performanceCounter(0);
+    ignore expiredDeferredBatch(now);
+    let ex1 = Prim.performanceCounter(0);
+    var rsSeeded : Nat = 0;
+    if (walkMarket != "") {
+      let rsBase : Nat = 3_000_000_000_000;
+      for (j in Nat.range(0, RELEASE_PROBE_SYNTH)) {
+        Map.add(deferredExecs, Nat.compare, rsBase + j, {
+          id = rsBase + j; owner = p; marketId = walkMarket; baseToken = walkBase; side = #buy;
+          qty = 1; kind = #limit; limitPrice = 1; ts = now - RELEASE_PROBE_SYNTH + j;
+          reservedTok = Types.QUOTE_TOKEN; reservedAmt = 0; expiresAt = now + DEFERRED_EXPIRY_NS;
+        });
+        marketIdxAdd(walkMarket, rsBase + j);
+        expiryIdxAdd(now + DEFERRED_EXPIRY_NS, rsBase + j);   // task 1788552852: indexed like parkDeferred would, so the expiry collect sees them
+        rsSeeded += 1;
+      };
+    };
+    let rs2 = Prim.performanceCounter(0);
+    if (walkMarket != "") { ignore stagedForMarketTopK(walkMarket, now + 1, releaseMaxPerPass()) };
+    let rs3 = Prim.performanceCounter(0);
+    // … and at the live depth + the release synth (none of it due: the
+    // seeded expiresAt is now + DEFERRED_EXPIRY_NS), the every-tick case.
+    let ex2 = Prim.performanceCounter(0);
+    ignore expiredDeferredBatch(now);
+    let ex3 = Prim.performanceCounter(0);
+    // Task 1788552852: the cross-swap pass's collect + sort, live then with
+    // RELEASE_PROBE_SYNTH synthetic swaps (ids ≥ 4e12, beside the other
+    // synth ranges; raw Map.add — the swap index/counter chokepoints are
+    // not what is measured, and query state is discarded at return).
+    // Seeded in id = ts order, as a live venue stages them.
+    let sw0 = Prim.performanceCounter(0);
+    ignore deferredSwapsByTs();
+    let sw1 = Prim.performanceCounter(0);
+    var swSeeded : Nat = 0;
+    if (walkMarket != "") {
+      let swBase : Nat = 4_000_000_000_000;
+      for (j in Nat.range(0, RELEASE_PROBE_SYNTH)) {
+        Map.add(deferredSwaps, Nat.compare, swBase + j, {
+          id = swBase + j; owner = p; sellMarket = walkMarket; sellToken = walkBase;
+          buyMarket = walkMarket; buyToken = walkBase; amount = 1; maxSlippage = 1;
+          ts = now - RELEASE_PROBE_SYNTH + j; expiresAt = now + DEFERRED_EXPIRY_NS;
+        });
+        swSeeded += 1;
+      };
+    };
+    let sw2 = Prim.performanceCounter(0);
+    ignore deferredSwapsByTs();
+    let sw3 = Prim.performanceCounter(0);
     {
       userBalances = a1 - a0; myPositionsPools = a2 - a1; crossSection = a3 - a2;
       repointSaturated = r1 - r0;
@@ -18045,6 +24267,126 @@ persistent actor Uplands {
       stagedPoolOrders = sPoolOrders; stagedPoolElsewhere = sPoolElse;
       stagedGlobal = Map.size(deferredExecs); stagedOwn = sOwn;
       sampledPrincipal = Principal.toText(p);
+      walkMarket; walkDepth = wDepth; walkSwap = wSwap; walkFokGate = wGate;
+      walkScanned = wScanned; walkTruncated = wTrunc;
+      myMarginPools = h1 - h0; myPositionFills = h2 - h1;
+      myPoolLiquidations = h3 - h2; myArchivePrincipals = h4 - h3;
+      poolsWalk = h5 - h4;
+      poolsTotal = Map.size(marginPools);
+      releaseSort = rs1 - rs0; releaseSortSynth = rs3 - rs2;
+      releaseSynthAtProbe = rsSeeded;
+      releaseMaxPerPass = releaseMaxPerPass(); releaseFillBudget = releaseFillBudget();
+      swapSort = sw1 - sw0; swapSortSynth = sw3 - sw2; swapSynthAtProbe = swSeeded;
+      expiryScan = ex1 - ex0; expiryScanSynth = ex3 - ex2; expirySynthAtProbe = rsSeeded;
+    };
+  };
+
+  // H-31 (F48): instruction-cost probe for the per-principal trade lookups at
+  // a SATURATED tape (the W5-19 rule — "bounded" is a measurement at a known
+  // size, not a claim). Query state is discarded at return (the W1-07 trick),
+  // so the probe appends synthetic fills straight onto orderStore.trades AND
+  // the index until the tape sits at TRADES_GLOBAL_CAP — the size the trim
+  // holds a busy venue at — then measures each lookup's core: for a principal
+  // that has never traded, for anonymous, for the live principal with the
+  // MOST fills (worst case for the O(own) reads), and for a synthetic owner of
+  // MAX_POOLS_PER_OWNER pools whose pools all carry ≥200 fills
+  // (getMyPositionFills' widest shape). tapeWalk is the NEGATIVE CONTROL: the
+  // legacy full-tape walk the lookups were converted away from, at the same
+  // tape size — test_h31_trade_history_index sizes its tolerance from it, so
+  // a real walk can never hide in GC noise and noise can never fail the pin.
+  // Synthetic parties are fixed blob-derived principals that own no account;
+  // synthetic ids continue the tape's own id sequence (query state).
+  public shared query (msg) func devTradeHistoryCostProbe() : async {
+    tapeLive : Nat;              // List.size(orderStore.trades) before seeding
+    tapePartiesLive : Nat;       // parties over the live tape (2 per trade, 1 when self-crossed)
+    indexEntriesLive : Nat;      // index entries before seeding — must equal tapePartiesLive
+    tapeSynthAtProbe : Nat;      // synthetic fills appended in query state
+    tapeAtProbe : Nat;           // tape size the numbers were taken at
+    virginHistory : Nat64;       // getUserTradesIndexed(virgin, 200) — backs getMyTradeHistory
+    virginHistorySince0 : Nat64; // getUserTradesSinceIndexed(virgin, 0, 200) — backs getMyTradeHistorySince
+    virginSinceId0 : Nat64;      // getUserTradesSinceIdIndexed(virgin, 0, 200) — backs getMyTradesSinceId
+    anonHistory : Nat64;         // the anonymous early return
+    sampledPrincipal : Text;
+    sampledOwn : Nat;            // the sampled principal's indexed fills at probe time
+    sampledHistory : Nat64;      // getUserTradesIndexed(sampled, 200) — O(min(own, 200))
+    sampledSinceId0 : Nat64;     // getUserTradesSinceIdIndexed(sampled, 0, 200)
+    ownerPools : Nat;            // pools minted for the synthetic owner (MAX_POOLS_PER_OWNER)
+    ownerFillsSeen : Nat;        // rows myPositionFillsOf(owner) returned (200 per pool once each pool holds ≥200)
+    ownerPositionFills : Nat64;  // myPositionFillsOf(owner) core
+    tapeWalk : Nat64;            // NEGATIVE CONTROL: legacy OrderBook.getUserTrades(virgin, 200), the full walk
+  } {
+    requireDevHook("devTradeHistoryCostProbe");
+    if (not Principal.isController(msg.caller)) { Runtime.trap("controller-only probe") };
+    let tapeLive = List.size(orderStore.trades);
+    let tapePartiesLive = OrderBook.tapePartyCount(orderStore);
+    let indexEntriesLive = OrderBook.userTradeIndexEntries(userTradeIndex);
+    // The live principal with the most fills.
+    var sampleP : Principal = Principal.fromText("2vxsx-fae");
+    var sampleN : Nat = 0;
+    for ((pp, l) in Map.entries(userTradeIndex)) {
+      if (List.size(l) > sampleN) { sampleP := pp; sampleN := List.size(l) };
+    };
+    let synthBuyer  = Principal.fromBlob(Text.encodeUtf8("probe-h31-buyer"));
+    let synthSeller = Principal.fromBlob(Text.encodeUtf8("probe-h31-seller"));
+    let virgin      = Principal.fromBlob(Text.encodeUtf8("probe-h31-virgin"));
+    let owner       = Principal.fromBlob(Text.encodeUtf8("probe-h31-pool-owner"));
+    let poolPs = Array.tabulate<Principal>(MAX_POOLS_PER_OWNER, func(_) { poolPrincipalOf(registerPool(owner, "", false)) });
+    let now = Time.now();
+    let idBase = orderStore.nextTradeId;
+    // Seed through the per-principal list handles (the writer's own
+    // get-or-create, fetched once): three List.adds per fill. 600k fills
+    // through indexUserTrade's two map lookups each exceeded the 5×10^9
+    // query budget; and should a fatter venue ever push this loop past
+    // 3.5×10^9 it stops short instead of trapping — tapeAtProbe then reads
+    // below the cap and the suite fails on THAT number, loudly.
+    let lBuyer  = OrderBook.userTradeList(userTradeIndex, synthBuyer);
+    let lSeller = OrderBook.userTradeList(userTradeIndex, synthSeller);
+    let lPools  = Array.map<Principal, List.List<Types.Trade>>(poolPs, func(pp) { OrderBook.userTradeList(userTradeIndex, pp) });
+    var seeded : Nat = 0;
+    label seed while (List.size(orderStore.trades) < TRADES_GLOBAL_CAP) {
+      if (seeded % 4096 == 0 and Prim.performanceCounter(0) > 3_500_000_000) { break seed };
+      // Every 8th fill lands on one of the owner's pools, round-robin, so each
+      // pool holds ≥200 fills at the cap (600k / 8 / 64 ≈ 1,170).
+      let k = (seeded / 8) % MAX_POOLS_PER_OWNER;
+      let onPool = seeded % 8 == 0;
+      let t : Types.Trade = {
+        id = idBase + seeded; marketId = ""; buyOrderId = 0; sellOrderId = 0;
+        buyer = if (onPool) { poolPs[k] } else { synthBuyer }; seller = synthSeller;
+        price = 1; quantity = 1; timestamp = now; takerOrderType = null;
+      };
+      List.add(orderStore.trades, t);
+      List.add(if (onPool) { lPools[k] } else { lBuyer }, t);
+      List.add(lSeller, t);
+      seeded += 1;
+    };
+    let tapeAtProbe = List.size(orderStore.trades);
+    let c0 = Prim.performanceCounter(0);
+    ignore OrderBook.getUserTradesIndexed(userTradeIndex, virgin, 200);
+    let c1 = Prim.performanceCounter(0);
+    ignore OrderBook.getUserTradesSinceIndexed(userTradeIndex, virgin, 0, 200);
+    let c2 = Prim.performanceCounter(0);
+    ignore OrderBook.getUserTradesSinceIdIndexed(userTradeIndex, virgin, 0, 200);
+    let c3 = Prim.performanceCounter(0);
+    ignore OrderBook.getUserTradesIndexed(userTradeIndex, Principal.fromText("2vxsx-fae"), 200);
+    let c4 = Prim.performanceCounter(0);
+    ignore OrderBook.getUserTradesIndexed(userTradeIndex, sampleP, 200);
+    let c5 = Prim.performanceCounter(0);
+    ignore OrderBook.getUserTradesSinceIdIndexed(userTradeIndex, sampleP, 0, 200);
+    let c6 = Prim.performanceCounter(0);
+    let fills = myPositionFillsOf(owner);
+    let c7 = Prim.performanceCounter(0);
+    ignore OrderBook.getUserTrades(orderStore, virgin, 200);
+    let c8 = Prim.performanceCounter(0);
+    {
+      tapeLive; tapePartiesLive; indexEntriesLive;
+      tapeSynthAtProbe = seeded; tapeAtProbe;
+      virginHistory = c1 - c0; virginHistorySince0 = c2 - c1; virginSinceId0 = c3 - c2;
+      anonHistory = c4 - c3;
+      sampledPrincipal = Principal.toText(sampleP); sampledOwn = sampleN;
+      sampledHistory = c5 - c4; sampledSinceId0 = c6 - c5;
+      ownerPools = poolPs.size(); ownerFillsSeen = fills.size();
+      ownerPositionFills = c7 - c6;
+      tapeWalk = c8 - c7;
     };
   };
 
@@ -18061,38 +24403,49 @@ persistent actor Uplands {
     var missing = 0; var stray = 0; var accWrong = 0;
     var detail = ""; var noted = 0;
     let note = func (t : Text) { if (noted < 8) { detail #= t # "; "; noted += 1 } };
-    // (a) every map entry is indexed under its owner(s).
-    for ((id, pm) in Map.entries(pendingMatches)) {
-      let tOk = switch (Map.get(pmIdsByUser, Principal.compare, pm.takerPrincipal)) { case (?s) { Map.get(s, Nat.compare, id) != null }; case null { false } };
-      let mOk = switch (Map.get(pmIdsByUser, Principal.compare, pm.makerPrincipal)) { case (?s) { Map.get(s, Nat.compare, id) != null }; case null { false } };
-      if (not (tOk and mOk)) { missing += 1; note("pm " # Nat.toText(id) # " unindexed") };
-    };
+    // (a) every map entry is indexed under its owner(s). (The fossil
+    // pendingMatches map was swept by the sixth one-shot migration, task
+    // 1788744109 — pmLive below stays in the Candid as a constant 0.)
     for ((id, d) in Map.entries(deferredExecs)) {
       let ok = switch (Map.get(deferredIdsByOwner, Principal.compare, d.owner)) { case (?s) { Map.get(s, Nat.compare, id) != null }; case null { false } };
       if (not ok) { missing += 1; note("exec " # Nat.toText(id) # " unindexed") };
+      // Task 1788550465: …and under its market.
+      let mOk = switch (Map.get(deferredIdsByMarket, Text.compare, d.marketId)) { case (?s) { Map.get(s, Nat.compare, id) != null }; case null { false } };
+      if (not mOk) { missing += 1; note("exec " # Nat.toText(id) # " unindexed by market") };
+      // (g) Task 1788552852: …and under its CURRENT expiresAt.
+      let eOk = switch (Map.get(deferredIdsByExpiry, Int.compare, d.expiresAt)) { case (?s) { Map.get(s, Nat.compare, id) != null }; case null { false } };
+      if (not eOk) { missing += 1; note("exec " # Nat.toText(id) # " unindexed by expiry") };
     };
     for ((id, s) in Map.entries(deferredSwaps)) {
       let ok = switch (Map.get(swapIdsByOwner, Principal.compare, s.owner)) { case (?st) { Map.get(st, Nat.compare, id) != null }; case null { false } };
       if (not ok) { missing += 1; note("swap " # Nat.toText(id) # " unindexed") };
     };
     // (b) every indexed id exists in its map, under the right owner.
-    for ((p, s) in Map.entries(pmIdsByUser)) {
-      for ((id, _) in Map.entries(s)) {
-        switch (Map.get(pendingMatches, Nat.compare, id)) {
-          case (?pm) {
-            if (not (Principal.equal(pm.takerPrincipal, p) or Principal.equal(pm.makerPrincipal, p))) {
-              stray += 1; note("pm idx wrong-owner " # Nat.toText(id));
-            };
-          };
-          case null { stray += 1; note("pm idx stray " # Nat.toText(id)) };
-        };
-      };
-    };
     for ((p, s) in Map.entries(deferredIdsByOwner)) {
       for ((id, _) in Map.entries(s)) {
         switch (Map.get(deferredExecs, Nat.compare, id)) {
           case (?d) { if (not Principal.equal(d.owner, p)) { stray += 1; note("exec idx wrong-owner " # Nat.toText(id)) } };
           case null { stray += 1; note("exec idx stray " # Nat.toText(id)) };
+        };
+      };
+    };
+    // Task 1788550465: the market index — every indexed id exists, under its market.
+    for ((m, s) in Map.entries(deferredIdsByMarket)) {
+      for ((id, _) in Map.entries(s)) {
+        switch (Map.get(deferredExecs, Nat.compare, id)) {
+          case (?d) { if (d.marketId != m) { stray += 1; note("exec market idx wrong-market " # Nat.toText(id)) } };
+          case null { stray += 1; note("exec market idx stray " # Nat.toText(id)) };
+        };
+      };
+    };
+    // (g) Task 1788552852: the expiry index — every indexed id exists, under
+    // its current expiresAt (a re-put that forgot to move it shows here as
+    // wrong-expiry + unindexed-by-expiry).
+    for ((e, s) in Map.entries(deferredIdsByExpiry)) {
+      for ((id, _) in Map.entries(s)) {
+        switch (Map.get(deferredExecs, Nat.compare, id)) {
+          case (?d) { if (d.expiresAt != e) { stray += 1; note("exec expiry idx wrong-expiry " # Nat.toText(id)) } };
+          case null { stray += 1; note("exec expiry idx stray " # Nat.toText(id)) };
         };
       };
     };
@@ -18138,6 +24491,27 @@ persistent actor Uplands {
         };
       };
     };
+    // (f) H-13: the per-owner staged counter (the STAGED_CAP_PER_OWNER gate)
+    // equals a fresh recount over BOTH staged maps, keyed exactly as
+    // incStagedCount/decStagedCount key it (scorecardKeyOf). A miss here is a
+    // cap that admits too much (undercount) or wedges an account (overcount).
+    var countWrong = 0;
+    let expectedCount = Map.empty<Text, Nat>();
+    for ((_, d) in Map.entries(deferredExecs)) {
+      let k = scorecardKeyOf(d.owner);
+      Map.add(expectedCount, Text.compare, k, Option.get(Map.get(expectedCount, Text.compare, k), 0) + 1);
+    };
+    for ((_, s) in Map.entries(deferredSwaps)) {
+      let k = scorecardKeyOf(s.owner);
+      Map.add(expectedCount, Text.compare, k, Option.get(Map.get(expectedCount, Text.compare, k), 0) + 1);
+    };
+    for ((k, v) in Map.entries(expectedCount)) {
+      let have = Option.get(Map.get(stagedCountByOwner, Text.compare, k), 0);
+      if (have != v) { countWrong += 1; note("staged count " # k # " have " # Nat.toText(have) # " want " # Nat.toText(v)) };
+    };
+    for ((k, _) in Map.entries(stagedCountByOwner)) {
+      if (Map.get(expectedCount, Text.compare, k) == null) { countWrong += 1; note("staged count stray " # k) };
+    };
     // (e) instruction cost of the indexed vs recomputed read, on a live sample.
     var sampleP : ?Principal = null; var sampleTok : Types.TokenId = "";
     label find for ((_, d) in Map.entries(deferredExecs)) { sampleP := ?d.owner; sampleTok := d.reservedTok; break find };
@@ -18158,9 +24532,9 @@ persistent actor Uplands {
     };
     {
       consistent = missing == 0 and stray == 0 and accWrong == 0
-        and linkFwdUnmirrored == 0 and linkRevStray == 0;
+        and linkFwdUnmirrored == 0 and linkRevStray == 0 and countWrong == 0;
       detail = if (detail == "") { "consistent" } else { detail };
-      pmLive = Map.size(pendingMatches); execLive = Map.size(deferredExecs); swapLive = Map.size(deferredSwaps);
+      pmLive = 0; execLive = Map.size(deferredExecs); swapLive = Map.size(deferredSwaps);
       accEntries = Map.size(softLockedAcc);
       releasedLinks = Map.size(stagedReleasedAs);
       releasedFromEntries = Map.size(stagedReleasedFrom);
@@ -18175,28 +24549,41 @@ persistent actor Uplands {
   // are consistent before the first message executes. This is what lets
   // the indexes stay transient (no migration, no stable-compat risk).
   func rebuildStagedIndexes() {
-    Map.clear(pmIdsByUser); Map.clear(deferredIdsByOwner);
+    Map.clear(deferredIdsByOwner); Map.clear(deferredIdsByMarket);
+    Map.clear(deferredIdsByExpiry);
     Map.clear(swapIdsByOwner); Map.clear(softLockedAcc);
-    for ((id, pm) in Map.entries(pendingMatches)) {
-      ownerIdxAdd(pmIdsByUser, pm.takerPrincipal, id);
-      ownerIdxAdd(pmIdsByUser, pm.makerPrincipal, id);
-    };
+    // H-13: the per-owner staged counter is stable, but it is a derived count
+    // of the two staged maps and is recounted here from them for the same
+    // reason the indexes are rebuilt — a venue upgraded with cross-swaps
+    // staged BEFORE the fix would otherwise under-count them until they
+    // drained (the audit's (f) check would then read inconsistent on the
+    // first upgrade of every live target).
+    Map.clear(stagedCountByOwner);
     for ((id, d) in Map.entries(deferredExecs)) {
       ownerIdxAdd(deferredIdsByOwner, d.owner, id);
+      marketIdxAdd(d.marketId, id);
+      expiryIdxAdd(d.expiresAt, id);
       slAccBump(d.owner, d.reservedTok, d.reservedAmt);
+      incStagedCount(d.owner);
     };
     for ((id, s) in Map.entries(deferredSwaps)) {
       ownerIdxAdd(swapIdsByOwner, s.owner, id);
       slAccBump(s.owner, s.sellToken, s.amount);
+      incStagedCount(s.owner);
     };
   };
   rebuildStagedIndexes();
   // W5-19 (F12): rebuild the transient owner→pools index.
   for ((id, pool) in Map.entries(marginPools)) { indexPoolOwner(pool.owner, id) };
+  // H-31: rebuild the transient principal → fills index from the tape.
+  OrderBook.rebuildUserTradeIndex(userTradeIndex, orderStore);
   // W1-07: rebuild the transient release-link reverse index. revAppend also
   // applies the per-order handle cap, so a pre-fix venue whose chains grew
-  // past it is trimmed (oldest handles first) as it comes up.
-  for ((k, v) in Map.entries(stagedReleasedAs)) { revAppend(v, k) };
+  // past it is trimmed (oldest handles first) as it comes up. Issue #55
+  // "rebuild loop": the trim deletes from stagedReleasedAs, so the walk is
+  // over a SNAPSHOT (inside rebuildReverse) — the live-cursor form skipped
+  // entries at >32 handles per id and trapped (refused install) at ~64.
+  ReleaseLinks.rebuildReverse(stagedReleasedAs, stagedReleasedFrom, STAGED_HANDLES_PER_ORDER_CAP);
 
   transient let oqlRegistry : OQL.Registry.Registry = OQL.Registry.build(oqlEntities);
   transient let oqlAccess = func (caller : Principal) : (OQL.Entity.Decl) -> OQL.Auth.Access {

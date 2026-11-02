@@ -16,6 +16,7 @@
 # ⚠️ Calls resetExchange.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -25,12 +26,11 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
 
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-PA=$(mkid net_long)
-PB=$(mkid net_short)
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-asA() { icp canister call --identity net_long  backend "$@" 2>&1; }
-asB() { icp canister call --identity net_short backend "$@" 2>&1; }
+mdx_identity_new net_long; PA=$(principal_of net_long)
+mdx_identity_new net_short; PB=$(principal_of net_short)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+asA() { icp canister call --candid "$MDX_CANDID" --identity net_long  backend "$@" 2>&1; }
+asB() { icp canister call --candid "$MDX_CANDID" --identity net_short backend "$@" 2>&1; }
 fld() { echo "$2" | tr -d '_' | grep -oE "$1 = -?[0-9]+" | head -1 | grep -oE "[0-9]+"; }
 release() { adm setAmmRefPrice "(\"$1\", $(e8 "$2") : nat)" >/dev/null; adm requoteAmm "(\"$1\")" >/dev/null; }
 netted() { adm getNettedVolumeUsd '()' | tr -d '_' | grep -oE "[0-9]+" | head -1; }
@@ -40,8 +40,8 @@ adm resetExchange "()" >/dev/null 2>&1 || true
 for m in BTC-ICPUSD SOL-ICPUSD; do adm createAmmPool "(\"$m\")" >/dev/null 2>&1; done
 adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
 adm setAmmRefPrice "(\"SOL-ICPUSD\", $(e8 180.0) : nat)"   >/dev/null
-adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat, 0:nat)"   >/dev/null 2>&1 || true
-adm setAmmConfig "(\"SOL-ICPUSD\", 30:nat, $(e8 150.0) : nat, 8:nat, 25:nat, 0:nat)" >/dev/null 2>&1 || true
+adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat)"   >/dev/null 2>&1 || true
+adm setAmmConfig "(\"SOL-ICPUSD\", 30:nat, $(e8 150.0) : nat, 8:nat, 25:nat)" >/dev/null 2>&1 || true
 adm enableAmm '("BTC-ICPUSD", true)' >/dev/null 2>&1 || true
 adm enableAmm '("SOL-ICPUSD", true)' >/dev/null 2>&1 || true
 AMM=$(adm getAmmPrincipal "()" | grep -oE 'principal "[^"]+"' | head -1 | sed -E 's/principal "(.+)"/\1/')

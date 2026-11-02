@@ -86,4 +86,4 @@ Fallback if the index is deferred: bound the work per batch (cap liquidations pe
 
 Credit is Menese's; item 1 of the same issue is [W3-01](W3-01-soft-locked-reserved-accumulator.md)
 (credit andreij6, #19 Finding 5). Item 2 of that issue — the matcher fill walk — is **already
-fixed** post-1.60 and must not be reworked.
+fixed** in 1.60 (a4fe012) and must not be reworked.

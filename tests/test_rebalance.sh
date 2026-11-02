@@ -63,14 +63,14 @@ assert_contains "auto-rebalancer defaults OFF" "$AUTO" "false"
 # forced-taker cap (spread + one level = 35bp → floor 74,737.5); the old
 # 74,500 bid is now correctly out of reach — that price being takeable was
 # exactly the "park an order and wait for the vault" leak.
-icp identity new buyer --storage plaintext 2>/dev/null || true
+mdx_identity_new buyer
 BUYER=$(principal_of buyer)
 call setTestBalance "(principal \"$BUYER\", \"ICPUSD\", $(e8 100000.0))" --identity alice > /dev/null
 call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 74850.0) : nat, $(e8 0.5) : nat)" --identity buyer > /dev/null
 
 # Trigger rebalance (manual controller path — works regardless of the flag).
 REBAL=$(call rebalanceAmm '("BTC-ICPUSD")' --identity alice)
-assert_contains "rebalance call returned" "$REBAL" "ok"
+assert_ok "rebalance call returned" "$REBAL"
 
 # Verify: lastRebalanceNs is now set (was 0 in the seed_amm fixture).
 # This single assertion is the regression lock for the dust-threshold

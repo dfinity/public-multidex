@@ -35,17 +35,14 @@ echo "── test_self_trade_prevention ──"
 
 # Pick whichever market actually has a priced AMM pool on this venue —
 # resetExchange in other suites can leave only a subset seeded.
-PICK=$(icp canister call backend getAmmPools '()' --query --identity anonymous 2>&1 \
+PICK=$(icp canister call --candid "$MDX_CANDID" backend getAmmPools '()' --query --identity anonymous 2>&1 \
   | tr '}' '\n' | grep -oE 'marketId = "[^"]*"' | head -1 | grep -oE '"[^"]*"' | tr -d '"')
 MKT="${PICK:-BTC-ICPUSD}"
-newid() { echo "y" | icp identity delete "$1" >/dev/null 2>&1 || true
-          icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; }
-delid() { echo "y" | icp identity delete "$1" >/dev/null 2>&1 || true; }
 
 # Two funded actors: STP is about who benefits, so we need a real second party
 # to prove liquidity still works.
 A="stp_a"; B="stp_b"
-newid "$A"; newid "$B"
+mdx_identity_new "$A"; mdx_identity_new "$B"   # virgin each run, deleted on EXIT (tests/_lib.sh)
 APRIN=$(icp identity principal --identity "$A" 2>/dev/null | tail -1)
 BPRIN=$(icp identity principal --identity "$B" 2>/dev/null | tail -1)
 call setTestBalance "(principal \"$APRIN\", \"ICPUSD\", 200000000000 : nat)" --identity anonymous >/dev/null
@@ -55,7 +52,7 @@ call setTestBalance "(principal \"$BPRIN\", \"ICPUSD\", 200000000000 : nat)" --i
 
 MARK=$(call getAmmPool "(\"$MKT\")" --query --identity anonymous | grep -oE 'refPrice = [0-9_]+' | head -1 | grep -oE '[0-9_]+' | tr -d '_')
 if [ -z "${MARK:-}" ] || [ "$MARK" = "0" ]; then
-  echo "  SKIP: $MKT has no reference price on this venue"; delid "$A"; delid "$B"; exit 0
+  echo "  SKIP: $MKT has no reference price on this venue"; exit 0
 fi
 echo "  market = $MKT   mark = $MARK"
 # ~$200 of notional, whatever the asset is priced at (1 BTC would exceed the
@@ -85,7 +82,7 @@ rose() { local i=0 v; while [ $i -lt 15 ]; do
 # ── §1 wallet crossing its OWN wallet order ──
 OID=$(rest_ask)
 if [ -z "${OID:-}" ]; then
-  echo "  SKIP: could not rest a post-only ask (book/oracle state)"; delid "$A"; delid "$B"; exit 0
+  echo "  SKIP: could not rest a post-only ask (book/oracle state)"; exit 0
 fi
 _ok "§1 A rested a post-only ask at the mark (order $OID)"
 # A now buys at the mark — the only ask at that price is its own.
@@ -129,6 +126,5 @@ fi
 
 call cancelAllMyOrders '(null)' --identity "$A" >/dev/null 2>&1 || true
 call cancelAllMyOrders '(null)' --identity "$B" >/dev/null 2>&1 || true
-delid "$A"; delid "$B"
 
 finish_test "self_trade_prevention"

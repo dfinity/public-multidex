@@ -83,7 +83,7 @@
   background: transparent;
   /* Same cyan outline as the Place Order / Swap Tokens boxes (orderbook.css
      .order-panel) — the signed-in pill belongs to that highlight family. */
-  border: 1.5px solid rgba(56, 189, 240, 0.45);
+  border: 1.5px solid var(--accent-outline);
   border-radius: 999px;
   color: var(--text);
   font-size: 14px;
@@ -94,7 +94,7 @@
 /* Hover feedback: the border reads THICKER — a ring shadow in the same color
    (no reflow). The pill's background must not change; the lighter fill is
    reserved for the OPEN (menu showing) state. */
-.user-menu-trigger:hover { box-shadow: 0 0 0 1px rgba(56, 189, 240, 0.45); }
+.user-menu-trigger:hover { box-shadow: 0 0 0 1px var(--accent-outline); }
 .user-menu.open .user-menu-trigger { border-color: var(--accent); background: var(--bg-hover); }
 /* Account view active: the pill is the selected "tab" (Account isn't in the
    desktop nav row). Full-saturation border + a 1px ring in the same colour
@@ -130,6 +130,12 @@
   display: block;
 }
 .user-menu-name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The #dev-login hook's loud marker (main.js devLoginPillName, task
+   1793497426): while a seat venue's throwaway identity is signed in the name
+   slot carries its label instead of a username — uncapped (the username cap
+   would clip it), amber ink, spaced caps. Set by renderProfileChip only; no
+   markup ever carries this class. */
+.user-menu-name.dev-identity, #drawer-acct-name.dev-identity { max-width: none; color: var(--cta-ink); font-weight: 700; letter-spacing: 0.04em; font-size: 12px; }
 .user-menu-caret { color: var(--text-dim); transition: transform 0.15s; flex-shrink: 0; }
 .user-menu.open .user-menu-caret { transform: rotate(180deg); }
 .user-menu-dropdown {
@@ -142,7 +148,7 @@
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 6px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-pop);
   z-index: 200;
 }
 .user-menu.open .user-menu-dropdown { display: block; }
@@ -160,7 +166,9 @@
   border-radius: 6px;
   transition: background 0.12s, color 0.12s;
 }
-.user-menu-item:hover { background: var(--bg-input); color: var(--accent); }
+.user-menu-item:hover, .user-menu-item:focus-visible { background: var(--bg-input); color: var(--accent); }
+/* An inset ring: the dropdown's padding is 6px, an outer ring would sit on its edge. */
+.user-menu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .user-menu-sep { border-top: 1px solid var(--border); margin: 6px 0; }
 
 /* Hamburger — hidden on desktop */
@@ -172,6 +180,40 @@
   cursor: pointer;
   padding: 4px;
 }
+
+/* ── Theme toggle (sun / moon) ─────────────────────────────────────
+   The round button at the far right of .header-right: a 34px hit target,
+   outlined like its pill neighbour, accent on hover. The glyph shown is the
+   DESTINATION — a sun while the dark theme is on (press for light), a moon
+   while light — keyed on <html data-theme>. theme.js owns the state and the
+   aria attributes; base.css explains the token architecture it switches. */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.theme-toggle:hover { color: var(--accent); border-color: var(--accent-outline); background: var(--accent-tint-1); }
+.theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.theme-toggle svg, .drawer-theme svg { width: 18px; height: 18px; display: block; flex-shrink: 0; }
+/* Specificity note: the hide rules must out-rank the `.theme-toggle svg`
+   display:block above (0,1,1) — hence the two-class selectors (0,2,0); the
+   light-theme swap below ranks higher still through :root[data-theme]. */
+.theme-toggle .theme-icon-moon, .drawer-theme .theme-icon-moon { display: none; }
+:root[data-theme="light"] .theme-icon-sun { display: none; }
+:root[data-theme="light"] .theme-icon-moon { display: block; }
+/* The drawer's row twin — mobile only (responsive.css reveals it at the top
+   of the open drawer, styled like the nav rows, and hides the round one). */
+.drawer-theme { display: none; }
 
 /* Chart cell — fills its grid cell; desktop uses full height, mobile uses fixed height */
 .mini-chart {
@@ -212,24 +254,38 @@
 /* View selector for the chart cell: chart | liquidations | hide. Replaces the
    old Hide toggle. The label carries the ACCENT colour on purpose — the cell
    holds more than a price chart now, and a dimmed control would never be
-   discovered. Same interaction shape as the order book's granularity menu. */
+   discovered. Same interaction shape as the order book's granularity menu.
+   A menu button (main.js renderMiniChart, 1793503737): .mini-chart-view is
+   the positioning wrapper that carries the .open state, .mcv-trigger the real
+   <button> that draws the box the wrapper used to draw, .mcv-menu the
+   role=menu, .mcv-item its role=menuitem buttons — reset so they render
+   exactly as the divs they replace, plus :focus-visible rings in the accent
+   token (the expand button's shape). */
 .mini-chart-view {
   position: relative;
   margin-left: auto;
   display: flex;
   align-items: center;
+}
+.mcv-trigger {
+  display: inline-flex;
+  align-items: center;
   gap: 5px;
+  margin: 0;
   padding: 4px 8px;
   border: 1px solid var(--border);
   border-radius: 4px;
+  background: transparent;
   color: var(--accent);
+  font: inherit;
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
   user-select: none;
   transition: border-color 0.15s;
 }
-.mini-chart-view:hover { border-color: var(--accent); }
+.mcv-trigger:hover { border-color: var(--accent); }
+.mcv-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mcv-menu {
   display: none;
   position: absolute;
@@ -239,19 +295,53 @@
   background: var(--bg-card, var(--bg-input));
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-pop);
   z-index: 40;
   overflow: hidden;
 }
 .mini-chart-view.open .mcv-menu { display: block; }
 .mcv-item {
+  display: block;
+  width: 100%;
+  margin: 0;
   padding: 7px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
   font-size: 12px;
   font-weight: 400;
-  color: var(--text-dim);
+  text-align: left;
   white-space: nowrap;
+  cursor: pointer;
 }
-.mcv-item:hover { background: var(--bg-hover); color: var(--text); }
+.mcv-item:hover, .mcv-item:focus-visible { background: var(--bg-hover); color: var(--text); }
+/* The menu clips its corners (overflow: hidden), so the ring sits inside. */
+.mcv-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Expand: the same chart full-screen (#chart-overlay, main.js openChart). A
+   real <button> with an aria-label, at the right end of the bar. It replaces
+   the market header's #chart-btn, which had been display:none since the
+   initial commit — the overlay was unreachable at every width (1793498839).
+   Chart-only like the interval buttons: hidden over the liquidation map and
+   while the cell is collapsed (the state rules below), never otherwise. */
+.mini-chart-expand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  margin-left: 6px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 0.15s, border-color 0.15s;
+}
+.mini-chart-expand:hover { color: var(--text); border-color: var(--accent); }
+.mini-chart-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .mini-chart-canvas { width: 100%; flex: 1; min-height: 0; }
 
@@ -271,8 +361,9 @@
 }
 .mini-chart-heat .hm2-wrap { height: auto; flex: 1; min-height: 150px; }
 .mini-chart.mcv-showing-heat .mini-chart-canvas { display: none; }
-/* Interval buttons are chart-only — meaningless over the map. */
-.mini-chart.mcv-showing-heat .mini-chart-iv { display: none; }
+/* Interval buttons and the expand control are chart-only — meaningless over the map. */
+.mini-chart.mcv-showing-heat .mini-chart-iv,
+.mini-chart.mcv-showing-heat .mini-chart-expand { display: none; }
 .mini-chart.mini-chart-collapsed {
   /* When the user hides the chart, the cell shrinks to the toolbar height
      (no canvas, no interval buttons), freeing the grid row for the rest
@@ -292,5 +383,6 @@
    that matters (and needs no :has()); this generalises it. */
 .mini-chart:has(.mini-chart-view.open) { overflow: visible; }
 .mini-chart.mini-chart-collapsed .mini-chart-canvas { display: none; }
-.mini-chart.mini-chart-collapsed .mini-chart-iv { display: none; }
+.mini-chart.mini-chart-collapsed .mini-chart-iv,
+.mini-chart.mini-chart-collapsed .mini-chart-expand { display: none; }
 

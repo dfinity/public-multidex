@@ -9,8 +9,10 @@ person) — file those via GitHub's private vulnerability reporting: **Security 
 Report a vulnerability**
 (https://github.com/dfinity/public-multidex/security/advisories/new). We mirror
 advisories into the public tracker once the fix ships, keeping the GHSA id so
-the cross-reference graph survives. This is the `#play`-era policy; it will be
-revised before the venue transitions to `#production`.
+the cross-reference graph survives. The same rule applies to our own triage
+documents and task briefs: any that carry a working primitive for that class are
+held from the public mirror until the fix ships. This is the `#play`-era policy;
+it will be revised before the venue transitions to `#production`.
 
 If the private channel is unavailable to you for any reason, email
 **multidex@dfinity.org** instead.

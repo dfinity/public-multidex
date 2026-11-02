@@ -45,6 +45,17 @@ CE_IDENTITY=""
 [ -f "$(dirname "$0")/.cloud-engine.conf" ] && . "$(dirname "$0")/.cloud-engine.conf" 2>/dev/null
 [ -n "${BOT_IDENTITY:-}" ] && CE_IDENTITY="$BOT_IDENTITY"
 
+# The FUNDING identity (task 1789609263): every refill (fund_call) and every
+# balance read the refill loop makes (bal_of) signs as FUND_IDENTITY — the
+# controller-designated funding authority (setFundingAuthority; the
+# operator's `mdex-bots` key) handed in as MDX_FUNDING_IDENTITY by
+# scripts/lib/bots.sh — and only FALLS BACK to the controller identity above
+# when none is set (the pre-1789609263 posture, named in the banner below).
+# Local: anonymous, the local controller, unless overridden. Nothing below
+# this line reads CE_IDENTITY / BOT_IDENTITY for a refill.
+if $REMOTE; then FUND_IDENTITY="${MDX_FUNDING_IDENTITY:-$CE_IDENTITY}"
+else             FUND_IDENTITY="${MDX_FUNDING_IDENTITY:-anonymous}"; fi
+
 # Identity namespace for THIS fleet. Two fleets (e.g. the live subnet and a
 # cloud engine) must not share one: the names are global to the icp identity
 # store, so they would trade as the SAME principals and — worse — whichever
@@ -152,41 +163,34 @@ trap cleanup INT TERM
 # SET whose delta records as an external flow, so refills raise the bot's
 # leaderboard baseline too — bots can't fake profit by being refilled.
 #
-# Posture: remote+conf funds as the engine controller; local as anonymous;
-# a dev-postured remote self-funds via the faucet AS each bot.
+# Posture: remote funds as FUND_IDENTITY (the funding authority, else the
+# controller it fell back to); local as anonymous; a dev-postured remote with
+# NO funding identity self-funds via the faucet AS each bot.
 SEED_CASH_REMOTE=40000;    FLOOR_CASH_REMOTE=10000     # $ (player-parity mix)
 SEED_ASSET_USD_REMOTE=15000; FLOOR_ASSET_USD_REMOTE=4000
 SEED_CASH_LOCAL=50000000;  FLOOR_CASH_LOCAL=12000000
 SEED_ASSET_UNITS_LOCAL=100000; FLOOR_ASSET_UNITS_LOCAL=25000
 REFILL_CHECK_S=${REFILL_CHECK_S:-60}
 
-fund_call() {   # controller-scoped setTestBalance for the current posture
-  if $REMOTE && [ -n "$CE_IDENTITY" ]; then
-    icp canister call --identity "$CE_IDENTITY" $ENV_FLAG backend "$@" >/dev/null 2>&1 || true
-  else
-    adm "$@" >/dev/null 2>&1 || true
-  fi
+fund_call() {   # setTestBalance as the FUNDING identity (never the controller key)
+  [ -n "$FUND_IDENTITY" ] || return 0   # remote, no funding identity: the faucet path in fund_bot applies
+  icp canister call --identity "$FUND_IDENTITY" $ENV_FLAG backend "$@" >/dev/null 2>&1 || true
 }
 bal_of() {      # e8 balance of ($1=principal, $2=token)
-  # getTestBalance is scoped to self-or-controller (it used to be an open public
-  # query, which leaked every principal's holdings). We read OTHER principals
-  # here — the bots' — so we must call as the controller, same posture logic as
-  # fund_call above. A non-controller now gets 0 back, which would read as
-  # "below floor" and refill forever.
-  if $REMOTE && [ -n "$CE_IDENTITY" ]; then
-    icp canister call --query --identity "$CE_IDENTITY" $ENV_FLAG backend getTestBalance \
-      "(principal \"$1\", \"$2\")" 2>&1 | grep -oE "[0-9][0-9_]*" | head -1 | tr -d '_'
-  else
-    icp canister call --query --identity anonymous $ENV_FLAG backend getTestBalance \
-      "(principal \"$1\", \"$2\")" 2>&1 | grep -oE "[0-9][0-9_]*" | head -1 | tr -d '_'
-  fi
+  # getTestBalance is scoped to self, a controller, or the funding authority
+  # (it used to be an open public query, which leaked every principal's
+  # holdings). We read OTHER principals here — the bots' — so we call as the
+  # same FUND_IDENTITY fund_call signs with: an identity that could mint but
+  # not read would get 0 back, read it as "below floor", and refill forever.
+  icp canister call --query --identity "${FUND_IDENTITY:-anonymous}" $ENV_FLAG backend getTestBalance \
+    "(principal \"$1\", \"$2\")" 2>&1 | grep -oE "[0-9][0-9_]*" | head -1 | tr -d '_'
 }
 
 # Seed OR refill one bot to full. $2 = "seed" (unconditional) | "refill"
 # (only tokens below floor, with a log line so ops sees the drip).
 fund_bot() {
   local p="$1" mode="$2" id="$3"
-  if $REMOTE && [ -z "$CE_IDENTITY" ]; then
+  if $REMOTE && [ -z "$FUND_IDENTITY" ]; then
     # Faucet posture: ADDs, so only top up on refill when below floor.
     if [ "$mode" = seed ]; then
       icp canister call --identity "$id" $ENV_FLAG backend addTestTokens "(\"ICPUSD\", $(e8 50000000.0))" >/dev/null 2>&1 || true
@@ -256,8 +260,10 @@ replenisher_loop() {
 
 echo "── funding $BOTS bots ──"
 if $REMOTE; then
-  if [ -n "$CE_IDENTITY" ]; then
-    echo "  (remote target ${IC_ENV} — funding as engine identity '$CE_IDENTITY' at ~\$100k value each)"
+  if [ -n "${MDX_FUNDING_IDENTITY:-}" ]; then
+    echo "  (remote target ${IC_ENV} — funding as the FUNDING AUTHORITY '$FUND_IDENTITY' at ~\$100k value each; the controller key signs no refill)"
+  elif [ -n "$FUND_IDENTITY" ]; then
+    echo "  (remote target ${IC_ENV} — funding as the CONTROLLER identity '$FUND_IDENTITY' at ~\$100k value each — no MDX_FUNDING_IDENTITY set; designate a funding authority (setFundingAuthority, task 1789609263))"
   else
     echo "  (remote target ${IC_ENV} — self-funding via the faucet; dev posture only)"
   fi

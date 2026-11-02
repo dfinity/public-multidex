@@ -91,6 +91,17 @@ always be recomputed from the events. CSV export does that client-side.
     gated to `msg.caller == main`; writes to its own stable Region; updates
     its per-user index (`principal → vec of region offsets`, on heap or in a
     second region); rejects when sealed/full.
+    Beside it (task 1793489930) a per-principal **fill index** — the same
+    offset tuples, fills only, built in seq order by a cursor over the global
+    index like the deposit/withdrawal index: live per append, and after an
+    upgrade by a self-driven timer (`postupgrade` arms it; a sealed segment
+    never sees another append). `getEventsForPrincipalsFiltered(principals,
+    kinds, offset, limit)` pages fills off it newest-first with a k-way
+    reverse merge (no gather, no sort); a segment holding none of a user's
+    fills answers `total = 0` in one hop. The exchange federates it as
+    `getMyArchivedEventsFiltered`, whose `filtered = false` flags a pre-index
+    segment answered through the unfiltered pager (all kinds) until
+    `adminUpgradeArchives` reaches it.
   - `getMyEvents(cursor) / getEventsRange(from, to)` — public queries;
     `getMyEvents` keyed on `msg.caller` (II delegations work against any
     canister, so the frontend queries archives directly).
@@ -186,6 +197,38 @@ query certification is a Phase-D hardening, not required to start.)
   inside main was considered and rejected: regions (like wasm heap) are
   grow-only for the canister's lifetime, so only deleting a sidecar returns
   the space physically.
+- **Season boundary (`resetSeason`; W4-14/15, #55 / 1788468754):** the same
+  wipe, but the closed season's chain is SEALED, never deleted — it is the
+  prize-audit record. The detach clears the LIVE routing table (`getArchives`
+  serves the current season only; the new season's chain restarts at seq 0)
+  and records every segment in the season registry: the sealed segments,
+  the season's active tip (`lastSeq` null — it ends where the record's
+  `finalEventSeq` says), and the successor pre-spawned before the boundary
+  when one existed (also `lastSeq` null, `firstSeq` 0, and it never held an
+  event). `getSeasonRecords()` carries the boundary record (principals, the
+  certified `chainHead`, `finalEventSeq`); `getSeasonArchives(N)` exports
+  that season's registry rows in `getArchives`' row shape, which is what
+  makes the sealed chain walkable end to end: `verify_ledger.mjs --season N`
+  / `ledger.js opts.season` route by it, tell the empty successor from the
+  tip by its certified head, treat a list jump after a sealed predecessor as
+  a re-anchor CLAIM (the chain's own `#gap` events remain the only proof),
+  validate each sealed segment's certificate, and require the walked head
+  to equal the record's `chainHead` with the tape ending at
+  `finalEventSeq - 1`. The live gap tuples and shed baselines
+  (`getLedgerGaps` / `getShedBaselines`) are cleared at the boundary and
+  describe the NEW season, so the detach first PRESERVES the closed
+  season's pair under its season number (1788474114: `_seasonGaps`, a
+  parallel stable map — `SeasonRecord` cannot grow a field in place under
+  enhanced orthogonal persistence), exported by `getSeasonGaps(N)` /
+  `getSeasonShedBaselines(N)` in the live pair's shapes. The season walks
+  consult those exactly where the live walk consults the live pair: the
+  tuples are re-anchor claims the sealed chain's `#gap` events must still
+  prove, and the baselines are where `--fold` resets — so a season that
+  shed folds exactly from its own record. A season closed before that
+  landed answers `[]`: its re-anchors are inferred from the list jumps
+  (same proof demanded) and its fold cannot reset across a shed (warned).
+  The fuel loop and `archiveExecute`'s deep-history walk read the same
+  registry, so "lives on" stays true operationally too.
 
 ## 6. Cycles: funding, top-up, survival
 
@@ -288,7 +331,20 @@ subsystem (history) took down a critical one (the price feed) via shared heap.
   outage). The exchange keeps trading; the *history* in the gap is gone. A gap
   forces a chain re-anchor: the post-gap events open a fresh archive segment the
   next time L1 can roll (their `prevHash` points at a dropped event, so they
-  can't extend the old chain).
+  can't extend the old chain). The shed also hash-commits a `#gap` event on
+  the chain itself (W2-04 — the only re-anchor justification the verifiers
+  accept; the tuple list is an uncertified self-report), and that event
+  carries the **same coalesced range** as the tuple, not just this shed's
+  own drop (1788469743): with nothing acked between sheds — the successor
+  spawn blocked, 10-min backoff — every later shed drops `cap − shedTo`
+  events from the *front* of the queue, and the earlier sheds' own `#gap`
+  events sit ever closer to it (L2 at 250k/200k drops the first declaration
+  at shed 6; the L3 shear at 375k/200k at shear 3, its baseline swallowed
+  by the bisect rule below). Declaring the coalesced outage means the newest
+  surviving declaration always spans from the last acked seq, whatever
+  earlier ones were dropped, so the honest list jump stays justifiable
+  forever; the verifiers match it directly and keep their contiguous merge
+  (#55.4) for chains written before the change, which carry per-shed halves.
 
   **The shed closes its own gap.** Immediately after the drop, the canister
   re-opens the tape with a **re-baseline**: one absolute re-attestation row per
@@ -307,6 +363,32 @@ subsystem (history) took down a critical one (the price feed) via shared heap.
   later gap are compacted out of the record. Baseline size is O(live ledger
   entries) (~thousands of rows), which is why the cap's headroom
   (250k − 200k = 50k) must stay well above it.
+
+- **L3 — the shear, gated on memory pressure (H-32, 2026-09-05).** Admission
+  (W1-08) throttles USER inflow but not internal emitters, and L2 needs a
+  failing shipper, so a queue could pass the L2 cap while the shipper read
+  healthy; #52.2 added a SIZE-ONLY shear at 1.5× the L2 cap (375k) as the
+  absolute ceiling, ratified as "10+ minutes of internal-emitter excess". The
+  exit set is admitted at every floor, though, and one registered principal's
+  dust exits reached it in ~18 minutes with a healthy archive (F12). Three
+  changes close that: (1) the shear needs size AND a memory-pressure signal —
+  wasm memory at 75 % of the canister's `wasm_memory_limit` (the platform
+  default until `canister_status` has been read) or a `lowmemory()` hook in the
+  last 10 minutes — so a large-but-healthy backlog with heap room is drained,
+  never sheared; (2) the drain scales with backlog: above the soft admission
+  tier a ship tick sends up to `SHIP_BURST_MAX` (8) further batches to the
+  active archive after its ordinary one (~1.8k ev/s; a 375k backlog clears in
+  ~3.5 min instead of ~31); (3) the four value-moving exits are bounded per
+  principal by a dust-coalescing window — the first exit of a 30 s window
+  writes live, a later DUST exit (< 10 ICPUSD of value, not spend-all) still
+  executes but its `#delta` rows are moved off the journal and summed with its
+  semantic row into the window, flushed as ordinary rows at the window's end
+  (never dropped, never refused — the W1-05 doctrine stands). Withheld rows
+  are stable state and are forced out ahead of every absolute row (a shed's
+  re-baseline, a season seal, a replay reset); a world wipe clears them with
+  the journal. `getCanisterInfo` exposes `exitCoalesced`, `exitRowsWithheld`
+  and `shipBurstBatches`; `tests/test_exit_coalesce.sh` and
+  `test_archive_failover.sh` §F pin the three.
 
 **Composition.** L1 handles the realistic failure (one archive broke) with no
 loss; L2 is the true floor for "the whole archival subsystem is down," trading a
@@ -365,7 +447,17 @@ only the unavoidable transit queue (§3).
   across the chain; the frontend Archive tab pages the active archive then
   continues into sealed ones. `tickArchiveFuel` watermark-funds ALL
   archives (LOW 1T → HIGH 2T, never when main's own headroom is thin);
-  `adminUpgradeArchives` upgrades the whole chain in place. Spawns are
+  `adminUpgradeArchives` upgrades the whole chain in place (reply:
+  `N upgraded, B skipped (blackholed), F failed — <id>: <reject text>; …` — a
+  failed hop is NAMED in the reply and logged with principal + cause, never
+  counted as a design skip; #54.7, 1793569495). A `not found` cause means the
+  canister no longer EXISTS (the engine lost its first sealed segment,
+  2026-11-01): `adminDropMissingArchive(id)` retires its routing row once the
+  management canister itself answers the not-found class inside the call, and
+  declares the lost range `[firstSeq, lastSeq+1)` as a hash-committed `#gap`
+  (+ a `#config` row and a balance re-baseline) so the verifiers accept the
+  coverage jump; the federation meanwhile answers `unavailable` for such a
+  segment and the history views skip it. Spawns are
   balance-guarded (attaching more cycles than held TRAPS — uncatchable, so
   the guard logs + arms a 10-min retry instead of silently loop-trapping).
   Lock-in: `tests/test_archive_chain.sh`.
@@ -391,7 +483,34 @@ only the unavoidable transit queue (§3).
   segment under a fresh certificate, and the verifiers' guarantee should be
   read with that dependency stated.
   The chain starts at `chainStartSeq` (pre-chain events stay unverifiable)
-  and dies with the tape on a reset. prevHash is surfaced in the Archive
+  and dies with the tape on a reset — every epoch, season boundaries
+  included, restarts it at seq 0. Each archive's `chainStartSeq` is its
+  OWN per-canister anchor and uncertified, so the off-chain verifiers pin
+  the chain origin at 0 (or an explicit `--expect-start`) and take it from
+  nothing the host answers (#55.1; docs/pre-mainnet-checklist.md). A
+  re-anchor (a seq jump in the archive list) is honoured only for a range
+  some `#gap` event — or a run of exactly *contiguous* `#gap` events —
+  commits on the chain: back-to-back sheds under a blocked successor spawn
+  leave the list a single jump, because an archive that acked nothing is
+  abandoned, not sealed (#55.4; the merge takes walk-collected events only,
+  never `getLedgerGaps`, and a hole or a superset still refuses). Since
+  1788469743 each such shed declares the whole *coalesced* outage on the
+  chain (§8b) — a later shed drops the earlier declarations off the queue
+  front, so the survivor must span the jump by itself; the merge remains
+  for pre-change chains, which declare one half per shed. The WINDOW check (`--last N`; the page's newest-N scope)
+  obeys the same discipline: it is planned against the archive list's serve
+  bounds (`firstSeq`/`lastSeq` — what each actor can physically return),
+  never against `chainStartSeq`; since 1788472713 it is a *clipped full
+  walk* — `planWindow` routes the request newest-backwards across the list,
+  every archive holding tape inside the window is visited (hash carried
+  across each boundary, every visited sealed head compared and
+  certificate-checked), a jump inside the window — the leading clip
+  included — must be a chain-declared `#gap` run (or operator-accepted),
+  a window starting exactly at a boundary is bridged by the unvisited
+  predecessor's own last event, and only the tape below the window is
+  skipped (by definition of the request); zero verified links at any start
+  other than the chain origin is refused rather than reported as "0 links
+  verified" (#55.6). prevHash is surfaced in the Archive
   tab's CSV/JSON export. Still deferred from the original Phase-D list:
   blackholing (waits for governance — blackholed bugs are forever) and a
   stable-Region spill for the capture queue (no pathological backlog ever
@@ -419,7 +538,10 @@ The executable form of the claim is the in-canister auditor
 (`adminReplayReset/Step/Report`): fold the chain's `#delta` events, diff
 against live `Accounts` for EVERY account (users, pools, vault, treasury,
 insurance), demand zero mismatches at a quiescent moment. Lock-in:
-`tests/test_archive_replay.sh`. The same fold over the public tape is the
+`tests/test_archive_replay.sh`. The auditor is single-flight: step refuses an
+overlapping step (W4-09) and reset TRAPS while a step is in flight (#54.2) —
+either overlap folded pages into cleared maps and raised a FALSE reserve
+alarm; lock-in `tests/test_w4_batch2.sh` §1/§1b. The same fold over the public tape is the
 PoR liabilities computation; with the certified chain head it is verifiable
 by anyone without trusting the operator.
 
@@ -444,7 +566,10 @@ delete it; anyone can still fund it, and the watermark task keeps doing
 so). Explicit opt-in because it is irreversible: enable at production
 deploy (checklist), leave OFF in dev (resets cannot delete blackholed
 archives — they leak as orphans). `adminUpgradeArchives` skips immutable
-members by design.
+members by design — classified from the seal-time record
+(`_archivesBlackholed`, written where the controller drop succeeds), and
+reported as `skipped (blackholed)` distinct from `failed — <id>: <cause>` (#54.7;
+the reply names each failed hop since 1793569495).
 
 Costs/caveats: tape volume roughly triples (a fill ≈ 5 deltas — absorbed by
 Phase-B chain growth); adding the journal to `AccountState` and new event

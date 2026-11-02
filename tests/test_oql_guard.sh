@@ -44,12 +44,13 @@ echo "── test_oql_guard ──"
 # Call execute() with a raw JSON string, via an args file so the shell cannot
 # mangle backslash escapes (a bare \ud800 on the command line is eaten by zsh).
 oql() {
-  python3 - "$1" <<'PY' > /tmp/oqlguard.did
+  local args; args=$(scratch_new oqlguard.did) || exit 1
+  python3 - "$1" <<'PY' > "$args" || { _fail "cannot write the args file $args"; exit 1; }
 import sys
 inner = sys.argv[1]
 print('("' + inner.replace("\\", "\\\\").replace('"', '\\"') + '")', end="")
 PY
-  icp canister call --args-file /tmp/oqlguard.did backend "${2:-execute}" --query --identity anonymous 2>&1
+  icp canister call --candid "$MDX_CANDID" --args-file "$args" backend "${2:-execute}" --query --identity anonymous 2>&1
 }
 
 # ── §1 oversized query is rejected, cheaply ──
@@ -109,8 +110,9 @@ assert_contains "§3 well-formed pair is rejected (mo:json cannot decode it)" "$
 assert_not_contains "§3 ...and does NOT trap the canister" "$R" "codepoint out of range"
 
 # Nothing is lost: the SAME character sent literally as UTF-8 parses fine.
-printf '("{\\"start\\":\\"market\\",\\"limit\\":1,\\"where\\":{\\"eq\\":{\\"field\\":\\"id\\",\\"value\\":\\"\xf0\x9f\x98\x80\\"}}}")' > /tmp/oqlguard_raw.did
-R=$(icp canister call --args-file /tmp/oqlguard_raw.did backend execute --query --identity anonymous 2>&1)
+RAW=$(scratch_new oqlguard_raw.did) || exit 1
+printf '("{\\"start\\":\\"market\\",\\"limit\\":1,\\"where\\":{\\"eq\\":{\\"field\\":\\"id\\",\\"value\\":\\"\xf0\x9f\x98\x80\\"}}}")' > "$RAW" || { _fail "cannot write the args file $RAW"; exit 1; }
+R=$(icp canister call --candid "$MDX_CANDID" --args-file "$RAW" backend execute --query --identity anonymous 2>&1)
 assert_contains "§3 the same character as raw UTF-8 is accepted" "$R" "rows = vec"
 
 # An escaped backslash must not be misread as the start of an escape:
@@ -149,7 +151,7 @@ assert_not_contains "§5 heavy-but-legal query fits under the cap" \
 
 # schema() is a separate entry point and takes no query text — it must keep working.
 assert_contains "§5 schema() still serves" \
-  "$(icp canister call backend schema '()' --query --identity anonymous 2>&1)" "entities"
+  "$(icp canister call --candid "$MDX_CANDID" backend schema '()' --query --identity anonymous 2>&1)" "entities"
 
 # The guard must not have loosened authorization: the leaderboard still
 # publishes no principal (see the username de-linking work).
@@ -165,9 +167,14 @@ assert_not_contains "§5 leaderboard still exposes no principal field" "$LB" 'na
 # A 1000-row candid response is megabytes, so it goes to a FILE — passing it
 # as a shell argument (which assert_contains does) overflows ARG_MAX.
 rows() { grep -o 'name = "key"' "$1" | wc -l | tr -d ' '; }
+NOLIMIT=$(scratch_new oqlguard_nolimit.txt) || exit 1
+PROBE=$(scratch_new oqlguard_probe.txt) || exit 1
+BIGLIMIT=$(scratch_new oqlguard_biglimit.txt) || exit 1
+P1=$(scratch_new oqlguard_p1.txt) || exit 1
+P2=$(scratch_new oqlguard_p2.txt) || exit 1
 
-oql '{"start":"closedOrder"}' > /tmp/oqlguard_nolimit.txt
-N=$(rows /tmp/oqlguard_nolimit.txt)
+oql '{"start":"closedOrder"}' > "$NOLIMIT"
+N=$(rows "$NOLIMIT")
 if [ "$N" -le 1000 ] && [ "$N" -gt 0 ]; then _ok "§6 absent limit defaulted to a page ($N rows, not the whole store)"
 else _fail "§6 absent limit returned $N rows — expected a bounded page"; fi
 # hasMore must match REALITY, not a warm-venue assumption: probe one row past
@@ -176,21 +183,21 @@ else _fail "§6 absent limit returned $N rows — expected a bounded page"; fi
 # "hasMore = true" check misread it as a guard failure. At the clamp (N≥1000)
 # the probe can't see further, but a full defaulted page means more exists.
 if [ "$N" -ge 1000 ]; then
-  if grep -q "hasMore = true" /tmp/oqlguard_nolimit.txt; then _ok "§6 ...page bound hit and hasMore says there is more"
+  if grep -q "hasMore = true" "$NOLIMIT"; then _ok "§6 ...page bound hit and hasMore says there is more"
   else _fail "§6 defaulted page hit the bound but hasMore was not set"; fi
 else
-  oql "{\"start\":\"closedOrder\",\"limit\":$((N + 1))}" > /tmp/oqlguard_probe.txt
-  if [ "$(rows /tmp/oqlguard_probe.txt)" -gt "$N" ]; then
-    if grep -q "hasMore = true" /tmp/oqlguard_nolimit.txt; then _ok "§6 ...and says there is more to fetch"
+  oql "{\"start\":\"closedOrder\",\"limit\":$((N + 1))}" > "$PROBE"
+  if [ "$(rows "$PROBE")" -gt "$N" ]; then
+    if grep -q "hasMore = true" "$NOLIMIT"; then _ok "§6 ...and says there is more to fetch"
     else _fail "§6 store exceeds the defaulted page but hasMore was not set"; fi
   else
-    if grep -q "hasMore = false" /tmp/oqlguard_nolimit.txt; then _ok "§6 ...store fits one page and hasMore honestly says false"
+    if grep -q "hasMore = false" "$NOLIMIT"; then _ok "§6 ...store fits one page and hasMore honestly says false"
     else _fail "§6 store fits the defaulted page but hasMore was not false"; fi
   fi
 fi
 
-oql '{"start":"closedOrder","limit":100000000}' > /tmp/oqlguard_biglimit.txt
-N=$(rows /tmp/oqlguard_biglimit.txt)
+oql '{"start":"closedOrder","limit":100000000}' > "$BIGLIMIT"
+N=$(rows "$BIGLIMIT")
 if [ "$N" -le 1000 ]; then _ok "§6 absurd limit clamped ($N rows)"
 else _fail "§6 limit 1e8 returned $N rows — not clamped"; fi
 STORE_ROWS=$N   # rows visible under the clamp — the store size for the paging guard below
@@ -205,10 +212,10 @@ assert_contains "§6 huge offset completes past the end of the store" "$R" "hasM
 # fill two distinct 5-row pages; on a smaller store the check is undefined,
 # not failed.
 if [ "${STORE_ROWS:-0}" -ge 10 ]; then
-  oql '{"start":"closedOrder","limit":5,"offset":0}' > /tmp/oqlguard_p1.txt
-  oql '{"start":"closedOrder","limit":5,"offset":5}' > /tmp/oqlguard_p2.txt
-  if [ "$(rows /tmp/oqlguard_p1.txt)" = "5" ] && [ "$(rows /tmp/oqlguard_p2.txt)" = "5" ] \
-     && ! diff -q /tmp/oqlguard_p1.txt /tmp/oqlguard_p2.txt >/dev/null; then
+  oql '{"start":"closedOrder","limit":5,"offset":0}' > "$P1"
+  oql '{"start":"closedOrder","limit":5,"offset":5}' > "$P2"
+  if [ "$(rows "$P1")" = "5" ] && [ "$(rows "$P2")" = "5" ] \
+     && ! diff -q "$P1" "$P2" >/dev/null; then
     _ok "§6 ordinary paging is unaffected (two distinct 5-row pages)"
   else _fail "§6 paging broke under the clamp"; fi
 else

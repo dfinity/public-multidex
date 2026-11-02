@@ -93,3 +93,72 @@ changes ordering guarantees:
   quoted "principal" field is a display collision).
 - Live bonus observation: the W3-03 daily budget engaged during this session's suite churn
   (spentToday 555 ICP > 500 cap → auto-fuel deferring, logged) — the cap demonstrably works.
+
+## Extended 2026-09-04 — D7 (H-09 / H-22): the last two bare self-sends join the breaker, and the release passes are paced
+
+*Line numbers at `e987451` (`src/backend/main.mo`). Recorded here per the 2026-09 hardening plan's
+decision D7 (task `1788467622`, H-25); the design-side note is `docs/access-prioritization-design.md` §6.*
+
+- **Two self-sends had stayed outside `hbRun`**: the AMM tick (every pool requoted in one bare
+  `async` self-send) and the finaliser (bare `ignore finaliseExpiredPending()` from the beat). A trap
+  in either rolled back its own message — `removeDeferredExec` included — so the same staged entry
+  re-trapped at full cadence, unaccounted, forever; and one market's junk band (F4) took every
+  market's requote down with it. H-09 closed both (code `f02a73d`, merged `2178e8b`):
+  - `finaliseExpiredPending` is an `async*` COMPUTATION (`:2209`) dispatched as
+    `hbRunAsync("finalise", …)` (`:8983`). `hbRunAsync` (`:8881`) awaits it INLINE — `await* task()` —
+    so it is still ONE isolated message carrying `hbRun`'s accounting (a genuine cross-round `await`
+    would split the message, and a 0.5 s task would read as "lost" every beat on mainnet). `async*`
+    rather than a sync task because `processGeptorDue` (`:4474`) is a real fire-and-forget send and
+    needs send capability.
+  - The AMM tick is split per market: `tickAmmPool(id, now)` (`:4891`) is dispatched once per pool as
+    `hbRun("amm:" # id, …)` (loop `:8986-8992`), the snapshot separately as `hbRun("ammsnap", …)`
+    (`:8993`). One market's trap backs off THAT market only; the others are serviced next beat.
+  - `hbTrapTest` (`:8852`) and `hbComplete` (`:8862`) are the shared halves of `hbRun` (`:8869`) /
+    `hbRunAsync`; the per-market keys live in the same `_hbDisp` / `_hbDone` / `_hbStreak` maps
+    (`:8823-8825`) and surface in `getHbHealth` (`:8892`); `_lastAmmPoolNs` (`:8888`) holds the
+    per-pool dispatch stamps `hbReady` (`:8832`) reads. `setTestHbTrap(?"amm:<marketId>")` (`:8906`)
+    trips one market on `#dev`. The walk a tripped release was doing is bounded upstream too —
+    `WALK_SCAN_MAX = 512` (`:3173`), `FOK_GATE_ITER_BUDGET = MatchingEngine.MAX_MATCH_ITERATIONS_PER_CALL`
+    (256, `:3174`), `depthQueryCap` ±25 % of `refPrice` (`:3471`) — the breaker is the backstop, not
+    the bound.
+- **Dispatch table** (the breaker key IS the subtask name; cadence is the `hbReady` base, backed off
+  ×2^streak, cap 32×, every-beat tasks on a 1 s base):
+
+  | key | task | cadence | dispatcher |
+  |---|---|---|---|
+  | `finalise` | `finaliseExpiredPending` (`:2209`) — expiry sweep, GEPTOR due, deferred-expiry + cross-swap passes | `HB_FINALISE_NS` 0.5 s (`:8445`) | `hbRunAsync` (`:8983`) |
+  | `amm:<marketId>` | `tickAmmPool` (`:4891`) — requote / panic-cancel, rebalance, resting sweep, THAT market's `processDeferred` | `HB_AMM_NS` 2 s (`:8446`), per pool via `_lastAmmPoolNs` | `hbRun` (`:8990`) |
+  | `ammsnap` | `tickAmmSnapshot` (`:4934`) | `HB_AMM_NS` | `hbRun` (`:8993`) |
+  | the nine of 2026-08-15 | `reap` `drain` `tier` `heat` `leader` `arrears` `ttlsweep` `candles` `deadman` | as above | `hbRun` (`:8960-9027`) |
+
+- **The release passes are paced (H-22, code `be7d829`, merged `e987451`)** so the message the
+  breaker isolates is also bounded. One shared pacer beside the expiry pass's constants
+  (`MAX_EXPIRY_RELEASES_PER_PASS = 256` `:581`, `EXPIRY_PASS_FILL_BUDGET = 1_024` `:591` — the
+  model): `MAX_RELEASES_PER_PASS = 256` and `RELEASE_PASS_FILL_BUDGET = 1_024` (`:611-612`, both
+  `transient`), one `ReleaseBudget` per pass (`:617`) via `newReleaseBudget` / `releaseBudgetOpen` /
+  `chargeRelease` (`:618-624`), checked at the TOP of each release. `processDeferred` (`:3972`)
+  stops at either cap, leaves the remainder staged in the SAME (tierRank DESC, ts ASC) order
+  (`stagedForMarketSorted` `:4127` → `sortDeferredByPriority` `:4146`), sets `stillStaged` (`:4004`,
+  `:4013`) so the GEPTOR is re-armed (`:4026`), and the 2 s tick's requote resumes the cut pass;
+  `processDeferredSwaps` (`:4174`) runs the same budget (`releaseCrossSwap` `:4291` returns its fills
+  over both legs) and the next `finalise` resumes it. Nothing is dropped, only paced.
+- **Which message a release rides is chosen by the breaker.** `ammRequote(pool, release : Bool)`
+  (`:2572`): the tick and the operator's `requoteAmm` (`:19505`) pass `true`; the GEPTOR finalizer
+  (`finalizePriceFanout` `:19169`, `#geptor`) passes `hbStreakOf("amm:" # mkt) == 0` (`:19283`) and
+  runs the swap pass only while `hbStreakOf("finalise") == 0` (`:19292`; `hbStreakOf` at `:8861`).
+  So a tripped market's fetched mark and fresh ladder ALWAYS commit in the finalizer's message, and
+  its release runs only under its own backed-off `hbRun("amm:<marketId>")`; a healthy market keeps
+  the inline release (no extra hop, release latency unchanged).
+- **Dev hooks and probe.** `setTestReleasePacing(maxReleases, fillBudget)` (`:12942`; null = default,
+  0 → 1) pins the pacer on `#dev`; `devSweepCostProbe` (`:21676`) reports `releaseSort` /
+  `releaseSortSynth` / `releaseSynthAtProbe` / `releaseMaxPerPass` / `releaseFillBudget`
+  (`:21731-21735`), the synthetic cohort being `RELEASE_PROBE_SYNTH = 5_000` (`:960`). Measured: the
+  pre-pass collect+sort is the only N-dependent term left — 1.19 B instructions at 5,000 staged —
+  filed as follow-up `1788550465` (per-market staged index + top-K selection).
+- **Where the pins live.** `tests/test_heartbeat_isolation.sh` §5 (the finaliser runs behind the
+  breaker), §6 (the tick is dispatched per market), §7 (a tripped market's mark commits while its
+  release waits for its own `hbRun`); `tests/test_release_pacing.sh` §1–§5 (the real 256 cap in
+  priority order, the pin, the fill budget, the swap pass, liveness under running timers + the
+  probe); `tests/test_deploy_hygiene.sh` §6f (`hbRunAsync("finalise"`, `"amm:" # id`, no bare
+  `ignore tickAmm()` / `ignore finaliseExpiredPending()` remains, `await* task()` inline) and §6an
+  (`processDeferred(updated, now);` runs inside `ammRequote` after the pool put and the sweep).

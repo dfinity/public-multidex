@@ -2,6 +2,8 @@
 
 *Written 2026-06-09. A design proposal, not an implementation. Grounded in `MarginEngine.mo`, `BorrowEngine.mo`, `Types.mo`, and the sealed-matching model in `main.mo`. The HyperLiquid positions screenshot is the UX target, not a literal instruction.*
 
+*Note (2026-10-31): the orchestration below is written borrow-THEN-trade — borrow the leveraged portion, then place the order. That timing is history. Since 2026-09-05 (operator decision D5 option (d); `docs/limit-order-positions-design.md`) leverage is borrowed when an order FILLS (`poolFundForFill`): a staged or resting entry holds no debt and accrues no interest, cancelling it repays nothing, and the vault's lending capacity is consumed by live positions only. The position/PnL presentation layer this proposal argued for is what shipped as margin pools (`docs/margin-pools-design.md`).*
+
 ## Goal
 
 A trader with a margin account should think in **positions**, not in borrows. They press **Long** or **Short** on a coin, pick a size/leverage, and see one row per open position plus two headline numbers — **net account value** and **% to liquidation**. All the machinery that actually backs this (cross-margin collateral, per-asset LTV, borrow APR, health ratio, liquidation) stays exactly as it is underneath; we add a *presentation + orchestration* layer on top. No rip-and-replace.

@@ -13,7 +13,11 @@ names: one reads a **compile-time constant**, and the other queries a key that i
 without the code it is meant to pin**.
 
 This matters more than a typical coverage gap because the bridge-upgrade window is precisely where
-[W3-04](W3-04-bridge-admission-write-ahead.md) lives — a lost continuation during a routine deploy.
+the [W3-04](W3-04-bridge-admission-write-ahead.md) strand lives — an admission whose continuation
+never finished (told at the time, here and below, as a continuation lost to a routine deploy;
+#55 (d) measured that an upgrade waits for the message — the Motoko runtime traps in
+`canister_pre_upgrade` while a call is outstanding — so a trapped continuation is the shape;
+reworded 2026-11-02, task `1793581447`).
 The one test that exercises an upgrade cannot see the class of defect that upgrades cause.
 
 ## Evidence

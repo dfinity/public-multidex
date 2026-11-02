@@ -31,6 +31,7 @@
 # Needs #dev. ⚠️ resetExchange for a deterministic book.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
@@ -38,43 +39,42 @@ pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-P=$(mkid pf_p)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mdx_identity_new pf_p; P=$(principal_of pf_p)
 
 STOPPER="$SCRIPT_DIR/../scripts/stop_bots_local.sh"
 [ -f "$STOPPER" ] && { bash "$STOPPER" >/dev/null 2>&1 || true; sleep 2; }
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1
-SEED=$(mkid pf_seed)
+mdx_identity_new pf_seed; SEED=$(principal_of pf_seed)
 adm createAmmPool '("ICP-ICPUSD")' >/dev/null 2>&1
-adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 300.0) : nat, 5:nat, 10:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 300.0) : nat, 5:nat, 10:nat)" >/dev/null
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICP\", $(e8 20000.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICPUSD\", $(e8 300000.0) : nat)" >/dev/null
-icp canister call --identity pf_seed backend seedAmmPool "(\"ICP-ICPUSD\", $(e8 20000.0) : nat, $(e8 200000.0) : nat)" >/dev/null 2>&1
+mdx_lp_deposit pf_seed "ICP-ICPUSD" "$(e8 20000.0)" "$(e8 200000.0)" >/dev/null 2>&1
 adm enableAmm '("ICP-ICPUSD", true)' >/dev/null
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null
 
 echo "── §1 post-only bid stages, releases, RESTS (maker-or-kill: maker) ──"
 adm setTestBalance "(principal \"$P\", \"ICPUSD\", $(e8 30000.0) : nat)" >/dev/null
-icp canister call --identity pf_p backend placeLimitOrderPO "(\"ICP-ICPUSD\", variant { buy }, $(e8 9.60) : nat, $(e8 1100.0) : nat, null)" >/dev/null 2>&1
+icp canister call --candid "$MDX_CANDID" --identity pf_p backend placeLimitOrderPO "(\"ICP-ICPUSD\", variant { buy }, $(e8 9.60) : nat, $(e8 1100.0) : nat, null)" >/dev/null 2>&1
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null   # re-stamp: fresh price postdates the entry
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null                           # → releases; no funded cross at 9.60 → rests
-MO=$(icp canister call --identity pf_p backend getMyOrders '()' --query | tr -d '_\n' | grep -c 'id = ')
-STG=$(icp canister call --identity pf_p backend getMyStagedOrderIds '()' --query | tr -d ' \n_')
-PK=$(icp canister call --identity pf_p backend getMyReleaseRejections '()' --query | tr -d '\n' | grep -c 'Post-only' || true)
+MO=$(icp canister call --candid "$MDX_CANDID" --identity pf_p backend getMyOrders '()' --query | tr -d '_\n' | grep -c 'id = ')
+STG=$(icp canister call --candid "$MDX_CANDID" --identity pf_p backend getMyStagedOrderIds '()' --query | tr -d ' \n_')
+PK=$(icp canister call --candid "$MDX_CANDID" --identity pf_p backend getMyReleaseRejections '()' --query | tr -d '\n' | grep -c 'Post-only' || true)
 if [ "${MO:-0}" -ge 1 ] && [ "$STG" = "(vec{})" ] && [ "${PK:-0}" = "0" ]; then
   ok "post-only bid RESTS at 9.60 (released, not killed — no funded cross below the ~10.02 ask)"
-else nok "post-only did not rest (fixture)" "open=$MO staged=$STG poKills=$PK $(icp canister call --identity pf_p backend getMyReleaseRejections '()' --query | tr -d '\n' | head -c 150)"; fi
+else nok "post-only did not rest (fixture)" "open=$MO staged=$STG poKills=$PK $(icp canister call --candid "$MDX_CANDID" --identity pf_p backend getMyReleaseRejections '()' --query | tr -d '\n' | head -c 150)"; fi
 
 echo "── §2 mark falls 6% — the sweep re-homes the resting PO bid ──"
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 9.40) : nat)" >/dev/null   # −6.0%: bid 9.60 now rich vs fresh ask ≈9.42
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null                           # ladder rebuilds → sweep takes the bid
-ROWS=$(icp canister call --identity pf_p backend getMyTradesSinceId '(0 : nat, 5 : nat)' --query 2>/dev/null | tr -d '_\n' | tr -s ' ')
-NT=$(echo "$ROWS" | grep -c 'trade = record' || true)
+ROWS=$(icp canister call --candid "$MDX_CANDID" --identity pf_p backend getMyTradesSinceId '(0 : nat, 5 : nat)' --query 2>/dev/null | tr -d '_\n' | tr -s ' ')
+NT=$(echo "$ROWS" | grep -o 'trade = record' | wc -l | tr -d ' ')
 if [ "${NT:-0}" -ge 1 ]; then ok "swept: $NT fill(s) at the AMM's fresh ask (price improvement vs the 9.60 limit)"
-else nok "sweep did not take the resting PO bid" "$(icp canister call --identity pf_p backend getMyOrders '()' --query | tr -d '\n' | head -c 150)"; fi
+else nok "sweep did not take the resting PO bid" "$(icp canister call --candid "$MDX_CANDID" --identity pf_p backend getMyOrders '()' --query | tr -d '\n' | head -c 150)"; fi
 
 echo "── §3 the swept PO maker pays the MAKER rate (:10119 end-to-end) ──"
 FEE=$(echo "$ROWS" | grep -oE 'buyer = [0-9]+' | head -1 | grep -oE '[0-9]+$')
@@ -88,12 +88,21 @@ if [ -n "$FEE" ] && [ -n "$QTY" ] && [ -n "$PRC" ]; then
     ok "swept post-only paid the MAKER rate (fee=$FEE on \$-value $V; taker would be $TAKER) — 'never pays taker' holds end-to-end"
   else nok "swept post-only paid TAKER (the published-contract violation)" "fee=$FEE vs taker-rate $TAKER"; fi
 else nok "sweep fill not found for the fee assertion" "$(echo "$ROWS" | head -c 160)"; fi
-MVOL=$(icp canister call --identity pf_p backend getAccessPolicy '()' --query 2>/dev/null | tr -d '_\n' | tr -s ' ' | grep -oE 'myMakerVolUsd = [0-9]+' | grep -oE '[0-9]+$')
+MVOL=$(icp canister call --candid "$MDX_CANDID" --identity pf_p backend getAccessPolicy '()' --query 2>/dev/null | tr -d '_\n' | tr -s ' ' | grep -oE 'myMakerVolUsd = [0-9]+' | grep -oE '[0-9]+$')
 if [ "${MVOL:-0}" -gt 0 ]; then
   ok "swept fill landed in MAKER volume (myMakerVolUsd=$MVOL)"
 else nok "swept post-only binned as taker volume" "myMakerVolUsd=${MVOL:-unreadable}"; fi
 
 adm setTestTimersPaused '(false)' >/dev/null 2>&1
+# Fixture hygiene (the 5aab439 rule): this suite seeded the vault as the
+# ad-hoc identity pf_seed, whom _lib.sh's I1 frame (Σ alice..eve LP ==
+# vaultLPSupply) can never account for. Without a reset at exit the next
+# invariant-running suites inherit an unattributable ~$400k vault —
+# test_position_accounting and test_price_collar were the standing victims
+# (2026-08-31 full-suite red: I1 expected ≈4e13, got 0). Both tolerate the
+# empty venue this leaves: position_accounting §0 self-provisions, and
+# price_collar picks the pool position_accounting leaves behind.
+adm resetExchange "()" >/dev/null 2>&1 || true
 echo ""
 if [ $fail -eq 0 ]; then
   echo -e "${GREEN}PASS: test_po_sweep_fee ($pass assertions)${NC}"; exit 0

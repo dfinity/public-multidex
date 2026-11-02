@@ -376,7 +376,7 @@ export function dxUpdateIdentity() {
   } else {
     row.style.display = "none";
   }
-  // The Ask-AI handoff only exists where the Assistant does (backend AI key set).
+  // The Ask-AI handoff only exists where Agent Chat does (backend AI key set).
   const askBtn = document.getElementById("dx-ask-ai");
   if (askBtn) askBtn.style.display = appState.aiConfigured ? "" : "none";
   dxUpdateFilterMe();
@@ -739,11 +739,20 @@ async function dxRun(reset) {
   _dxOffset += objs.length;
   dxRenderTable(_dxRows);
   // History only: name any archive segment the fan-out could not read, so a
-  // partial read never renders as complete history (W1-03).
+  // partial read never renders as complete history (W1-03). Two distinct
+  // causes, two distinct wordings (#54.5): `degraded` is a segment the walk
+  // TRIED and could not read (a fault — stopped, frozen, mid-upgrade);
+  // `unvisited` is a segment the walk never reached because the per-request
+  // budget (hop cap / row caps) ran out first — older history exists there
+  // and is served per-archive, it is not missing. `hasMore` is the OQL
+  // window over the rows already fetched, unrelated to either.
   const degraded = res.degraded && res.degraded.length
     ? ` · ⚠ archive segment${res.degraded.length === 1 ? "" : "s"} unavailable (${res.degraded.join(", ")}) — history may be incomplete`
     : "";
-  dxStatus(`${_dxRows.length} row${_dxRows.length === 1 ? "" : "s"} · ${ms} ms${res.hasMore ? " · more available" : ""}${degraded}`);
+  const unvisited = res.unvisited && res.unvisited.length
+    ? ` · ⚠ walk budget exhausted — ${res.unvisited.length} older segment${res.unvisited.length === 1 ? "" : "s"} not read (${res.unvisited.join(", ")}); deeper history is served per archive`
+    : "";
+  dxStatus(`${_dxRows.length} row${_dxRows.length === 1 ? "" : "s"} · ${ms} ms${res.hasMore ? " · more available" : ""}${degraded}${unvisited}`);
   const more = document.getElementById("dx-more");
   if (more) more.style.display = res.hasMore ? "" : "none";
 }
@@ -757,14 +766,28 @@ function dxDownload(filename, content, mime) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+// H-19 (F44): RFC-4180 quoting alone is not enough for a spreadsheet. A cell
+// whose first character is `=`, `+`, `-` or `@` is evaluated as a FORMULA by
+// Excel / LibreOffice / Sheets (`=HYPERLINK(...)`, DDE `=cmd|...`), and a
+// leading tab or CR lets one hide behind the leading-character check. The
+// pool name is player-authored and rides `pool`/`position` rows straight into
+// a controller's export, so every such cell gets a leading `'` (the
+// spreadsheet's own "this is text" marker) and is ALWAYS quoted. A JS number
+// or bigint cannot carry a formula, so a negative PnL stays a bare number.
+// The backend refuses these shapes at pool creation too; this is the belt
+// that also covers names stored before that rule.
+const CSV_FORMULA_LEAD = /^[=+\-@\t\r]/;
+function dxCsvCell(v) {
+  if (v == null) return "";
+  if (typeof v === "number" || typeof v === "bigint") return String(v);
+  const s = String(v);
+  if (CSV_FORMULA_LEAD.test(s)) return `"'${s.replace(/"/g, '""')}"`;
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;   // RFC-4180 quoting
+}
 function dxToCsv(rows) {
   if (!rows.length) return "";
   const cols = Object.keys(rows[0]);
-  const cell = (v) => {
-    const s = v == null ? "" : String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;   // RFC-4180 quoting
-  };
-  return [cols.join(","), ...rows.map((r) => cols.map((c) => cell(r[c])).join(","))].join("\n");
+  return [cols.map(dxCsvCell).join(","), ...rows.map((r) => cols.map((c) => dxCsvCell(r[c])).join(","))].join("\n");
 }
 function dxExport(kind) {
   if (!_dxRows.length) { dxStatus("Run a query first — there are no rows to export.", true); return; }
@@ -792,7 +815,7 @@ async function dxCopyShareLink() {
     await navigator.clipboard.writeText(url);
     if (btn) { btn.textContent = "Link copied!"; setTimeout(() => { btn.textContent = "Copy link"; }, 1500); }
   } catch {
-    // Clipboard blocked (insecure context): surface the link in the raw box so it can be copied manually.
+    // writeText refused (a Permissions-Policy denying clipboard-write — the shipped policy did until task 1793506794 — no user activation, or an unfocused document; the context is secure, else navigator.clipboard would be undefined): surface the link in the raw box so it can be copied manually.
     if (raw) { raw.value = url; dxShowRaw(true); }
     dxStatus("Clipboard unavailable — link placed in the query box.");
   }
@@ -810,7 +833,7 @@ export function dxApplyShareLink() {
   history.replaceState(null, "", `${location.pathname}#ai/memory`);
 }
 
-// Hand the current query to the AI Assistant: prefill its input with a
+// Hand the current query to Agent Chat: prefill its input with a
 // run-and-interpret prompt and switch tabs. Deliberately does NOT send — the
 // user reviews and fires the turn; the explorer never spends an AI call itself.
 function dxAskAi() {
@@ -823,7 +846,7 @@ function dxAskAi() {
     input.value = `Run this OQL query${where} and interpret what the results say about the exchange right now: ${JSON.stringify(q)}`;
     input.dispatchEvent(new Event("input", { bubbles: true }));   // let any autosize listener react
   }
-  window.location.hash = "ai/assistant";   // → Assistant tab; assistantOnShow focuses the input
+  window.location.hash = "ai/agent-chat";   // → Agent Chat tab; assistantOnShow focuses the input
 }
 
 export function setupIntelli() {
@@ -849,7 +872,7 @@ export function setupIntelli() {
       await navigator.clipboard.writeText(appState.myPrincipalText);
       btn.textContent = "Copied!";
       setTimeout(() => { btn.textContent = "Copy"; }, 1500);
-    } catch { /* clipboard blocked (insecure context) — no-op */ }
+    } catch { /* writeText refused (a Permissions-Policy denying clipboard-write — the shipped policy did until task 1793506794 — no user activation, or an unfocused document; the context is secure, else navigator.clipboard would be undefined) — no-op */ }
   });
   document.getElementById("dx-add-agg")?.addEventListener("click", () => dxAddAgg());
   document.getElementById("dx-add-sort")?.addEventListener("click", () => dxAddSort());

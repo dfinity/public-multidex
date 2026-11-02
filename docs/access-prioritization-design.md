@@ -11,10 +11,15 @@ guarantee.
 ## 1. Problem
 
 The deposit gate (see `system func inspect`, `src/backend/main.mo`) already
-prices participation: in production a principal cannot make an ingress update
-call until a chain-key deposit has registered them (the Bridge's
-`creditAndRegister` arrives as an inter-canister call, which bypasses `inspect`
-by design). That kills anonymous spam. It does nothing further:
+prices participation: a principal cannot make an ingress update call until a
+chain-key deposit has registered them (the Bridge's `creditAndRegister` arrives
+as an inter-canister call, which bypasses `inspect` by design) — except for THE
+PRE-REGISTRATION SET (H-30, 2026-09: `PRE_REGISTRATION_METHODS` — profile,
+preferences, username, the two Internet Identity legs; plus the faucet on
+`#dev`), the frontend's pre-deposit surface, which an unknown principal reaches
+on `#dev`/`#play` and nothing else. That kills anonymous spam and the
+offline-keypair spam that used to reach every update outside production. It
+does nothing further:
 
 - **Under load, everyone degrades equally.** A canister has a bounded in-flight
   ingress queue; when registered-but-idle principals (or a hostile registered
@@ -85,8 +90,9 @@ ingress calls.
 
 - *Quote uptime*: fraction of GEPTOR passes over the window where the principal
   had two-sided resting quotes within `MM_MAX_SPREAD_BPS` of mid, at
-  ≥ `MM_MIN_DEPTH` per side. Sampled by the pass itself (it already walks the
-  book).
+  ≥ `MM_MIN_DEPTH` per side — counting only the depth the principal's available
+  balances could honour at sample time (H-14). Sampled by the pass itself (it
+  already walks the book).
 - *Maker share*: maker-side fill value over the window. (`CounterpartyStats`
   was once suggested as the seed of this, but that machinery was RETIRED
   2026-08-20 — #49.5: its map was provably never fed, and per-counterparty
@@ -122,12 +128,17 @@ code paths that can write, and `inspect` merely reads it:
   Hysteresis again: raise fast, lower slow.
 
 ```motoko
-system func inspect({ caller : Principal }) : Bool {
+system func inspect({ caller : Principal; msg : {...} }) : Bool {
   if (Principal.isController(caller)) { return true };
   if (Principal.isAnonymous(caller)) { return false };
   let key = Principal.toText(caller);
-  if (Map.get(registeredUsers, Text.compare, key) == null) { return not IS_PRODUCTION };
+  if (Map.get(registeredUsers, Text.compare, key) == null) {
+    // H-30: unknown principals reach the pre-registration set only (never in
+    // production); the msg switch routes the tag to its name, the list decides.
+    return not IS_PRODUCTION and isPreRegistrationMethod(nameOf(msg));
+  };
   if (_shedFloor == 0) { return true };                     // normal: all registered pass
+  if (isExitMethod(nameOf(msg))) { return true };           // W1-05: the exit set is never shed
   let rank = tierRank(Map.get(accessTiers, Text.compare, key));
   rank >= _shedFloor                                        // under load: floor rises
 };
@@ -214,6 +225,25 @@ behavior that earns the tier, so it cannot be farmed by parking dead quotes.
 resting orders and executes the moment its message does; nothing here delays
 it. The shield above removes the window in which a cancel could be "too late,"
 which is what cancel-priority was ever for.
+
+**Landed (2026-09, decision D7 — H-09 / H-22).** The sort key above ships
+(`sortDeferredByPriority`, `main.mo:4146`, reached through `stagedForMarketSorted`
+`:4127`), and the release pass it orders is now both isolated and paced. Each
+market's `processDeferred` runs inside that market's own heartbeat message,
+`hbRun("amm:<marketId>")` — the W3-08 failure-streak breaker extended to the AMM
+tick and, via `hbRunAsync("finalise")`, to the finaliser — so a trap in one
+market's release backs off that market only. A pass releases at most
+`MAX_RELEASES_PER_PASS = 256` entries and stops once
+`RELEASE_PASS_FILL_BUDGET = 1_024` fills have settled (`:611-612`), leaving the
+remainder staged in the same (tierRank DESC, ts ASC) order with the GEPTOR
+re-armed — so the tier priority holds ACROSS passes: a cut pass resumes from the
+oldest unreleased entry of the highest tier, and no lower tier overtakes it.
+The GEPTOR finalizer passes `release = hbStreakOf("amm:<mkt>") == 0` to
+`ammRequote`, so a tripped market's fetched mark still commits in the message
+that fetched it. Constants, keys, dev hooks (`setTestHbTrap`,
+`setTestReleasePacing`), probe fields and the test pins are recorded in
+[done/W3-08](tasks/done/W3-08-heartbeat-subtask-isolation.md) §"Extended
+2026-09-04".
 
 ## 7. Layer 3 — the canister itself
 

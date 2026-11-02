@@ -21,6 +21,12 @@
 #   §4 restart the segment → degraded drains back to empty
 #   §5 setTestArchiveStopped refuses a principal that is not one of OUR
 #      archive segments (it must never be a generic stop_canister)
+#   §6 (#54.5) a BUDGET-truncated walk is never reported as complete: with
+#      the hop budget pinned below the chain length (setTestArchiveMaxHops),
+#      `unvisited` names the segment(s) the walk never reached and
+#      `complete` is false — distinct from `degraded`, which stays empty
+#      (nothing failed). Restoring the budget drains it and `complete`
+#      returns to true. Pre-fix the hop cap broke the chain with NO marker.
 #
 # Structural assertions only (delta chatter makes counts workload-dependent).
 # Timers stay ON (the shipper is heartbeat-driven); sim killed.
@@ -28,15 +34,15 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-WD=$(mkid hop_wd)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mdx_identity_new hop_wd; WD=$(principal_of hop_wd)
 
 # The sim must be dead (it would inject noise into the assertions).
 # Stop it via the PID-file stopper — NEVER a pattern kill: `pkill -f` cannot
@@ -54,7 +60,7 @@ fi
 adm setTestTimersPaused '(false)' >/dev/null 2>&1 || true   # shipper must run
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestArchiveCap '(opt (20 : nat))' >/dev/null
-adm setTestBalance "(principal \"$WD\", \"ICPUSD\", 100_000_000_000 : nat)" >/dev/null
+adm setTestBalance "(principal \"$WD\", \"ICPUSD\", 1_000_000_000_000 : nat)" >/dev/null
 
 drain() {  # wait for the transit queue to empty (ship tick = 10s)
   local tries=0
@@ -68,7 +74,7 @@ drain() {  # wait for the transit queue to empty (ship tick = 10s)
 wd() {  # emit withdrawal events (each = 1 semantic + its ledger deltas)
   local n="$1" tag="$2" i=0
   while [ $i -lt "$n" ]; do
-    icp canister call --identity hop_wd backend withdraw "(\"ICPUSD\", 100_000_000 : nat, \"$tag-$i\")" >/dev/null 2>&1
+    icp canister call --candid "$MDX_CANDID" --identity hop_wd backend withdraw "(\"ICPUSD\", 1_000_000_000 : nat, \"$tag-$i\")" >/dev/null 2>&1
     i=$((i+1))
   done
 }
@@ -76,8 +82,9 @@ wd() {  # emit withdrawal events (each = 1 semantic + its ledger deltas)
 # ${2:-hop_wd}: the withdrawer by default (exercises the caller's-own-events
 # leg); pass `anonymous` to exercise the public money-flow leg.
 hist() {
-  printf '("%s")' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')" > /tmp/hopiso.did
-  icp canister call --args-file /tmp/hopiso.did backend archiveExecute --query --identity "${2:-hop_wd}" 2>&1
+  local args; args=$(scratch_new hopiso.did) || exit 1
+  printf '("%s")' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')" > "$args" || { echo "cannot write the args file $args" >&2; exit 1; }
+  icp canister call --candid "$MDX_CANDID" --args-file "$args" backend archiveExecute --query --identity "${2:-hop_wd}" 2>&1
 }
 Q='{"start":"userEvent","limit":200}'
 
@@ -111,15 +118,19 @@ ALLIDS=$(adm getArchiveChain '()' --query | tr -d '_\n' | grep -oE 'canisterId =
 for cid in $ALLIDS; do adm setTestArchiveStopped "(principal \"$cid\", false)" >/dev/null 2>&1; done
 sleep 1
 
+adm setTestArchiveMaxHops '(null)' >/dev/null 2>&1   # a prior failed §6 may have left the pin
+
 echo "── §2 baseline: all segments reachable ──"
 R=$(hist "$Q" | tr -d '_\n' | tr -s ' ')
 if echo "$R" | grep -q 'degraded = vec {}'; then ok "degraded is empty"; else nok "expected empty degraded" "$(echo "$R" | head -c 300)"; fi
+if echo "$R" | grep -q 'unvisited = vec {}'; then ok "unvisited is empty (chain shorter than the hop budget)"; else nok "expected empty unvisited" "$(echo "$R" | head -c 300)"; fi
+if echo "$R" | grep -q 'complete = true'; then ok "complete = true"; else nok "expected complete = true" "$(echo "$R" | head -c 300)"; fi
 # Rows are OQL cells (name/value pairs) — the seq cell proves ≥1 row came back.
 if echo "$R" | grep -q 'name = "seq"' ; then ok "rows returned"; else nok "no rows in baseline" "$(echo "$R" | head -c 300)"; fi
 
 echo "── §3 sealed segment stopped → degraded, not dead ──"
 ST=$(adm setTestArchiveStopped "(principal \"$SEALED_ID\", true)")
-if echo "$ST" | grep -q "ok"; then ok "sealed segment $SEALED_ID stopped"; else nok "stop refused" "$ST"; fi
+if mdx_ok "$ST"; then ok "sealed segment $SEALED_ID stopped"; else nok "stop refused" "$ST"; fi
 R=$(hist "$Q" | tr -d '_\n' | tr -s ' ')
 if echo "$R" | grep -q "reject\|Reject\|error"; then
   nok "archiveExecute failed outright (pre-fix behaviour)" "$(echo "$R" | head -c 300)"
@@ -127,13 +138,14 @@ else
   ok "archiveExecute still answers with a segment down"
 fi
 if echo "$R" | grep -Eq "degraded = vec \{[^}]*\"$SEALED_ID\""; then ok "degraded names the stopped segment"; else nok "degraded missing the cid" "$(echo "$R" | head -c 300)"; fi
+if echo "$R" | grep -q 'complete = false'; then ok "a degraded read is not complete"; else nok "expected complete = false with a segment down" "$(echo "$R" | head -c 300)"; fi
 if echo "$R" | grep -q 'name = "seq"'; then ok "reachable segment's rows still served"; else nok "no rows with one segment down" "$(echo "$R" | head -c 300)"; fi
 RA=$(hist "$Q" anonymous | tr -d '_\n' | tr -s ' ')
 if echo "$RA" | grep -Eq "degraded = vec \{[^}]*\"$SEALED_ID\""; then ok "anonymous caller gets the same degraded-not-dead read"; else nok "anonymous read did not degrade cleanly" "$(echo "$RA" | head -c 300)"; fi
 
 echo "── §4 restart → degraded drains ──"
 ST=$(adm setTestArchiveStopped "(principal \"$SEALED_ID\", false)")
-if echo "$ST" | grep -q "ok"; then ok "sealed segment restarted"; else nok "restart refused" "$ST"; fi
+if mdx_ok "$ST"; then ok "sealed segment restarted"; else nok "restart refused" "$ST"; fi
 sleep 1
 R=$(hist "$Q" | tr -d '_\n' | tr -s ' ')
 if echo "$R" | grep -q 'degraded = vec {}'; then ok "degraded empty again"; else nok "degraded did not drain" "$(echo "$R" | head -c 300)"; fi
@@ -142,6 +154,28 @@ echo "── §5 the stop hook is scoped to our own segments ──"
 ST=$(adm setTestArchiveStopped '(principal "aaaaa-aa", true)')
 if echo "$ST" | grep -q "not an archive segment"; then ok "foreign principal refused"; else nok "hook accepted a non-archive principal" "$ST"; fi
 
+echo "── §6 (#54.5) budget-truncated walk is marked, not reported complete ──"
+# The walk visits newest-first: active archive, then sealed segments newest
+# → oldest. With the hop budget pinned to 1 only the active archive is read
+# and the sealed segment ($SEALED_ID) is the one the budget skips. Nothing
+# failed, so `degraded` must stay empty — the two markers are distinct.
+adm setTestArchiveMaxHops '(opt (1 : nat))' >/dev/null 2>&1
+R=$(hist "$Q" | tr -d '_\n' | tr -s ' ')
+if echo "$R" | grep -q "reject\|Reject\|error"; then
+  nok "archiveExecute failed under the hop pin" "$(echo "$R" | head -c 300)"
+else
+  ok "archiveExecute answers under a 1-hop budget"
+fi
+if echo "$R" | grep -Eq "unvisited = vec \{[^}]*\"$SEALED_ID\""; then ok "unvisited names the budget-skipped sealed segment"; else nok "unvisited missing the skipped cid (pre-fix: silent truncation)" "$(echo "$R" | head -c 300)"; fi
+if echo "$R" | grep -q 'complete = false'; then ok "complete = false on a budget exit"; else nok "budget-truncated walk reported complete" "$(echo "$R" | head -c 300)"; fi
+if echo "$R" | grep -q 'degraded = vec {}'; then ok "degraded stays empty (a budget exit is not a fault)"; else nok "budget exit leaked into degraded" "$(echo "$R" | head -c 300)"; fi
+RA=$(hist "$Q" anonymous | tr -d '_\n' | tr -s ' ')
+if echo "$RA" | grep -Eq "unvisited = vec \{[^}]*\"$SEALED_ID\"" && echo "$RA" | grep -q 'complete = false'; then ok "anonymous caller sees the same budget marker"; else nok "anonymous read hid the truncation" "$(echo "$RA" | head -c 300)"; fi
+adm setTestArchiveMaxHops '(null)' >/dev/null 2>&1
+R=$(hist "$Q" | tr -d '_\n' | tr -s ' ')
+if echo "$R" | grep -q 'unvisited = vec {}' && echo "$R" | grep -q 'complete = true'; then ok "budget restored → unvisited drains, complete = true"; else nok "marker did not drain after restoring the budget" "$(echo "$R" | head -c 300)"; fi
+
+adm setTestArchiveMaxHops '(null)' >/dev/null 2>&1
 adm setTestArchiveCap '(null)' >/dev/null 2>&1
 echo ""
 if [ $fail -eq 0 ]; then

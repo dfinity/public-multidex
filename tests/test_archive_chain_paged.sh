@@ -31,15 +31,15 @@
 # shipper or simulator appending events cannot flake it.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 arc() { local id="$1"; shift; icp canister call --identity anonymous "$id" "$@" 2>&1; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
 
 flat() { tr -d '_\n' | tr -s ' '; }
 # Numeric field by name. Anchored on a leading space/brace so ` checked` never
@@ -48,14 +48,14 @@ num() { echo "$1" | grep -oE "[ {;]$2 = [0-9]+" | grep -oE "[0-9]+" | head -1; }
 # `field = opt (N : nat)` → N, empty when null.
 optnum() { echo "$1" | grep -oE "$2 = opt \([0-9]+" | grep -oE "[0-9]+" | head -1; }
 
-WD=$(mkid archpg_wd)
+mdx_identity_new archpg_wd; WD=$(principal_of archpg_wd)
 if [ -z "$WD" ]; then echo "cannot create test identity"; exit 1; fi
 
 # Clear any tiny archive cap a previous test may have left behind, so the
 # events below land in ONE archive and the walk has a chain to page over.
 adm setTestArchiveCap '(null)' >/dev/null 2>&1 || true
 adm setTestTimersPaused '(false)' >/dev/null 2>&1 || true   # the shipper must run
-adm setTestBalance "(principal \"$WD\", \"ICPUSD\", 100_000_000_000 : nat)" >/dev/null
+adm setTestBalance "(principal \"$WD\", \"ICPUSD\", 1_000_000_000_000 : nat)" >/dev/null
 
 drain() {  # wait for the transit queue to empty (ship tick = 10s)
   local tries=0
@@ -70,7 +70,7 @@ drain() {  # wait for the transit queue to empty (ship tick = 10s)
 echo "── §1 put a chain in the active archive ──"
 i=0
 while [ $i -lt 8 ]; do
-  icp canister call --identity archpg_wd backend withdraw "(\"ICPUSD\", 100_000_000 : nat, \"paged-$i\")" >/dev/null 2>&1
+  icp canister call --candid "$MDX_CANDID" --identity archpg_wd backend withdraw "(\"ICPUSD\", 1_000_000_000 : nat, \"paged-$i\")" >/dev/null 2>&1
   i=$((i+1))
 done
 if drain; then ok "events shipped (queue drained)"; else nok "queue not drained" "unshipped=${UNSHIPPED:-?}"; fi

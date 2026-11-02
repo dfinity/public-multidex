@@ -34,8 +34,8 @@ fi
 
 MKT="ICP-ICPUSD"
 
-icp identity new sqb_maker --storage plaintext 2>/dev/null || true
-icp identity new sqb_user  --storage plaintext 2>/dev/null || true
+mdx_identity_new sqb_maker
+mdx_identity_new sqb_user
 MAKER=$(principal_of sqb_maker)
 USER=$(principal_of sqb_user)
 

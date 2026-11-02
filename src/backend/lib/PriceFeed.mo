@@ -5,6 +5,7 @@ import Char "mo:core/Char";
 import Nat32 "mo:core/Nat32";
 import Option "mo:core/Option";
 import Int "mo:core/Int";
+import Nat "mo:core/Nat";
 
 // PriceFeed.mo — multi-source external price aggregation.
 //
@@ -396,16 +397,44 @@ module {
   //   · both groups present and within `depegThresholdBps` → the pooled
   //     aggregate (maximal sources; the groups corroborate each other, so
   //     cross-quote dispersion carries no hidden signal)
-  //   · groups DIVERGED → the USD group is the mark (the venue's mark is
-  //     USD-denominated) with ITS dispersion and ITS source count — the
-  //     divergence is reported to the caller as the depeg signal instead of
-  //     being averaged into the blend
+  //   · groups DIVERGED and the USD group is ROBUST on its own (its surviving
+  //     count reaches `minSources`, the caller's floor) → the USD group is the
+  //     mark (the venue's mark is USD-denominated) with ITS dispersion and ITS
+  //     source count — the divergence is reported to the caller as the depeg
+  //     signal instead of being averaged into the blend (`mark = #usdGroup`)
+  //   · groups DIVERGED but the USD group ALONE is below the floor → the
+  //     pooled trim STAYS the mark and the divergence is reported as a
+  //     signal only (`diverged`, `depegBps`, `mark = #pooled`). The decision
+  //     to discard the USDT venues has to be robust BEFORE it may discard
+  //     them: a two-venue USD group has a breakdown point of zero (see
+  //     MIN_ROBUST_SOURCES), so one stale or thin USD venue could otherwise
+  //     "diverge" the fleet, hand the mark to a group the caller's floor
+  //     then refuses, and freeze the mark on six healthy venues — with the
+  //     shipped fleet (two USD, six USDT) that was every divergence, real
+  //     depegs included, so "the mark follows the USD group" was unreachable.
+  //     A pooled mark under a REAL depeg is USDT-dominated; the USD-quoted
+  //     XRC anchor's divergence cross-check is the backstop on that side.
   //   · one group empty → the other, with no cross-check available
   // The returned Aggregate keeps the FULL reading fleet for observability
-  // regardless of which group priced the mark.
+  // regardless of which sample set priced the mark; `mark` says which.
+  public type MarkBasis = { #pooled; #usdGroup };
+  public type QuoteAggregate = {
+    agg : Aggregate; usdCount : Nat; usdtCount : Nat; depegBps : Nat; diverged : Bool;
+    mark : MarkBasis;
+  };
+
+  // `depegBps` when the divergence is not finitely representable — the USD
+  // group pricing at ~1e-302 (a hostile upstream body under the byte cap,
+  // `> 0.0`, and parseLeadingFloat has no lower bound) makes the quotient
+  // infinite or absurdly large. Saturating keeps the signal (any threshold is
+  // exceeded) where zeroing would hide it. Twin of the `< 1e15` gate in
+  // `aggregate`.
+  public let DEPEG_BPS_SATURATED : Nat = 1_000_000_000_000_000;
+
   public func aggregateByQuote(
-    asset : Asset, readings : [Reading], sources : [Source], now : Int, depegThresholdBps : Nat
-  ) : { agg : Aggregate; usdCount : Nat; usdtCount : Nat; depegBps : Nat; diverged : Bool } {
+    asset : Asset, readings : [Reading], sources : [Source], now : Int,
+    depegThresholdBps : Nat, minSources : Nat
+  ) : QuoteAggregate {
     func quoteOf(sourceId : Text) : QuoteAsset {
       for (src in sources.vals()) { if (src.id == sourceId) { return src.quote } };
       #usd;   // unknown source id — treat as the mark's own denomination
@@ -424,23 +453,115 @@ module {
       return {
         agg = aggregate(asset, readings, now);
         usdCount = aggUsd.sourceCount; usdtCount = aggUsdt.sourceCount;
-        depegBps = 0; diverged = false;
+        depegBps = 0; diverged = false; mark = #pooled;
       };
     };
     let diffBps = Float.abs(aggUsd.price - aggUsdt.price) / aggUsd.price * 10000.0;
-    let depegBps = if (diffBps < 0.0) { 0 } else { Int.abs(Float.toInt(diffBps)) };
+    // Finiteness gate before Float.toInt: it TRAPS on inf/NaN, and this runs
+    // in the tick's post-await continuation — a trap there left
+    // `lastAggregates` unwritten, bypassed the XRC fallback and skipped every
+    // later pool that tick, every 30s. `< 1e15` is false for inf AND NaN;
+    // both saturate (reported as diverged), neither is zeroed.
+    let depegBps : Nat =
+      if (diffBps < 0.0) { 0 }
+      else if (diffBps < 1.0e15) { Int.abs(Float.toInt(diffBps)) }
+      else { DEPEG_BPS_SATURATED };
     let diverged = depegBps > depegThresholdBps;
-    if (diverged) {
+    if (diverged and aggUsd.sourceCount >= minSources) {
       { agg = { aggUsd with readings }; usdCount = aggUsd.sourceCount;
-        usdtCount = aggUsdt.sourceCount; depegBps; diverged = true };
+        usdtCount = aggUsdt.sourceCount; depegBps; diverged = true; mark = #usdGroup };
     } else {
       { agg = aggregate(asset, readings, now); usdCount = aggUsd.sourceCount;
-        usdtCount = aggUsdt.sourceCount; depegBps; diverged = false };
+        usdtCount = aggUsdt.sourceCount; depegBps; diverged; mark = #pooled };
     };
   };
 
   func appendReading(a : [Reading], r : Reading) : [Reading] {
     Array.tabulate<Reading>(a.size() + 1, func(i) { if (i < a.size()) { a[i] } else { r } });
+  };
+
+  // ── The fan-out accumulator (H-37 / F34) ──────────────────────────
+  // One refresh is one FAN-OUT: N per-source self-calls that each RECORD
+  // their reading here as it lands. The mark is applied by the FIRST arrival
+  // that sees a robust quorum with acceptable dispersion (#quorum), by the
+  // last arrival (#complete), or by the caller's deadline (#deadline — the
+  // periodic sweep; #drained — an awaiting caller whose every self-call has
+  // returned). It is NEVER applied by the slowest provider: before this the
+  // refresh awaited all N futures in order, so one venue trickling its body
+  // set the cadence of every mark (Motoko cannot select on or abandon an
+  // await — hence the restructure). Readings that land after finalization
+  // ATTACH for observability (`late`) and never re-apply the mark.
+  //
+  // Pure: main.mo does the I/O and every side effect (the apply, the
+  // requote, the guards); this module owns the DECISION so mops-test can
+  // drive the state machine without a replica. `aggregateOf` is the caller's
+  // aggregation (aggregateByQuote with its sources/floor) so the quorum test
+  // judges the SAME trimmed, per-quote sample the apply will price on.
+  public type FanoutReason = { #quorum; #complete; #deadline; #drained };
+  public type FanoutStep   = { #wait; #finalize : FanoutReason; #late };
+  public type FanoutState = {
+    expected      : Nat;            // self-calls dispatched
+    quorum        : Nat;            // surviving readings that finalize early
+    var readings  : [Reading];      // arrival order; late arrivals included
+    var finalized : ?FanoutReason;
+    var late      : Nat;            // readings that landed after finalization
+  };
+
+  public func fanoutNew(expected : Nat, quorum : Nat) : FanoutState {
+    { expected; quorum; var readings = []; var finalized = null; var late = 0 };
+  };
+
+  // The ROBUST quorum: a strict majority of the dispatched fleet, never below
+  // the caller's floor. A majority (5 of 8) rather than the bare floor (3):
+  // the trim locates the cluster with a median and a MAD and its breakdown
+  // point is what bounds the mark, so finalizing on the three FASTEST venues
+  // would hand the mark to whichever pair answers first — the dispersion gate
+  // bounds that damage, the majority removes it. The DEADLINE, not the
+  // quorum, is the latency bound: a fleet that cannot reach a majority
+  // (three venues down) still finalizes on `#complete` when the failures
+  // report, or on the deadline when one of them hangs.
+  public func robustQuorum(total : Nat, floor : Nat) : Nat {
+    Nat.max(floor, total / 2 + 1);
+  };
+
+  // The quorum test IS the apply gate's quality floor with `quorum` in place
+  // of the floor: enough survivors, a usable price, dispersion within bounds.
+  public func quorumReached(agg : Aggregate, quorum : Nat, maxStddevBps : Float) : Bool {
+    agg.sourceCount >= quorum and agg.price > 0.0 and agg.stddevBps <= maxStddevBps;
+  };
+
+  // Record one arrival. Failed readings (ok=false) count toward #complete —
+  // a venue that answered "no" has answered — and never toward the quorum
+  // (they leave `aggregate`'s sample). Exactly one #finalize per state: a
+  // later arrival is #late, whatever it says.
+  public func fanoutRecord(st : FanoutState, r : Reading, aggregateOf : [Reading] -> Aggregate, maxStddevBps : Float) : FanoutStep {
+    st.readings := appendReading(st.readings, r);
+    switch (st.finalized) {
+      case (?_) { st.late += 1; return #late };
+      case null {};
+    };
+    if (st.readings.size() >= st.expected) { st.finalized := ?#complete; return #finalize(#complete) };
+    if (quorumReached(aggregateOf(st.readings), st.quorum, maxStddevBps)) { st.finalized := ?#quorum; return #finalize(#quorum) };
+    #wait;
+  };
+
+  // Close an OPEN fan-out from outside (deadline / drained). True iff this
+  // call finalized it — the caller runs the apply exactly when it is true.
+  public func fanoutClose(st : FanoutState, reason : FanoutReason) : Bool {
+    switch (st.finalized) {
+      case (?_) { false };
+      case null { st.finalized := ?reason; true };
+    };
+  };
+
+  public func fanoutReasonText(r : ?FanoutReason) : Text {
+    switch (r) {
+      case null { "open" };
+      case (?#quorum) { "quorum" };
+      case (?#complete) { "complete" };
+      case (?#deadline) { "deadline" };
+      case (?#drained) { "drained" };
+    };
   };
 
   // ── Body parsing ──────────────────────────────────────────────────

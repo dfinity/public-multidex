@@ -8,6 +8,7 @@
 # 5) Verifying results after order execution
 
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 
 BACKEND="tz2ag-zx777-77776-aaabq-cai"
 GREEN='\033[0;32m'
@@ -59,10 +60,11 @@ echo ""
 # ── Step 0: Create test identities ─────────────────────────────
 echo -e "${YELLOW}Setting up test identities...${NC}"
 
-# Create test identities if they don't exist
-icp identity new alice --storage plaintext 2>/dev/null || true
-icp identity new bob --storage plaintext 2>/dev/null || true
-icp identity new charlie --storage plaintext 2>/dev/null || true
+# Create the STANDING test identities if they don't exist (kept across runs —
+# never mdx_identity_new, which would delete them on EXIT)
+mdx_identity_ensure alice
+mdx_identity_ensure bob
+mdx_identity_ensure charlie
 
 ALICE_PRINCIPAL=$(icp identity principal --identity alice 2>/dev/null)
 BOB_PRINCIPAL=$(icp identity principal --identity bob 2>/dev/null)
@@ -135,14 +137,14 @@ echo -e "${YELLOW}Step 4: Placing limit orders on BTC-ICPUSD...${NC}"
 
 # Alice places sell orders (asks)
 RESULT=$(call placeLimitOrder '("BTC-ICPUSD", variant { sell }, 68000.0, 0.5)' --identity alice)
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Alice sell 0.5 BTC @ 68000"
 else
   fail "Alice sell order" "$RESULT"
 fi
 
 RESULT=$(call placeLimitOrder '("BTC-ICPUSD", variant { sell }, 69000.0, 0.3)' --identity alice)
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Alice sell 0.3 BTC @ 69000"
 else
   fail "Alice sell order 2" "$RESULT"
@@ -150,14 +152,14 @@ fi
 
 # Bob places buy orders (bids)
 RESULT=$(call placeLimitOrder '("BTC-ICPUSD", variant { buy }, 67000.0, 0.4)' --identity bob)
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Bob buy 0.4 BTC @ 67000"
 else
   fail "Bob buy order" "$RESULT"
 fi
 
 RESULT=$(call placeLimitOrder '("BTC-ICPUSD", variant { buy }, 66500.0, 0.6)' --identity bob)
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Bob buy 0.6 BTC @ 66500"
 else
   fail "Bob buy order 2" "$RESULT"
@@ -186,7 +188,7 @@ echo -e "${YELLOW}Step 6: Charlie places market buy order...${NC}"
 # Charlie buys 0.2 BTC at market (should match Alice's 68000 ask)
 RESULT=$(call placeMarketOrder '("BTC-ICPUSD", variant { buy }, 0.2, 0.10, false)' --identity charlie)
 echo "Market order result: $RESULT"
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Charlie market buy 0.2 BTC executed"
 else
   fail "Charlie market buy" "$RESULT"
@@ -215,7 +217,7 @@ echo -e "${YELLOW}Step 7: Testing ETH-ICPUSD market...${NC}"
 
 # Alice sells ETH
 RESULT=$(call placeLimitOrder '("ETH-ICPUSD", variant { sell }, 3500.0, 5.0)' --identity alice)
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Alice sell 5 ETH @ 3500"
 else
   fail "Alice ETH sell" "$RESULT"
@@ -224,7 +226,7 @@ fi
 # Bob buys ETH (should match Alice's ask)
 RESULT=$(call placeLimitOrder '("ETH-ICPUSD", variant { buy }, 3500.0, 2.0)' --identity bob)
 echo "Bob ETH buy result: $RESULT"
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Bob buy 2 ETH @ 3500 (should match)"
 else
   fail "Bob ETH buy" "$RESULT"
@@ -245,7 +247,7 @@ echo "Bob placed order ID: $ORDER_ID"
 
 if [ -n "$ORDER_ID" ]; then
   CANCEL_RESULT=$(call cancelMyOrder "($ORDER_ID)" --identity bob)
-  if echo "$CANCEL_RESULT" | grep -q "ok"; then
+  if mdx_ok "$CANCEL_RESULT"; then
     pass "Order $ORDER_ID cancelled successfully"
   else
     fail "Cancel order" "$CANCEL_RESULT"
@@ -263,14 +265,14 @@ echo -e "${YELLOW}Step 9: Testing liquidity re-use...${NC}"
 # but together would exceed her balance
 
 RESULT=$(call placeLimitOrder '("BTC-ICPUSD", variant { buy }, 65000.0, 1.0)' --identity alice)
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Alice buy 1 BTC @ 65000 (65000 ICPUSD)"
 else
   fail "Alice cross-market buy 1" "$RESULT"
 fi
 
 RESULT=$(call placeLimitOrder '("ETH-ICPUSD", variant { buy }, 3000.0, 15.0)' --identity alice)
-if echo "$RESULT" | grep -q "ok"; then
+if mdx_ok "$RESULT"; then
   pass "Alice buy 15 ETH @ 3000 (45000 ICPUSD)"
 else
   fail "Alice cross-market buy 2" "$RESULT"

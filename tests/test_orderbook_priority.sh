@@ -11,6 +11,7 @@
 # controlled.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
@@ -24,11 +25,10 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
 
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-PM=$(mkid ob_maker); PT=$(mkid ob_taker)
-adm()  { icp canister call --identity anonymous backend "$@" 2>&1; }
-mk()   { icp canister call --identity ob_maker backend "$@" 2>&1; }
-tk()   { icp canister call --identity ob_taker backend "$@" 2>&1; }
+mdx_identity_new ob_maker; PM=$(principal_of ob_maker); mdx_identity_new ob_taker; PT=$(principal_of ob_taker)
+adm()  { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mk()   { icp canister call --candid "$MDX_CANDID" --identity ob_maker backend "$@" 2>&1; }
+tk()   { icp canister call --candid "$MDX_CANDID" --identity ob_taker backend "$@" 2>&1; }
 # Sealed-until-GEPTOR: orders stage off-book and execute on the next GEPTOR
 # release, so no fill price comes back inline. The realized price is the NEWEST
 # trade for the market instead.
@@ -76,7 +76,7 @@ clean(){ for t in BTC ETH SOL ICP ICPUSD; do adm setTestBalance "(principal \"$1
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1   # deterministic releases (via release() only)
 adm createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1
-adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, 0 : nat, 0:nat, 10:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, 0 : nat, 0:nat, 10:nat)" >/dev/null
 adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
 adm enableAmm '("BTC-ICPUSD", true)' >/dev/null
 # Stamp a fresh oracle price + run the GEPTOR pass → releases everything staged

@@ -26,6 +26,7 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -33,10 +34,10 @@ ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
-ID=cesc; icp identity new $ID --storage plaintext 2>/dev/null || true
+ID=cesc; mdx_identity_new $ID
 P=$(icp identity principal --identity $ID 2>/dev/null | tail -1)
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-usr() { icp canister call --identity $ID backend "$@" 2>&1; }
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+usr() { icp canister call --candid "$MDX_CANDID" --identity $ID backend "$@" 2>&1; }
 fld() { echo "$2" | tr -d '_' | grep -oE "$1 = -?[0-9]+" | head -1 | grep -oE "[0-9]+"; }
 release() { adm setAmmRefPrice "(\"$1\", $(e8 "$2") : nat)" >/dev/null; adm requoteAmm "(\"$1\")" >/dev/null; }
 
@@ -58,16 +59,16 @@ adm setTestTimersPaused '(true)' >/dev/null 2>&1 || true
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1 || true
 adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
-adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat, 0:nat)" >/dev/null 2>&1 || true
+adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat)" >/dev/null 2>&1 || true
 adm enableAmm '("BTC-ICPUSD", true)' >/dev/null 2>&1 || true
 # Seed the vault PROPERLY (via seedAmmPool, so vault balances are LP-backed):
 # raw setTestBalance on the AMM principal would leave un-backed balances that
 # distort §4's LP mint/redeem arithmetic. The seeded vault is also the margin
 # LENDER for §1/§2.
-SEED=$(icp identity new cesc_seed --storage plaintext >/dev/null 2>&1; icp identity principal --identity cesc_seed 2>/dev/null | tail -1)
+mdx_identity_new cesc_seed; SEED=$(principal_of cesc_seed)
 adm setTestBalance "(principal \"$SEED\", \"BTC\",    $(e8 100.0) : nat)"     >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICPUSD\", $(e8 5000000.0) : nat)" >/dev/null
-icp canister call --identity cesc_seed backend seedAmmPool "(\"BTC-ICPUSD\", $(e8 100.0) : nat, $(e8 5000000.0) : nat)" >/dev/null 2>&1
+mdx_lp_deposit cesc_seed "BTC-ICPUSD" "$(e8 100.0)" "$(e8 5000000.0)" >/dev/null 2>&1
 adm setTestBalance "(principal \"$P\", \"ICPUSD\", $(e8 100000.0) : nat)" >/dev/null
 
 echo "── §1 pool-era C2: margin gate on pool withdrawals ──"
@@ -91,7 +92,7 @@ if echo "$W1" | grep -q "initial-margin requirement"; then
 else nok "indebted pool let collateral walk out" "$W1"; fi
 # A margin-safe withdraw (\$2k → ratio ≈ 1.8) still works — the gate isn't a wall.
 W2=$(usr withdrawMarginPool "($PID, $(e8 2000.0) : nat)")
-if echo "$W2" | grep -q "ok"; then ok "margin-safe \$2k withdraw allowed (control)"; else nok "healthy withdraw refused" "$W2"; fi
+if mdx_ok "$W2"; then ok "margin-safe \$2k withdraw allowed (control)"; else nok "healthy withdraw refused" "$W2"; fi
 
 echo "── §2 liquidation reaches a pool with a RESTING order open ──"
 # Park a resting limit BUY (far below market → rests after release), then
@@ -115,26 +116,36 @@ if [ "${NORD1:-0}" -eq 0 ]; then
   ok "resting order force-cancelled ahead of the seize (cancelAllUserOrders)"
 else nok "resting order survived a liquidation" "orders=$NORD1"; fi
 
-echo "── §3 M1: LP mint gated during an ACTIVE circuit-breaker pend ──"
+echo "── §3 M1: an LP mint WAITS through an ACTIVE circuit-breaker pend (sealed door, apiVersion 6.0.0) ──"
+# depositLp is a STAGED request now: under a pend on a HELD leg it is
+# accepted (funds reserved) and stays PENDING — nothing settles against the
+# frozen mark — until the confirmation clears the pend (a direct set does).
+# Staged RAW here (not mdx_lp_deposit: its re-stamp would clear the pend).
 adm setTestPendingJump '("BTC", opt (5500000000000 : nat), null)' >/dev/null   # BTC pend: 50k → 55k held for confirmation
 DL1=$(usr depositLp "(\"BTC-ICPUSD\", 0 : nat, $(e8 100.0) : nat)")
-if echo "$DL1" | grep -q "circuit-breaker confirmation"; then
-  ok "mint REFUSED while a HELD leg's price is pending confirmation"
-else nok "mint accepted against a frozen refPrice (M1)" "$DL1"; fi
-# Precision: a pend on an asset the vault does NOT hold must not block.
+ID1=$(mdx_lp_reqid "$DL1")
+adm adminRunStagedLp '()' >/dev/null
+if mdx_ok "$DL1" && [ -n "$ID1" ] && [ -n "$(mdx_lp_pending $ID "$ID1")" ] && [ -z "$(mdx_lp_outcome $ID "$ID1")" ]; then
+  ok "mint request #$ID1 stays PENDING while a HELD leg's price awaits confirmation (never settles at the frozen mark)"
+else nok "mint settled against a frozen refPrice (M1)" "$DL1 :: $(mdx_lp_view $ID)"; fi
 adm setTestPendingJump '("BTC", null, null)' >/dev/null
+DL1S=$(mdx_lp_settle $ID "$ID1" "$DL1" "BTC-ICPUSD" 0); RC1=$?
+if [ "$RC1" = "0" ] && [ "${DL1S:-0}" -gt 0 ] 2>/dev/null; then
+  ok "…and settles once the pend clears (minted $DL1S LP at the confirmed mark)"
+else nok "request did not settle after the pend cleared" "rc=$RC1 $DL1S"; fi
+# Precision: a pend on an asset the vault does NOT hold must not block.
 adm setTestPendingJump '("ETH", opt (300000000000 : nat), null)' >/dev/null    # vault holds no ETH
-DL2=$(usr depositLp "(\"BTC-ICPUSD\", 0 : nat, $(e8 100.0) : nat)")
-if echo "$DL2" | grep -q "ok"; then
-  ok "pend on an UNHELD asset doesn't block (held-legs-only gate)"
-else nok "over-broad gate: unheld asset pend blocked the mint" "$DL2"; fi
+DL2=$(mdx_lp_deposit $ID "BTC-ICPUSD" 0 "$(e8 100.0)"); RC2=$?
+if [ "$RC2" = "0" ]; then
+  ok "pend on an UNHELD asset doesn't block (held-legs-only gate: settled with the ETH pend still live)"
+else nok "over-broad gate: unheld asset pend blocked the mint" "rc=$RC2 $DL2"; fi
 adm setTestPendingJump '("ETH", null, null)' >/dev/null
 
 echo "── §4 debt-free humans unaffected: depositLp / withdrawLp round-trip ──"
 LP=$(usr getMyVaultLp "()" | tr -d '_' | grep -oE "[0-9]+" | head -1)
 if [ -n "${LP:-}" ] && [ "$LP" != "0" ]; then ok "LP minted for the debt-free depositor"; else nok "deposit should have minted LP" "lp=$LP"; fi
-WL=$(usr withdrawLp "($(awk -v l="$LP" 'BEGIN{printf "%.0f", l/2}') : nat)")
-if echo "$WL" | grep -q "ok"; then ok "in-kind withdrawLp works (no false-positive debt/price gate)"; else nok "withdrawLp refused a clean user" "$WL"; fi
+WL=$(mdx_lp_withdraw $ID "$(awk -v l="$LP" 'BEGIN{printf "%.0f", l/2}')"); RC4=$?
+if [ "$RC4" = "0" ]; then ok "in-kind withdrawLp settles (no false-positive debt/price gate)"; else nok "withdrawLp refused a clean user" "rc=$RC4 $WL"; fi
 
 # Fixture hygiene: the vault LP here is split between two ad-hoc identities
 # (cesc_seed's seed stake, cesc's §4 remainder) that _lib.sh's I1

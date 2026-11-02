@@ -16,7 +16,7 @@ import "@fontsource-variable/newsreader/opsz-italic.css";
 // re-published) CDN artefact would execute with full DOM access on the trading
 // page. An import is content-hashed into our own bundle and pinned by
 // package-lock.json, and it lets the app ship a real CSP with `script-src 'self'`.
-import { createChart, CandlestickSeries, HistogramSeries, LineSeries } from "lightweight-charts";
+import { createChart, CandlestickSeries, HistogramSeries, LineSeries, TickMarkType } from "lightweight-charts";
 
 // Pure formatting/display helpers (number/price/time/quantity, price flash).
 import { formatQty, priceDecimals, formatBookPrice, formatBookQty, uniformDecimals, formatNum, formatPrice, formatTime, flashPriceEl } from "./format.js";
@@ -28,13 +28,22 @@ import { appState } from "./state.js";
 // OQL display helpers (shared with the data explorer) + the feature modules.
 import { oqlRowsToObjects, oqlFormatCell, dxEsc } from "./oql.js";
 import { setupIntelli, dxApplyShareLink, dxEnsureSchema, dxOnAuthChange, dxUpdateIdentity } from "./explorer.js";
-import { setupAssistant, assistantOnShow, resetAssistant } from "./assistant.js";
+import { setupAssistant, assistantOnShow, assistantOnAuthChange, resetAssistant, assistantRefreshFooter } from "./assistant.js";
 import { setIdenticon } from "./identicon.js";
 import { DOCS_PARTS, DOCS_PAGES, docsPage } from "./docs.js";
 import { setupLedger } from "./ledger.js";
 import { startUpdateCheck } from "./update-check.js";
+// Dark / light theme: the toggle + persistence + system-following live in
+// theme.js; the chart/heat-map/identicon surfaces here re-skin on its
+// mdx:theme event (they take colours as strings and never watch CSS).
+import { setupTheme, onThemeChange, chartThemeOptions, candleThemeOptions, volumeBarColor, chartTrackColor, themeToken } from "./theme.js";
 // Exact-hostname local-replica test — gates fetchRootKey() (see host.js).
 import { isLocalReplicaOrigin } from "./host.js";
+// The asset canister's ic_env cookie, read by picking OUR row rather than the
+// first one (a foreign twin or another venue's stale row can list first on a
+// developer machine — canister-env.js has the two flavours and the ranking).
+import { readCanisterEnv, isCanisterEnvMismatchReject } from "./canister-env.js";
+import { setupDemoMode, renderDemoMarker, demoSignInRefusal } from "./demo-mode.js";
 
 // ── Missing-asset images ─────────────────────────────────────────
 // Token logos are rendered from markup templates and a token may simply have
@@ -58,16 +67,25 @@ document.addEventListener("error", (ev) => {
 // __CLOUD_ENGINE__ so a build without the define stays harmless.
 const APP_VERSION = (() => { try { return __APP_VERSION__; } catch { return ""; } })();
 
-// Cloud-engine mode (baked at build time via vite.config.js __CLOUD_ENGINE__,
+// Cloud-engine mode (baked at build time via vite.config.mjs __CLOUD_ENGINE__,
 // set by scripts/deploy.sh). On a cloud engine the engine pays for compute, so
 // the canister's own cycles read ~0 — suppress the "low/out of cycles" warning
 // (memory warnings still apply). Guarded so it's harmless if define is absent.
 const CLOUD_ENGINE = (typeof __CLOUD_ENGINE__ !== "undefined") ? __CLOUD_ENGINE__ : false;
 
 let AuthClient, HttpAgent, Actor, IDL, Principal;
+let MemoryCredentialStorage, MemoryStateStorage;   // @icp-sdk/auth 11.x in-memory stores (authClientOpts → makeInMemoryStores)
 let authClient = null;
 let identity = null;
 let icAgent = null;       // the authenticated HttpAgent, reused to build the archive appState.actor
+// ic_env cookie hygiene (canister-env.js, task 1793499221): the backend id the
+// live actors were built against, the one-shot self-heal's state, and a
+// generation counter that lazily-built agents (the Ledger page's raw agent)
+// compare against so a healed env never keeps serving a stale root key.
+let _boundBackendId = null;
+let _envHealTried = false;
+let _envHealed = null;          // { from, to } once the heal replaced the env
+let _canisterEnvGeneration = 0;
 // appState.actor, appState.publicActor, appState.archiveActor, appState.isAuthenticated, appState.myPrincipalText now live on
 // appState (state.js) so the feature modules can share them — see import above.
 
@@ -111,10 +129,10 @@ let chartCandleSeries = null;   // candlestick series
 let chartVolumeSeries = null;   // volume histogram series
 let chartTrades = [];           // raw trades for current market chart (legacy, used by mini chart fallback)
 let chartInterval = 3600000;    // current chart interval in ms (default 1h)
-let chartCandleData = null;     // { candles, volumes } from backend getCandles API
-let chartCurrentPage = 0;       // current highest page loaded for full chart
-let chartHasMore = false;       // whether older pages exist
+let chartCandleData = null;     // { candles, volumes }: every getCandles page loaded, merged by bar time
+let chartHasMore = false;       // whether pages older than the held run exist
 let chartLoadingMore = false;   // prevent concurrent page loads
+let chartReturnFocus = null;    // the element that opened the overlay — focus goes back to it on close
 const CHART_VISIBLE_CANDLES = 120; // default candles on screen — more history + thinner candles (auto-fit to width)
 let lastTradeIds = new Set();   // IDs of trades rendered in last renderTrades call
 let renderedTrades = [];        // most recent rendered trades (newest-first) for time tick updates
@@ -171,7 +189,6 @@ let uomPage = 0;                // current pagination page
 let uomOpenOrders = [];         // cached SPOT open orders for current market
 let uomPoolOrders = [];         // cached resting MARGIN orders for current market (owned by pool principals)
 let stagedOrderIds = new Set(); // ids of STAGED (off-book, awaiting-GEPTOR) orders
-let uomPendingMatches = [];     // cached pending matches for current market (taker side)
 // appState.myPrincipalText now lives on appState (state.js).
 // Per-market trade history: marketId → newest-first trades[]. Replaces the
 // old single-market `uomTradeHistory` so cross-market trades arriving via
@@ -186,6 +203,8 @@ let orderBookState = {};           // marketId → { asks: Map<price, level>, bi
 let miniChartInstance = null;    // lightweight-charts instance for the Markets-page mini chart
 let miniChartSeries = null;      // candlestick series for mini chart
 let miniChartVolumeSeries = null;// volume histogram series for mini chart
+let miniChartReskin = null;      // re-skins the live mini chart on a theme change (set by renderMiniChart)
+let miniChartMerge = null;       // merges a fresh page 0 into the mini chart's held pages (set by renderMiniChart)
 let miniChartRefreshInterval = null; // refresh interval for mini chart
 let miniChartCandleInterval = 3600000; // current candle interval for mini chart (default 1h)
 
@@ -299,32 +318,28 @@ function getIdlFactory() {
       toAmount: IDL.Nat,
       fullyFilled: IDL.Bool,
       swapOrderId: IDL.Opt(IDL.Nat),
+      // The ICPUSD budget actually STAGED (min(amount, available)) — raw e8,
+      // the name is deliberately NOT in money.js's MONEY_KEYS (task 1788465056).
+      stagedBudget: IDL.Opt(IDL.Nat),
     });
-    const PendingMatch = IDL.Record({
-      id:               IDL.Nat,
-      marketId:         IDL.Text,
-      makerOrderId:     IDL.Nat,
-      makerPrincipal:   IDL.Principal,
-      takerPrincipal:   IDL.Principal,
-      takerSide:        Side,
-      takerOrderType:   OrderType,
-      price:            IDL.Nat,
-      quantity:         IDL.Nat,
-      takerDebitToken:  IDL.Text,
-      takerDebitAmount: IDL.Nat,
-      makerDebitToken:  IDL.Text,
-      makerDebitAmount: IDL.Nat,
-      createdAtNs:      IDL.Int,
-      expiryNs:         IDL.Int,
-      status: IDL.Variant({ pending: IDL.Null, finalized: IDL.Null, voided: IDL.Null }),
+    // Why a swap's release walk stopped (getMyRecentSwap.stopReason).
+    const SwapStopReason = IDL.Variant({
+      filled: IDL.Null, budgetExhausted: IDL.Null, bookExhausted: IDL.Null,
+      slippage: IDL.Null, unfunded: IDL.Null, workBound: IDL.Null,
     });
+    // (The PendingMatch record, the pendingMatches result fields and
+    // getMyPendingMatches were REMOVED at apiVersion 6.0.0 — candid/README.md.)
     const MatchResult = IDL.Record({
       trades: IDL.Vec(Trade),
-      pendingMatches: IDL.Vec(PendingMatch),
       remainingQty: IDL.Nat,
       totalFilled: IDL.Nat,
       avgPrice: IDL.Nat,
       affectedUsers: IDL.Vec(IDL.Principal),
+      // Task 3088499384: candid/backend.did publishes these two on MatchResult
+      // and the decoder drops unlisted fields silently — list them (raw e8
+      // quoteSpent is NOT in money.js's MONEY_KEYS; normalise at any read site).
+      quoteSpent: IDL.Nat,
+      stopReason: SwapStopReason,
     });
     // Principal-level margin health (collateral / debt / ratio), still read for
     // net-value/debt display via getMyMarginHealth.
@@ -337,10 +352,14 @@ function getIdlFactory() {
       isLiquidatable:   IDL.Bool,
     });
     // ── Margin Pools (first-class segregated positions) ──
+    // Per-token loan figures (task 1788730982): `amount` is a MONEY_KEY, so
+    // normMoney scales the nested records at the boundary like every other.
+    const TokenAmount = IDL.Record({ token: IDL.Text, amount: IDL.Nat });
     const MarginPoolView = IDL.Record({
       id: IDL.Nat, name: IDL.Text, isolated: IDL.Bool, principal: IDL.Text,
       health: MarginHealth, marginUsage: IDL.Nat, freeQuote: IDL.Nat,
       valueUsd: IDL.Int, createdAt: IDL.Int,
+      loans: IDL.Vec(TokenAmount), repayable: IDL.Vec(TokenAmount),
     });
     // Position/pool history (episodes = one row per open→flat lifetime).
     const PositionEpisode = IDL.Record({
@@ -373,6 +392,9 @@ function getIdlFactory() {
       size: IDL.Int, entryPrice: IDL.Nat, markPrice: IDL.Nat,
       notionalUsd: IDL.Nat, unrealizedPnl: IDL.Int, realizedPnl: IDL.Int,
       liqPrice: IDL.Opt(IDL.Nat), pctToLiq: IDL.Opt(IDL.Nat),
+      // #54.8: the direction rides with the price (from the health slope, not
+      // the size sign) and "already past" is the pool's own health verdict.
+      liqDir: IDL.Opt(IDL.Variant({ down: IDL.Null, up: IDL.Null })), isLiquidatable: IDL.Bool,
     });
     const AccountSummary = IDL.Record({
       netAccountValueUsd: IDL.Int, freeWalletValueUsd: IDL.Nat,
@@ -381,7 +403,6 @@ function getIdlFactory() {
     });
     const PlaceLimitResult = IDL.Record({
       order: Order,
-      pendingMatches: IDL.Vec(PendingMatch),
     });
     const UserProfile = IDL.Record({
       userId: IDL.Text,
@@ -502,14 +523,13 @@ function getIdlFactory() {
     });
 
     // ── AMM + price-feed types (Phase 2/3/4/5) ──
-    const Pool = IDL.Record({
+    const PoolView = IDL.Record({   // the .did names the public pool record PoolView (6.0.0: the stored Pool minus a fossil field)
       marketId: IDL.Text,
       baseToken: IDL.Text,
       spreadBps: IDL.Nat,
       quoteDepthBase: IDL.Nat,
       numLevels: IDL.Nat,
       levelSpacingBps: IDL.Nat,
-      protectionWindowSec: IDL.Nat,
       enabled: IDL.Bool,
       inventoryTargetBase: IDL.Nat,
       skewIntensityBps: IDL.Nat,
@@ -557,6 +577,16 @@ function getIdlFactory() {
       timestamp: IDL.Int,
       readings: IDL.Vec(Reading),
     });
+    // 1788471187: the USD/USDT split behind each asset's mark (issue #55
+    // "oracle split") — `mark` names which sample set priced it.
+    const MarkBasis = IDL.Variant({ pooled: IDL.Null, usdGroup: IDL.Null });
+    const QuoteSignal = IDL.Record({
+      mark: MarkBasis,
+      diverged: IDL.Bool,
+      depegBps: IDL.Nat,
+      usdCount: IDL.Nat,
+      usdtCount: IDL.Nat,
+    });
     const PriceFeedStats = IDL.Record({
       successCount: IDL.Nat,
       failureCount: IDL.Nat,
@@ -564,6 +594,37 @@ function getIdlFactory() {
       intervalSec: IDL.Nat,
       minSources: IDL.Nat,
       maxStddevBps: IDL.Float64,
+      // The decoder DROPS wire fields this record does not name, so every
+      // field the Status page reads has to be listed here: the four Phase-6
+      // breaker fields below were served by the backend but absent from
+      // this IDL, which left `maxRefPriceAgeSec` undefined at the render
+      // site (the AMM-sidelined threshold silently fell back to 300s) and
+      // `suspendedCount` always 0.
+      suspendedCount: IDL.Nat,
+      panicCancels: IDL.Nat,
+      jumpThresholdBps: IDL.Float64,
+      maxRefPriceAgeSec: IDL.Nat,
+      depegAlarmBps: IDL.Nat,
+      quoteSignals: IDL.Vec(IDL.Tuple(IDL.Text, QuoteSignal)),
+      // H-37 (F34): the fan-out census — the shape (sources, quorum,
+      // deadline) and how each refresh closed (quorum / complete / deadline /
+      // drained), late readings, abandoned fan-outs, and the open count
+      // `refreshInFlight` derives from. Named here so the decoder keeps them
+      // (frontend_display_integrity pins the IDL against candid/backend.did).
+      fanoutSources: IDL.Nat,
+      fanoutQuorum: IDL.Nat,
+      fanoutDeadlineSec: IDL.Nat,
+      // 1788558580: the STAGING window the deadline protects (DEFERRED_EXPIRY_NS
+      // in whole seconds). Additive on the wire; named here so the decoder
+      // keeps it (1788636325 — the §K battery tripped on its omission).
+      stagingWindowSec: IDL.Nat,
+      fanoutOpen: IDL.Nat,
+      fanoutQuorumCount: IDL.Nat,
+      fanoutCompleteCount: IDL.Nat,
+      fanoutDeadlineCount: IDL.Nat,
+      fanoutDrainedCount: IDL.Nat,
+      fanoutLateReadings: IDL.Nat,
+      fanoutAbandoned: IDL.Nat,
     });
     const PoolSnapshot = IDL.Record({
       timestamp: IDL.Int,
@@ -581,6 +642,25 @@ function getIdlFactory() {
       icp: IDL.Nat,
       icpusd: IDL.Nat,
     });
+    // Task 1788503312 — sealed LP requests. The Earn card STAGES a deposit /
+    // withdrawal (funds or shares reserved now) and the backend settles it at
+    // the first NAV whose basket marks all postdate the request; the card
+    // polls getMyStagedLpRequests for the outcome. Field-for-field mirrors of
+    // candid/backend.did (display battery §K).
+    const StagedLpKind = IDL.Variant({
+      deposit: IDL.Record({ marketId: IDL.Text, baseAmount: IDL.Nat, quoteAmount: IDL.Nat }),
+      withdraw: IDL.Record({ lpAmount: IDL.Nat }),
+    });
+    const StagedLpRequest = IDL.Record({
+      id: IDL.Nat, kind: StagedLpKind, ts: IDL.Int, expiresAt: IDL.Int,
+      waitingOn: IDL.Vec(IDL.Text),   // markets that have not yet postdated it; empty = settles on the next pass
+      cancelRefusal: IDL.Opt(IDL.Text), // task 1788731609: why cancelStagedLpRequest would refuse right now; [] = cancellable
+    });
+    const LpRequestOutcome = IDL.Record({
+      id: IDL.Nat, kind: StagedLpKind, ts: IDL.Int, settledNs: IDL.Int,
+      outcome: IDL.Variant({ minted: IDL.Nat, redeemed: VaultBasket, cancelled: IDL.Text }),
+    });
+    const StagedLpView = IDL.Record({ pending: IDL.Vec(StagedLpRequest), recent: IDL.Vec(LpRequestOutcome) });
     const VaultPrices = IDL.Record({
       btc: IDL.Nat,
       eth: IDL.Nat,
@@ -593,6 +673,10 @@ function getIdlFactory() {
       totalQuoteValue: IDL.Nat,
       lpSupply: IDL.Nat,
       valuePerLP: IDL.Nat,
+      // Task 3088499384: published on VaultValue, previously unlisted (dropped
+      // at decode). costBasis is raw e8 and NOT in MONEY_KEYS.
+      costBasis: IDL.Nat,
+      gainLossPct: IDL.Int,
     });
     const VaultSnapshot = IDL.Record({
       timestamp: IDL.Int,
@@ -640,12 +724,20 @@ function getIdlFactory() {
     // History adds `degraded`: archive segments (canister ids) this pass could
     // not read — one stopped/frozen segment degrades the page instead of
     // failing it (W1-03). Empty ⇒ the read was complete.
-    const ArchiveOqlResult = IDL.Record({ rows: OqlRows, hasMore: IDL.Bool, degraded: IDL.Vec(IDL.Text) });
+    // #54.5 added `unvisited` (segments a BUDGET exit stopped short of) and
+    // `complete` (no degraded, nothing unvisited). explorer.js renders the
+    // walk-budget warning from `unvisited` — which this record never listed,
+    // so the decoder dropped it and the warning could not render (task
+    // 3088499384; tests/frontend_display_integrity §K pins the field set).
+    const ArchiveOqlResult = IDL.Record({
+      rows: OqlRows, hasMore: IDL.Bool, degraded: IDL.Vec(IDL.Text),
+      unvisited: IDL.Vec(IDL.Text), complete: IDL.Bool,
+    });
 
     return IDL.Service({
       addTestTokens: IDL.Func([IDL.Text, IDL.Nat], [], []),
       getDeployMode: IDL.Func([], [IDL.Text], ["query"]),
-      // Whether the AI assistant is configured (a key is set). Gates the AI Assistant tab.
+      // Whether the AI assistant is configured (a key is set). Gates the Agent Chat tab.
       aiConfigured: IDL.Func([], [IDL.Bool], ["query"]),
       // Play-mode lifetime deposit allowance (null when no cap is active).
       getPlayDepositAllowance: IDL.Func([], [IDL.Opt(IDL.Record({
@@ -686,11 +778,40 @@ function getIdlFactory() {
       // every balance emitted after each L2 shed — replay resets there and
       // reconstructs balances from the tape alone (docs/archive-design.md §8b).
       getShedBaselines: IDL.Func([], [IDL.Vec(IDL.Tuple(IDL.Nat, IDL.Nat))], ["query"]),
+      // 1788474114: a CLOSED season's gap tuples + shed re-baselines (same
+      // shapes as the two above), preserved at the season boundary — the
+      // sealed-season walk consults them where the live walk consults the live pair.
+      getSeasonGaps: IDL.Func([IDL.Nat], [IDL.Vec(IDL.Tuple(IDL.Nat, IDL.Nat, IDL.Int))], ["query"]),
+      getSeasonShedBaselines: IDL.Func([IDL.Nat], [IDL.Vec(IDL.Tuple(IDL.Nat, IDL.Nat))], ["query"]),
+      // #55 (1788468754): a CLOSED season's routing table (same row shape as
+      // getArchives) and the boundary records the client verifier anchors a
+      // sealed season's walk to (ledger.js verifyChainClient opts.season).
+      getSeasonArchives: IDL.Func([IDL.Nat], [IDL.Vec(IDL.Record({
+        canisterId: IDL.Text, firstSeq: IDL.Nat, lastSeq: IDL.Opt(IDL.Nat),
+      }))], ["query"]),
+      getSeasonRecords: IDL.Func([], [IDL.Vec(IDL.Record({
+        season: IDL.Nat, endedNs: IDL.Int, finalEventSeq: IDL.Nat, totalRanked: IDL.Nat,
+        archives: IDL.Vec(IDL.Principal), chainHead: IDL.Opt(IDL.Vec(IDL.Nat8)),
+        finalTop: IDL.Vec(IDL.Record({
+          rank: IDL.Nat, username: IDL.Text, profitUsd: IDL.Int, capitalUsd: IDL.Nat,
+          equityUsd: IDL.Int, returnBps: IDL.Int, feeLevel: IDL.Nat, badgeCount: IDL.Nat,
+        })),
+      }))], ["query"]),
       // Owner-gated archive history, federated through the exchange (the raw
       // archive method is no longer callable from the browser). One archive per
       // call — the caller keeps chain paging via getArchives.
+      // `unavailable` (task 1793569495): opt cause when the segment could not
+      // be read — its canister no longer exists ("segment missing", the
+      // engine's 2026-11-01 shape) or it is stopped/frozen; the pagers skip
+      // that source and keep walking instead of rejecting the whole call.
       getMyArchivedEvents: IDL.Func([IDL.Principal, IDL.Nat, IDL.Nat],
-        [IDL.Record({ events: IDL.Vec(UserEvent), total: IDL.Nat })], ["composite_query"]),
+        [IDL.Record({ events: IDL.Vec(UserEvent), total: IDL.Nat, unavailable: IDL.Opt(IDL.Text) })], ["composite_query"]),
+      // Kind-filtered twin (task 1793489930): the history backfill asks each
+      // segment for the caller's fills only (kinds = ["fill"]); `filtered`
+      // false = a pre-filter segment answered through the legacy pager (all
+      // kinds, all-kinds offsets — the caller filters client-side).
+      getMyArchivedEventsFiltered: IDL.Func([IDL.Principal, IDL.Vec(IDL.Text), IDL.Nat, IDL.Nat],
+        [IDL.Record({ events: IDL.Vec(UserEvent), total: IDL.Nat, filtered: IDL.Bool, unavailable: IDL.Opt(IDL.Text) })], ["composite_query"]),
       getBalances: IDL.Func([], [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat))], ["query"]),
       getBalance: IDL.Func([IDL.Text], [IDL.Nat], ["query"]),
       getDepositAddress: IDL.Func([IDL.Text], [IDL.Text], ["query"]),
@@ -738,7 +859,6 @@ function getIdlFactory() {
         [IDL.Variant({ ok: PlaceLimitResult, err: IDL.Text })],
         []
       ),
-      getMyPendingMatches: IDL.Func([], [IDL.Vec(PendingMatch)], ["query"]),
       placeMarketOrder: IDL.Func(
         [IDL.Text, Side, IDL.Nat, IDL.Nat, IDL.Bool],
         [IDL.Variant({ ok: MatchResult, err: IDL.Text })],
@@ -770,6 +890,7 @@ function getIdlFactory() {
         fromToken: IDL.Text, fromAmount: IDL.Nat,
         toToken: IDL.Text, toAmount: IDL.Nat,
         filled: IDL.Bool, note: IDL.Text,
+        stopReason: IDL.Opt(SwapStopReason),
       }))], ["query"]),
       getRecentEvents: IDL.Func([IDL.Nat], [IDL.Vec(IDL.Record({
         id: IDL.Nat, ts: IDL.Int, severity: IDL.Text,
@@ -836,13 +957,17 @@ function getIdlFactory() {
       quoteSwap: IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat, IDL.Nat],
         [IDL.Variant({
-          ok: IDL.Record({ outAmount: IDL.Nat, consumedFrom: IDL.Nat, feeQuote: IDL.Nat, exhausted: IDL.Bool, impactBps: IDL.Nat }),
+          ok: IDL.Record({ outAmount: IDL.Nat, consumedFrom: IDL.Nat, feeQuote: IDL.Nat, exhausted: IDL.Bool, impactBps: IDL.Nat,
+                           availableFrom: IDL.Nat, clampedByReserve: IDL.Bool }),
           err: IDL.Text,
         })], ["query"]),
       getMyAvailableBalances: IDL.Func([], [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat))], ["query"]),
       closePosition:      IDL.Func([IDL.Nat, IDL.Text, IDL.Nat, IDL.Opt(IDL.Nat)], [IDL.Variant({ ok: IDL.Null, err: IDL.Text })], []),
       getPoolOrders:      IDL.Func([IDL.Nat], [IDL.Vec(Order)], ["query"]),
       cancelPoolOrder:    IDL.Func([IDL.Nat, IDL.Nat], [IDL.Variant({ ok: IDL.Null, err: IDL.Text })], []),
+      // The owner's repay lever (task 1788533844): pays min(amount, debt, free)
+      // of the pool's `token` debt in kind; ok = the amount paid (e8).
+      repayPoolDebt:      IDL.Func([IDL.Nat, IDL.Text, IDL.Nat], [IDL.Variant({ ok: IDL.Nat, err: IDL.Text })], []),
       getMyMarginPools:   IDL.Func([], [IDL.Vec(MarginPoolView)], ["query"]),
       getMyPositionEpisodes: IDL.Func([], [IDL.Vec(PositionEpisode)], ["query"]),
       getMyPoolTransfers:    IDL.Func([], [IDL.Vec(PoolTransfer)], ["query"]),
@@ -858,8 +983,8 @@ function getIdlFactory() {
       getPublicTradesSince: IDL.Func([IDL.Text, IDL.Nat], [IDL.Vec(PublicTrade)], ["query"]),
       getMarketChanges: IDL.Func([MarketChangesRequest], [MarketChangesResponse], ["query"]),
       // AMM + price feed (Stats page)
-      getAmmPools: IDL.Func([], [IDL.Vec(Pool)], ["query"]),
-      getAmmPool: IDL.Func([IDL.Text], [IDL.Opt(Pool)], ["query"]),
+      getAmmPools: IDL.Func([], [IDL.Vec(PoolView)], ["query"]),
+      getAmmPool: IDL.Func([IDL.Text], [IDL.Opt(PoolView)], ["query"]),
       getPoolValue: IDL.Func([IDL.Text], [IDL.Opt(PoolValueInfo)], ["query"]),
       getAmmPrincipal: IDL.Func([], [IDL.Principal], ["query"]),
       getLastAggregate: IDL.Func([IDL.Text], [IDL.Opt(Aggregate)], ["query"]),
@@ -880,6 +1005,9 @@ function getIdlFactory() {
         longNotionalUsd: IDL.Nat, shortNotionalUsd: IDL.Nat,
         longHealth: IDL.Opt(IDL.Nat), shortHealth: IDL.Opt(IDL.Nat),
         longNearLiqBps: IDL.Opt(IDL.Nat), shortNearLiqBps: IDL.Opt(IDL.Nat),
+        longNearLiqDir: IDL.Opt(IDL.Variant({ down: IDL.Null, up: IDL.Null })),
+        shortNearLiqDir: IDL.Opt(IDL.Variant({ down: IDL.Null, up: IDL.Null })),
+        longLiquidatable: IDL.Bool, shortLiquidatable: IDL.Bool,
         computedNs: IDL.Int,
       }))], ["query"]),
       // Margin disclosure — see docs/margin-heatmap-design.md. The heat map
@@ -891,9 +1019,36 @@ function getIdlFactory() {
         insuranceValueUsd: IDL.Nat, liquidatablePositions: IDL.Nat,
         liquidatableNotionalUsd: IDL.Nat, worstCaseAbsorbUsd: IDL.Nat,
         truncated: IDL.Bool, computedNs: IDL.Int,
+        // Task 3088499384: the expected-loss reserve pair (MarginRiskSummary
+        // in candid/backend.did; both already in MONEY_KEYS) — unlisted until
+        // now, so the decoder dropped them.
+        impairmentGrossUsd: IDL.Nat, impairmentReserveUsd: IDL.Nat,
       })], ["query"]),
       getVaultValueHistory: IDL.Func([], [IDL.Vec(VaultSnapshot)], ["query"]),
       getMyVaultLp: IDL.Func([], [IDL.Nat], ["query"]),
+      // The caller's instant liquidity (task 1788465539): shares redeem at
+      // NAV but are paid from what the vault HOLDS, so the most redeemable
+      // NOW is the caller's pro-rata share of the held basket; the rest as
+      // margin loans repay. Additive — an older backend rejects the unknown
+      // method and the Earn card degrades to the NAV tiles.
+      getMaxInstantWithdraw: IDL.Func([], [IDL.Record({
+        withdrawableNowUsd: IDL.Nat, withdrawableNowLp: IDL.Nat, totalNavUsd: IDL.Nat,
+        lpBalance: IDL.Nat, lentOutFraction: IDL.Nat, vaultHoldingsUsd: IDL.Nat,
+        vaultLentOutUsd: IDL.Nat, vaultNavUsd: IDL.Nat, exitFeeBps: IDL.Nat,
+        // Task 1788475754: the expected-loss reserve NAV deducts, and the
+        // caller's pro-rata share of it — the mark-down, disclosed.
+        vaultImpairmentReserveUsd: IDL.Nat, provisionedLossUsd: IDL.Nat,
+        // Task 1788513125: the redeem-side mark gate — the text withdrawLp
+        // would refuse with right now (a held leg unpriced / pended / stale
+        // while the loan book is non-zero), else empty.
+        withdrawalPaused: IDL.Opt(IDL.Text),
+        // Task 1788475756: locked shares — the caller's locked LP (their
+        // loan-book claim, released as repayments land), the vault-wide
+        // total, and the NAV those locked shares carry (only UNLOCKED shares
+        // share the cash, so a deposit's instant fraction is
+        // (H + V) / (NAV − lockedNav + V) × keep).
+        lockedLp: IDL.Nat, vaultLockedLp: IDL.Nat, vaultLockedNavUsd: IDL.Nat,
+      })], ["query"]),
       getAmmBookShare: IDL.Func([IDL.Text], [IDL.Opt(AmmBookShare)], ["query"]),
       // ── Earn: AMM vault LP + insurance staking ──
       getMyVaultPosition: IDL.Func([], [IDL.Record({
@@ -904,16 +1059,22 @@ function getIdlFactory() {
         token: IDL.Text, currentWeight: IDL.Nat,
         targetWeight: IDL.Nat, depositMultiplier: IDL.Nat,
       }))], ["query"]),
+      // The LP doors are the STAGED requests since apiVersion 6.0.0 (task
+      // 1788731608): #ok is the request, the outcome lands in
+      // getMyStagedLpRequests (the 5.1.0 stageLp* names are gone).
       depositLp: IDL.Func([IDL.Text, IDL.Nat, IDL.Nat],
-        [IDL.Variant({ ok: IDL.Nat, err: IDL.Text })], []),
+        [IDL.Variant({ ok: StagedLpRequest, err: IDL.Text })], []),
       withdrawLp: IDL.Func([IDL.Nat],
-        [IDL.Variant({ ok: VaultBasket, err: IDL.Text })], []),
+        [IDL.Variant({ ok: StagedLpRequest, err: IDL.Text })], []),
+      getMyStagedLpRequests: IDL.Func([], [StagedLpView], ["query"]),
+      // Owner cancel under the staged-order commit rule (task 1788731609).
+      cancelStagedLpRequest: IDL.Func([IDL.Nat], [IDL.Variant({ ok: IDL.Null, err: IDL.Text })], []),
       stakeInsurance: IDL.Func([IDL.Nat],
         [IDL.Variant({ ok: IDL.Nat, err: IDL.Text })], []),
       unstakeInsurance: IDL.Func([IDL.Nat],
         [IDL.Variant({ ok: IDL.Nat, err: IDL.Text })], []),
       getMyInsuranceStake: IDL.Func([], [IDL.Record({
-        shares: IDL.Nat, valueUsd: IDL.Nat,
+        shares: IDL.Nat, valueUsd: IDL.Nat, unlockAtNs: IDL.Int,
       })], ["query"]),
       getInsuranceFund: IDL.Func([], [IDL.Record({
         bufferUsd: IDL.Nat, uncoveredBadDebtUsd: IDL.Nat,
@@ -953,7 +1114,17 @@ function getIdlFactory() {
           stagedCapPerOwner: IDL.Nat, minOrderNotionalUsd: IDL.Nat,
           shedSoftStaged: IDL.Nat, shedHardStaged: IDL.Nat,
           badgeVolUsd: IDL.Vec(IDL.Tuple(IDL.Nat, IDL.Nat)),
+          // Task 3088499384: the ship-queue shed thresholds + shear cap,
+          // published but unlisted (dropped at decode).
+          shedSoftShip: IDL.Nat, shedHardShip: IDL.Nat, shipShearCap: IDL.Nat,
         }),
+        // Task 3088499384: the rest of getAccessPolicy's published record —
+        // api version, the caller's dead-man/uptime/open-order state, the
+        // open-order cap, ship-queue depth, STP policy and the timer flag.
+        // None is read yet; listed so a future read cannot decode undefined.
+        apiVersion: IDL.Text, myDeadmanArmed: IDL.Bool, myOpenOrderCount: IDL.Nat,
+        myUptimeQualified: IDL.Bool, openOrderCap: IDL.Nat, shipQueueDepth: IDL.Nat,
+        stpPolicy: IDL.Text, timersPaused: IDL.Bool,
       })], ["query"]),
       getLeaderboard: IDL.Func([], [IDL.Record({
         computedAtNs: IDL.Int, totalRanked: IDL.Nat,
@@ -974,6 +1145,10 @@ function getIdlFactory() {
         journalUnshipped: IDL.Nat, ledgerJournalPending: IDL.Nat, archivedEvents: IDL.Nat,
         emergencyRolls: IDL.Nat, ledgerGaps: IDL.Nat, shedEvents: IDL.Nat, shipFailStreak: IDL.Nat,
         archiveCanisterId: IDL.Opt(IDL.Text),
+        // W4-16 / #55: the archive spawn slot — a canister main CREATED whose
+        // install has not completed (or whose continuation was lost). opt for
+        // the pre-slot-backend reason appVersion is opt above.
+        pendingSpawn: IDL.Opt(IDL.Record({ cid: IDL.Text, atNs: IDL.Int })),
         archivesSealed: IDL.Nat,
         archiveCycles: IDL.Nat, archiveLifetimeTopUp: IDL.Nat,
         autoFuelEnabled: IDL.Bool, fuelRouteWired: IDL.Bool, fuelLifetimeCycles: IDL.Nat,
@@ -981,6 +1156,16 @@ function getIdlFactory() {
         fuelPendingNotify: IDL.Opt(IDL.Record({ blockIndex: IDL.Nat, icpE8s: IDL.Nat, sinceNs: IDL.Int })),
         treasuryUsdE8s: IDL.Nat, treasuryIcpE8s: IDL.Nat,
         oracleDivergence: IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat, IDL.Int)),
+        // Task 3088499384: the arb/bridge fuel figures, the acknowledged
+        // oracle-divergence count and the season-sealing flag are published
+        // on getCanisterInfo but were never listed here (dropped at decode).
+        ackDivergences: IDL.Nat, seasonSealing: IDL.Bool,
+        arbCycles: IDL.Nat, arbLifetimeTopUp: IDL.Nat,
+        bridgeCycles: IDL.Nat, bridgeLifetimeTopUp: IDL.Nat,
+        // H-32 (1788467629): the per-principal exit-set coalescing window and
+        // the backlog-scaled ship drain telemetry — additive on the wire,
+        // mirrored here so the §K battery (IDL ⊇ .did) stays green (1788636325).
+        exitCoalesced: IDL.Nat, exitRowsWithheld: IDL.Nat, shipBurstBatches: IDL.Nat,
       })], ["query"]),
       // The full archive chain (sealed segments + active tip + pre-spawned
       // successor) with the fuel pass's last observation per canister.
@@ -991,6 +1176,9 @@ function getIdlFactory() {
         firstSeq: IDL.Opt(IDL.Nat), lastSeq: IDL.Opt(IDL.Nat),
         cycles: IDL.Opt(IDL.Nat), freezeLimitCycles: IDL.Opt(IDL.Nat),
         frozen: IDL.Opt(IDL.Bool), observedAtNs: IDL.Opt(IDL.Int),
+        // Task 3088499384: ArchiveChainEntry.degraded (opt bool — the fuel
+        // pass's per-segment read verdict), published but unlisted.
+        degraded: IDL.Opt(IDL.Bool),
       }))], ["query"]),
     });
   };
@@ -998,23 +1186,43 @@ function getIdlFactory() {
 
 // ── Initialization ──────────────────────────────────────────────
 async function init() {
+  // First: the theme toggles must work even if nothing below gets far (the
+  // backend unreachable, the SDK failing) — /theme-boot.js already stamped
+  // data-theme pre-paint; this wires the buttons and the system listener.
+  setupTheme();
   setupEventListeners();
   setupAssistant({
     getMarkets: () => markets,       // inject markets (kept local in main.js)
     ensureActor: setupActor,         // self-heal a missing actor at submit time
     refreshAccountData,              // refresh Account views after a confirmed action (#46.2 §3)
+    // The Markets view after a confirmed action (task 1793489932 item 2): a
+    // confirmed order used to leave the trade page stale until its own poll.
+    refreshTradeView: () => { refreshBalances(); refreshUserOrders(); refreshOrderBook(); refreshMarkets(); },
+    // WHO / WHERE for the prompt's context block + the whoami tool (item 3):
+    // the page, the selected market, the order form's mode and pool.
+    getContext: () => ({ tab: currentTab, route: window.location.hash || "", market: selectedMarket, orderMode, pool: selectedOrderPool() }),
+    // Live data the confirm card resolves against (item 1): AVAILABLE
+    // balances in human units (the order form's own gate) and the pool cache.
+    getAvailableBalance: (token) => userAvailBalances[token],
+    getMyPools: () => _poolsCache,
+    // The sign-in edge's re-seed gate (task 1793554545): whether the Agent
+    // Chat pane is the ACTIVE view — the Intelligence view active with the ai
+    // sub-tab selected (what refreshAiGate tests before it routes there).
+    isAiPaneActive: () => currentTab === "intelli" && appState.intelliTab === "ai",
   });
   setupIntelli();
   // The public Ledger page (top-level Ledger tab): raw (non-money-normalized)
   // archive actors — the client-side verifier re-hashes exact candid values.
   {
     let rawAgent = null;
+    let rawAgentGen = -1;      // the _canisterEnvGeneration rawAgent was built under
     const rawActors = new Map();
     const getRawAgent = async () => {
-      if (rawAgent) return rawAgent;
-      let canisterEnv;
-      try { const m = await import("@icp-sdk/core/agent/canister-env"); canisterEnv = m.safeGetCanisterEnv?.(); } catch {}
+      if (rawAgent && rawAgentGen === _canisterEnvGeneration) return rawAgent;
+      rawActors.clear();       // actors bound to the previous agent go with it
+      const canisterEnv = readCanisterEnv();
       rawAgent = await HttpAgent.create({ host: window.location.origin, rootKey: canisterEnv?.IC_ROOT_KEY });
+      rawAgentGen = _canisterEnvGeneration;
       // ROOT KEY — the anchor of the ledger verifier's certificate check.
       //
       // fetchRootKey() asks THIS ORIGIN for the key and installs whatever comes
@@ -1045,9 +1253,27 @@ async function init() {
         const a = appState.publicActor || appState.actor;
         return a?.getShedBaselines ? await a.getShedBaselines() : [];
       },
+      // #55 (1788468754): a closed season's table + records, for opts.season.
+      listSeasonArchives: async (season) => {
+        const a = appState.publicActor || appState.actor;
+        return a?.getSeasonArchives ? await a.getSeasonArchives(BigInt(season)) : [];
+      },
+      getSeasonRecords: async () => {
+        const a = appState.publicActor || appState.actor;
+        return a?.getSeasonRecords ? await a.getSeasonRecords() : [];
+      },
+      // 1788474114: the closed season's preserved gap tuples + shed baselines.
+      getSeasonGaps: async (season) => {
+        const a = appState.publicActor || appState.actor;
+        return a?.getSeasonGaps ? await a.getSeasonGaps(BigInt(season)) : [];
+      },
+      getSeasonShedBaselines: async (season) => {
+        const a = appState.publicActor || appState.actor;
+        return a?.getSeasonShedBaselines ? await a.getSeasonShedBaselines(BigInt(season)) : [];
+      },
       makeRawArchiveActor: async (id) => {
+        const agent = await getRawAgent();   // first: a healed env clears rawActors
         if (rawActors.has(id)) return rawActors.get(id);
-        const agent = await getRawAgent();
         const actor = Actor.createActor(getArchiveIdlFactory(), { agent, canisterId: id });
         rawActors.set(id, actor);
         return actor;
@@ -1077,6 +1303,8 @@ async function init() {
     const coreMod = await import("@icp-sdk/core/agent");
     const principalMod = await import("@icp-sdk/core/principal");
     AuthClient = authMod.AuthClient;
+    MemoryCredentialStorage = authMod.MemoryCredentialStorage;
+    MemoryStateStorage = authMod.MemoryStateStorage;
     HttpAgent = coreMod.HttpAgent;
     Actor = coreMod.Actor;
     Principal = principalMod.Principal;   // for building the archive principal set
@@ -1084,7 +1312,7 @@ async function init() {
     // Create anonymous public appState.actor for pre-login queries
     await createAnonymousActor();
     await refreshMarkets();
-    refreshAiGate();   // show/hide the AI Assistant tab per backend key config (non-blocking)
+    refreshAiGate();   // show/hide the Agent Chat tab per backend key config (non-blocking)
 
     // Load persisted preferences from IndexedDB (works for anonymous users)
     const localPrefs = await loadLocalPrefs();
@@ -1100,13 +1328,25 @@ async function init() {
     startAcctValueClock();   // header account value on the wall-clock 10s grid
     resolveDeployModeAndBanner();   // #play launch notice (posture-gated)
 
-    // Boot client uses default IndexedDB storage so a PERSISTENT (on-disk)
-    // session restores across restarts. An in-memory session rebuilds the
-    // client with memory storage at sign-in (see doLogin) and never restores.
-    // @icp-sdk/auth 8.x: constructor (not create), sync isAuthenticated,
-    // ASYNC getIdentity, signOut (not logout). identityProvider is bound at
-    // construction; requestAttributes (the play verification flow) is why
-    // we're on 7.x+ at all — 8.0 changed its nonce to a callback (doLogin).
+    // Boot client uses the default stores (IndexedDB credentials, localStorage
+    // sign-in record) so a PERSISTENT (on-disk) session restores across
+    // restarts. An in-memory session rebuilds the client with memory stores at
+    // sign-in (see doLogin) and never restores.
+    // @icp-sdk/auth 11.x contract (8.0.3 → 11.1.0, task 1787222434; 9.0
+    // rewrote the client, 10.0 moved the peer to @icp-sdk/core 6, 11.0 touched
+    // SSO only): constructor (not create); SYNC isAuthenticated()/getStatus()
+    // answered from the sign-in record every tab shares (localStorage
+    // `ic-session-state`); ASYNC getIdentity() — it awaits the restore, which
+    // may MINT and may END the session instead (see below); signIn/signOut (not
+    // login/logout), signOut also revoking the session at the II canister and
+    // RE-THROWING a failed revoke after the local wipe (signOutQuietly);
+    // identityProvider is an { authorizeUrl, canisterId } pair bound at
+    // construction — a string throws (authClientOpts); requestAttributes (the
+    // play verification flow, 7.x+) keeps its 8.0 callback nonce (doLogin). The
+    // session is Internet Identity's now: the client re-mints short-lived app
+    // delegations from the II canister while it lasts, so the IdleManager is
+    // gone (9.0) — the 1h idle logout is the app's own timer (startIdleLogout)
+    // — and a session's end arrives as a status (watchSessionStatus).
     authClient = new AuthClient(authClientOpts());
     registerJanitorSW();
     // Stamp the footer badge from the build's version and start watching the
@@ -1121,21 +1361,38 @@ async function init() {
     const tabsWereClosed = tabsAllClosedSinceLastLoad();
     appState.isAuthenticated = authClient.isAuthenticated();
     if (appState.isAuthenticated && tabsWereClosed) {
-      await authClient.signOut();
+      await signOutQuietly();
       appState.isAuthenticated = false;
     }
     startSessionHeartbeat();
     if (appState.isAuthenticated) {
       identity = await authClient.getIdentity();
-      await setupActor();
-      await onLogin();
-      // Re-run updateUI: showUI() above ran it while isAuthenticated was still
-      // false (auth restores here, after), which left the order panel in its
-      // signed-out state — auth overlay up + "Sign in to trade" — even though
-      // onLogin() hydrated the pill/orders/positions. Without this, a refresh
-      // of a persistent session shows a half-signed-in UI.
-      updateUI();
+      // auth 9.0+: the restore getIdentity() awaits can END the session instead
+      // of returning it — a credential the janitor removed, a chain II refused
+      // to re-mint under — and then answers the ANONYMOUS identity while the
+      // status has flipped. Act only on a session that is still held; anything
+      // else is the signed-out state the status now says it is.
+      if (!authClient.isAuthenticated() || identity.getPrincipal().isAnonymous()) {
+        identity = null;
+        appState.isAuthenticated = false;
+      } else {
+        await setupActor();
+        await onLogin();
+        // Re-run updateUI: showUI() above ran it while isAuthenticated was still
+        // false (auth restores here, after), which left the order panel in its
+        // signed-out state — auth overlay up + "Sign in to trade" — even though
+        // onLogin() hydrated the pill/orders/positions. Without this, a refresh
+        // of a persistent session shows a half-signed-in UI.
+        updateUI();
+        startIdleLogout();
+      }
     }
+    watchSessionStatus();
+    // #dev-login (task 1793497426): the seat venue's local sign-in — the hash
+    // itself, or the seed a previous load of this tab kept, restores the
+    // throwaway identity. AFTER the II restore above (a real session wins);
+    // gated inside on the backend's posture answer — nothing on any other venue.
+    if (devLoginHashHit() || devLoginSeed() !== null) devLogin("boot");
   } catch (e) {
     console.warn("ICP SDK not available, running in demo mode:", e.message);
     setupDemoMode();
@@ -1157,8 +1414,21 @@ function getIdentityProviderUrl() {
   // The `/authorize` path is mandatory: the auth client uses the URL
   // verbatim (no auto-append), and a bare `https://id.ai` lands on the
   // home page so authentication silently fails to start.
+  //
+  // Since @icp-sdk/auth 9.0 this URL is HALF of the provider: the ceremony
+  // renders here, and the app's delegations are then MINTED by a canister
+  // call (authClientOpts names it, and pins the call to mainnet).
   return "https://id.ai/authorize";
 }
+
+// The other half of the provider pair @icp-sdk/auth 9.0 introduced: the
+// canister that mints (and on sign-out revokes) this app's delegations —
+// mainnet Internet Identity, the same id on every network — and the API host
+// the client's own agent reaches it through. Pinned to mainnet because core's
+// default host for a `*.localhost` origin is the LOCAL gateway, where this
+// canister does not exist (icp.yaml: no local II, the hosted id.ai everywhere).
+const II_CANISTER_ID = "rdmx6-jaaaa-aaaaa-aaadq-cai";
+const II_API_HOST = "https://icp-api.io";
 
 // Internet Identity derives a principal PER ORIGIN, so the same player signing
 // in on the custom domain vs. the raw canister URL would land on DIFFERENT
@@ -1187,8 +1457,7 @@ function getDerivationOrigin() {
 
 async function getCanisterId() {
   try {
-    const envMod = await import("@icp-sdk/core/agent/canister-env");
-    const canisterEnv = envMod.safeGetCanisterEnv?.();
+    const canisterEnv = readCanisterEnv();
     return (
       canisterEnv?.["PUBLIC_CANISTER_ID:backend"] ||
       document.querySelector('meta[name="canister-id"]')?.getAttribute("content")
@@ -1201,11 +1470,7 @@ async function getCanisterId() {
 async function createAnonymousActor() {
   if (!HttpAgent || !Actor) return;
   try {
-    let canisterEnv;
-    try {
-      const envMod = await import("@icp-sdk/core/agent/canister-env");
-      canisterEnv = envMod.safeGetCanisterEnv?.();
-    } catch {}
+    const canisterEnv = readCanisterEnv();
 
     const agent = await HttpAgent.create({
       host: window.location.origin,
@@ -1218,6 +1483,7 @@ async function createAnonymousActor() {
 
     if (canisterId) {
       appState.publicActor = wrapActor(Actor.createActor(getIdlFactory(), { agent, canisterId }));
+      _boundBackendId = canisterId;
     }
   } catch (e) {
     console.warn("Failed to create anonymous actor:", e.message);
@@ -1227,11 +1493,7 @@ async function createAnonymousActor() {
 async function setupActor() {
   if (!identity) return;
   try {
-    let canisterEnv;
-    try {
-      const envMod = await import("@icp-sdk/core/agent/canister-env");
-      canisterEnv = envMod.safeGetCanisterEnv?.();
-    } catch {}
+    const canisterEnv = readCanisterEnv();
 
     const agent = await HttpAgent.create({
       identity,
@@ -1248,6 +1510,7 @@ async function setupActor() {
 
     if (canisterId) {
       appState.actor = wrapActor(Actor.createActor(getIdlFactory(), { agent, canisterId }));
+      _boundBackendId = canisterId;
     }
   } catch (e) {
     console.warn("Failed to create actor:", e.message);
@@ -1259,7 +1522,9 @@ async function setupActor() {
 // The browser queries it DIRECTLY as the signed-in principal (the archive
 // indexes by caller), reusing the same agent. Built lazily from the archive
 // canister id reported by getCanisterInfo. Self-contained IDL (must match the
-// backend UserEvent Candid exactly, or decode fails silently).
+// backend UserEvent Candid exactly, or decode fails silently) — pinned two
+// ways by tests/frontend_display_integrity.test.mjs §K: to candid/archive.did
+// (superset rule) and, const by const, to getIdlFactory's copies (identical).
 let _archiveId = null;
 function getArchiveIdlFactory() {
   return ({ IDL }) => {
@@ -1301,6 +1566,14 @@ function getArchiveIdlFactory() {
         firstSeq: IDL.Opt(IDL.Nat), nextSeq: IDL.Nat, eventCount: IDL.Nat, bytes: IDL.Nat64,
         users: IDL.Nat, cycles: IDL.Nat, memorySizeBytes: IDL.Nat, heapLiveBytes: IDL.Nat,
         chainStartSeq: IDL.Opt(IDL.Nat), chainHead: IDL.Opt(IDL.Vec(IDL.Nat8)),
+        // Low-memory hook telemetry (the sidecar's own canister_on_low_wasm_memory
+        // record) — published, so listed (display battery §K vs candid/archive.did).
+        lowMemoryAtNs: IDL.Int, lowMemoryCount: IDL.Nat,
+        // Fill-index progress (task 1793489930): opt — a pre-index segment
+        // decodes as null.
+        fillIndexCursor: IDL.Opt(IDL.Nat),
+        // D/W-index progress (task 1793495003): opt, same reason.
+        dwIndexCursor: IDL.Opt(IDL.Nat),
       })], ["query"]),
       // Public tape + the tamper-evidence surface (the Ledger page verifier).
       getEventsRange: IDL.Func([IDL.Nat, IDL.Nat], [IDL.Vec(UserEvent)], ["query"]),
@@ -1360,8 +1633,7 @@ async function getBridgeActor() {
   if (!icAgent || !Actor || !appState.isAuthenticated) return null;
   if (!_bridgeId) {
     try {
-      const envMod = await import("@icp-sdk/core/agent/canister-env");
-      const env = envMod.safeGetCanisterEnv?.();
+      const env = readCanisterEnv();
       _bridgeId = env?.["PUBLIC_CANISTER_ID:bridge"] || BRIDGE_LOCAL_FALLBACK;
     } catch { _bridgeId = BRIDGE_LOCAL_FALLBACK; }
   }
@@ -1407,11 +1679,8 @@ let lastVerifyMessage = null;
 // report the outcome. Called from the Google sign-in path (doLogin), which
 // verifies in the same II interaction as the sign-in.
 async function presentAttributesToBackend(attributes) {
-  const [identityMod, envMod] = await Promise.all([
-    import("@icp-sdk/core/identity"),
-    import("@icp-sdk/core/agent/canister-env"),
-  ]);
-  const canisterEnv = envMod.safeGetCanisterEnv?.();
+  const identityMod = await import("@icp-sdk/core/identity");
+  const canisterEnv = readCanisterEnv();
   const canisterId = canisterEnv?.["PUBLIC_CANISTER_ID:backend"]
     || document.querySelector('meta[name="canister-id"]')?.getAttribute("content");
   // The signed bundle travels as sender_info on the finish call: wrap the
@@ -1462,11 +1731,8 @@ async function presentAttributesToBackend(attributes) {
 // non-anonymous principal passes the play gate; the nonce is not
 // caller-bound — the bundle's own signature/origin checks carry trust).
 async function mintNonceEphemeral() {
-  const [identityMod, envMod] = await Promise.all([
-    import("@icp-sdk/core/identity"),
-    import("@icp-sdk/core/agent/canister-env"),
-  ]);
-  const canisterEnv = envMod.safeGetCanisterEnv?.();
+  const identityMod = await import("@icp-sdk/core/identity");
+  const canisterEnv = readCanisterEnv();
   const canisterId = canisterEnv?.["PUBLIC_CANISTER_ID:backend"]
     || document.querySelector('meta[name="canister-id"]')?.getAttribute("content");
   const agent = await HttpAgent.create({
@@ -1752,8 +2018,11 @@ async function handleSimulateDeposit() {
   try {
     // The play allowance is CONSUMED here: the DEX values the deposit at
     // press-time marks, debits the lifetime allowance, and reserves the
-    // units — a refused deposit is never created, and an admitted one can
-    // always claim (claims settle against the reservation, no re-pricing).
+    // units. A refused deposit is rolled back — whether the DEX said #err
+    // or the call never reached it (the DEX stopped for an upgrade, #55) —
+    // and a pending the DEX never reserved is dropped at Confirm rather than
+    // becoming claimable; an admitted one can always claim (claims settle
+    // against the reservation, no re-pricing).
     const r = await bridge.devSimulateDeposit(asset, BigInt(Math.round(amt * 1e8)));
     if (r && "err" in r) { showToast(r.err, "error"); return; }
     // Clear the amount now the allowance it referred to has been consumed —
@@ -1797,148 +2066,48 @@ function wireDepositPage() {
 }
 
 // ── Demo Mode (when SDK not available) ──────────────────────────
-function setupDemoMode() {
-  appState.actor = createMockActor();
-  appState.publicActor = appState.actor;
-  appState.isAuthenticated = false;
-}
-
-function createMockActor() {
-  const balances = {};
-  const orders = [];
-  const deposits = [];
-  let nextId = 1;
-
-  return {
-    addTestTokens: async (token, amount) => {
-      balances[token] = (balances[token] || 0) + amount;
-      deposits.push({ token, amount, timestamp: Date.now() * 1000000, kind: { deposit: null } });
-    },
-    getBalances: async () => {
-      return Object.entries(balances).filter(([_, v]) => v > 0.0001);
-    },
-    getBalance: async (token) => balances[token] || 0,
-    getMarkets: async () => [
-      { id: "BTC-ICPUSD", baseToken: "BTC", quoteToken: "ICPUSD", lastPrice: 67500.0, volume24h: 8_215_000.0, priceChange24hAbs:  1550.00, markPrice: 67510.0 },
-      { id: "ETH-ICPUSD", baseToken: "ETH", quoteToken: "ICPUSD", lastPrice:  3450.0, volume24h: 2_110_000.0, priceChange24hAbs:   -39.12, markPrice:  3451.0 },
-      { id: "ICP-ICPUSD", baseToken: "ICP", quoteToken: "ICPUSD", lastPrice:    12.5, volume24h:   340_000.0, priceChange24hAbs:     0.0, markPrice:    12.5 },
-    ],
-    getOrderBook: async () => ({
-      bids: [
-        { price: 67400, quantity: 0.5, orderCount: 3 },
-        { price: 67300, quantity: 1.2, orderCount: 5 },
-        { price: 67200, quantity: 0.8, orderCount: 2 },
-      ],
-      asks: [
-        { price: 67600, quantity: 0.3, orderCount: 2 },
-        { price: 67700, quantity: 0.9, orderCount: 4 },
-        { price: 67800, quantity: 1.5, orderCount: 6 },
-      ],
-      spread: 200,
-    }),
-    getRecentTrades: async () => {
-      const now = Date.now() * 1000000;
-      return [
-        { id: 1n, marketId: "BTC-ICPUSD", side: { buy: null },  price: 67010, quantity: 0.12, timestamp: now - 40000000000 },
-        { id: 2n, marketId: "BTC-ICPUSD", side: { sell: null }, price: 67120, quantity: 0.08, timestamp: now - 25000000000 },
-        { id: 3n, marketId: "BTC-ICPUSD", side: { sell: null }, price: 67080, quantity: 0.21, timestamp: now - 9000000000 },
-        { id: 4n, marketId: "BTC-ICPUSD", side: { buy: null },  price: 67200, quantity: 0.05, timestamp: now - 2000000000 },
-      ];
-    },
-    getRecentEvents: async () => {
-      const now = Date.now() * 1000000;
-      return [
-        { id: 4, ts: now - 5000000000,   severity: "info",  category: "swap",   message: "Swap 50.00 ICP → 0.02 BTC", market: ["BTC-ICPUSD"] },
-        { id: 3, ts: now - 60000000000,  severity: "warn",  category: "amm",    message: "BTC oracle stale — AMM widening quotes (+1.20% half-spread)", market: ["BTC-ICPUSD"] },
-        { id: 2, ts: now - 90000000000,  severity: "warn",  category: "oracle", message: "BTC price feed degraded to 5/6 sources ($67,000.00)", market: ["BTC-ICPUSD"] },
-        { id: 1, ts: now - 120000000000, severity: "info",  category: "oracle", message: "BTC price feed recovered to 6/6 sources", market: ["BTC-ICPUSD"] },
-      ];
-    },
-    getAllTrades: async () => [],
-    getCandles: async () => ({ candles: [], hasMore: false }),
-    getTradesSince: async () => [],
-    getUserStatus: async () => ({ version: 0n, lastTradeTime: 0n, openOrderCount: 0n }),
-    getMyTradeHistorySince: async () => [],
-    getMarketStatus: async () => ({ version: 0n, lastTradeId: 0n }),
-    getRecentPublicTrades: async () => [],
-    getPublicTradesSince: async () => [],
-    getMarketChanges: async () => ({
-      marketStatus: [], orderBook: [], orderBookDelta: [], newTrades: [],
-      userStatus: [], userOpenOrders: [], userBalances: [], newUserTrades: [],
-    }),
-    getMyOrders: async () => orders.filter((o) => o.status.open !== undefined || o.status.partiallyFilled !== undefined),
-    getMyClosedOrders: async () => [
-      {
-        id: 9002n, marketId: "BTC-ICPUSD", side: { sell: null }, orderType: { limit: null },
-        price: 68120.0, quantity: 0.25, filled: 0.25, status: { filled: null },
-        placedAt: (BigInt(Date.now()) - 7_200_000n) * 1_000_000n,
-        closedAt: (BigInt(Date.now()) - 3_600_000n) * 1_000_000n,
-      },
-      {
-        id: 9001n, marketId: "ETH-ICPUSD", side: { buy: null }, orderType: { limit: null },
-        price: 1580.0, quantity: 2.0, filled: 0.0, status: { cancelled: null },
-        placedAt: (BigInt(Date.now()) - 86_400_000n) * 1_000_000n,
-        closedAt: (BigInt(Date.now()) - 82_800_000n) * 1_000_000n,
-      },
-    ],
-    getMyOrdersOnMarket: async () => [],
-    getMyStagedOrderIds: async () => [],
-    getMyRecentSwap: async () => [],
-    placeLimitOrder: async (market, side, price, qty) => {
-      const o = { id: nextId++, marketId: market, owner: "demo", side, orderType: { limit: null }, price, quantity: qty, filled: 0, status: { open: null }, timestamp: Date.now() * 1000000, originalQuantity: qty };
-      orders.push(o);
-      return { ok: o };
-    },
-    placeLimitOrderExp: async (market, side, price, qty) => {
-      const o = { id: nextId++, marketId: market, owner: "demo", side, orderType: { limit: null }, price, quantity: qty, filled: 0, status: { open: null }, timestamp: Date.now() * 1000000, originalQuantity: qty };
-      orders.push(o);
-      return { ok: o };
-    },
-    placeMarketOrder: async () => ({ ok: { trades: [], remainingQty: 0, totalFilled: 0, avgPrice: 0 } }),
-    swap: async () => ({ ok: { fromAmount: 0, toAmount: 0, fullyFilled: false, swapOrderId: [] } }),
-    cancelMyOrder: async (id) => {
-      const idx = orders.findIndex((o) => Number(o.id) === Number(id));
-      if (idx >= 0) orders[idx].status = { cancelled: null };
-      return { ok: null };
-    },
-    whoami: async () => "demo-principal",
-    getMyProfile: async () => ({
-      userId: "DEMO",
-      username: "Swift-Fox-42",
-      regenCount: 0,
-      createdAt: Date.now() * 1000000,
-    }),
-    regenerateUsername: async () => ({ ok: { userId: "DEMO", username: "Brave-Hawk-17", regenCount: 1, createdAt: Date.now() * 1000000 } }),
-    getMyTradeHistory: async () => [],
-    getMyAdjustments: async () => [],
-    getMyDeposits: async () => deposits,
-    getCanisterInfo: async () => ({
-      canisterId: "rdmx6-jaaaa-aaaaa-aaadq-cai", cycles: 500_000_000_000_000n,
-      freezingLimitCycles: 1_500_000_000_000n,
-      burnPerDay: 4_200_000_000_000n, idleBurnPerDay: 1_400_000_000_000n,
-      computeAllocation: 0n,
-      lastHeartbeatNs: BigInt(Date.now()) * 1_000_000n,
-      nowNs: BigInt(Date.now()) * 1_000_000n, timersPaused: false,
-      memorySizeBytes: 268_435_456n, heapLiveBytes: 201_326_592n,
-      wasmMemoryLimitBytes: 4_294_967_296n, lowMemoryAtNs: 0n, ordersRetained: 1_204n,
-      tradesRetained: 5_877n, usersRegistered: 42n,
-      journalUnshipped: 2n, ledgerJournalPending: 0n, archivedEvents: 18_344n,
-      archiveCanisterId: ["rrkah-fqaaa-aaaaa-aaaaq-cai"],
-      archivesSealed: 0n,
-      archiveCycles: 2_000_000_000_000n, archiveLifetimeTopUp: 0n,
-      autoFuelEnabled: true, fuelRouteWired: true, fuelLifetimeCycles: 0n,
-      fuelPendingNotify: [],
-      treasuryUsdE8s: 96_260_607_603_700n, treasuryIcpE8s: 5_000_000_000n,
-      oracleDivergence: [],
-    }),
-  };
-}
+// Lives in demo-mode.js (#54.9): setupDemoMode() swaps in the stamped mock
+// actor, renderDemoMarker() lights the persistent #demo-banner and disables
+// sign-in from updateUI(), and login() refuses via demoSignInRefusal().
 
 // ── Auth ─────────────────────────────────────────────────────────
 
 const SIGNIN_TTL_KEY = "mdx.signinTtlMin";   // remembered max-session-length choice (minutes, string)
 const SIGNIN_MEM_KEY = "mdx.signinInMemory"; // remembered in-memory-key toggle ("1"/"0")
-const IDLE_OPTS = { idleTimeout: 60 * 60 * 1000 };   // 1h idle logout (library default is 10min)
+
+// 1h idle logout. Until @icp-sdk/auth 8.x this was the library's IdleManager
+// (`idleOptions: { idleTimeout }`; its default onIdle signed out, then
+// reloaded). 9.0 removed it — "the idle timeout belongs to the canister":
+// signIn's maxTimeToIdle, which Internet Identity measures as time since the
+// session last MINTED, and a signed-in tab polls and re-mints, so it never
+// idles there. docs/session-policy.md promises "1 h with no mouse/key/touch in
+// an open tab → ends", so the timer is the app's now: the IdleManager's own
+// event list and its default action. Armed on every II sign-in (the boot
+// restore, doLogin), disarmed by logout(); the #dev-login identity never had
+// it and still does not.
+const IDLE_TIMEOUT_MS = 60 * 60 * 1000;
+const IDLE_EVENTS = ["mousedown", "mousemove", "keydown", "touchstart", "wheel"];
+let _idleTimer = null;
+function idleArm() {
+  if (_idleTimer === null) return;   // not armed (signed out, or a logout is under way)
+  clearTimeout(_idleTimer);
+  _idleTimer = setTimeout(onIdleLogout, IDLE_TIMEOUT_MS);
+}
+function startIdleLogout() {
+  if (_idleTimer === null) for (const ev of IDLE_EVENTS) document.addEventListener(ev, idleArm, { passive: true });
+  else clearTimeout(_idleTimer);
+  _idleTimer = setTimeout(onIdleLogout, IDLE_TIMEOUT_MS);
+}
+function stopIdleLogout() {
+  if (_idleTimer === null) return;
+  clearTimeout(_idleTimer);
+  _idleTimer = null;
+  for (const ev of IDLE_EVENTS) document.removeEventListener(ev, idleArm);
+}
+async function onIdleLogout() {
+  console.info("idle for 1h: signing out");
+  try { await logout(); } finally { location.reload(); }
+}
 
 // Session janitor: end an on-disk session when the LAST app tab closes.
 //
@@ -1988,40 +2157,97 @@ function registerJanitorSW() {
     .catch((e) => console.warn("Session janitor SW unavailable:", e));
 }
 
-// AuthClient constructor options (7.x: identityProvider and the optional
-// one-click openIdProvider are bound at CONSTRUCTION). Storage too, so the
-// in-memory mode is applied by REBUILDING the client (doLogin), not per call.
+// AuthClient constructor options. Since @icp-sdk/auth 9.0 the identity
+// provider is a PAIR — the authorize URL the ceremony renders at and the
+// canister that mints this app's delegations (a bare URL string throws a
+// TypeError) — and two stores replace 8.x's `storage`: credentialStorage (the
+// keys and their chains; IndexedDB by default) and stateStorage (who is signed
+// in, until when; localStorage by default, so every tab of the origin
+// converges). The optional one-click openIdProvider and the stores are bound
+// at CONSTRUCTION, so the in-memory mode is applied by REBUILDING the client
+// (doLogin), not per call. agentOptions pins the agent the client mints and
+// revokes with to mainnet: 9.0 made sign-in a pair of calls to the II canister
+// (app_prepare_delegation / app_get_delegation), and core's default host for a
+// `*.localhost` origin is the LOCAL gateway, where rdmx6-… does not exist —
+// every venue's Internet Identity lives on mainnet, so say so (CSP connect-src
+// already names icp-api.io).
 function authClientOpts(inMemory, openIdProvider) {
   const derivationOrigin = getDerivationOrigin();
   return {
-    identityProvider: getIdentityProviderUrl(),
-    idleOptions: IDLE_OPTS,
+    identityProvider: { authorizeUrl: getIdentityProviderUrl(), canisterId: II_CANISTER_ID },
+    agentOptions: { host: II_API_HOST },
     ...(derivationOrigin ? { derivationOrigin } : {}),
     ...(openIdProvider ? { openIdProvider } : {}),
-    ...(inMemory ? { storage: makeInMemoryStorage() } : {}),
+    ...(inMemory ? makeInMemoryStores() : {}),
   };
 }
 
-// In-memory AuthClientStorage: the delegation + base key live only in this JS
-// Map — never written to disk (no IndexedDB / localStorage), so there's no
-// forensic trace and the session dies on tab close / reload by construction.
-// The base key stays a non-extractable CryptoKey (the Map holds the object;
-// unlike sessionStorage there's no string-serialization forcing a weaker key).
-function makeInMemoryStorage() {
-  const m = new Map();
-  return {
-    get: async (k) => (m.has(k) ? m.get(k) : null),
-    set: async (k, v) => { m.set(k, v); },
-    remove: async (k) => { m.delete(k); },
+// In-memory stores (auth 11.x: the library's own MemoryCredentialStorage +
+// MemoryStateStorage replace the 8.x custom `storage` Map, which 9.0+ would
+// silently IGNORE — an "in-memory" sign-in landing in IndexedDB): the session
+// key, the app key, their delegation chains AND the who-is-signed-in record
+// live only in this JS heap — never written to IndexedDB or localStorage, so
+// there is no forensic trace and the session dies on tab close / reload by
+// construction. The keys stay non-extractable CryptoKeys (the store generates
+// `extractable: false`; nothing is serialized, so nothing forces a weaker key).
+// Both stores, not just the credential one: a sign-in record that outlived its
+// credential would make the next load of this origin — and every other tab —
+// read "signed in" for a session no tab can hold any more.
+function makeInMemoryStores() {
+  return { credentialStorage: new MemoryCredentialStorage(), stateStorage: new MemoryStateStorage() };
+}
+
+// auth 9.0+: signOut() also revokes the session at the Internet Identity
+// canister and RE-THROWS a failed revoke AFTER the local wipe (offline, a
+// boundary node down). The device is signed out either way — say so, and never
+// let it unwind a boot (into demo mode) or a logout.
+async function signOutQuietly() {
+  if (!authClient) return;
+  try {
+    await authClient.signOut();
+  } catch (e) {
+    console.warn("sign-out: signed out on this device; the session could not be revoked at Internet Identity:", e?.message || e);
+  }
+}
+
+// auth 9.0+: a session's end is a STATUS, not an exception. The sign-in record
+// every tab of the origin shares (localStorage `ic-session-state`) flips when
+// another tab signs out (a `storage` event) and when II refuses to re-mint
+// under it (the session was revoked or ended: `expired`); the clock passing
+// the session's expiry is read lazily by getStatus() — no event — hence the
+// slow poll beside the subscription. 8.x had nothing here: calls simply failed
+// until a reload. A subscription belongs to one client, and doLogin rebuilds
+// the client, so this re-subscribes; the poll is one for the page.
+let _loggingOut = false;
+let _statusUnsub = null;
+let _statusPoll = null;
+function watchSessionStatus() {
+  if (!authClient) return;
+  const check = () => {
+    if (_loggingOut || devIdentityActive || !appState.isAuthenticated || !authClient) return;
+    if (authClient.isAuthenticated()) return;
+    const state = authClient.getStatus().state;
+    console.info(`session ${state}: signing this tab out`);
+    logout().then(() => {
+      showToast(state === "expired" ? "Your session ended — sign in again to continue." : "Signed out in another tab.", "info");
+    }).catch((e) => console.warn("session-end sign-out failed:", e?.message || e));
   };
+  _statusUnsub?.();
+  _statusUnsub = authClient.subscribe(check);
+  if (!_statusPoll) _statusPoll = setInterval(check, 15_000);
 }
 
 // Any "Sign in" click opens the options dialog (session length + whether the
-// session is written to disk). Demo mode (no II client) signs in directly.
+// session is written to disk). Demo mode REFUSES (#54.9): the mock actor can't
+// sign anyone in, and the old shortcut that flipped isAuthenticated over the
+// mock only deepened the illusion of a live venue — the persistent
+// #demo-banner (renderDemoMarker, from updateUI) is the signal, this is the
+// wall behind the disabled buttons.
 function login() {
-  if (!authClient) {   // demo mode
-    appState.isAuthenticated = true;
-    onLogin().then(updateUI);
+  const refusal = demoSignInRefusal();
+  if (refusal || !authClient) {
+    renderDemoMarker();
+    showToast(refusal || "Sign-in is unavailable: the identity client did not load. Reload to retry.", "error");
     return;
   }
   const modal = document.getElementById("signin-modal");
@@ -2043,10 +2269,21 @@ appState.getUserProfile = () => userProfile;
 
 // Perform the II login for a chosen posture. Rebuilds the client so the
 // storage mode (and the optional one-click Google path) take effect; the
-// chosen max-session-length becomes the delegation's maxTimeToLive
-// (nanoseconds) — the cap while a tab stays open.
+// chosen max-session-length becomes the Internet Identity SESSION's
+// maxTimeToLive (nanoseconds). @icp-sdk/auth 9.0 moved that bound from the one
+// delegation 8.x minted to the session II keeps: the client mints short-lived
+// app delegations under it and re-mints while it lasts, so it is still the cap
+// while a tab stays open — and when it passes, the status turns `expired`
+// (watchSessionStatus). maxTimeToIdle is left to II's default (7 days: never
+// the binding bound under a ≤ 1-day TTL; the 1h idle logout is the app's own
+// timer, startIdleLogout).
 async function doLogin({ ttlMinutes, inMemory, openIdProvider }) {
+  // auth 9.0+: one client per configuration — dispose the superseded one (its
+  // browser listeners, state subscription and scheduled refresh; NOT a
+  // sign-out) before rebuilding, then re-point the status watcher at the new one.
+  authClient?.dispose();
   authClient = new AuthClient(authClientOpts(inMemory, openIdProvider));
+  watchSessionStatus();
   try {
     // Everything window-bound starts INSIDE the click gesture (signer-js
     // channel rule): the sign-in, and — on the Google path — the attribute
@@ -2067,6 +2304,7 @@ async function doLogin({ ttlMinutes, inMemory, openIdProvider }) {
     }
     identity = await signInPromise;
     appState.isAuthenticated = true;
+    startIdleLogout();   // the 1h idle logout — the app's own since auth 9.0 removed the IdleManager
     await setupActor();
     if (attributesPromise) {
       // Present the bundle only where it matters: a play venue with an
@@ -2094,9 +2332,9 @@ async function doLogin({ ttlMinutes, inMemory, openIdProvider }) {
 }
 
 async function logout() {
-  if (authClient) {
-    await authClient.signOut();
-  }
+  _loggingOut = true;   // watchSessionStatus stands down: this sign-out is ours
+  stopIdleLogout();
+  if (authClient) await signOutQuietly();
   identity = null;
   appState.isAuthenticated = false;
   appState.actor = null;
@@ -2108,7 +2346,10 @@ async function logout() {
   appState.archiveActor = null; _archiveId = null; _archRows = []; _archSeen = new Set(); _archTradeIds = new Set();
   appState.bridgeActor = null;   // drop the Bridge actor bound to the old identity
   lastVerifyMessage = null;      // verification errors belong to the old identity too
+  applyWithdrawPause(document.getElementById("earn-vault-withdraw-btn"), null);   // the pause was the old identity's quote (task 1788515292)
+  applyWithdrawMax(document.getElementById("earn-vault-withdraw-input"), document.getElementById("earn-vault-withdraw-max"), 0, null);   // so was the Max button's stash — the next sign-in must not fill the old identity's figure (task 1793553361)
   resetAssistant();              // the assistant transcript belongs to the old identity — never let it leak across sign-ins (GHSA-6qpg)
+  devLoginForget();              // the #dev-login seed belongs to the old identity too — sign-out ends it (task 1793497426)
   if (statusPollInterval) { clearInterval(statusPollInterval); statusPollInterval = null; }
   renderProfileChip();
   renderAccountPage();
@@ -2116,7 +2357,96 @@ async function logout() {
   if (!authClient) setupDemoMode();
   startAutoRefresh(); // restart with public-only tickers
   updateUI();
+  _loggingOut = false;
 }
+
+// ── #dev-login: the seat venue's local sign-in (task 1793497426) ──────────
+// Shape (b), decided by the operator on 2026-11-01: a URL hook, not a button.
+// Factory seats drive browser smokes by navigation and cannot complete an
+// Internet Identity passkey flow (nor create accounts for one), so a #dev
+// venue — and ONLY a #dev venue — lets a tab sign in as a throwaway Ed25519
+// identity: navigate to #dev-login, or call window.__mdxDevLogin() in the
+// console. NOTHING renders for it on any posture — no button, no menu row, no
+// entry in the sign-in dialog — and the gate is the backend's own posture
+// answer (getDeployMode, awaited via _deployModeKnown; state.js's "dev"
+// default is a placeholder, never knowledge): anywhere else the hook prints
+// ONE console line and does nothing — no toast, no UI. The backend refuses the
+// dev faucet outside #dev anyway, so a wrong-posture attempt could at most
+// mint an unfunded, unregistered principal. The identity's 32-byte seed lives
+// in sessionStorage, so a reload keeps the principal inside the tab (a new tab
+// is a new principal); it rides the SAME setupActor() / onLogin() path a real
+// II login takes, so registration (the first faucet deposit), aiComplete,
+// Markets and Account see an ordinary signed-in session; the header pill reads
+// LOCAL DEV IDENTITY while it is active (renderProfileChip → devLoginPillName);
+// sign-out (logout → devLoginForget) drops the seed and returns to the
+// ordinary signed-out state — the GHSA-6qpg epoch boundary (resetAssistant)
+// is untouched.
+const DEV_LOGIN_HASH = "dev-login";
+const DEV_LOGIN_SEED_KEY = "mdx.devlogin.seed.v1";   // sessionStorage: the 32 seed bytes, hex
+const DEV_LOGIN_PILL = "LOCAL DEV IDENTITY";
+let devIdentityActive = false;
+let _devLoginBusy = false;
+
+// The one place the URL is read for the hook: the bare #dev-login hash.
+function devLoginHashHit() {
+  return (window.location.hash || "").slice(1).toLowerCase() === DEV_LOGIN_HASH;
+}
+// The seed this tab keeps (hex), or null. devLogin writes it; devLoginForget drops it.
+function devLoginSeed() {
+  try { return sessionStorage.getItem(DEV_LOGIN_SEED_KEY); } catch { return null; }
+}
+function devLoginForget() {
+  devIdentityActive = false;
+  try { sessionStorage.removeItem(DEV_LOGIN_SEED_KEY); } catch {}
+}
+// What the header pill shows instead of the username while the dev identity
+// is active (null otherwise — the ordinary username path).
+function devLoginPillName() { return devIdentityActive ? DEV_LOGIN_PILL : null; }
+
+async function devLogin(source) {
+  if (_devLoginBusy) return false;
+  _devLoginBusy = true;
+  try {
+    // The gate: the backend's answer, never the default. Wait for the startup
+    // read; if it gave up (no actor yet, a transient reject) read once more.
+    let answered = await _deployModeKnown;
+    if (!answered) { await resolveDeployModeAndBanner(); answered = _deployModeAnswered; }
+    if (!answered || appState.deployMode !== "dev") {
+      console.info("dev-login: not a #dev venue");
+      return false;
+    }
+    if (devIdentityActive && appState.isAuthenticated && identity) return true;   // a re-hit of the hash: already signed in this way
+    if (appState.isAuthenticated) { console.info("dev-login: a session is already signed in — sign out first"); return false; }
+    if (!HttpAgent || !Actor) { console.info("dev-login: the ICP SDK did not load"); return false; }
+    // The identity module the bundle already ships (mintNonceEphemeral imports
+    // the same one) — no new dependency. A kept seed reproduces the principal.
+    const identityMod = await import("@icp-sdk/core/identity");
+    let hex = devLoginSeed();
+    if (!/^[0-9a-f]{64}$/.test(hex || "")) {
+      hex = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+      try { sessionStorage.setItem(DEV_LOGIN_SEED_KEY, hex); } catch {}
+    }
+    identity = identityMod.Ed25519KeyIdentity.generate(Uint8Array.from(hex.match(/.{2}/g), (h) => parseInt(h, 16)));
+    devIdentityActive = true;
+    // From here the path is doLogin's: flag, actor, hydrate, repaint.
+    appState.isAuthenticated = true;
+    await setupActor();
+    await onLogin();
+    updateUI();
+    console.info(`dev-login: signed in as ${identity.getPrincipal().toText()} (${source})`);
+    return true;
+  } catch (e) {
+    console.warn("dev-login failed:", e?.message || e);
+    devLoginForget();
+    identity = null;
+    appState.isAuthenticated = false;
+    return false;
+  } finally {
+    _devLoginBusy = false;
+  }
+}
+// The console spelling shares the implementation (and the gate).
+window.__mdxDevLogin = () => devLogin("console");
 
 async function onLogin() {
   // Independent endpoints — fetch concurrently instead of serially (this used
@@ -2128,6 +2458,17 @@ async function onLogin() {
     seedReleaseRejections(),   // baseline so historical rejections don't toast on sign-in
   ]);
   refreshAiGate();   // re-probe with the signed-in actor (heals a failed startup probe; non-blocking)
+  // The sign-in edge (task 1793551778): a pane seeded before this session
+  // restored — a page loading on #ai/agent-chat seeds the greeting from
+  // showUI(), ahead of the II restore and the #dev-login boot hook — replays
+  // this principal's transcript now that whoami (refreshProfile, above) has
+  // named it. A no-op when the first show was already signed in. And the
+  // re-seed (task 1793554545): a sign-out on the AI tab reset the pane
+  // (logout → resetAssistant) and this sign-in shows it again from
+  // applyIntelliAuthGate (updateUI, after this) without a sub-tab click —
+  // nothing else would seed it, so the edge seeds the greeting while the
+  // pane is the active view (the isAiPaneActive dep of setupAssistant).
+  assistantOnAuthChange();
   startAutoRefresh();
   if (currentTab === "account" && acctTab === "deposit") refreshDepositPage();   // re-render in place if already on it
 
@@ -2186,7 +2527,8 @@ function renderProfileChip() {
   if (header) header.classList.toggle("authed", authed);
   if (!authed) {
     if (dAvatarEl) dAvatarEl.style.display = "none";
-    if (dNameEl) dNameEl.textContent = "Account";
+    if (dNameEl) { dNameEl.textContent = "Account"; dNameEl.classList.remove("dev-identity"); }
+    if (nameEl) nameEl.classList.remove("dev-identity");
     closeUserMenu();
     return;
   }
@@ -2197,18 +2539,27 @@ function renderProfileChip() {
   // old on a public board.) Falls back to the initial before the profile loads.
   const initial = userProfile.username ? userProfile.username[0].toUpperCase() : "?";
   setIdenticon(avatarEl, userProfile.username, initial);
-  if (nameEl) nameEl.textContent = userProfile.username || "—";
+  // The #dev-login hook's loud marker (task 1793497426): while a seat venue's
+  // throwaway identity is signed in, both pills read its label instead of the
+  // drawn username (the identicon still seeds from the username).
+  const pillName = devLoginPillName();
+  if (nameEl) { nameEl.textContent = pillName || userProfile.username || "—"; nameEl.classList.toggle("dev-identity", !!pillName); }
   if (dAvatarEl) {
     dAvatarEl.style.display = "";
     setIdenticon(dAvatarEl, userProfile.username, initial);
   }
-  if (dNameEl) dNameEl.textContent = userProfile.username || "Account";
+  if (dNameEl) { dNameEl.textContent = pillName || userProfile.username || "Account"; dNameEl.classList.toggle("dev-identity", !!pillName); }
 }
 
-function closeUserMenu() {
-  document.getElementById("user-menu")?.classList.remove("open");
-  document.getElementById("user-menu-trigger")?.setAttribute("aria-expanded", "false");
-}
+// Through the dropdown's setter (userMenu, makeDropdown): .open and
+// aria-expanded are written only on a change, so the sign-out path
+// (renderProfileChip, its one caller) writes nothing while the menu is
+// already closed. The items no longer close through here: wireMenuButton
+// (setupEventListeners) closes and refocuses the trigger after an
+// activation. (It used to run on EVERY document click from the shared
+// closer and rewrite the trigger's aria-expanded each time; the closer now
+// touches only open dropdowns, this one included.)
+function closeUserMenu() { userMenu.setOpen(false); }
 
 async function doRegenerateUsername() {
   if (!appState.actor || !appState.isAuthenticated) return;
@@ -2319,6 +2670,9 @@ async function refreshMarkets() {
     }
   } catch (e) {
     console.warn("Failed to fetch markets:", e);
+    // A reject that names the WRONG CANISTER (IC0301 / IC0536) is a cookie
+    // problem, not a market problem — hand it to the one-shot ic_env self-heal.
+    if (isCanisterEnvMismatchReject(e?.message ?? e)) await handleCanisterEnvMismatch(e, "getMarkets");
   }
 }
 
@@ -2378,11 +2732,13 @@ async function updateSwapPreview() {
   const rateEl     = document.getElementById("swap-preview-rate");
   const impactEl   = document.getElementById("swap-preview-impact");
   const loadingEl  = document.getElementById("swap-preview-loading");
+  const availEl    = document.getElementById("swap-preview-avail");
 
   if (!fromAmount || fromAmount <= 0 || fromToken === toToken) {
     toAmountEl.value = "";
     toAmountEl.classList.remove("estimated");
     previewEl.style.display = "none";
+    if (availEl) availEl.style.display = "none";
     lastSwapEstimate = null;
     updateSwapButtonState();
     return;
@@ -2417,6 +2773,7 @@ async function updateSwapPreview() {
       impactEl.textContent = "";
       impactEl.className = "swap-preview-impact";
       previewEl.style.display = "flex";
+      if (availEl) availEl.style.display = "none";
       lastSwapEstimate = { filled: false, consumedFrom: 0, fromAmount, fromToken, toAmount: 0, toToken };
       updateSwapButtonState();
       return;
@@ -2426,6 +2783,26 @@ async function updateSwapPreview() {
     const consumedFrom = Number(q.consumedFrom) / 1e8;
     const feeQuote     = Number(q.feeQuote) / 1e8;
     const filled       = !q.exhausted;
+    // #55 silent "complete", the preview half (task 1788478363): the estimate
+    // above is for the FULL amount (a logged-out/unfunded preview stays a real
+    // market quote), but swap() stages min(amount, available) — funds reserved
+    // by the caller's open orders cannot convert. When the backend says a
+    // reservation clamps this amount, say so beside the estimate, while the
+    // user is still typing, not first in the staging toast. Tap → fill "From"
+    // with the spendable amount.
+    const availableFrom    = Number(q.availableFrom || 0n) / 1e8;   // raw e8 (not a MONEY_KEYS name)
+    const clampedByReserve = !!q.clampedByReserve && availableFrom < fromAmount - 1e-8;
+    if (availEl) {
+      if (clampedByReserve) {
+        availEl.textContent = `⚠ Only ${formatNum(availableFrom)} of ${formatNum(fromAmount)} ${fromToken} is available — ${formatNum(fromAmount - availableFrom)} ${fromToken} is reserved by your open orders; only the available part will convert — tap to fill`;
+        availEl.dataset.fill = String(availableFrom);
+        availEl.style.display = "block";
+      } else {
+        availEl.textContent = "";
+        delete availEl.dataset.fill;
+        availEl.style.display = "none";
+      }
+    }
 
     // Output decimals follow the trades-feed Size rule: as many as the output
     // asset's price has integer digits (ICPUSD prices at 1 → 1 dp). Thousands
@@ -2456,7 +2833,7 @@ async function updateSwapPreview() {
       impactEl.className = "swap-preview-impact";
     }
     previewEl.style.display = "flex";
-    lastSwapEstimate = { filled, consumedFrom, fromAmount, fromToken, toAmount, toToken };
+    lastSwapEstimate = { filled, consumedFrom, fromAmount, fromToken, toAmount, toToken, availableFrom, clampedByReserve };
     updateSwapButtonState();
   }, 250);
 }
@@ -2768,19 +3145,9 @@ async function pollChanges() {
         }
         if (selectedMarket) renderUserOrdersMobile();
       }
-      // Always refresh the pending-match list — they finalise on a timer
-      // and rendering needs the live countdown. Cheap query call. Filter
-      // to taker-side only: maker-side pending matches mean someone else
-      // is crossing our resting order, which is already visible in Open
-      // Orders, so showing them too is duplicate noise.
-      try {
-        const pms = await appState.actor.getMyPendingMatches();
-        uomPendingMatches = pms.filter((p) => {
-          if (!appState.myPrincipalText) return true; // pre-whoami, show all
-          return String(p.takerPrincipal) === appState.myPrincipalText;
-        });
-        renderUserOrdersMobile();
-      } catch (e) { /* swallow */ }
+      // (The per-tick getMyPendingMatches poll is gone — task 1788516198:
+      // the query is an inert stub that can never return a row. The IDL
+      // still declares it so the interface mirrors candid/backend.did.)
     }
   } catch (e) {
     console.warn("Failed to poll changes:", e);
@@ -2877,6 +3244,7 @@ function startAutoRefresh() {
   refreshInterval = setInterval(() => {
     refreshAllOrderBookCaches();
     refreshMarkets();
+    refreshVaultLiquidity();   // Earn pane only; the withdraw gate follows the mark (task 1788515292)
   }, 10000);
 }
 
@@ -2982,7 +3350,7 @@ function aggregateCandles(trades, intervalMs) {
       // Push completed candle
       const ts = Math.floor(bucketStart / 1000); // lightweight-charts uses Unix seconds
       candles.push({ time: ts, open, high, low, close });
-      volumes.push({ time: ts, value: vol, color: close >= open ? "rgba(94,230,180,0.4)" : "rgba(240,122,108,0.4)" });
+      volumes.push({ time: ts, value: vol, up: close >= open, color: volumeBarColor(close >= open) });
       // Start new bucket
       bucketStart = bucket;
       open = t.price;
@@ -2999,13 +3367,66 @@ function aggregateCandles(trades, intervalMs) {
   // Push final candle
   const ts = Math.floor(bucketStart / 1000);
   candles.push({ time: ts, open, high, low, close });
-  volumes.push({ time: ts, value: vol, color: close >= open ? "rgba(94,230,180,0.4)" : "rgba(240,122,108,0.4)" });
+  volumes.push({ time: ts, value: vol, up: close >= open, color: volumeBarColor(close >= open) });
 
   return { candles, volumes };
 }
 
-// Set chart to show last N candles, scrolled to current time
+// The lazy older-page load (the subscribeVisibleLogicalRangeChange subscribers
+// in renderChartData and renderMiniChart) fires on a USER pan only. The
+// library reports every change of the visible range, its own included, and
+// the chart's own changes all land at or left of the first bar — exactly where
+// the subscribers read "the user reached the left edge" — so every interval
+// switch and every overlay open bought one wasted older-page query (task
+// 1793502035). Three programmatic sources, from lightweight-charts 5.1.0:
+//   · series.setData() on a replaced series fires SYNCHRONOUSLY, before the
+//     re-anchor runs: the old bar spacing against the new series puts `from`
+//     far below 5 whenever the chart is wider than 600 px or was panned;
+//   · timeScale().fitContent() / setVisibleLogicalRange() are DEFERRED to the
+//     widget's next requestAnimationFrame and fire there — zero or one event,
+//     a frame later, or minutes later in a hidden tab, where rAF is suspended;
+//   · timeScale().scrollToRealTime() — no longer called here (task
+//     1793510573, see showLastCandles). It ANIMATED from the pre-fit offset
+//     to the real-time one over 400 ms (DefaultAnimationDuration): after a
+//     prior pan, a stream of events, every one left of the fit position, and
+//     the widget never applies the slide's finished frame.
+// So a flag cleared on the first event is wrong (none may come; several may),
+// and there is no fixed range to compare the user against while a slide
+// runs. The gate is armed at the start of each programmatic motion and holds
+// until one animation frame has run (the deferred fit, hidden tab included)
+// AND CHART_REANCHOR_SETTLE_MS have passed (sized for the slide; kept as the
+// margin for a slow frame and any trailing programmatic event). A user pan
+// inside the window is ignored; a pan is a stream of events, so the first one
+// past the window still loads. Per chart (a WeakMap keyed by the chart
+// object), so the overlay and the mini chart share one helper.
+const CHART_REANCHOR_SETTLE_MS = 600;
+const chartReanchors = new WeakMap(); // chart → { until, framed }
+function armChartReanchor(chart) {
+  const s = { until: performance.now() + CHART_REANCHOR_SETTLE_MS, framed: false };
+  chartReanchors.set(chart, s);
+  requestAnimationFrame(() => { s.framed = true; });
+}
+function chartReanchorSettling(chart) {
+  const s = chartReanchors.get(chart);
+  return s !== undefined && (!s.framed || performance.now() < s.until);
+}
+
+// Set chart to show last N candles, anchored at real time. A programmatic
+// re-anchor: arms the lazy-load gate above for the range events it causes.
+// The fit ALONE lands exactly at real time: setVisibleLogicalRange sets the
+// right offset to `to - baseIndex` = 0 and fitContent passes applyDefaultOffset
+// (= options.rightOffset, 0 on both charts), both deferred to the widget's
+// next frame. No scrollToRealTime() after it (task 1793510573): lightweight-
+// charts 5.1.0 reads the slide's start from the PRE-fit offset (the fit has
+// not run yet) and its draw pass applies the animation only while
+// !finished(time), with no finishing frame, so the LAST applied position has
+// progress < 1 — at 60 fps the view rested up to ~4% of the slide short of
+// real time, the newest bar off the right edge (seat venue: a 48-bar pan then
+// an interval switch rested 7 bars left of the newest candle). To move a
+// chart to real time, land it: the fit, or
+// scrollToPosition(timeScale().options().rightOffset, false).
 function showLastCandles(chart, totalCandles) {
+  armChartReanchor(chart);
   if (totalCandles > CHART_VISIBLE_CANDLES) {
     chart.timeScale().setVisibleLogicalRange({
       from: totalCandles - CHART_VISIBLE_CANDLES,
@@ -3014,14 +3435,14 @@ function showLastCandles(chart, totalCandles) {
   } else {
     chart.timeScale().fitContent();
   }
-  chart.timeScale().scrollToRealTime();
 }
 
 // Convert backend candles (ns timestamps) to LightweightCharts format.
 // Fills gaps between existing candles with whitespace markers so the time axis
 // visibly shows periods with no trading activity.
 // Timestamps are passed through as real UTC seconds — timezone display is
-// handled by the chart's localization.timeFormatter.
+// handled by the chart's localization.timeFormatter (the crosshair label) and
+// timeScale.tickMarkFormatter (chartTickMarkLabel below, the axis ticks).
 function backendCandlesToChart(backendCandles, intervalMs) {
   const candles = [];
   const volumes = [];
@@ -3049,12 +3470,112 @@ function backendCandlesToChart(backendCandles, intervalMs) {
     // cyan so quiet stretches read as a bright oracle-tracking line, visibly
     // distinct from the green/red of real trading.
     const synthetic = Number(c.volume) === 0;
-    const track = "rgba(56, 189, 240, 0.9)";
+    const track = chartTrackColor();
     candles.push({ time: ts, open: c.open, high: c.high, low: c.low, close: c.close,
-      ...(synthetic ? { color: track, borderColor: track, wickColor: track } : {}) });
-    volumes.push({ time: ts, value: c.volume, color: c.close >= c.open ? "rgba(94,230,180,0.4)" : "rgba(240,122,108,0.4)" });
+      ...(synthetic ? { synthetic: true, color: track, borderColor: track, wickColor: track } : {}) });
+    volumes.push({ time: ts, value: c.volume, up: c.close >= c.open, color: volumeBarColor(c.close >= c.open) });
   }
   return { candles, volumes };
+}
+
+// Re-colour converted chart data IN PLACE for the theme now in force. The
+// per-item colours above are strings baked at conversion time (the chart
+// library never looks at CSS), so the mdx:theme subscriber at the bottom of
+// this file calls this and then re-feeds the series with setData. The `up`
+// and `synthetic` markers are ours; lightweight-charts ignores them.
+function reskinChartData(data) {
+  if (!data) return;
+  const track = chartTrackColor();
+  for (const c of data.candles || []) {
+    if (c.synthetic) { c.color = track; c.borderColor = track; c.wickColor = track; }
+  }
+  for (const v of data.volumes || []) {
+    if (v.up !== undefined) v.color = volumeBarColor(v.up);
+  }
+}
+
+// Time-axis tick labels for BOTH charts — the overlay's (renderChartData) and
+// the mini chart's (renderMiniChart) share this one function so they cannot
+// drift (task 1793498838). lightweight-charts classifies every tick before it
+// asks (TickMarkFormatter's second argument, the TickMarkType enum): on a 1H
+// chart the hourly ticks are Time, a day boundary is DayOfMonth, the first
+// tick of a month is Month, of a year Year — and its default formatter prints
+// the unit the kind names. The two inline formatters this replaces printed
+// HH:MM for EVERY kind, so a 1H chart zoomed out across the day boundaries
+// read "01:00 01:00 01:00" and nothing on the axis said which day was on
+// screen. Same Date path as before, and as the crosshair's
+// localization.timeFormatter beside each call site: `time` is UTC seconds,
+// rendered in the browser's local timezone and default locale, 24-hour clock.
+// TimeWithSeconds never fires while both charts set secondsVisible: false; it
+// is handled so a flip of that option is honoured too. Returning a string for
+// every kind keeps the library's own default formatter out of the picture (a
+// null here would fall back to it).
+function chartTickMarkLabel(time, tickMarkType) {
+  const d = new Date(time * 1000);
+  switch (tickMarkType) {
+    case TickMarkType.Year:
+      return d.toLocaleDateString(undefined, { year: "numeric" });
+    case TickMarkType.Month:
+      return d.toLocaleDateString(undefined, { month: "short" });
+    case TickMarkType.DayOfMonth:
+      return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    case TickMarkType.TimeWithSeconds:
+      return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    case TickMarkType.Time:
+    default:
+      return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+}
+
+// getCandles pages are CANDLE_PAGE_SIZE backend candles each, cut back from
+// the NEWEST candle (page 0 = the newest page; src/backend/mixins/
+// MarketData.mo passes the same 100 — keep them in step). Because pages are
+// cut from the newest, a counted cursor (page += 1) drifts the moment the
+// series grows: after N new candles "page k+1" overlaps the held run by N
+// bars, and past a full page of growth it fetches nothing the chart lacks. So
+// the cursor is DERIVED from what the chart holds instead: the held bars are
+// one contiguous run ending at the newest candle, and the next older page is
+// the one whose window ends at or above the oldest held bar.
+const CANDLE_PAGE_SIZE = 100;
+function nextOlderCandlePage(heldCandles) {
+  let real = 0;
+  for (const c of heldCandles) if (c.open !== undefined) real++;
+  return Math.floor(real / CANDLE_PAGE_SIZE);
+}
+
+// Merge a converted getCandles page into the candle + volume arrays a chart
+// already holds, keyed by bar time: an incoming bar replaces the held bar at
+// its time, bars at new times are added, every other held bar is kept, and
+// the result is re-sorted. A whitespace gap marker never overwrites a real
+// bar. `overlap` counts the incoming real bars whose times were already held:
+// zero against a non-empty hold means the page does not reach back to it
+// (the series moved more than a page while no tick landed — a suspended tab),
+// and splicing it on would draw a hole as continuous history, so the callers
+// start over from the page instead. Why a merge and not setData(page): the
+// periodic refreshes refetch page 0, and feeding it wholesale threw away
+// every older page the user had scrolled into (task 1793498836); the lazy
+// older-page load prepends, and once the series has grown its page overlaps
+// the held run (see CANDLE_PAGE_SIZE) — a duplicate time makes
+// lightweight-charts' setData throw.
+function mergeChartPage(heldCandles, heldVolumes, page) {
+  const real = (b) => b.open !== undefined || b.value !== undefined;
+  const merge = (held, incoming) => {
+    const byTime = new Map();
+    for (const bar of held) byTime.set(bar.time, bar);
+    let overlap = 0;
+    for (const bar of incoming) {
+      const prev = byTime.get(bar.time);
+      if (prev !== undefined && real(prev)) {
+        if (!real(bar)) continue;
+        overlap++;
+      }
+      byTime.set(bar.time, bar);
+    }
+    return { bars: Array.from(byTime.values()).sort((a, b) => a.time - b.time), overlap };
+  };
+  const candles = merge(heldCandles, page.candles);
+  const volumes = merge(heldVolumes, page.volumes);
+  return { candles: candles.bars, volumes: volumes.bars, overlap: candles.overlap };
 }
 
 async function openChart() {
@@ -3065,9 +3586,12 @@ async function openChart() {
   const overlay = document.getElementById("chart-overlay");
   overlay.style.display = "flex";
   document.getElementById("chart-title").textContent = selectedMarket;
+  // A dialog: focus moves into it (tabindex=-1 on the overlay) so Escape and
+  // Tab work from the keyboard, and goes back to whatever opened it on close.
+  chartReturnFocus = document.activeElement;
+  overlay.focus({ preventScroll: true });
 
   // Fetch candles from backend (server-side aggregation)
-  chartCurrentPage = 0;
   chartHasMore = false;
   chartLoadingMore = false;
   try {
@@ -3116,29 +3640,31 @@ function renderChartData() {
 
   const { candles, volumes } = chartCandleData;
 
+  // Colours come from the theme tokens (theme.js) — re-applied on mdx:theme.
+  const skin = chartThemeOptions();
   chartInstance = createChart(container, {
     width: container.clientWidth,
     height: container.clientHeight,
     layout: {
       background: { type: "solid", color: "transparent" },
-      textColor: "#7A8699", // Fog
+      textColor: skin.layout.textColor,
       fontSize: 12,
       panes: {
-        separatorColor: "rgba(34,46,64,0.7)",
-        separatorHoverColor: "rgba(59,184,212,0.35)",
+        separatorColor: skin.layout.panes.separatorColor,
+        separatorHoverColor: skin.layout.panes.separatorHoverColor,
         enableResize: false,
       },
     },
     grid: {
       // Ridge at low opacity
-      vertLines: { color: "rgba(34,46,64,0.5)" },
-      horzLines: { color: "rgba(34,46,64,0.5)" },
+      vertLines: skin.grid.vertLines,
+      horzLines: skin.grid.horzLines,
     },
     crosshair: {
       mode: 0,
       // Glacier at ~50% opacity — dashed crosshair per design spec
-      vertLine: { color: "rgba(59,184,212,0.5)", width: 1, style: 2 },
-      horzLine: { color: "rgba(59,184,212,0.5)", width: 1, style: 2 },
+      vertLine: { ...skin.crosshair.vertLine, width: 1, style: 2 },
+      horzLine: { ...skin.crosshair.horzLine, width: 1, style: 2 },
     },
     localization: {
       timeFormatter: (time) => {
@@ -3147,16 +3673,13 @@ function renderChartData() {
       },
     },
     timeScale: {
-      borderColor: "rgba(34,46,64,0.7)",
+      borderColor: skin.timeScale.borderColor,
       timeVisible: true,
       secondsVisible: false,
-      tickMarkFormatter: (time) => {
-        const d = new Date(time * 1000);
-        return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
-      },
+      tickMarkFormatter: chartTickMarkLabel,
     },
     rightPriceScale: {
-      borderColor: "rgba(34,46,64,0.7)",
+      borderColor: skin.rightPriceScale.borderColor,
     },
   });
 
@@ -3166,14 +3689,7 @@ function renderChartData() {
   // labels only in the volume pane — no more shared/overlapping axis.
   chartCandleSeries = chartInstance.addSeries(
     CandlestickSeries,
-    {
-      upColor: "#5EE6B4",       // Alpine Mint
-      downColor: "#F07A6C",     // Ember Clay
-      borderUpColor: "#5EE6B4",
-      borderDownColor: "#F07A6C",
-      wickUpColor: "#5EE6B4",
-      wickDownColor: "#F07A6C",
-    },
+    candleThemeOptions(),   // Alpine Mint / Ember Clay (or their light-theme deeps)
     0,
   );
   chartInstance.priceScale("right").applyOptions({
@@ -3200,9 +3716,12 @@ function renderChartData() {
 
   showLastCandles(chartInstance, candles.length);
 
-  // Scroll-to-load: when user scrolls near the left edge, load older candles
+  // Scroll-to-load: when user scrolls near the left edge, load older candles.
+  // The chart's own range changes (a re-anchor, its scroll animation) are not
+  // a pan — see armChartReanchor.
   chartInstance.timeScale().subscribeVisibleLogicalRangeChange((range) => {
     if (!range || !chartHasMore || chartLoadingMore) return;
+    if (chartReanchorSettling(chartInstance)) return;
     // If the visible range starts near or before index 5, load more
     if (range.from < 5) {
       loadOlderCandles();
@@ -3222,25 +3741,31 @@ function renderChartData() {
 }
 
 async function loadOlderCandles() {
-  if (chartLoadingMore || !chartHasMore || !selectedMarket) return;
+  if (chartLoadingMore || !chartHasMore || !selectedMarket || !chartCandleData) return;
   chartLoadingMore = true;
   const src = appState.actor || appState.publicActor;
   if (!src) { chartLoadingMore = false; return; }
+  const data = chartCandleData;
+  const interval = chartInterval;
   try {
-    chartCurrentPage += 1;
-    const resp = await src.getCandles(selectedMarket, chartInterval, chartCurrentPage);
+    // The page is derived from the hold, not counted — see CANDLE_PAGE_SIZE.
+    const resp = await src.getCandles(selectedMarket, interval, nextOlderCandlePage(chartCandleData.candles));
+    // The hold this page was fetched for is gone (interval changed, chart
+    // re-opened): the page belongs to the old series.
+    if (data !== chartCandleData) return;
     chartHasMore = resp.hasMore;
     if (resp.candles.length) {
-      const older = backendCandlesToChart(resp.candles, chartInterval);
-      // Prepend older candles to existing data
-      chartCandleData.candles = [...older.candles, ...chartCandleData.candles];
-      chartCandleData.volumes = [...older.volumes, ...chartCandleData.volumes];
+      const older = backendCandlesToChart(resp.candles, interval);
+      // Merged, not prepended: the page overlaps the held run by however many
+      // candles arrived since the pages it joins were fetched (mergeChartPage).
+      const merged = mergeChartPage(chartCandleData.candles, chartCandleData.volumes, older);
+      chartCandleData.candles = merged.candles;
+      chartCandleData.volumes = merged.volumes;
       if (chartCandleSeries) chartCandleSeries.setData(chartCandleData.candles);
       if (chartVolumeSeries) chartVolumeSeries.setData(chartCandleData.volumes);
     }
   } catch (e) {
     console.warn("Failed to load older candles:", e);
-    chartCurrentPage -= 1; // revert so retry is possible
   } finally {
     chartLoadingMore = false;
   }
@@ -3252,7 +3777,6 @@ async function changeChartInterval(intervalMs) {
     b.classList.toggle("active", Number(b.dataset.interval) === chartInterval);
   });
   // Re-fetch candles from backend with new interval
-  chartCurrentPage = 0;
   chartHasMore = false;
   chartLoadingMore = false;
   const src = appState.actor || appState.publicActor;
@@ -3262,6 +3786,9 @@ async function changeChartInterval(intervalMs) {
       chartCandleData = backendCandlesToChart(resp.candles, chartInterval);
       chartHasMore = resp.hasMore;
       if (chartInstance && chartCandleSeries && chartVolumeSeries && chartCandleData.candles.length) {
+        // The replaced series fires a range event of its own, synchronously,
+        // before the re-anchor — arm the lazy-load gate ahead of it.
+        armChartReanchor(chartInstance);
         chartCandleSeries.setData(chartCandleData.candles);
         chartVolumeSeries.setData(chartCandleData.volumes);
         showLastCandles(chartInstance, chartCandleData.candles.length);
@@ -3274,27 +3801,42 @@ async function changeChartInterval(intervalMs) {
   }
 }
 
-// Refresh chart data — re-fetch page 0 candles from backend
+// Refresh chart data — refetch page 0 and MERGE it into the held series: the
+// open candle is replaced, new candles are appended, and the older pages the
+// user scrolled into stay (task 1793498836 — feeding page 0 wholesale threw
+// them away every 5 s, and reset the paging cursor with them). The view is
+// left to the library: lightweight-charts keeps the bars on screen when the
+// last bar is off-screen and follows a new bar only when it is visible
+// (timeScale.shiftVisibleRangeOnNewBar, the default) — no re-anchor here,
+// exactly as the mdx:theme re-skin (display-integrity §P P8b).
 async function refreshChartData() {
-  if (!selectedMarket || !chartInstance) return;
-  // A page load in flight owns chartCurrentPage and will prepend its result
-  // onto whatever is loaded when it lands; replacing the series underneath it
-  // would splice an older page straight onto a fresh page 0. Skip the tick —
-  // the next one is 5s away.
+  if (!selectedMarket || !chartInstance || !chartCandleData) return;
+  // A page load in flight would merge fine on top (the merges commute), but
+  // two re-feeds in one breath buy nothing — the next tick is 5 s away.
   if (chartLoadingMore) return;
   const src = appState.actor || appState.publicActor;
   if (!src) return;
+  const data = chartCandleData;
+  const interval = chartInterval;
   try {
-    const resp = await src.getCandles(selectedMarket, chartInterval, 0);
-    chartCandleData = backendCandlesToChart(resp.candles, chartInterval);
-    // The series is page 0 and nothing else again, so the paging cursor goes
-    // back with it, exactly as changeChartInterval does after the same
-    // refetch. loadOlderCandles increments the cursor and prepends, so a
-    // cursor left at 3 would put page 4 next to page 0 with pages 1-3 missing
-    // — a discontinuous price history presented as continuous, and one that
-    // never repairs itself because those pages are never refetched.
-    chartCurrentPage = 0;
-    chartHasMore = resp.hasMore;
+    const resp = await src.getCandles(selectedMarket, interval, 0);
+    // The hold this page was fetched for is gone (interval changed, chart
+    // re-opened or closed): merged into the new one it would never be
+    // repaired. An empty page is not a merge either.
+    if (data !== chartCandleData || !chartInstance || !resp.candles.length) return;
+    const page = backendCandlesToChart(resp.candles, interval);
+    const merged = data.candles.length ? mergeChartPage(data.candles, data.volumes, page) : null;
+    if (merged && merged.overlap > 0) {
+      data.candles = merged.candles;
+      data.volumes = merged.volumes;
+      // chartHasMore describes the OLD end of the held run, which a page-0
+      // merge never moves; resp.hasMore only says older-than-page-0 exists.
+    } else {
+      // Nothing held, or no held time in the fresh page: the series moved
+      // more than a page while no tick landed. Start over from page 0.
+      chartCandleData = page;
+      chartHasMore = resp.hasMore;
+    }
     if (chartCandleSeries) chartCandleSeries.setData(chartCandleData.candles);
     if (chartVolumeSeries) chartVolumeSeries.setData(chartCandleData.volumes);
   } catch (e) {
@@ -3315,6 +3857,36 @@ function closeChart() {
     chartCandleSeries = null;
     chartVolumeSeries = null;
   }
+  const back = chartReturnFocus;
+  chartReturnFocus = null;
+  // The opener may be gone (the chart cell is rebuilt on a market switch).
+  if (back && back.isConnected) back.focus({ preventScroll: true });
+}
+
+// The overlay is aria-modal, so Tab must not leave it (1793503737): from its
+// last control Tab wraps to the first, from the first (or from the overlay
+// itself, which openChart focuses) Shift+Tab wraps to the last, and focus
+// that has fallen to the body — a click on the chart canvas — comes back
+// inside instead of walking the page beneath. The controls are the interval
+// buttons, the × and the chart library's attribution link (lightweight-charts
+// renders an <a href> inside the canvas container); the selector is generic
+// so a control added later is trapped too. Routed from the document keydown
+// listener in setupEventListeners, beside Escape.
+function trapChartOverlayFocus(e) {
+  const overlay = document.getElementById("chart-overlay");
+  const focusables = Array.from(overlay.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  )).filter((el) => el.getClientRects().length > 0);
+  if (!focusables.length) { e.preventDefault(); return; }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  const inside = active !== overlay && overlay.contains(active);
+  if (e.shiftKey) {
+    if (!inside || active === first) { e.preventDefault(); last.focus(); }
+  } else if (!inside || active === last) {
+    e.preventDefault(); first.focus();
+  }
 }
 
 // ── Mini Chart (mobile inline) ──────────────────────────────────
@@ -3333,6 +3905,8 @@ async function renderMiniChart() {
   if (miniChartInstance) {
     miniChartInstance.remove();
     miniChartInstance = null;
+    miniChartReskin = null;
+    miniChartMerge = null;
     miniChartSeries = null;
     miniChartVolumeSeries = null;
   }
@@ -3358,9 +3932,26 @@ async function renderMiniChart() {
   container.innerHTML = `<div class="mini-chart-bar">${intervals.map((iv) =>
     `<button class="mini-chart-iv${iv.ms === miniChartCandleInterval ? " active" : ""}" data-ms="${iv.ms}">${iv.label}</button>`
   ).join("")}<div class="mini-chart-view" id="mini-chart-view">`
+    // The view menu is a MENU BUTTON (the WAI-ARIA pattern): a real <button>
+    // trigger — Tab reaches it; Enter, Space and ArrowDown open the menu onto
+    // its first item, ArrowUp onto its last — whose aria-expanded mirrors the
+    // wrapper's .open (the dropdown's one setter, chartViewMenu), and a
+    // role=menu of role=menuitem buttons (applyChartView builds them; the
+    // keys are wireMenuButton's, wired below). It was divs with click
+    // handlers only, so the Liquidations view and Hide were unreachable from
+    // the keyboard (1793503737).
+    + `<button type="button" class="mcv-trigger" id="mcv-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="mcv-menu">`
     + `<span class="mcv-label" id="mcv-label"></span>`
-    + `<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`
-    + `<div class="mcv-menu" id="mcv-menu"></div></div></div>`
+    + `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`
+    + `</button>`
+    + `<div class="mcv-menu" id="mcv-menu" role="menu" aria-label="Chart cell view"></div></div>`
+    // Expand: the same chart full-screen (#chart-overlay). A real <button> with
+    // an aria-label — reachable by Tab, opened by Enter — not a div with a
+    // click handler. Chart-only like the interval buttons (header.css hides
+    // both over the liquidation map and while the cell is collapsed).
+    + `<button class="mini-chart-expand" type="button" aria-label="Open the full-size chart" title="Full-size chart (Esc closes)">`
+    + `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M7 1h4v4M11 1L7 5M5 11H1V7M1 11l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+    + `</button></div>`
     + `<div class="mini-chart-canvas" id="mini-chart-canvas"></div>`
     + `<div class="mini-chart-heat heatmap" id="mini-chart-heat"></div>`;
 
@@ -3369,27 +3960,29 @@ async function renderMiniChart() {
   // Create empty chart immediately (visible as empty grid).
   // Size to the container's actual rect so it fills a grid cell on desktop.
   const initialH = canvasEl.clientHeight || (isMobile() ? 170 : 260);
+  // Colours come from the theme tokens (theme.js) — re-applied on mdx:theme.
+  const skin = chartThemeOptions();
   miniChartInstance = createChart(canvasEl, {
     width: canvasEl.clientWidth,
     height: initialH,
     layout: {
       background: { type: "solid", color: "transparent" },
-      textColor: "#7A8699",
+      textColor: skin.layout.textColor,
       fontSize: isMobile() ? 10 : 11,
       // v5 pane separator — the horizontal divider between candle and
       // volume panes. Ridge at ~60% opacity matches other internal borders.
       panes: {
-        separatorColor: "rgba(34,46,64,0.6)",
-        separatorHoverColor: "rgba(59,184,212,0.35)",
+        separatorColor: skin.layout.panes.separatorColor,
+        separatorHoverColor: skin.layout.panes.separatorHoverColor,
         enableResize: false,
       },
     },
-    grid: { vertLines: { color: "rgba(34,46,64,0.4)" }, horzLines: { color: "rgba(34,46,64,0.4)" } },
+    grid: { vertLines: skin.grid.vertLines, horzLines: skin.grid.horzLines },
     crosshair: {
       mode: 0,
       // Glacier at ~50% opacity — dashed crosshair per design spec
-      vertLine: { color: "rgba(59,184,212,0.5)", width: 1, style: 2 },
-      horzLine: { color: "rgba(59,184,212,0.5)", width: 1, style: 2 },
+      vertLine: { ...skin.crosshair.vertLine, width: 1, style: 2 },
+      horzLine: { ...skin.crosshair.horzLine, width: 1, style: 2 },
     },
     localization: {
       timeFormatter: (time) => {
@@ -3398,20 +3991,17 @@ async function renderMiniChart() {
       },
     },
     timeScale: {
-      borderColor: "rgba(34,46,64,0.5)",
+      borderColor: skin.timeScale.borderColor,
       timeVisible: true,
       secondsVisible: false,
-      tickMarkFormatter: (time) => {
-        const d = new Date(time * 1000);
-        return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
-      },
+      tickMarkFormatter: chartTickMarkLabel,
     },
     // Candle pane's right-axis scale: small top margin leaves a bit of
     // headroom for price labels. The candle pane's size (as a fraction of
     // total chart height) is controlled separately via panes[1].setHeight()
     // below — v5's pane API is what gives us separate right-axis regions
     // for price vs. volume labels.
-    rightPriceScale: { borderColor: "rgba(34,46,64,0.5)", scaleMargins: { top: 0.15, bottom: 0.10 } },
+    rightPriceScale: { borderColor: skin.rightPriceScale.borderColor, scaleMargins: { top: 0.15, bottom: 0.10 } },
     handleScroll: true,
     handleScale: true,
   });
@@ -3419,11 +4009,7 @@ async function renderMiniChart() {
   // Candle series → pane 0 (default main pane)
   miniChartSeries = miniChartInstance.addSeries(
     CandlestickSeries,
-    {
-      upColor: "#5EE6B4", downColor: "#F07A6C",
-      borderUpColor: "#5EE6B4", borderDownColor: "#F07A6C",
-      wickUpColor: "#5EE6B4", wickDownColor: "#F07A6C",
-    },
+    candleThemeOptions(),
     0,
   );
 
@@ -3450,11 +4036,49 @@ async function renderMiniChart() {
 
   // Mini chart pagination state (declared before the ResizeObserver so the
   // observer's closure can see the latest candle array on the first resize).
-  let miniPage = 0;
   let miniHasMore = false;
   let miniLoadingMore = false;
   let miniAllCandles = [];
   let miniAllVolumes = [];
+  // Theme change: re-skin this chart in place — chrome + candle colours via
+  // applyOptions, and the per-bar volume / synthetic-candle colours (baked
+  // into the data) by re-feeding it. Module-level so the mdx:theme
+  // subscriber can reach this closure's arrays; nulled when the chart goes.
+  miniChartReskin = () => {
+    if (!miniChartInstance) return;
+    miniChartInstance.applyOptions(chartThemeOptions());
+    if (miniChartSeries) miniChartSeries.applyOptions(candleThemeOptions());
+    reskinChartData({ candles: miniAllCandles, volumes: miniAllVolumes });
+    if (miniChartSeries && miniAllCandles.length) miniChartSeries.setData(miniAllCandles);
+    if (miniChartVolumeSeries && miniAllVolumes.length) miniChartVolumeSeries.setData(miniAllVolumes);
+  };
+
+  // Periodic refresh (refreshMiniChart, every 10 s): merge a fresh page 0 into
+  // the held pages — the open candle replaced, new candles appended, the older
+  // pages the user scrolled into kept (task 1793498836). Module-level like
+  // miniChartReskin, for the same reason: the arrays live in this closure. No
+  // re-anchor: the library keeps the bars on screen and follows a new bar
+  // only when the last bar is visible (timeScale.shiftVisibleRangeOnNewBar).
+  miniChartMerge = (resp, market, interval) => {
+    // A page for another market or interval (changed under the fetch) would
+    // splice foreign bars into this series and never be repaired; an empty
+    // page is not a merge.
+    if (!miniChartInstance || market !== marketAtCall || interval !== miniChartCandleInterval || !resp.candles.length) return;
+    const page = backendCandlesToChart(resp.candles, interval);
+    const merged = miniAllCandles.length ? mergeChartPage(miniAllCandles, miniAllVolumes, page) : null;
+    if (merged && merged.overlap > 0) {
+      miniAllCandles = merged.candles;
+      miniAllVolumes = merged.volumes;
+    } else {
+      // Nothing held, or no held time in the page (the series moved more than
+      // a page while no tick landed): start over from page 0.
+      miniAllCandles = page.candles;
+      miniAllVolumes = page.volumes;
+      miniHasMore = resp.hasMore;
+    }
+    if (miniChartSeries) miniChartSeries.setData(miniAllCandles);
+    if (miniChartVolumeSeries) miniChartVolumeSeries.setData(miniAllVolumes);
+  };
 
   // Resize observer — track both width and height so the chart fills its grid cell.
   // The first real layout can happen after chart creation (grid cell was 0×0
@@ -3475,22 +4099,28 @@ async function renderMiniChart() {
   });
   ro.observe(canvasEl);
 
-  // Scroll-to-load: fetch older candles when user drags near left edge
+  // Scroll-to-load: fetch older candles when user drags near left edge. The
+  // page is derived from the hold (nextOlderCandlePage) and merged, not
+  // prepended — see mergeChartPage. The chart's own range changes (a
+  // re-anchor, its scroll animation) are not a pan — see armChartReanchor.
   miniChartInstance.timeScale().subscribeVisibleLogicalRangeChange((range) => {
     if (!range || !miniHasMore || miniLoadingMore) return;
+    if (chartReanchorSettling(miniChartInstance)) return;
     if (range.from < 5) {
       miniLoadingMore = true;
-      miniPage += 1;
-      src.getCandles(selectedMarket, miniChartCandleInterval, miniPage).then((resp) => {
+      const interval = miniChartCandleInterval;
+      src.getCandles(selectedMarket, interval, nextOlderCandlePage(miniAllCandles)).then((resp) => {
+        if (interval !== miniChartCandleInterval) return; // changed under the fetch: the page is the old interval's
         miniHasMore = resp.hasMore;
         if (resp.candles.length) {
-          const older = backendCandlesToChart(resp.candles, miniChartCandleInterval);
-          miniAllCandles = [...older.candles, ...miniAllCandles];
-          miniAllVolumes = [...older.volumes, ...miniAllVolumes];
+          const older = backendCandlesToChart(resp.candles, interval);
+          const merged = mergeChartPage(miniAllCandles, miniAllVolumes, older);
+          miniAllCandles = merged.candles;
+          miniAllVolumes = merged.volumes;
           if (miniChartSeries) miniChartSeries.setData(miniAllCandles);
           if (miniChartVolumeSeries) miniChartVolumeSeries.setData(miniAllVolumes);
         }
-      }).catch(() => { miniPage -= 1; }).finally(() => { miniLoadingMore = false; });
+      }).catch(() => { /* the next pan past the edge retries */ }).finally(() => { miniLoadingMore = false; });
     }
   });
 
@@ -3500,7 +4130,6 @@ async function renderMiniChart() {
       miniChartCandleInterval = Number(btn.dataset.ms);
       container.querySelectorAll(".mini-chart-iv").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      miniPage = 0;
       miniHasMore = false;
       try {
         const resp = await src.getCandles(selectedMarket, miniChartCandleInterval, 0);
@@ -3508,25 +4137,44 @@ async function renderMiniChart() {
         const conv = backendCandlesToChart(resp.candles, miniChartCandleInterval);
         miniAllCandles = conv.candles;
         miniAllVolumes = conv.volumes;
-        if (miniChartSeries) { miniChartSeries.setData(miniAllCandles); showLastCandles(miniChartInstance, miniAllCandles.length); }
+        if (miniChartSeries) {
+          // The replaced series fires a range event of its own, synchronously,
+          // before the re-anchor — arm the lazy-load gate ahead of it.
+          armChartReanchor(miniChartInstance);
+          miniChartSeries.setData(miniAllCandles);
+          showLastCandles(miniChartInstance, miniAllCandles.length);
+        }
         if (miniChartVolumeSeries) miniChartVolumeSeries.setData(miniAllVolumes);
       } catch (e) { console.warn("Failed to change mini chart interval:", e); }
     });
   });
 
-  // View dropdown: chart | liquidations | hide
+  // View menu: chart | liquidations | hide — a menu button on the shared
+  // dropdown helper: chartViewMenu's setter keeps the wrapper's .open and the
+  // trigger's aria-expanded together (the outside-click closer walks it with
+  // the page's other dropdowns), wireMenuButton carries the keys — Enter /
+  // Space / ArrowDown open onto the first item, ArrowUp onto the last, the
+  // arrows move with wrap, Home / End jump, Enter / Space activate, Escape
+  // closes back to the trigger, Tab closes and moves on — and the mouse paths
+  // (the trigger toggles, an item activates, a click elsewhere closes). The
+  // cell is rebuilt on every render, so the wiring is re-attached here to the
+  // fresh trigger and menu (the dropdown itself is minted once and resolves
+  // them by id). Activation rebuilds the item list (applyChartView), so focus
+  // always goes back to the trigger: the item that had it is gone.
   applyChartView(container);
-  const viewEl = container.querySelector("#mini-chart-view");
-  viewEl.addEventListener("click", (e) => {
-    const item = e.target.closest(".mcv-item");
-    if (item) {
-      setChartView(item.dataset.view);
-      viewEl.classList.remove("open");
-      e.stopPropagation();
-      return;
-    }
-    viewEl.classList.toggle("open");
-    e.stopPropagation();
+  wireMenuButton(chartViewMenu, {
+    menu: container.querySelector("#mcv-menu"),
+    itemSelector: ".mcv-item",
+    onActivate: (item) => setChartView(item.dataset.view),
+  });
+
+  // Expand → the full-size overlay, at the interval this cell is showing (so
+  // "bigger" means the same chart). The market header's #chart-btn that used
+  // to own openChart had been display:none since the initial commit — the
+  // overlay was unreachable at every width (1793498839).
+  container.querySelector(".mini-chart-expand").addEventListener("click", () => {
+    chartInterval = miniChartCandleInterval;
+    openChart();
   });
 
   // Now fetch data asynchronously and draw when ready
@@ -3538,6 +4186,10 @@ async function renderMiniChart() {
     miniAllCandles = conv.candles;
     miniAllVolumes = conv.volumes;
     if (miniChartSeries && miniAllCandles.length) {
+      // The first setData fires a range event of its own, synchronously, at
+      // the default bar spacing (6 px: `from` is below 5 on any chart wider
+      // than 600 px) — arm the lazy-load gate ahead of it.
+      armChartReanchor(miniChartInstance);
       miniChartSeries.setData(miniAllCandles);
       showLastCandles(miniChartInstance, miniAllCandles.length);
     }
@@ -3550,19 +4202,17 @@ async function renderMiniChart() {
 }
 
 async function refreshMiniChart() {
-  if (!miniChartInstance || !miniChartSeries || !selectedMarket) return;
+  if (!miniChartInstance || !miniChartSeries || !miniChartMerge || !selectedMarket) return;
   const src = appState.actor || appState.publicActor;
   if (!src) return;
+  const market = selectedMarket;
+  const interval = miniChartCandleInterval;
   try {
-    // Only refresh the latest page — don't reset scroll position
-    const resp = await src.getCandles(selectedMarket, miniChartCandleInterval, 0);
-    const conv = backendCandlesToChart(resp.candles, miniChartCandleInterval);
-    if (conv.candles.length && miniChartSeries) {
-      miniChartSeries.setData(conv.candles);
-    }
-    if (conv.volumes.length && miniChartVolumeSeries) {
-      miniChartVolumeSeries.setData(conv.volumes);
-    }
+    // Page 0 only, handed to the chart's own merge (renderMiniChart's
+    // miniChartMerge) — never fed to the series wholesale: that threw away
+    // every older page the user had scrolled into (task 1793498836).
+    const resp = await src.getCandles(market, interval, 0);
+    if (miniChartMerge) miniChartMerge(resp, market, interval);
   } catch (e) { /* ignore */ }
 }
 
@@ -3571,6 +4221,8 @@ function destroyMiniChart() {
   if (miniChartInstance) {
     miniChartInstance.remove();
     miniChartInstance = null;
+    miniChartReskin = null;
+    miniChartMerge = null;
     miniChartSeries = null;
     miniChartVolumeSeries = null;
   }
@@ -3795,7 +4447,7 @@ async function refreshStatusTab() {
     bannerEl.style.display = "";
     bannerEl.className = "access-shed-banner " + (affected ? "shed-affected" : "shed-safe");
     bannerEl.textContent = affected
-      ? `⚠ The exchange is under heavy load and your rank is temporarily shed at the gate — orders will be refused until load drops. Queries still work.`
+      ? `⚠ The exchange is under heavy load and your rank is temporarily shed at the gate — new orders will be refused until load drops; cancels, closes and withdrawals are still admitted at any load, and queries still work.`
       : `The exchange is under load (rank floor ${floor}) — your level keeps full access.`;
   } else { bannerEl.style.display = "none"; }
 
@@ -3950,10 +4602,13 @@ function applyChartView(container) {
   const current = CHART_VIEWS.find((v) => v.id === _chartView) || CHART_VIEWS[0];
   if (label) label.textContent = current.state || current.label;
   if (menu) {
-    menu.innerHTML = CHART_VIEWS
+    // Through setMenuItems: a rebuild under the keyboard keeps the item (the
+    // activated one is gone from the list, so wireMenuButton's close returns
+    // focus to the trigger anyway).
+    setMenuItems(menu, CHART_VIEWS
       .filter((v) => v.id !== _chartView && !(_chartView === "hidden" && v.id === "hidden"))
-      .map((v) => `<div class="mcv-item" data-view="${v.id}">${escH(v.label)}</div>`)
-      .join("");
+      .map((v) => `<button type="button" class="mcv-item" role="menuitem" tabindex="-1" data-view="${v.id}">${escH(v.label)}</button>`)
+      .join(""), "view");
   }
   // The chart only lays out correctly when its cell is actually visible.
   if (_chartView === "chart" && miniChartInstance) {
@@ -3969,6 +4624,186 @@ function setChartView(view) {
   _chartView = view;
   try { localStorage.setItem("mdx.chartView", view); } catch { /* private mode */ }
   applyChartView();
+}
+
+// ── Dropdowns: one open-state setter each, the shared menu-button keys ──────
+// The page's dropdowns — the chart cell's view menu (1793503737), the order
+// book's price-grouping menus (Markets and Swap), the market selector, the
+// price/stats popup (mobile and the compact desktop header), the desktop
+// header's overflow popup (1793506246), the signed-in user menu and the
+// select replacement under Wallet / Swap / Earn (enhanceSelectDropdown) — all
+// run on this one helper (1793509280 moved the view menu and the user menu
+// onto it; 1793511304 the user menu's keys and the select replacement). Most
+// were divs with click handlers: no tab stop, no role, no keys, so none of
+// them could be worked from the keyboard.
+//
+// Each dropdown's open state lives in two places that must agree — the
+// wrapper's .open class (the stylesheet shows the popup off it) and the
+// trigger's aria-expanded — so each gets ONE setter, minted by makeDropdown,
+// that its own handlers, the outside-click closer (setupEventListeners) and
+// selectMarket's close-all use alike; DROPDOWNS is what the closer walks.
+// Wrapper and trigger are resolved per call because they can move: the chart
+// cell is rebuilt on every renderMiniChart, and the overflow trigger is
+// whichever cell updateMarketHeaderMode last tagged .market-stat-more, with
+// the popup and its button re-parented with it.
+const DROPDOWNS = [];
+function makeDropdown({ wrap, trigger, onOpen }) {
+  const wrapEl = () => (typeof wrap === "function" ? wrap() : wrap);
+  const triggerEl = () => (typeof trigger === "function" ? trigger() : trigger);
+  const isOpen = () => !!wrapEl()?.classList.contains("open");
+  const setOpen = (open) => {
+    const w = wrapEl();
+    const on = !!(open && w);
+    // Written only on a change: the layout pass (updateMarketHeaderMode)
+    // closes through here on every tele poll, selectMarket's close-all on
+    // every market switch, and a same-value rewrite is still a DOM mutation
+    // (an attributes record per setAttribute; a same-value classList.toggle
+    // re-serialises the class attribute too).
+    if (on !== isOpen()) w?.classList.toggle("open", on);
+    const t = triggerEl();
+    if (t && t.getAttribute("aria-expanded") !== (on ? "true" : "false")) t.setAttribute("aria-expanded", on ? "true" : "false");
+    // After the class flip, so the popup has its box: placeGranMenu resets
+    // the menu's scroll position, which a display:none element cannot take
+    // (the styles it sets need no box, and nothing paints between the two).
+    if (on && onOpen) onOpen(w);
+  };
+  const d = { wrapEl, triggerEl, isOpen, setOpen };
+  DROPDOWNS.push(d);
+  return d;
+}
+
+// The granularity menus are position:fixed (the book panel scrolls and would
+// clip them — orderbook.css), parked above their trigger as they open — and
+// opened scrolled to the top: the browser keeps a scroller's offset across
+// the display flip, so a list the keyboard had walked to its end (End /
+// ArrowUp) would otherwise re-open showing its bottom instead of Exact.
+function placeGranMenu(menuId, triggerId) {
+  const menu = document.getElementById(menuId);
+  const rect = document.getElementById(triggerId)?.getBoundingClientRect();
+  if (!menu || !rect) return;
+  menu.style.left = rect.left + "px";
+  menu.style.bottom = (window.innerHeight - rect.top + 4) + "px";
+  menu.scrollTop = 0;
+}
+
+const obGranMenu = makeDropdown({
+  wrap: () => document.getElementById("ob-granularity"),
+  trigger: () => document.getElementById("ob-gran-trigger"),
+  onOpen: () => placeGranMenu("ob-gran-menu", "ob-gran-trigger"),
+});
+const swapObGranMenu = makeDropdown({
+  wrap: () => document.getElementById("swap-ob-granularity"),
+  trigger: () => document.getElementById("swap-ob-gran-trigger"),
+  onOpen: () => placeGranMenu("swap-ob-gran-menu", "swap-ob-gran-trigger"),
+});
+const marketSelectorMenu = makeDropdown({
+  wrap: () => document.getElementById("market-selector"),
+  trigger: () => document.getElementById("market-selector-trigger"),
+});
+const marketStatsPopup = makeDropdown({
+  wrap: () => document.getElementById("market-stats-toggle"),
+  trigger: () => document.getElementById("market-stats-trigger"),
+});
+const marketStatMorePopup = makeDropdown({
+  wrap: () => document.querySelector(".market-stat-more"),
+  trigger: () => document.getElementById("market-stats-more"),
+});
+// The chart cell's view menu (renderMiniChart rebuilds the cell, so the
+// wrapper and trigger are looked up on every call) and the signed-in user
+// menu (header.css shows it off .header.authed; a menu button over the
+// Account shortcuts and Sign out — wireMenuButton in setupEventListeners —
+// and renderProfileChip's sign-out path closes it through closeUserMenu).
+const chartViewMenu = makeDropdown({
+  wrap: () => document.getElementById("mini-chart-view"),
+  trigger: () => document.getElementById("mcv-trigger"),
+});
+const userMenu = makeDropdown({
+  wrap: () => document.getElementById("user-menu"),
+  trigger: () => document.getElementById("user-menu-trigger"),
+});
+
+// The menu-button keyboard contract (the WAI-ARIA pattern), for a dropdown
+// whose popup is a list of choices. The trigger is the one tab stop: Enter,
+// Space and ArrowDown open the menu onto its first item, ArrowUp onto its
+// last; inside, the arrows move with wrap, Home / End jump, Enter / Space
+// activate (the items are real buttons, so that is their click), Escape
+// closes back to the trigger and stops there, Tab closes and moves on
+// (Shift+Tab stops on the trigger). Activation returns focus to the trigger:
+// the pollers rebuild the items. Mouse paths are what they were: the trigger
+// toggles, an item activates, a click elsewhere closes (the shared closer —
+// the trigger's click is let bubble to it, so a menu open elsewhere closes).
+function wireMenuButton(d, { menu, itemSelector, onActivate }) {
+  const trigger = d.triggerEl();
+  if (!trigger || !menu) return;
+  const items = () => Array.from(menu.querySelectorAll(itemSelector));
+  const open = (focusIndex) => {
+    d.setOpen(true);
+    if (focusIndex === undefined) return;
+    const list = items();
+    if (list.length) list[(focusIndex + list.length) % list.length].focus();
+  };
+  const close = (refocus) => {
+    d.setOpen(false);
+    if (refocus) trigger.focus();
+  };
+  trigger.addEventListener("click", (e) => {
+    if (d.isOpen()) close(false);
+    // A click synthesised by assistive tech (detail 0) lands on the first
+    // item like the keys do; a pointer click just opens.
+    else open(e.detail === 0 ? 0 : undefined);
+  });
+  trigger.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") { e.preventDefault(); open(0); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); open(-1); }
+    else if (e.key === "Escape" && d.isOpen()) { e.preventDefault(); e.stopPropagation(); close(true); }
+  });
+  menu.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const item = e.target.closest(itemSelector);
+    if (!item) return;
+    onActivate(item);
+    close(true);
+  });
+  menu.addEventListener("keydown", (e) => {
+    const list = items();
+    const at = list.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); list[(at + 1) % list.length]?.focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); list[(at - 1 + list.length) % list.length]?.focus(); }
+    else if (e.key === "Home") { e.preventDefault(); list[0]?.focus(); }
+    else if (e.key === "End") { e.preventDefault(); list[list.length - 1]?.focus(); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(true); }
+    else if (e.key === "Tab") { close(true); if (e.shiftKey) e.preventDefault(); }
+  });
+}
+
+// A disclosure, for a popup that is rows to read with nothing to pick (the
+// price/stats popups): the trigger's own click toggles through the setter,
+// Escape closes. The listeners sit on the trigger element itself, so the
+// overflow trigger keeps them as updateMarketHeaderMode moves it.
+function wireDisclosure(d) {
+  const trigger = d.triggerEl();
+  if (!trigger) return;
+  trigger.addEventListener("click", () => d.setOpen(!d.isOpen()));
+  trigger.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && d.isOpen()) { e.preventDefault(); e.stopPropagation(); d.setOpen(false); }
+  });
+}
+
+// Rebuild a menu's items under the keyboard. The lists these menus show are
+// rebuilt by the polls (the order book's every render, the market list's
+// every refreshMarkets), and replacing a focused item drops focus to the
+// body mid-arrow-walk; the item that had focus is found again by its data
+// key (the same choice), else by position.
+function setMenuItems(container, html, key) {
+  const active = document.activeElement;
+  const had = active !== container && container.contains(active) ? active : null;
+  const list = () => Array.from(container.querySelectorAll('[role="menuitem"]'));
+  const want = had ? had.dataset[key] : null;
+  const at = had ? list().indexOf(had) : -1;
+  container.innerHTML = html;
+  if (!had) return;
+  const items = list();
+  (items.find((it) => it.dataset[key] === want) || items[Math.min(at, items.length - 1)])?.focus();
 }
 
 // ── Liquidation heat surface ─────────────────────────────────────────
@@ -4016,29 +4851,45 @@ async function refreshHeatmap(marketId) {
 }
 
 // The thermal ramp. Cold cells sleep near the page background so empty price
-// space stays dark; the hot end runs blue → cyan → green → yellow → red →
-// white-hot, the palette every liquidation map trains traders on.
-const HEAT_STOPS = [
-  [0.00,  15,  23,  42],
-  [0.16,  29,  78, 156],
-  [0.34,   6, 148, 186],
-  [0.52,  34, 197,  94],
-  [0.70, 234, 179,   8],
-  [0.85, 249, 115,  22],
-  [0.94, 239,  68,  68],
-  [1.00, 254, 228, 220],
-];
-function heatColor(t) {
+// space stays quiet; the hot end runs blue → cyan → green → yellow → red →
+// white-hot on the dark theme (the palette every liquidation map trains
+// traders on) and inverts its ends on the light one (hot burns to a dark
+// ember on a white field). Only the STOP POSITIONS live here — the colours
+// are the --heat-0…7 tokens in base.css, one set per theme, read at draw
+// time so a theme change repaints with the right ramp; margin-ui.css's
+// .hm2-scale-bar is the same eight stops as the legend strip.
+const HEAT_STOP_T = [0.00, 0.16, 0.34, 0.52, 0.70, 0.85, 0.94, 1.00];
+// "#rrggbb" | "#rgb" | "rgb(a)(r, g, b[, a])" → [r, g, b]; null when unparsable.
+function parseCssRgb(str) {
+  const v = String(str || "").trim();
+  let m = /^#([0-9a-f]{6})$/i.exec(v);
+  if (m) return [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16), parseInt(m[1].slice(4, 6), 16)];
+  m = /^#([0-9a-f]{3})$/i.exec(v);
+  if (m) return m[1].split("").map((c) => parseInt(c + c, 16));
+  m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(v);
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+  return null;
+}
+function heatStops() {
+  let last = [0, 0, 0];
+  return HEAT_STOP_T.map((t, i) => {
+    const rgb = parseCssRgb(themeToken(`--heat-${i}`)) || last;   // a missing token repeats its predecessor
+    last = rgb;
+    return [t, ...rgb];
+  });
+}
+function heatColor(t, stops) {
   const x = Math.max(0, Math.min(1, t));
-  for (let i = 1; i < HEAT_STOPS.length; i++) {
-    if (x <= HEAT_STOPS[i][0]) {
-      const [t0, r0, g0, b0] = HEAT_STOPS[i - 1];
-      const [t1, r1, g1, b1] = HEAT_STOPS[i];
+  for (let i = 1; i < stops.length; i++) {
+    if (x <= stops[i][0]) {
+      const [t0, r0, g0, b0] = stops[i - 1];
+      const [t1, r1, g1, b1] = stops[i];
       const f = (x - t0) / (t1 - t0 || 1);
       return `rgb(${Math.round(r0 + (r1 - r0) * f)},${Math.round(g0 + (g1 - g0) * f)},${Math.round(b0 + (b1 - b0) * f)})`;
     }
   }
-  return "rgb(254,228,220)";
+  const [, r, g, b] = stops[stops.length - 1];
+  return `rgb(${r},${g},${b})`;
 }
 
 // Paint the surface into the Markets chart cell (its only home — the map is
@@ -4093,8 +4944,10 @@ function drawHeatSurface(mount, cols) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
 
-  const css = getComputedStyle(document.documentElement);
-  const cMuted = (css.getPropertyValue("--text-muted") || "#64748b").trim();
+  // Theme tokens, read per draw: the ramp, the axis ink, the gridlines.
+  const cMuted = themeToken("--text-muted");
+  const cGrid = themeToken("--heat-grid", cMuted);
+  const stops = heatStops();
   const AXIS_R = 56, AXIS_B = 16;
   const plotW = W - AXIS_R, plotH = H - AXIS_B;
 
@@ -4185,7 +5038,7 @@ function drawHeatSurface(mount, cols) {
   for (let k = 0; k <= ticks; k++) {
     const p = pMin + ((pMax - pMin) * k) / ticks;
     const y = yOf(p);
-    ctx.fillStyle = "rgba(148,163,184,0.07)";
+    ctx.fillStyle = cGrid;
     ctx.fillRect(0, y, plotW, 1);
     ctx.fillStyle = cMuted;
     ctx.textAlign = "left";
@@ -4203,7 +5056,7 @@ function drawHeatSurface(mount, cols) {
       const yBot = yOf(m * (1 + Number(b.bandLowBps) / 10000));
       const h = Math.max(yBot - yTop, 1);
       const isAgg = isAggregate(b);
-      ctx.fillStyle = heatColor(tOf(densityOf(b), isAgg));
+      ctx.fillStyle = heatColor(tOf(densityOf(b), isAgg), stops);
       if (isAgg) {
         // Sub-k side: real magnitude, unresolved placement. Fade it out
         // towards the mark so it reads as "somewhere out there" rather than
@@ -4211,8 +5064,8 @@ function drawHeatSurface(mount, cols) {
         // (Sharp bands are earned once k positions cluster.)
         const towardMark = Number(b.bandHighBps) <= 0 ? yTop : yBot;  // mark-side edge
         const g = ctx.createLinearGradient(0, towardMark, 0, towardMark === yTop ? yBot : yTop);
-        g.addColorStop(0, heatColor(tOf(densityOf(b), true)));
-        g.addColorStop(1, "rgba(0,0,0,0)");
+        g.addColorStop(0, heatColor(tOf(densityOf(b), true), stops));
+        g.addColorStop(1, "transparent");
         ctx.fillStyle = g;
       }
       // +0.6 overdraw kills the hairline seams between columns.
@@ -4229,9 +5082,9 @@ function drawHeatSurface(mount, cols) {
     const x = xOf(i) + colW / 2, y = yOf(m);
     if (started) ctx.lineTo(x, y); else { ctx.moveTo(x, y); started = true; }
   }
-  ctx.strokeStyle = "rgba(255,255,255,0.88)";
+  ctx.strokeStyle = themeToken("--heat-mark");
   ctx.lineWidth = 1.5;
-  ctx.shadowColor = "rgba(255,255,255,0.35)";
+  ctx.shadowColor = themeToken("--heat-mark-glow");
   ctx.shadowBlur = 4;
   ctx.stroke();
   ctx.shadowBlur = 0;
@@ -4239,7 +5092,7 @@ function drawHeatSurface(mount, cols) {
   const lastMark = Number(cols[cols.length - 1].markPrice);
   if (lastMark) {
     const y = Math.min(Math.max(yOf(lastMark), 7), plotH - 7);
-    ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.fillStyle = themeToken("--heat-mark");
     ctx.textAlign = "left";
     ctx.fillText("$" + formatNum(lastMark), plotW + 6, y);
   }
@@ -4365,33 +5218,272 @@ function renderMarginRisk(risk) {
     + (risk.truncated ? `<div class="margin-risk-note">Partial scan — more pools than the per-pass cap.</div>` : "");
 }
 
-// The loan-book haircut disclosure (#50.1). The "Value" tile is the LP's
-// slice of vault NAV, and NAV counts the loan book (what the vault has lent
-// to margin pools) as an asset — but withdrawLp pays IN KIND from what the
-// vault physically HOLDS, leaving the receivable behind for whoever stays
-// (see the PAID FROM HOLDINGS comment in main.mo). While utilisation is
-// non-zero the NAV figure is therefore an UPPER BOUND on what a withdrawal
-// returns today — reaching ~2× at the 0.50 borrow cap — so the
-// physically-backed figure is shown beside it rather than left for the
-// withdrawal receipt to reveal.
-function renderVaultHaircut(lpValue, risk) {
-  const el = document.getElementById("earn-vault-haircut");
-  if (!el) return;
-  // risk fields are pre-normalised by money.js (MONEY_KEYS) — do NOT divide;
-  // vaultUtilisationBps is not a money field and stays in bps.
-  const nav  = risk ? Number(risk.vaultValueUsd) : 0;
-  const debt = risk ? Number(risk.totalDebtUsd)  : 0;
-  if (!(lpValue > 0) || !(nav > 0) || !(debt > 0)) { el.style.display = "none"; return; }
-  const backedFrac = Math.max(0, 1 - debt / nav);          // physical holdings / NAV
-  const utilPct = Number(risk.vaultUtilisationBps) / 100;  // % of the borrow cap
-  el.style.display = "";
-  el.textContent =
-    `Value marks your slice of vault NAV, which counts $${formatNum(debt)} lent to margin pools as an asset. `
-    + `Withdrawals pay in kind from what the vault physically holds — redeemable today ≈ $${formatNum(lpValue * backedFrac)} `
-    + `(loan book at ${utilPct.toFixed(1)}% of the borrow cap), before the 0.4% exit fee.`;
+// The instant-liquidity disclosure (task 1788465539; replaces the #50.1
+// haircut note). Every LP share redeems at NAV — held basket + loan book −
+// arrears, per share, exactly what the "Value" tile marks — minus the 0.4%
+// exit fee, paid IN KIND from what the vault physically HOLDS. A loan cannot
+// be handed out, so the most an LP can take NOW is their pro-rata share of
+// the held basket; the rest of their value is their share of the loan book
+// and becomes withdrawable as margin loans repay (those shares keep earning
+// meanwhile). The tiles say exactly that — "withdrawable now / total" and how
+// much of the vault is lent out — and the deposit-side note says what a NEW
+// deposit would be instantly withdrawable, BEFORE it is made: a deposit's
+// cash joins the pool's shared liquidity (F6, informed consent).
+// Locked shares (task 1788727875, model 1788475756 — docs/amm-vault-design.md
+// §5 "Locked shares"): a withdrawal locks the exiter's RETAINED shares so they
+// cannot re-claim the stayers' cash; locked shares carry loan-book value only
+// and unlock as the vault's margin loans repay (a partial repayment unlocks
+// them pro rata, a full one clears every lock). After a max exit the LP reads
+// "withdrawable now $0 / $N" — the note says WHY (their N locked of M shares)
+// and the withdraw placeholder carries the locked count. Both figures are the
+// quote's own `lockedLp` / `lpBalance` — never derived client-side.
+// The withdraw submit gate (task 1788515292). getMaxInstantWithdraw's
+// withdrawalPaused is the exact "LP withdrawal paused: …" refusal withdrawLp
+// would return right now (1788513125), null otherwise. While it is set the
+// submit is disabled with that text as its tooltip — the refusal shown BEFORE
+// the click, not after it — and it goes live again on the next quote where
+// the field is null. The gate latches what it disabled (data-paused) and
+// re-enables ONLY its own gate, so anything else that may one day toggle the
+// button's `disabled` composes with it instead of fighting it. Today nothing
+// else does: onVaultWithdraw validates the amount on click (showEarnHint), and
+// the one-tap Max beside the field has a writer of its own (applyWithdrawMax,
+// below) that reads the same `paused` and never touches the submit.
+function applyWithdrawPause(btn, paused) {
+  if (!btn) return;
+  if (paused) {
+    btn.disabled = true;
+    btn.title = paused;
+    btn.dataset.paused = "1";
+  } else if (btn.dataset.paused) {
+    btn.disabled = false;
+    btn.title = "";
+    delete btn.dataset.paused;
+  }
 }
 
+// THE CAP DRIFTS; "MAX NOW" UNDER-ASKS (task 1788746837, operator policy (a),
+// 2026-11-01). getMaxInstantWithdraw's withdrawableNowLp is exact at the
+// instant it is quoted — lpBal × H / NAV over unlocked shares — and the
+// settlement check is the SAME inequality, exact: nothing is clamped or queued
+// (operator decision 2026-09-03). But a withdrawal is staged and settles at the
+// next fresh mark, and NAV carries the loan book, which ACCRUES (every pool
+// interaction, the 30 s sweep, and — since task 1788736589 — every mark update
+// and heartbeat beat), while every mark move re-prices H and NAV besides. So a
+// request for EXACTLY the quote is refused — "Withdrawal exceeds your instant
+// liquidity … Withdrawable now: …", naming a cap a few base units under what
+// was typed — whenever any of those lands between the quote and the
+// settlement: on a live feed, a few seconds out of every thirty. The backend
+// stays exact (no tolerance, no clamp, no new reply shape); the card asks for a
+// hair LESS: the quote × (1 − LP_WITHDRAW_DRIFT_ALLOWANCE), floored to the LP
+// base unit (10^-8), so the figure the box suggests is one that settles.
+// 0.01 % is ≈ 22 days of 5 % interest on test_vault_lp §7's $135k book against
+// the seconds the race spans, and $10 on a $100k position — which stays the
+// LP's to take later (their shares, their cap). The one constant below is the
+// whole policy; the card names it beside the figure. Pinned in
+// tests/frontend_display_integrity.test.mjs (G3c, M2c); the suite's own "max
+// exit" fixtures ask the same way (tests/test_vault_lp.sh `underask`).
+const LP_WITHDRAW_DRIFT_ALLOWANCE = 1e-4;   // 0.01 % — ONE named constant (1e-6 granularity in the fill below)
+
+// The Earn card's "max now": the quote less the drift allowance, floored to the
+// LP base unit — exact in base units (toE8 scales the whole units in BigInt;
+// the ratio is a bigint divide, which truncates), so the fill sits on the LP
+// grid, is strictly under the quote for every positive quote, and is 0 for no
+// quote. EVERY path that writes the quote into the withdraw field goes through
+// here (today: the placeholder, from renderVaultLiquidity, and the one-tap Max
+// button, from onVaultWithdrawMax — task 1793553361).
+function lpWithdrawMaxFill(nowLp) {
+  const n = Number(nowLp);
+  if (!(n > 0)) return 0;
+  const units   = toE8(n);                                                                       // LP base units, exact
+  const keepPpm = 1_000_000n - BigInt(Math.round(LP_WITHDRAW_DRIFT_ALLOWANCE * 1_000_000));   // 999_900 per 1_000_000
+  return fromE8(units * keepPpm / 1_000_000n);                                                 // floor to the base unit
+}
+
+// The one-tap "Max" beside the withdraw field (task 1793553361). Before it the
+// PLACEHOLDER was the whole Max control: the user read "max now 84,991.49 …"
+// and retyped it — commas and all, into a number input that rejects them. This
+// is the ONE writer of the button's disabled/title and of the quote it fills
+// from: the LATEST quote's withdrawableNowLp (exact, as the backend sent it) is
+// stashed on the field (data-max-now-lp) while its fill is positive and dropped
+// otherwise, and onVaultWithdrawMax applies lpWithdrawMaxFill to it AT THE TAP
+// — so the figure filled is the placeholder's, through the one helper, never a
+// client-side re-derivation from NAV or the cap (G3's rule). Disabled while
+// there is nothing to fill (a cap of 0 — a max exit, no position — or no quote
+// yet) and while the submit is paused: it reads the same `paused` the latch
+// above reads, so the two buttons agree, and it never writes the submit's own
+// `disabled` (applyWithdrawPause stays its one writer).
+function applyWithdrawMax(wIn, mBtn, nowLp, paused) {
+  const fill = lpWithdrawMaxFill(nowLp);
+  if (wIn) {
+    if (fill > 0) wIn.dataset.maxNowLp = String(nowLp);
+    else delete wIn.dataset.maxNowLp;
+  }
+  if (!mBtn) return;
+  mBtn.disabled = !(fill > 0) || !!paused;
+  mBtn.title = paused ? paused
+    : (fill > 0 ? `Fill the field with ${formatNum(fill)} LP — your instant maximum less the drift allowance` : "Nothing is withdrawable right now");
+}
+
+function renderVaultLiquidity(liq) {
+  const el     = document.getElementById("earn-vault-liquidity");
+  const nowEl  = document.getElementById("earn-vault-now");
+  const lentEl = document.getElementById("earn-vault-lent");
+  const provEl = document.getElementById("earn-vault-provision");
+  const depEl  = document.getElementById("earn-vault-deposit-liquidity");
+  const wIn    = document.getElementById("earn-vault-withdraw-input");
+  const wBtn   = document.getElementById("earn-vault-withdraw-btn");
+  const mBtn   = document.getElementById("earn-vault-withdraw-max");
+  if (!liq) {
+    if (el) el.style.display = "none";
+    if (depEl) depEl.style.display = "none";
+    // No quote (older backend, failed query): no client-side gate — the
+    // server-side refusal still stands, and the button must never be left
+    // stuck disabled on a lost query. The Max button follows the same rule
+    // (task 1793553361): the last quote's stash stays fillable — the
+    // placeholder keeps its last figure too — with the pause dropped; it is
+    // disabled only while no quote has ever landed.
+    applyWithdrawPause(wBtn, null);
+    applyWithdrawMax(wIn, mBtn, Number(wIn?.dataset.maxNowLp || 0), null);
+    return;
+  }
+  // Pre-normalised by money.js (MONEY_KEYS) — do NOT divide. lentOutFraction
+  // crosses the boundary as a 0..1 FRACTION (the render owns the ×100, like
+  // sharePercent); exitFeeBps is not a money field and stays in bps.
+  const nowUsd    = Number(liq.withdrawableNowUsd);
+  const navUsd    = Number(liq.totalNavUsd);
+  const nowLp     = Number(liq.withdrawableNowLp);
+  const lentPct   = Number(liq.lentOutFraction) * 100;
+  const vaultHeld = Number(liq.vaultHoldingsUsd);
+  const vaultNav  = Number(liq.vaultNavUsd);
+  const vaultLent = Number(liq.vaultLentOutUsd);
+  const feePct    = Number(liq.exitFeeBps) / 100;            // bps → %
+  const keep      = 1 - Number(liq.exitFeeBps) / 10000;
+  // The caller's LOCKED shares and their total (task 1788727875): both from
+  // the quote — lockedLp is the backend's lock state (VaultLock.mo), never a
+  // client-side derivation; `?? 0` degrades an older backend to "no locks".
+  const lockedLp  = Number(liq.lockedLp ?? 0);
+  const myLp      = Number(liq.lpBalance ?? 0);
+  if (nowEl) nowEl.textContent = navUsd > 0 ? `$${formatNum(nowUsd)} / $${formatNum(navUsd)}` : "—";
+  if (lentEl) lentEl.textContent = `${lentPct.toFixed(1)}%`;
+  // The impairment reserve (task 1788475754): NAV already carries the loan
+  // book net of expected loss on under-water / near-liquidation pools beyond
+  // the insurance fund's first-loss. Show the vault-level reserve and the
+  // caller's share of it — the mark-down is disclosed, not hidden. "$0" is the
+  // honest reading on a healthy book (every pool at or above maintenance).
+  const provVault = Number(liq.vaultImpairmentReserveUsd ?? 0);
+  const provMine  = Number(liq.provisionedLossUsd ?? 0);
+  if (provEl) {
+    provEl.textContent = provVault > 0
+      ? `$${formatNum(provVault)}${navUsd > 0 ? ` (yours $${formatNum(provMine)})` : ""}`
+      : "$0";
+    provEl.title = "Expected loss on under-water or near-liquidation margin loans, beyond the insurance fund's first-loss, already deducted from the vault's value. Releases as those loans repay or recover.";
+  }
+  // With locked shares the placeholder names both figures — "max now 0" after
+  // a max exit is the honest reading, and the locked count says where the
+  // rest is. "Max now" is the quote LESS the drift allowance (lpWithdrawMaxFill,
+  // task 1788746837) and says so: the figure the box suggests is one that
+  // settles; the tiles above keep the exact quote. The percent is derived from
+  // the constant, so text and arithmetic cannot drift apart.
+  const pct    = (LP_WITHDRAW_DRIFT_ALLOWANCE * 100).toFixed(2);   // "0.01"
+  const fillLp = lpWithdrawMaxFill(nowLp);
+  const maxNow = fillLp > 0 ? `max now ${formatNum(fillLp)} after a ${pct}% drift allowance` : "max now 0";
+  if (wIn) {
+    wIn.placeholder = lockedLp > 0
+      ? `LP to withdraw (${maxNow}; ${formatNum(lockedLp)} locked)`
+      : (nowLp > 0 ? `LP to withdraw (${maxNow})` : "LP to withdraw");
+    wIn.title = fillLp > 0
+      ? `Max now ${formatNum(fillLp)} LP is your instant maximum less a ${pct}% drift allowance, so the figure settles even if the vault re-prices between this quote and your request's settlement.`
+      : "";
+  }
+  // The redeem-side mark gate (task 1788513125): while a held leg's mark is
+  // pended / stale / missing and the loan book is non-zero, withdrawLp
+  // refuses — say so beside the figures AND on the submit itself (below),
+  // before the user submits.
+  const paused = Array.isArray(liq.withdrawalPaused) ? (liq.withdrawalPaused[0] ?? null) : null;
+  applyWithdrawPause(wBtn, paused);
+  // The one-tap Max (task 1793553361): the same quote, the same pause.
+  applyWithdrawMax(wIn, mBtn, nowLp, paused);
+  if (el) {
+    if (!(navUsd > 0)) { el.style.display = "none"; }
+    else {
+      el.style.display = "";
+      // The slice of the LP's value that is out on loan: NAV minus the gross
+      // (pre-fee) value of what is withdrawable now.
+      const lentMine = Math.max(0, navUsd - nowUsd / keep);
+      const pausedNote = paused ? `${paused}. ` : "";
+      // The caller's own locked position (task 1788727875): N of M shares,
+      // both the quote's figures, formatted like the LP tile.
+      const lockedNote = lockedLp > 0
+        ? ` ${formatNum(lockedLp)} of your ${formatNum(myLp)} LP shares are locked from your earlier withdrawal(s); they carry loan-book value only and unlock as the vault's margin loans repay (a partial repayment unlocks them pro rata).`
+        : "";
+      // The allowance, in the user's terms (task 1788746837): why the box's
+      // figure is a hair under the tile's. Before the locked sentence, which
+      // stays last.
+      const driftNote = fillLp > 0
+        ? ` The withdraw box's "max now" is your instant maximum less a ${pct}% drift allowance: the maximum moves by a hair as margin interest accrues and marks update between a quote and your request's settlement, so a request for exactly the quoted figure can be refused — the allowance is what lets the figure you type settle.`
+        : "";
+      el.textContent = pausedNote + (vaultLent > 0
+        ? `Every LP share redeems at full vault value (NAV) less the ${feePct.toFixed(1)}% exit fee, paid in kind from what the vault holds. `
+          + `$${formatNum(vaultLent)} of the vault (${lentPct.toFixed(1)}%) is lent to margin pools, so your instant maximum is your share of its holdings: `
+          + `$${formatNum(nowUsd)} now. The other $${formatNum(lentMine)} of your value is lent out and becomes withdrawable as those loans repay — your shares keep earning meanwhile.`
+        : `Every LP share redeems at full vault value (NAV) less the ${feePct.toFixed(1)}% exit fee, paid in kind from what the vault holds. Nothing is lent out right now, so your whole position is withdrawable.`)
+        + driftNote + lockedNote;
+    }
+  }
+  if (depEl) {
+    // Marginal deposit: its instantly-withdrawable fraction is holdings /
+    // (NAV − locked NAV) — only UNLOCKED shares share the cash; shares an
+    // earlier exiter left LOCKED carry loan-book value only (task 1788475756)
+    // — net of the exit fee; a deposit of V shifts it to (H + V) / (NAV −
+    // lockedNav + V).
+    const lockedNav = Number(liq.vaultLockedNavUsd ?? 0);
+    const unlockedNav = Math.max(0, vaultNav - lockedNav);
+    const frac = unlockedNav > 0 ? Math.min(1, vaultHeld / unlockedNav) * keep : keep;
+    depEl.style.display = "";
+    depEl.textContent = vaultLent > 0
+      ? `Before you deposit: a deposit made now is about ${(frac * 100).toFixed(1)}% instantly withdrawable (net of the exit fee). `
+        + `Its cash joins the pool's shared liquidity while ${lentPct.toFixed(1)}% of the vault is lent out; the rest becomes withdrawable as those loans repay.`
+      : `Before you deposit: nothing is lent out right now, so a deposit made now is fully withdrawable (net of the ${feePct.toFixed(1)}% exit fee).`;
+  }
+}
+
+// The quote-only re-poll (task 1788515292). The pause clears on a market-wide
+// price restamp, which bumps NO user version — pollChanges (2 s, version-
+// driven) would never re-render the Earn card for it, so a lifted pause would
+// sit on the button until the user's own version moved or they re-entered the
+// tab. So while the signed-in Earn pane is on screen, the slow ticker
+// (startAutoRefresh, 10 s) re-quotes getMaxInstantWithdraw and re-renders the
+// disclosure + the submit gate; a cleared pend re-enables within one tick. The
+// rest of the card stays version-driven. A failed re-quote keeps the last
+// render — never blanks the note, never flaps the gate.
+let _liqPollInFlight = false;
+async function refreshVaultLiquidity() {
+  if (!appState.actor || !appState.isAuthenticated || _liqPollInFlight) return;
+  if (currentTab !== "account" || acctTab !== "earn") return;
+  if (!appState.actor.getMaxInstantWithdraw) return;
+  _liqPollInFlight = true;
+  try {
+    const liq = await appState.actor.getMaxInstantWithdraw();
+    if (liq) renderVaultLiquidity(liq);
+  } catch (_) { /* keep the last render */ }
+  finally { _liqPollInFlight = false; }
+}
+
+// A render generation (task 1793560085). The card is re-rendered from several
+// places within a few seconds of an Earn action — onVaultDeposit's two
+// refreshAccountEarn() calls (after staging, after the outcome) and pollChanges
+// on every user-version bump (depositLp bumps at staging, recordLpOutcome at
+// settlement ~3 s later) — and a render whose eight answers PREDATE the
+// settlement can resolve AFTER the render whose answers postdate it, so the
+// older paint won (seen: LP 0.00 / $0.00 and a stale "Staged deposit #111" line
+// over a position minted 4 s earlier, until the tab was re-entered). Every
+// start takes a generation and a render paints only while it is still the
+// newest; a slower, earlier render bails after its queries. Starts are never
+// coalesced — a render started before a bump must never suppress the one
+// started after it. refreshVaultLiquidity (the quote only) keeps its own latch.
+let _earnRenderSeq = 0;
 async function renderEarnCard() {
+  const seq = ++_earnRenderSeq;
   // Split cards: AMM Vault + Insurance Fund (one renderer feeds both).
   const card = document.getElementById("earn-vault-card");
   const insCard = document.getElementById("earn-insurance-card");
@@ -4402,11 +5494,12 @@ async function renderEarnCard() {
     card.dataset.wired = "1";
     document.getElementById("earn-vault-deposit-btn")?.addEventListener("click", onVaultDeposit);
     document.getElementById("earn-vault-withdraw-btn")?.addEventListener("click", onVaultWithdraw);
+    document.getElementById("earn-vault-withdraw-max")?.addEventListener("click", onVaultWithdrawMax);   // the one-tap Max (task 1793553361)
     document.getElementById("earn-ins-stake-btn")?.addEventListener("click", onInsuranceStake);
     document.getElementById("earn-ins-unstake-btn")?.addEventListener("click", onInsuranceUnstake);
   }
   try {
-    const [pos, vault, stake, fund, weights, risk] = await Promise.all([
+    const [pos, vault, stake, fund, weights, risk, liq, staged] = await Promise.all([
       appState.actor.getMyVaultPosition(),
       appState.actor.getVaultValue(),
       appState.actor.getMyInsuranceStake(),
@@ -4415,8 +5508,14 @@ async function renderEarnCard() {
       // Never fail the whole card if this one query is unavailable (e.g. an
       // older backend that predates it).
       appState.actor.getMarginRiskSummary?.().catch(() => null) ?? null,
+      // Same degrade: the instant-liquidity quote is additive.
+      appState.actor.getMaxInstantWithdraw?.().catch(() => null) ?? null,
+      // Same degrade: the staged-request view (task 1788503312) is additive.
+      appState.actor.getMyStagedLpRequests?.().catch(() => null) ?? null,
     ]);
+    if (seq !== _earnRenderSeq) return;   // a newer render has started — its answers are fresher (task 1793560085)
     renderMarginRisk(risk);
+    renderVaultStaged(staged);
     // AMM vault
     const lp        = Number(pos.lpBalance);
     const lpValue   = Number(pos.estimatedValue);
@@ -4430,7 +5529,7 @@ async function renderEarnCard() {
     setText("earn-vault-value", "$" + formatNum(lpValue));
     setText("earn-vault-share", (shareFrac * 100).toFixed(2) + "%");
     setText("earn-vault-vplp", valuePerLP.toFixed(4));
-    renderVaultHaircut(lpValue, risk);
+    renderVaultLiquidity(liq);
     // Target-weight table: current vs target weight + live deposit bonus/fee.
     const wEl = document.getElementById("earn-vault-weights");
     if (wEl && Array.isArray(weights)) {
@@ -4455,6 +5554,14 @@ async function renderEarnCard() {
     const poolUsd   = Number(fund.bufferUsd);
     setText("earn-ins-shares", formatNum(shares));
     setText("earn-ins-value", "$" + formatNum(stakeVal));
+    // H-35: the unstake cooldown — unlockAtNs (ns since epoch; 0 = unlocked)
+    // is additive on getMyInsuranceStake, so an older backend simply omits it.
+    const unlockMs = Number(stake.unlockAtNs ?? 0) / 1e6;
+    const unlockTile = document.getElementById("earn-ins-unlock-tile");
+    if (unlockTile) unlockTile.style.display = (shares > 0 && unlockMs > Date.now()) ? "" : "none";
+    if (shares > 0 && unlockMs > Date.now()) {
+      setText("earn-ins-unlock", new Date(unlockMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+    }
     setText("earn-ins-sharevalue", shareVal.toFixed(4));
     setText("earn-ins-pool", "$" + formatNum(poolUsd));
     // Yield in flight — see the tile's comment in index.html.
@@ -4473,33 +5580,178 @@ async function renderEarnCard() {
 
 function setText(id, txt) { const el = document.getElementById(id); if (el) el.textContent = txt; }
 
+// Sealed LP requests (task 1788503312; docs/amm-vault-design.md §5): the
+// card STAGES a deposit / withdrawal — funds or shares reserved now — and
+// the backend settles it at the first NAV whose basket marks ALL postdate the
+// request (the rule staged orders release on, so a stale mark cannot be
+// sniped; the request itself arms the price fetch, so settlement is ~1-2 s
+// away). The call returns the staged request; the outcome (minted N LP /
+// redeemed / cancelled — a refusal at settlement, or the 5-min TTL backstop
+// when the feed stalls: fail-closed, refunded) lands in getMyStagedLpRequests'
+// `recent`, which this polls for a few seconds after staging. The window is
+// 12 s against a measured ~3 s settlement on a ticking venue (task 1793558036:
+// the deposit that "never settled" was a NaN request id — money.js's
+// wrapActor had collapsed the staged reply, fixed there); should the window
+// still close on a pending request, the hint it leaves is RESOLVED by the next
+// render of the staged view (settleStagedLpHint), never left behind.
+const STAGED_LP_POLL_MS = 1000, STAGED_LP_POLL_ROUNDS = 12;
+async function awaitStagedLp(id, verb) {
+  for (let i = 0; i < STAGED_LP_POLL_ROUNDS; i++) {
+    await new Promise((r) => setTimeout(r, STAGED_LP_POLL_MS));
+    let view = null;
+    try { view = await appState.actor.getMyStagedLpRequests(); } catch { return; }
+    const done = (view?.recent || []).find((o) => Number(o.id) === id);
+    if (done) { reportStagedLpOutcome(done, verb); renderVaultStaged(view); return; }
+    renderVaultStaged(view);
+  }
+  // Still pending when the window closed: the hint names the request it is
+  // about (showEarnHint's data-staged-lp-id marker) so the Earn refresh, the
+  // user-version poll settlement bumps, or the cancel re-poll reports the
+  // outcome and clears it. The refund clause stays — fail-closed.
+  showEarnHint(`Your ${verb} is still staged — it settles at the next fresh mark, and is cancelled and refunded automatically if none arrives within 5 minutes.`, id, verb);
+}
+// One report per outcome, for the poll and for the render that resolves a
+// lingering hint: the toast, and showEarnMsg hides the inline slot.
+function reportStagedLpOutcome(done, verb) {
+  const oc = done.outcome;
+  if ("minted" in oc) showEarnMsg(`Settled: minted ${formatNum(Number(oc.minted))} LP at the post-request NAV.`, "ok");
+  else if ("redeemed" in oc) showEarnMsg("Settled: redeemed at the post-request NAV for your basket share.", "ok");
+  else showEarnMsg(`Staged ${verb} cancelled: ${oc.cancelled}`, "err");
+}
+// A "still staged" hint resolves against every later staged view: its request
+// in `recent` → the settled / cancelled report (which drops the marker and
+// hides the slot); in neither list (evicted from the last-8 window, another
+// identity's view) → cleared silently; still pending → kept. No marker, or no
+// view (a failed query) → the slot is not touched.
+function settleStagedLpHint(view) {
+  const el = document.getElementById("earn-msg");
+  const raw = el?.dataset?.stagedLpId;
+  if (!raw || !view) return;
+  const id = Number(raw);
+  const verb = el.dataset.stagedLpVerb || "request";
+  const done = (view.recent || []).find((o) => Number(o.id) === id);
+  if (done) { reportStagedLpOutcome(done, verb); return; }
+  if ((view.pending || []).some((p) => Number(p.id) === id)) return;
+  delete el.dataset.stagedLpId;
+  delete el.dataset.stagedLpVerb;
+  el.style.display = "none";
+  el.textContent = "";
+}
+// The card's pending line: "staged — settles at the next fresh mark", naming
+// the markets a request is still waiting on, with a Cancel affordance per
+// request (task 1788731609). The cancel is under the staged-order commit
+// rule — refused for the request's first 3 s and while a post-request price
+// fetch is in flight for a market it waits on — and the backend publishes
+// that verdict on the view as `cancelRefusal` (opt text), so the button is
+// DISABLED with the exact refusal text while it holds and the UI never
+// re-derives the rule. A locked request unlocks within seconds, so a single
+// re-poll is armed whenever a refusal is showing.
+let stagedLpRepollTimer = null;
+function scheduleStagedLpRepoll() {
+  if (stagedLpRepollTimer) return;
+  stagedLpRepollTimer = setTimeout(async () => {
+    stagedLpRepollTimer = null;
+    if (!appState.actor) return;
+    try { renderVaultStaged(await appState.actor.getMyStagedLpRequests()); } catch { /* next Earn refresh re-renders */ }
+  }, 1500);
+}
+function renderVaultStaged(view) {
+  settleStagedLpHint(view);   // a lingering "still staged" hint resolves against this view first (task 1793558036)
+  const el = document.getElementById("earn-vault-staged");
+  if (!el) return;
+  const pending = view?.pending || [];
+  if (!pending.length) { el.style.display = "none"; el.textContent = ""; return; }
+  el.style.display = "";
+  el.textContent = "";
+  let locked = false;
+  for (const p of pending) {
+    const kind = "deposit" in p.kind ? "deposit" : "withdrawal";
+    const waiting = p.waitingOn.length ? ` (waiting on ${p.waitingOn.join(", ")})` : "";
+    // opt text decodes as [] | [text]; an older backend without the field decodes as undefined → cancellable
+    const refusal = Array.isArray(p.cancelRefusal) ? (p.cancelRefusal[0] ?? null) : null;
+    const line = document.createElement("div");
+    line.className = "earn-staged-line";
+    const txt = document.createElement("span");
+    txt.textContent = `Staged ${kind} #${p.id} — settles at the next fresh mark${waiting}. `;
+    line.appendChild(txt);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-secondary btn-sm earn-staged-cancel";
+    btn.dataset.stagedId = String(p.id);
+    btn.textContent = "Cancel";
+    btn.disabled = refusal !== null;
+    btn.title = refusal ?? "Withdraw this request: its reservation is released and nothing settles";
+    btn.addEventListener("click", () => onCancelStagedLp(Number(p.id), kind));
+    line.appendChild(btn);
+    if (refusal !== null) {
+      locked = true;
+      const why = document.createElement("span");
+      why.className = "earn-staged-refusal";
+      why.textContent = ` ${refusal}`;
+      line.appendChild(why);
+    }
+    el.appendChild(line);
+  }
+  if (locked) scheduleStagedLpRepoll();
+}
+async function onCancelStagedLp(id, kind) {
+  if (!appState.actor) return;
+  try {
+    const r = await appState.actor.cancelStagedLpRequest(id);
+    if ("ok" in r) showEarnMsg(`Staged ${kind} #${id} cancelled — reservation released, nothing settled.`, "ok");
+    else showEarnMsg(r.err, "err");
+  } catch (e) { showEarnMsg("Cancel failed: " + e, "err"); }
+  await refreshAccountEarn();
+}
+
 async function onVaultDeposit() {
   const input = document.getElementById("earn-vault-deposit-input");
   const token = document.getElementById("earn-vault-deposit-token")?.value || "ICPUSD";
   const amount = parseFloat(input?.value);
   if (!appState.actor || !(amount > 0)) { showEarnHint(`Enter a ${token} amount to deposit.`); return; }
+  let stagedId = null;
   try {
     // Unified vault. ICPUSD is the quote leg (any market); a base asset is
-    // the base leg of its own X-ICPUSD market.
+    // the base leg of its own X-ICPUSD market. Staged (task 1788503312; the
+    // door itself since apiVersion 6.0.0): the reply is the request, not the
+    // mint — awaitStagedLp reports that.
     const r = (token === "ICPUSD")
       ? await appState.actor.depositLp("BTC-ICPUSD", toE8(0), toE8(amount))
       : await appState.actor.depositLp(`${token}-ICPUSD`, toE8(amount), toE8(0));
-    if ("ok" in r) { showEarnMsg(`Deposited ${formatNum(amount)} ${token} — minted ${formatNum(Number(r.ok))} LP.`, "ok"); input.value = ""; }
+    if ("ok" in r) { showEarnMsg(`Deposit of ${formatNum(amount)} ${token} staged — settles at the next fresh mark.`, "ok"); input.value = ""; stagedId = Number(r.ok.id); }
     else { showEarnMsg(r.err, "err"); }
   } catch (e) { showEarnMsg("Deposit failed: " + e, "err"); }
   await refreshAccountEarn();
+  if (stagedId !== null) { await awaitStagedLp(stagedId, "deposit"); await refreshAccountEarn(); }
 }
 
 async function onVaultWithdraw() {
   const input = document.getElementById("earn-vault-withdraw-input");
   const lp = parseFloat(input?.value);
   if (!appState.actor || !(lp > 0)) { showEarnHint("Enter an LP amount to withdraw."); return; }
+  let stagedId = null;
   try {
-    const r = await appState.actor.withdrawLp(toE8(lp));
-    if ("ok" in r) { showEarnMsg(`Redeemed ${formatNum(lp)} LP for your basket share.`, "ok"); input.value = ""; }
+    const r = await appState.actor.withdrawLp(toE8(lp));   // staged since 6.0.0 — the reply is the request
+    if ("ok" in r) { showEarnMsg(`Withdrawal of ${formatNum(lp)} LP staged — settles at the next fresh mark.`, "ok"); input.value = ""; stagedId = Number(r.ok.id); }
     else { showEarnMsg(r.err, "err"); }
   } catch (e) { showEarnMsg("Withdraw failed: " + e, "err"); }
   await refreshAccountEarn();
+  if (stagedId !== null) { await awaitStagedLp(stagedId, "withdrawal"); await refreshAccountEarn(); }
+}
+
+// The one-tap "Max" (task 1793553361): fill the withdraw field with the
+// placeholder's "max now" figure — the LATEST quote, stashed on the field by
+// applyWithdrawMax, through lpWithdrawMaxFill at the tap (the quote less the
+// drift allowance, on the LP grid) — as a PLAIN number: never formatNum, whose
+// commas a number input rejects. Nothing is queried and nothing is derived
+// here; with no stash (no quote yet, a cap of 0, signed out) the button is
+// disabled and this fills nothing.
+function onVaultWithdrawMax() {
+  const wIn = document.getElementById("earn-vault-withdraw-input");
+  if (!wIn) return;
+  const nowLp = Number(wIn.dataset.maxNowLp || 0);
+  if (!(lpWithdrawMaxFill(nowLp) > 0)) return;
+  wIn.value = String(lpWithdrawMaxFill(nowLp));
 }
 
 async function onInsuranceStake() {
@@ -4538,13 +5790,21 @@ function showEarnMsg(text, kind) {
   const el = document.getElementById("earn-msg");
   if (!el) return;
   el.style.display = "none";   // never leave a stale inline result behind
+  delete el.dataset.stagedLpId;   // nor a staged-hint marker for a hint the slot no longer shows (task 1793558036)
+  delete el.dataset.stagedLpVerb;
 }
-function showEarnHint(text) {
+// `stagedLpId` / `verb` (task 1793558036): the staged request a "still staged"
+// hint is about — awaitStagedLp's marker, read back by settleStagedLpHint on
+// the next render of the staged view. Any other hint drops the marker: the
+// slot then says something else and there is no lingering hint to resolve.
+function showEarnHint(text, stagedLpId = null, verb = "") {
   const el = document.getElementById("earn-msg");
   if (!el) return;
   el.textContent = text;
   el.className = "margin-msg margin-msg-err";
   el.style.display = "block";
+  if (stagedLpId !== null) { el.dataset.stagedLpId = String(stagedLpId); el.dataset.stagedLpVerb = verb; }
+  else { delete el.dataset.stagedLpId; delete el.dataset.stagedLpVerb; }
 }
 
 // After an Earn action: re-FETCH, don't just repaint. renderBalances() reads
@@ -4681,7 +5941,6 @@ function renderPoolsRows(positions) {
     wrap.innerHTML = `<div class="empty-state">No pools yet — create one below, or just place a Margin order on the Markets page (a default cross pool is created for you).</div>`;
     return;
   }
-  const esc = (s) => String(s).replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
   const byPool = new Map();
   (positions || []).forEach((p) => {
     const k = Number(p.poolId);
@@ -4694,6 +5953,7 @@ function renderPoolsRows(positions) {
     const list = byPool.get(id) || [];
     const debt = p.health ? Number(p.health.debtUsd) || 0 : 0;
     const free = Number(p.freeQuote) || 0;
+    const repay = poolRepayFigures(p, debt, free, list);   // the Repay row's per-token figures (1788730982)
     const equity = Number(p.valueUsd) || 0;
     const usage = Number(p.marginUsage) || 0;
     // Same definition the old header used, per pool: % to liq = 1 − usage.
@@ -4708,7 +5968,7 @@ function renderPoolsRows(positions) {
     const lev = list.length && equity > 0.0000001 ? exposure / equity : null;
     return `<div class="pool-block" data-pool="${id}">
       <div class="pool-block-head">
-        <span class="pool-block-name">${esc(p.name)} <span class="pos-roe">· ${p.isolated ? "isolated" : "cross"}</span></span>
+        <span class="pool-block-name">${escH(p.name)} <span class="pos-roe">· ${p.isolated ? "isolated" : "cross"}</span></span>
         ${chip("Equity", fmtUsd(equity))}
         ${chip("Net funded", _poolNetFunded.has(id) ? fmtUsd(_poolNetFunded.get(id)) : "—")}
         ${chip("Exposure", list.length ? fmtUsd(exposure) : "—")}
@@ -4726,10 +5986,119 @@ function renderPoolsRows(positions) {
           <button class="btn btn-secondary btn-sm pool-fund-btn" data-pool="${id}" type="button">Fund</button>
           <button class="btn btn-secondary btn-sm pool-withdraw-btn" data-pool="${id}" type="button">Withdraw</button>
         </span>
-        <span class="pool-fin-detail" hidden>Borrowed ${debt > 0.0000001 ? fmtUsd(debt) : "nothing"} · Free cash ${fmtUsd(free)} — interest accrues only on actual borrows; cash-funded positions cost nothing to hold.</span>
+        <span class="pool-fin-detail" hidden>Borrowed ${debt > 0.0000001 ? fmtUsd(debt) : "nothing"} · Free cash ${fmtUsd(free)} — interest accrues only on actual borrows, each taken at the fill that needed it (a resting entry has borrowed nothing); cash-funded positions cost nothing to hold.</span>
+        ${repay.tokens.length ? poolRepayControlHTML(id, repay) : ""}
       </div>
     </div>`;
   }).join("");
+}
+
+// ── The owner's Repay control (task 1788533844, operator decision (i)) ──
+// Idle pool debt is the OWNER's to retire: the liquidation pass never
+// repays it, and a top-up (Fund) is margin, not repayment — fund → place the
+// previewed order must keep working, and the owner's leverage is the owner's
+// choice. The control drives repayPoolDebt(poolId, token, amount), which
+// pays min(amount, debt, free) in kind — free = the pool's available balance
+// minus the earmark of its RESTING EXITS in that token (the backend's
+// poolRestingOrderNeeds — an entry borrows at its fill and holds nothing
+// back), so a resting close is never unfunded.
+// The preview is that min() over the PER-TOKEN figures the pool view carries
+// since task 1788730982: `loans` (the accrued debt per owed token, in kind —
+// a short's is BASE) and `repayable` (available − the resting earmark per
+// owed token: exactly the `free` repayPoolDebt pays from), so "Will pay" is
+// the backend's answer to the unit for every token. Against an OLDER backend
+// (the fields absent) it falls back to the view's two USD-shaped figures —
+// debtUsd (the whole debt: exact only for ICPUSD debt) and freeQuote
+// (available ICPUSD BEFORE the earmark — an upper bound) — and a short's
+// base token gets no figure at all: the preview degrades to "up to <amount>"
+// and the backend's min() still governs. All figures arrive pre-normalised
+// (MONEY_KEYS — `amount` covers the nested records).
+function poolRepayPreview(amount, debt, free) {
+  const a = Number(amount), d = Number(debt), f = Number(free);
+  if (!(a > 0) || !(d > 0) || !(f > 0)) return 0;
+  return Math.min(a, d, f);
+}
+// The Repay row's figures: { exact, tokens: [{ token, debt, free }] } — one
+// entry per token the pool OWES (nothing owed → no row). debt/free are null
+// only on the older-backend fallback for a short's base token.
+function poolRepayFigures(p, debtUsd, freeQuote, positions) {
+  const loans = p && Array.isArray(p.loans) ? p.loans : null;
+  if (loans) {
+    const rep = new Map((Array.isArray(p.repayable) ? p.repayable : []).map((r) => [String(r.token), Number(r.amount) || 0]));
+    const tokens = loans.filter((l) => Number(l.amount) > 0)
+      .map((l) => ({ token: String(l.token), debt: Number(l.amount) || 0, free: rep.get(String(l.token)) || 0 }));
+    return { exact: true, tokens };
+  }
+  if (!(debtUsd > 0.0000001)) return { exact: false, tokens: [] };
+  const shortBases = [...new Set((positions || []).filter((x) => Number(x.size) < 0).map((x) => String(x.baseToken)))];
+  return { exact: false, tokens: [{ token: "ICPUSD", debt: debtUsd, free: freeQuote },
+    ...shortBases.map((t) => ({ token: t, debt: null, free: null }))] };
+}
+function poolRepayFmt(v, token) { return token === "ICPUSD" ? fmtUsd(v) : `${fmtQty(v, token)} ${token}`; }
+function poolRepayFigsHTML(token, debt, free) {
+  const has = debt != null;
+  return `Debt <b class="pool-repay-debt">${has ? poolRepayFmt(debt, token) : "—"}</b> · Free ${escH(token)} <b class="pool-repay-free">${has ? poolRepayFmt(free, token) : "—"}</b>`;
+}
+function poolRepayControlHTML(id, figs) {
+  // The selector lists exactly the owed tokens; each option carries ITS
+  // debt/free, so switching the token re-figures the row from the view.
+  const opts = figs.tokens.map((t) => `<option value="${escH(t.token)}"${t.debt == null ? "" : ` data-debt="${t.debt}" data-free="${t.free}"`}>${escH(t.token)}</option>`).join("");
+  const first = figs.tokens[0];
+  return `<div class="pool-repay" data-pool="${id}" data-exact="${figs.exact ? 1 : 0}">
+      <span class="pool-repay-figs">${poolRepayFigsHTML(first.token, first.debt, first.free)}</span>
+      <input class="pos-input pool-repay-amt" type="number" min="0" step="any" placeholder="amount" />
+      <select class="pos-input pool-repay-token">${opts}</select>
+      <span class="pool-repay-preview">Will pay ${poolRepayFmt(0, first.token)}</span>
+      <button class="btn btn-secondary btn-sm pool-repay-btn" data-pool="${id}" type="button" disabled>Repay</button>
+      <span class="pool-repay-note">Idle debt is yours to retire — the liquidation pass never repays it, and Fund is margin, not repayment. Repay pays min(amount, debt, free); free excludes what your resting orders earmark.</span>
+    </div>`;
+}
+// Recompute one pool's figures + "Will pay" preview + the submit gate
+// (delegated from #pools-rows on input/change): the selected option carries
+// the token's debt/free from the view, and the button is disabled while the
+// preview is zero, so a click can never reach the backend with nothing to pay.
+function updatePoolRepayPreview(row) {
+  if (!row) return;
+  const amt = parseFloat(row.querySelector(".pool-repay-amt")?.value || "0");
+  const sel = row.querySelector(".pool-repay-token");
+  const opt = sel ? sel.options[sel.selectedIndex] : null;
+  const token = (opt && opt.value) || (sel && sel.value) || "ICPUSD";
+  const hasFigs = !!(opt && opt.dataset.debt !== undefined);
+  const debt = hasFigs ? Number(opt.dataset.debt) || 0 : 0, free = hasFigs ? Number(opt.dataset.free) || 0 : 0;
+  const figs = row.querySelector(".pool-repay-figs");
+  if (figs) figs.innerHTML = poolRepayFigsHTML(token, hasFigs ? debt : null, hasFigs ? free : null);
+  const pv = row.querySelector(".pool-repay-preview");
+  const btn = row.querySelector(".pool-repay-btn");
+  if (hasFigs) {
+    const pay = poolRepayPreview(amt, debt, free);
+    if (pv) pv.textContent = pay > 0 ? `Will pay ${poolRepayFmt(pay, token)}`
+      : amt > 0 && !(free > 0.0000001) ? `Will pay ${poolRepayFmt(0, token)} — nothing free (Fund first, or close/cancel)`
+      : `Will pay ${poolRepayFmt(0, token)}`;
+    if (btn) btn.disabled = !(pay > 0);
+  } else {
+    // Older-backend fallback for a base-token repay: no per-token figure in
+    // the view — the backend pays min(amount, base debt, free base) and
+    // reports what it paid.
+    if (pv) pv.textContent = amt > 0 ? `Will pay up to ${fmtQty(amt, token)} ${token} (min(amount, debt, free) at the backend)` : "Will pay —";
+    if (btn) btn.disabled = !(amt > 0);
+  }
+}
+// Repay idle pool debt from the pool's free funds — repayPoolDebt, the
+// owner's lever. The backend pays min(amount, debt, free) and returns what it
+// paid; #err names why nothing could be paid (no debt in that token, nothing
+// free past the resting earmark, not your pool) and is surfaced verbatim.
+async function onRepayPoolDebt(poolId, token, amt) {
+  if (!appState.actor) return;
+  const p = _poolsCache.find((x) => String(Number(x.id)) === String(poolId));
+  if (!p) return posMsg("Pool not found — refresh and try again.", "err");
+  if (!(amt > 0)) return posMsg("Enter an amount > 0.", "err");
+  try {
+    const res = await appState.actor.repayPoolDebt(BigInt(Number(p.id)), String(token), toE8(amt));
+    if ("err" in res) return posMsg(res.err, "err");
+    const paid = fromE8(res.ok);   // the variant payload is raw e8 (not a MONEY_KEYS field)
+    posMsg(`Repaid ${token === "ICPUSD" ? fmtUsd(paid) : `${fmtQty(paid, token)} ${token}`} of "${p.name}"'s ${token} debt.`, "ok");
+    await Promise.all([renderPositions(), refreshBalances()]);
+  } catch (e) { posMsg(String(e), "err"); }
 }
 
 // HyperLiquid-style positions table (shared by the Account box and the Markets
@@ -4757,14 +6126,30 @@ function positionsTableHTML(positions, opts) {
     const liqRaw = optNum(p.liqPrice), ptlRaw = optNum(p.pctToLiq);
     const liq = liqRaw != null ? liqRaw / 1e8 : null;
     const ptl = ptlRaw != null ? ptlRaw / 1e6 : null;
+    // #54.8: "already past" is the pool's OWN health verdict (isLiquidatable),
+    // never mark-vs-liqPrice — rounding puts the displayed price on the wrong
+    // side of the mark by dust. A liquidatable row prints the word, not a
+    // distance. The distance's SIGN is the direction the mark must move,
+    // read off liqDir (the health slope: a net-long pool can liquidate on a
+    // RISING mark), not off the side pill.
+    const isLiquidatable = p.isLiquidatable === true;
+    const liqDirOpt = p.liqDir;
+    const liqUp = Array.isArray(liqDirOpt) && liqDirOpt.length ? ("up" in liqDirOpt[0]) : !isLong;
     // A liquidation price absurdly far from the mark (>100× either way)
     // means "no practical liquidation at current equity". A dust first fill
     // backed by a deep cross pool puts it at astronomical values (seen live:
     // a 0.0000026 SOL short showing liq $8.2B and ten-billion % to liq) —
     // mathematically true, meaningless to display. Print — instead, and keep
     // the row itself (its Close button must stay reachable: dust exposure
-    // still blocks an isolated pool).
-    const liqSane = liq != null && liq > 0 && mark > 0 && liq <= mark * 100 && liq * 100 >= mark;
+    // still blocks an isolated pool). A liq price of exactly 0 is NOT that
+    // case: it is liqPrice's "liquidatable at every price" answer (a short-
+    // like pool with nothing price-independent left) and prints as itself.
+    const liqSane = liq != null && mark > 0 && (liq === 0 || (liq <= mark * 100 && liq * 100 >= mark));
+    const liqCell = isLiquidatable
+      ? `<span class="pos-down pos-liquidatable">liquidatable</span>`
+      : liqSane
+        ? `${fmtUsdPrice(liq, mark)}${ptl != null ? ` <span class="pos-roe">${liqUp ? "+" : "−"}${ptl.toFixed(1)}%</span>` : ""}`
+        : "—";
     const sizeAbs = Math.abs(size);
     const sizeStr = sizeAbs > 0 && sizeAbs < 0.005 ? "&lt;0.01" : fmtQty(sizeAbs, base);
     const pnlCls = uPnl >= 0 ? "pos-up" : "pos-down";
@@ -4777,7 +6162,7 @@ function positionsTableHTML(positions, opts) {
       <td>${fmtUsdPrice(entry, mark)}</td>
       <td>${fmtUsdPrice(mark)}</td>
       <td class="${pnlCls}">${uPnl >= 0 ? "+" : ""}${fmtUsd(uPnl)} <span class="pos-roe">(${roe >= 0 ? "+" : ""}${roe.toFixed(1)}%)</span></td>
-      <td>${liqSane ? fmtUsdPrice(liq, mark) : "—"}${liqSane && ptl != null ? ` <span class="pos-roe">${ptl.toFixed(1)}%</span>` : ""}</td>
+      <td>${liqCell}</td>
       <td class="${rPnl >= 0 ? "pos-up" : "pos-down"}">${rPnl !== 0 ? (rPnl >= 0 ? "+" : "") + fmtUsd(rPnl) : "—"}</td>
       <td><button class="btn btn-danger btn-sm pos-close-btn" data-pool="${Number(p.poolId)}" data-market="${p.marketId}">Close</button></td>
     </tr>`;
@@ -4811,6 +6196,15 @@ function wirePositionActions() {
       onFundOrWithdrawPool(fw.dataset.pool, amt, fw.classList.contains("pool-fund-btn"));
       return;
     }
+    // The owner's Repay (1788533844): amount + token from the pool's own row.
+    const rp = e.target.closest(".pool-repay-btn");
+    if (rp) {
+      const row = rp.closest(".pool-repay");
+      const amt = parseFloat(row?.querySelector(".pool-repay-amt")?.value || "0");
+      const token = row?.querySelector(".pool-repay-token")?.value || "ICPUSD";
+      onRepayPoolDebt(rp.dataset.pool, token, amt);
+      return;
+    }
     // Financing disclosure: reveal the borrow/free-cash detail line.
     const fin = e.target.closest(".pool-fin-toggle");
     if (fin) {
@@ -4824,6 +6218,14 @@ function wirePositionActions() {
     const close = e.target.closest(".pos-close-btn");
     if (close) onClosePosition(close.dataset.pool, close.dataset.market);
   });
+  // Live "Will pay" preview + submit gate for the Repay rows (typing an
+  // amount or switching the token). Delegated too — the rows re-render.
+  for (const ev of ["input", "change"]) {
+    document.getElementById("pools-rows")?.addEventListener(ev, (e) => {
+      const row = e.target.closest(".pool-repay");
+      if (row) updatePoolRepayPreview(row);
+    });
+  }
   document.getElementById("pool-orders-wrap")?.addEventListener("click", (e) => {
     const btn = e.target.closest(".pool-cancel-btn");
     if (btn) onCancelPoolOrder(btn.dataset.pool, btn.dataset.order);
@@ -4901,7 +6303,7 @@ async function onCancelPoolOrder(poolId, orderId) {
   try {
     const res = await appState.actor.cancelPoolOrder(BigInt(Number(poolId)), BigInt(Number(orderId)));
     if ("err" in res) return posMsg(res.err, "err");
-    posMsg("Order cancelled; the pre-borrow was repaid.", "ok");
+    posMsg("Order cancelled (an unfilled entry holds no borrow — nothing to repay).", "ok");
     await Promise.all([renderPositions(), refreshBalances()]);
   } catch (e) { posMsg(String(e), "err"); }
 }
@@ -4935,6 +6337,18 @@ function walletMsg(text, type) {
 // anchored directly under a button. The native <select> is kept, visually
 // hidden, as the value source, so existing reads of `.value` and any `change`
 // listeners keep working — selecting an option dispatches `change` on it.
+// The menu is a makeDropdown instance (1793511304): ONE setter for the
+// wrapper's .open (stats.css shows the menu and turns the chevron off it) and
+// the button's aria-expanded, walked by the shared outside-click closer in
+// setupEventListeners, and wireMenuButton carries the menu-button keys. (It
+// used to keep a document-level click closer and an unscoped Escape listener
+// of its own per instance, showing the menu by an inline display toggle, and
+// its button announced nothing.) The options are re-rendered as the menu
+// opens (onOpen — after the class flip, so the first item has a box to take
+// focus) because the native select's list can change under it (the Swap
+// token selects). cfg.label names the menu for assistive tech and prefixes
+// the button's own name ("Sell token: BTC"); cfg.icons puts the asset icon
+// before each symbol.
 function enhanceSelectDropdown(selectId, cfg = {}) {
   const sel = document.getElementById(selectId);
   if (!sel || sel.dataset.enhanced) return;
@@ -4951,30 +6365,43 @@ function enhanceSelectDropdown(selectId, cfg = {}) {
   // Optional asset icon before the symbol (cfg.icons — the Swap token selects).
   // Sourced from public/assets/<SYM>.svg; hides itself if the file is missing.
   const icon = (v) => cfg.icons ? `<img class="dd-icon" src="/assets/${encodeURIComponent(v)}.svg" alt="" data-hide-on-error>` : "";
+  const menuId = `${selectId}-dd-menu`;
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "pos-input dd-btn";
+  btn.setAttribute("aria-haspopup", "menu");
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-controls", menuId);
   const menu = document.createElement("div");
   menu.className = "dd-menu";
-  menu.style.display = "none";
+  menu.id = menuId;
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", cfg.label || "Options");
 
-  const renderBtn = () => { btn.innerHTML = `${icon(sel.value)}<span class="dd-label"></span><span class="dd-chevron">▾</span>`; btn.querySelector(".dd-label").textContent = labelFor(sel.value); };
+  // The button's accessible name is the group AND the value — "Sell token:
+  // BTC" — not the bare value (1793512901): aria-label on a button replaces
+  // its content as the name, so AT hears which select this is before what
+  // it holds (the menu already carries cfg.label). Rewritten on every render.
+  const renderBtn = () => {
+    btn.innerHTML = `${icon(sel.value)}<span class="dd-label"></span><span class="dd-chevron" aria-hidden="true">▾</span>`;
+    const text = labelFor(sel.value);
+    btn.querySelector(".dd-label").textContent = text;
+    btn.setAttribute("aria-label", cfg.label ? `${cfg.label}: ${text}` : text);
+  };
   const renderMenu = () => {
     menu.innerHTML = opts().map((o) =>
-      `<button type="button" class="dd-opt${o.value === sel.value ? " dd-opt-active" : ""}" data-v="${o.value}">${icon(o.value)}<span class="dd-opt-label"></span></button>`).join("");
+      `<button type="button" class="dd-opt${o.value === sel.value ? " dd-opt-active" : ""}" role="menuitem" tabindex="-1" data-v="${o.value}">${icon(o.value)}<span class="dd-opt-label"></span></button>`).join("");
     menu.querySelectorAll(".dd-opt").forEach((b) => { b.querySelector(".dd-opt-label").textContent = labelFor(b.dataset.v); });
   };
-  const close = () => { menu.style.display = "none"; wrap.classList.remove("dd-open"); };
-  const open = () => { renderMenu(); menu.style.display = "block"; wrap.classList.add("dd-open"); };
 
-  btn.addEventListener("click", (e) => { e.stopPropagation(); menu.style.display === "block" ? close() : open(); });
-  menu.addEventListener("click", (e) => {
-    const opt = e.target.closest(".dd-opt"); if (!opt) return;
-    if (sel.value !== opt.dataset.v) { sel.value = opt.dataset.v; renderBtn(); sel.dispatchEvent(new Event("change", { bubbles: true })); }
-    close();
+  const dd = makeDropdown({ wrap, trigger: btn, onOpen: renderMenu });
+  wireMenuButton(dd, {
+    menu,
+    itemSelector: ".dd-opt",
+    onActivate: (opt) => {
+      if (sel.value !== opt.dataset.v) { sel.value = opt.dataset.v; renderBtn(); sel.dispatchEvent(new Event("change", { bubbles: true })); }
+    },
   });
-  document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) close(); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
   sel.addEventListener("change", renderBtn); // keep label synced on programmatic changes
 
   renderBtn();
@@ -5047,7 +6474,7 @@ async function renderAccountTrades() {
       afFetchNext().then((added) => { if (added || !afMore()) renderAccountTrades(); });
     }
     if (!merged.length) {
-      tbody.innerHTML = `<tr><td colspan="7" class="empty-state">${afMore() ? "Searching the archive for older history…" : "No trades yet"}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" class="empty-state">${afMore() ? afProgressHTML() : "No trades yet"}</td></tr>`;
       return;
     }
     const loadMore = afMore()
@@ -5063,7 +6490,9 @@ async function renderAccountTrades() {
         <td>${formatNum(typeof r.price === "bigint" ? r.price * r.quantity : Number(r.price) * Number(r.quantity))}</td>
       </tr>`).join("") + loadMore;
     document.getElementById("account-trades-more")?.addEventListener("click", async function () {
-      this.disabled = true; this.textContent = "Loading…";
+      // The button becomes the progress line while the pull runs
+      // (afNotifyProgress rewrites .af-progress text in place).
+      this.disabled = true; this.classList.add("af-progress"); this.textContent = afProgressText();
       await afFetchNext();
       renderAccountTrades();
     });
@@ -5086,7 +6515,8 @@ async function renderAccountOpenOrders() {
       return;
     }
     // Tag pool-owned (margin) rows so the Type column says so — cancel needs
-    // no special routing (cancelMyOrder deleverages pool orders backend-side).
+    // no special routing (cancelMyOrder accepts pool orders backend-side; an
+    // unfilled entry holds no borrow, so there is nothing to repay).
     const { mine, pool } = await splitPoolOrders(merged);
     const orders = [...mine, ...pool.map((o) => ({ ...o, _pool: true }))];
     // Newest first.
@@ -5947,6 +7377,11 @@ function setupEventsPager() {
 // on the Canister sub-tab. Anyone can refuel it — no controller access needed.
 let canisterInfoTimer = null;
 let lastCanisterInfo = null;
+// The app-wide countdown ("MULTI/DEX will run out of fuel in ~…") is
+// intrusive, so it shows only inside this window of the predicted freeze;
+// the System page keeps the 3-day heads-up (TIME_WARN_SEC → timeWarn, in
+// fuelState below). Operator instruction 2026-11-01 (task 1793572114).
+const BANNER_FREEZE_WARN_SEC = 24 * 3600;
 
 function fuelState(info) {
   const cyclesT = Number(info.cycles) / 1e12;                      // total balance → trillions
@@ -5985,6 +7420,9 @@ function fuelState(info) {
   const secsToFreeze   = burnPerDay > 0 ? (liquidCycles / burnPerDay) * 86400 : Infinity;
   const TIME_WARN_SEC  = 72 * 3600;   // warn ~3 days out
   const timeWarn       = !CLOUD_ENGINE && Number.isFinite(secsToFreeze) && secsToFreeze < TIME_WARN_SEC;
+  // The banner's own, tighter window — timeWarn's 3-day lead is the System
+  // card's; the app-wide countdown waits for this one (BANNER_FREEZE_WARN_SEC).
+  const freezeSoon     = timeWarn && secsToFreeze < BANNER_FREEZE_WARN_SEC;
   // Wasm-memory pressure. A canister past its wasm_memory_limit still serves
   // queries but REJECTS every update (IC0539) — from out here that looks
   // identical to an out-of-cycles freeze (heartbeat stalls either way), so a
@@ -6006,7 +7444,7 @@ function fuelState(info) {
     ? (memFull ? "memory" : critical ? "cycles" : "unknown")
     : null;
   return { cyclesT, freezingLimitT, liquidT, ageSec, paused, frozen, critical, low,
-           burnPerDay, idleBurnPerDay, secsToFreeze, timeWarn,
+           burnPerDay, idleBurnPerDay, secsToFreeze, timeWarn, freezeSoon,
            memBytes, memLimit, memFrac, memFull, memHigh, cause,
            dead: frozen || critical || memFull };
 }
@@ -6104,7 +7542,8 @@ function applyBannerDismiss(el, key, sig) {
 // ✕ writes a localStorage flag so a returning visitor isn't nagged (unlike
 // the status banners, which resurface each session). Keyed by a version so
 // the notice can be re-shown if the story changes materially.
-const LAUNCH_NOTICE_KEY = "mdx.launchNoticeHidden.v1";
+// v2 2026-11-01: the story changed.
+const LAUNCH_NOTICE_KEY = "mdx.launchNoticeHidden.v2";
 function renderLaunchBanner() {
   const el = document.getElementById("launch-banner");
   if (!el) return;
@@ -6117,10 +7556,32 @@ function renderLaunchBanner() {
   }
   el.innerHTML =
     `<span class="launch-mark">✦</span>` +
-    `<strong>You're early.</strong> MULTI/DEX was written entirely by AI, runs 100% on-chain, ` +
-    `and will be owned by the world. It's in <strong>play mode</strong> — trade dummy assets, climb ` +
-    `the leaderboard, and help decide when it's ready for the NNS. ` +
+    `<strong>You're early!</strong> MULTI/DEX is written and maintained by AI, while the world's ` +
+    `biggest DAO gates its upgrades. ` +
+    `<span class="launch-rest">It has no owner, and it runs 100% onchain without any backdoors. ` +
+    `Today, MULTI/DEX is running in "<strong>Play Mode</strong>" with dummy assets. Join, trade, and ` +
+    `climb the leaderboard to win prizes. Production is coming soon…</span> ` +
     `<a class="launch-more" href="#docs/launch">Read the story →</a>`;
+  // Phones (≤480px; stats.css): sentences 2–5 sit in .launch-rest, hidden
+  // until "Read more" discloses them in place — a real button (aria-expanded,
+  // keyboard-operable) that toggles .expanded on the strip, reads "Show less"
+  // while open, and recomputes --chrome-h. Per visit, nothing stored: the
+  // class lives on the element, so a repaint (sign-in) keeps the state it
+  // finds. Desktop never shows the control (display: none outside the media
+  // query). Task 1793575027.
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "launch-expand";
+  const setExpanded = (on) => {
+    more.setAttribute("aria-expanded", on ? "true" : "false");
+    more.textContent = on ? "Show less" : "Read more";
+  };
+  setExpanded(el.classList.contains("expanded"));
+  more.addEventListener("click", () => {
+    setExpanded(el.classList.toggle("expanded"));
+    updateChromeHeight();
+  });
+  el.appendChild(more);
   const b = document.createElement("button");
   b.className = "banner-dismiss";
   b.title = "Hide this notice";
@@ -6138,12 +7599,68 @@ function renderLaunchBanner() {
 // Resolve the deployment posture once (public query) and (re)render the
 // launch notice. Safe pre-auth — getDeployMode is a query the publicActor
 // can make. Idempotent; call whenever an actor becomes available.
+// `_deployModeKnown` settles once the startup read has ANSWERED (true) or
+// given up (false): state.js's "dev" default is a placeholder, not knowledge,
+// and the #dev-login hook (devLogin) waits on this before trusting
+// appState.deployMode (task 1793497426).
+let _deployModeAnswered = false;
+let _deployModeSettle = () => {};
+const _deployModeKnown = new Promise((r) => { _deployModeSettle = r; });
 async function resolveDeployModeAndBanner() {
   try {
     const a = appState.publicActor || appState.actor;
-    if (a?.getDeployMode) { appState.deployMode = await a.getDeployMode(); }
+    if (a?.getDeployMode) { appState.deployMode = await a.getDeployMode(); _deployModeAnswered = true; }
   } catch { /* leave deployMode unset → banner stays hidden */ }
+  _deployModeSettle(_deployModeAnswered);
   renderLaunchBanner();
+  renderHomePostureBadge();
+  // The race: refreshCanisterInfo's first fuel paint can land before this read
+  // answers, and updateFuelBanner picks its treasury sentence PER PAINT — so a
+  // play/dev venue showed the production sentence until the next poll. Repaint
+  // once from the cached info now the posture is known (task 1793575028).
+  if (_deployModeAnswered && lastCanisterInfo) updateFuelBanner(lastCanisterInfo);
+}
+
+// Console handle for a smoke of the notice's LOOK (task 1793573913). The
+// notice is #play-only and a seat venue runs #dev, so
+// window.__mdxLaunchBannerPreview() paints it once the way #play would: the
+// dismissal flag is set aside first (a ✕ pressed during the smoke must not
+// hide the next preview), the posture answer stands in as "play" for that
+// one paint and is restored after it (a later resolveDeployModeAndBanner
+// hides it again, as on any #dev venue). Refused anywhere but a #dev venue,
+// judged by the backend's own answer the way fuelBannerSmoke judges it: one
+// console line, nothing painted. Nothing in the app reads it.
+function launchBannerPreview() {
+  if (!_deployModeAnswered || appState.deployMode !== "dev") {
+    console.info("launch-banner preview: not a #dev venue");
+    return false;
+  }
+  try { localStorage.removeItem(LAUNCH_NOTICE_KEY); } catch {}
+  const saved = appState.deployMode;
+  appState.deployMode = "play";
+  try { renderLaunchBanner(); } finally { appState.deployMode = saved; }
+  return true;
+}
+window.__mdxLaunchBannerPreview = launchBannerPreview;
+
+// ── Home: the honesty badge ──────────────────────────────────────
+// The hero's badge ships the play-mode line in the markup (true on every live
+// target today, so the first paint is right) and is corrected here from the
+// same getDeployMode read as the launch notice: a #dev venue names itself a
+// development deployment; any other (or unresolved) posture HIDES the badge
+// rather than claim something this page cannot know (#54.9: nothing
+// fabricated on screen). The dot (first child) stays; only the text changes.
+function renderHomePostureBadge() {
+  const el = document.getElementById("home-posture-badge");
+  if (!el) return;
+  const mode = appState.deployMode;
+  const line = mode === "play" ? "Live in play mode — trade with free dummy crypto"
+    : mode === "dev" ? "Development venue — seeded test assets, nothing real"
+    : null;
+  if (!line) { el.style.display = "none"; return; }
+  while (el.lastChild && el.lastChild.nodeType === Node.TEXT_NODE) el.removeChild(el.lastChild);
+  el.appendChild(document.createTextNode(line));
+  el.style.display = "";
 }
 
 function updateFuelBanner(info) {
@@ -6232,24 +7749,44 @@ function updateFuelBanner(info) {
           `The exchange will draw on its own treasury to create new cycles automatically. ` +
           `No action needed.`;
       }
-    } else if (s.timeWarn) {
-      // The actionable one: a countdown to the freeze at the measured burn rate.
+    } else if (s.freezeSoon) {
+      // The actionable one: a countdown to the freeze at the measured burn
+      // rate — app-wide only inside BANNER_FREEZE_WARN_SEC (24h); timeWarn's
+      // 3-day lead stays on the System page card.
       sig = "warn:freeze";
-      el.className = "fuel-banner warn";
+      // asks-cycles: a donation appeal — hidden in mobile mode by stats.css
+      // (operator, 2026-11-02); the frozen tier is never hidden.
+      el.className = "fuel-banner warn asks-cycles";
+      // The treasury sentence is posture-aware (operator instruction
+      // 2026-11-01): on a play/dev venue the treasury holds no REAL assets,
+      // so "is empty" would misdescribe it. The posture is the backend's
+      // ANSWER only — state.js's "dev" default is a placeholder, never
+      // knowledge (resolveDeployModeAndBanner) — so an unanswered read keeps
+      // the production sentence, the conservative wording.
+      const demoPosture = _deployModeAnswered && (appState.deployMode === "play" || appState.deployMode === "dev");
+      const treasuryNote = demoPosture
+        ? `While in demo mode, the self-funding treasury does not hold real assets, so a top-up must come from outside — send cycles to `
+        : `The self-funding treasury is empty, so a top-up must come from outside — send cycles to `;
       el.innerHTML =
         `<strong>⚠ MULTI/DEX will run out of fuel in ~${fmtDuration(s.secsToFreeze)}.</strong> ` +
         `At the current burn rate (≈${fmtCycles(s.burnPerDay)}/day) its spendable cycles ` +
         `(≈${s.liquidT.toFixed(1)}T) will reach the freezing threshold and trading will halt. ` +
-        `The self-funding treasury is empty, so a top-up must come from outside — send cycles to ` +
+        treasuryNote +
         `<code class="fuel-banner-id">${info.canisterId}</code>`;
-    } else {
+    } else if (s.low) {
+      // The balance tier (liquid < 5T), countdown-less. It is reached between
+      // 24h and 72h out too — recorded for the operator in task 1793572114.
       sig = "warn:low";
-      el.className = "fuel-banner warn";
+      el.className = "fuel-banner warn asks-cycles";
       el.innerHTML =
         `<strong>⚠ MULTI/DEX is low on spendable fuel (≈${s.liquidT.toFixed(1)}T above its ` +
         `freezing threshold).</strong> It freezes and halts trading when that reaches 0 — ` +
         `top it up by sending cycles to ` +
         `<code class="fuel-banner-id">${info.canisterId}</code>`;
+    } else {
+      // timeWarn alone — 24h to 72h out with ≥ 5T liquid: the System page
+      // carries the heads-up; nothing app-wide yet.
+      show = false;
     }
     if (show) {
       el.style.display = "";
@@ -6262,6 +7799,26 @@ function updateFuelBanner(info) {
   }
   updateChromeHeight();
 }
+
+// Console handle for a smoke of the banner's tiers (task 1793572114). The
+// live venue is never near a freeze, so window.__mdxFuelBanner(info, opts)
+// paints the banner from a crafted getCanisterInfo-shaped `info`;
+// `opts.deployMode` stands in for the posture answer for that one paint
+// (the production sentence, seen on a dev venue) and is restored after it.
+// Refused anywhere but a #dev venue, judged by the backend's own answer the
+// way devLogin judges it: one console line, nothing painted. Nothing in the
+// app reads it.
+function fuelBannerSmoke(info, opts = {}) {
+  if (!_deployModeAnswered || appState.deployMode !== "dev") {
+    console.info("fuel-banner smoke: not a #dev venue");
+    return false;
+  }
+  const saved = appState.deployMode;
+  if (typeof opts.deployMode === "string") appState.deployMode = opts.deployMode;
+  try { updateFuelBanner(info); } finally { appState.deployMode = saved; }
+  return true;
+}
+window.__mdxFuelBanner = fuelBannerSmoke;
 
 // Oracle divergence banner — the ops alarm the backend raises when a HEALTHY
 // primary price sits >300bps from the independent XRC anchor (a possible
@@ -6443,8 +8000,7 @@ async function getPublicArchiveActor(archiveId) {
   if (!archiveId || !HttpAgent || !Actor) return null;
   if (_pubArchiveActor && _pubArchiveActorId === archiveId) return _pubArchiveActor;
   try {
-    let canisterEnv;
-    try { const m = await import("@icp-sdk/core/agent/canister-env"); canisterEnv = m.safeGetCanisterEnv?.(); } catch {}
+    const canisterEnv = readCanisterEnv();
     const agent = await HttpAgent.create({ host: window.location.origin, rootKey: canisterEnv?.IC_ROOT_KEY });
     _pubArchiveActor = wrapActor(Actor.createActor(getArchiveIdlFactory(), { agent, canisterId: archiveId }));
     _pubArchiveActorId = archiveId;
@@ -6460,8 +8016,12 @@ async function renderArchiveStats(info) {
   const sec = document.getElementById("stats-archive-section");
   if (!sec || !info) return;
   const archiveId = (info.archiveCanisterId && info.archiveCanisterId.length) ? info.archiveCanisterId[0] : null;
-  if (!archiveId) { sec.style.display = "none"; return; }   // sidecar not spawned yet
+  // Sidecar not spawned yet — but a PENDING spawn (the first-ever archive
+  // mid-install, or its orphan) is exactly what an operator needs listed, so
+  // the section stays up for the slot row alone; the tiles keep their dashes.
+  if (!archiveId && !spawnSlotOf(info)) { sec.style.display = "none"; return; }
   sec.style.display = "";
+  if (!archiveId) return;
   // The chain table renders independently of the ACTIVE archive's health —
   // when the tip is frozen/unreachable is exactly when you need the list.
   renderArchiveChain();
@@ -6572,6 +8132,54 @@ async function renderArchiveChain() {
   }).join("");
 }
 
+// ── The archive spawn slot (W4-16 / #55 "orphan slot overwritten") ──
+// getCanisterInfo.pendingSpawn is the slot main holds between creating an
+// archive canister and finishing its install. Empty is the normal state; a
+// few seconds non-null is an install in flight; anything longer is an ORPHAN
+// (continuation lost) — every further spawn is refused until the backend's
+// reconciler reaps it at 5 min. Rendered beside the archive id so the orphan
+// is listed somewhere: amber once it has outlived a normal install, red once
+// the reconciler itself is late. Age comes from the canister's clock pair
+// (nowNs − atNs, like the fuelPendingNotify latch), never from Date.now().
+const SPAWN_SLOT_WARN_SEC = 60;
+const SPAWN_SLOT_OVERDUE_SEC = 300;
+function spawnSlotOf(info) {
+  const ps = Array.isArray(info?.pendingSpawn) ? info.pendingSpawn[0] : info?.pendingSpawn;
+  return (ps && ps.cid) ? ps : null;
+}
+function spawnSlotClass(ageS) {
+  return ageS >= SPAWN_SLOT_OVERDUE_SEC ? "health-bad"
+    : ageS >= SPAWN_SLOT_WARN_SEC ? "health-warn"
+    : "health-ok";
+}
+function fmtSpawnAge(ageS) {
+  const s = Math.max(0, Math.floor(ageS));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+function renderSpawnSlot(info) {
+  const row = document.getElementById("archive-spawn-slot");
+  if (!row) return;
+  const ps = spawnSlotOf(info);
+  if (!ps) { row.style.display = "none"; return; }
+  row.style.display = "";
+  const ageS = Math.max(0, (Number(info.nowNs) - Number(ps.atNs)) / 1e9);
+  const cls = spawnSlotClass(ageS);
+  const idEl = document.getElementById("archive-spawn-id");
+  if (idEl) idEl.textContent = ps.cid;
+  const ageEl = document.getElementById("archive-spawn-age");
+  if (ageEl) {
+    ageEl.textContent = cls === "health-bad"
+      ? `created ${fmtSpawnAge(ageS)} ago — reconciler overdue (reaps at 5 min; spawns refused meanwhile)`
+      : cls === "health-warn"
+        ? `created ${fmtSpawnAge(ageS)} ago — install slow? orphan if it outlives 5 min`
+        : `created ${fmtSpawnAge(ageS)} ago — installing`;
+    ageEl.className = "spawn-slot-age " + cls;
+  }
+}
+
 // Consecutive health-poll failures (reset on success). One failed poll is
 // noise; three (~1 min) is an outage worth surfacing.
 let canisterInfoFailures = 0;
@@ -6586,6 +8194,7 @@ async function refreshCanisterInfo() {
     updateFuelBanner(info);
     updateOracleBanner(info);
     renderStatsCanister(info);
+    renderSpawnSlot(info);
     renderArchiveStats(info);   // async, fire-and-forget — must not block the main render
   } catch (e) {
     console.warn("getCanisterInfo failed:", e);
@@ -6599,23 +8208,102 @@ async function refreshCanisterInfo() {
     const frozenOutOfCycles = /IC0207|is frozen|out of cycles|top up the canister/i.test(msg);
     if (frozenOutOfCycles) {
       updateFuelBannerUnreachable("cycles", msg);
+    } else if (isCanisterEnvMismatchReject(msg)) {
+      // IC0301 / IC0536 from the health poll: the id this page is calling is
+      // not this venue's exchange — a foreign or stale ic_env cookie, not a
+      // network issue. Certain from the first reject, so no 3-strike wait.
+      await handleCanisterEnvMismatch(e, "getCanisterInfo");
     } else if (canisterInfoFailures >= 3) {
       updateFuelBannerUnreachable("network", msg);
     }
   }
 }
 
+// ── ic_env cookie self-heal (canister-env.js has the why) ─────────────────
+// Flavour (b) of the cookie problem — our own row carrying ANOTHER venue's
+// ids, because a back/forward navigation served this page from cache without
+// a Set-Cookie or another tab at this host name rewrote the jar — leaves the
+// row-picker nothing to prefer. The cure is a fresh HTML response: a
+// same-origin fetch of this page with `cache: "reload"` applies its Set-Cookie
+// to the jar, after which readCanisterEnv() names this venue's ids again and
+// the actors are rebuilt against them. ONCE per page load, never a loop: a
+// heal that changes nothing (a twin the picker could not resolve, a replica
+// that genuinely lost a canister) leaves the banner to name the mismatch.
+async function healCanisterEnvOnce(source) {
+  if (_envHealTried) return false;
+  _envHealTried = true;
+  const was = _boundBackendId;
+  try {
+    await fetch(location.pathname, { cache: "reload", credentials: "same-origin" });
+  } catch (e) {
+    console.warn(`ic_env self-heal (${source}): re-fetching the page failed:`, e?.message ?? e);
+  }
+  const env = readCanisterEnv();
+  const now = env?.["PUBLIC_CANISTER_ID:backend"] || null;
+  if (!now || now === was) {
+    console.info(`ic_env self-heal (${source}): the re-read cookie still names backend ${was ?? "(none)"} — nothing to rebuild`);
+    return false;
+  }
+  console.info(`ic_env self-heal (${source}): this page had read another venue's ic_env cookie — backend ${was ?? "(none)"} -> ${now}; rebuilding the actors`);
+  _canisterEnvGeneration += 1;        // lazily-built agents (the Ledger raw agent) rebuild on next use
+  _bridgeId = null;                   // re-read from the healed env on next use
+  _pubArchiveActor = null; _pubArchiveActorId = null;
+  await createAnonymousActor();
+  if (identity) await setupActor();   // the signed-in agent + actor; archive/bridge actors are nulled inside
+  _envHealed = { from: was, to: now };
+  return true;
+}
+
+// Shared by the two callers whose rejects are the trigger (the health poll and
+// the markets fetch): heal once, name the outcome in the banner, and re-run
+// the markets fetch against the rebuilt actor so the page has data at once;
+// the health poll's next tick (≤ 20 s) refreshes the canister card and, when
+// healthy, clears the note. A second mismatch cannot heal again (the flag),
+// so a still-wrong env ends in the banner, not a loop.
+async function handleCanisterEnvMismatch(e, source) {
+  const msg = String(e?.message ?? e);
+  const usedId = _boundBackendId;
+  const healed = await healCanisterEnvOnce(source);
+  await updateFuelBannerUnreachable("cookie", msg, { backendId: usedId, healed: healed ? _envHealed : null });
+  if (healed) refreshMarkets();
+}
+
 // Banner for the states where the canister CAN'T report on itself — the poll
 // error is the only evidence. cause="cycles": the IC refused the call because
 // the canister is frozen below its freezing threshold (even reads rejected) —
-// a top-up is the one and only fix. cause="network": can't reach the replica
-// at all; whatever is on screen is stale.
-async function updateFuelBannerUnreachable(cause, msg) {
+// a top-up is the one and only fix. cause="cookie": the reject named the WRONG
+// canister (IC0301 / IC0536) — this page is calling an id that is not this
+// venue's exchange because the ic_env cookie it read was set by another venue
+// (extra.backendId is that id; extra.healed is set once the self-heal
+// reconnected). cause="network": can't reach the replica at all; whatever is
+// on screen is stale.
+async function updateFuelBannerUnreachable(cause, msg, extra = {}) {
   const el = document.getElementById("fuel-banner");
   if (!el) return;
   el.className = "fuel-banner critical";
-  const cid = lastCanisterInfo?.canisterId || (await getCanisterId()) || "(canister id unavailable)";
-  if (cause === "cycles") {
+  const cid = extra.backendId || lastCanisterInfo?.canisterId || (await getCanisterId()) || "(canister id unavailable)";
+  if (cause === "cookie") {
+    // Named as what it is: the old "likely a network or replica issue" sent a
+    // seat ten minutes down the wrong path (task 1793489927). The doc section
+    // carries the cookie physics and the by-hand cure for the twin flavour.
+    const code = /IC0301/.test(msg) ? "IC0301, canister not found"
+      : /IC0536/.test(msg) ? "IC0536, no such query method"
+      : "a canister-routing reject";
+    if (extra.healed) {
+      el.className = "fuel-banner info";
+      el.innerHTML =
+        `<strong>ℹ Reconnected — this page read another venue's <code>ic_env</code> cookie (backend <code class="fuel-banner-id">${cid}</code>).</strong> ` +
+        `The replica rejected its first calls (${code}); the page re-read the cookie and rebuilt its connection to ` +
+        `<code class="fuel-banner-id">${extra.healed.to}</code>. Data refreshes within one health check; ` +
+        `see docs/seat-venue-bring-up.md (“Browser smoke on a seat venue”) for why this happens.`;
+    } else {
+      el.innerHTML =
+        `<strong>⛔ MULTI/DEX is unreachable — this page read another venue's <code>ic_env</code> cookie (backend <code class="fuel-banner-id">${cid}</code>).</strong> ` +
+        `The replica rejected the page's calls (${code}): that id is not this venue's exchange canister, and re-reading the cookie did not change it. ` +
+        `Reload the page; if this persists, delete the stale <code>ic_env</code> row for this host — ` +
+        `see docs/seat-venue-bring-up.md (“Browser smoke on a seat venue”).`;
+    }
+  } else if (cause === "cycles") {
     const known = lastCanisterInfo
       ? ` Its freezing threshold was last measured at ≈${(Number(lastCanisterInfo.freezingLimitCycles) / 1e12).toFixed(1)}T cycles — the balance has fallen to (or below) that level.`
       : "";
@@ -6668,7 +8356,7 @@ function setupStatsSubtabs() {
         await navigator.clipboard.writeText(id);
         copyBtn.textContent = "Copied!";
         setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500);
-      } catch { /* clipboard blocked (insecure context) — no-op */ }
+      } catch { /* writeText refused (a Permissions-Policy denying clipboard-write — the shipped policy did until task 1793506794 — no user activation, or an unfocused document; the context is secure, else navigator.clipboard would be undefined) — no-op */ }
     });
   }
   const archCopyBtn = document.getElementById("archive-id-copy");
@@ -6858,6 +8546,30 @@ function buildVaultPnlChart(snapshots) {
       <path d="${path}" class="pnl-line"/>
     </svg>
   `;
+}
+
+// ── Home: the proof strip ─────────────────────────────────────────
+// Three live tiles on the landing page — TVL, 24h volume, markets — from the
+// SAME reads the System KPI row (renderStatsKpis, below) makes: TVL is the
+// vault's total quote value (one getVaultValue query — the System page's own
+// definition of TVL), 24h volume is the sum over the markets[] list that
+// refreshMarkets() loaded at boot, and the market count is that list's
+// length. No new endpoint. A tile keeps its "—" until a real figure lands:
+// nothing on the landing page is ever a placeholder number (#54.9).
+async function refreshHomeFigures() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  if (markets.length) {
+    let vol = 0;
+    for (const m of markets) { vol += Number(m.volume24h || 0); }
+    set("home-kpi-24vol", fmtUsd(vol));
+    set("home-kpi-markets", String(markets.length));
+  }
+  const a = appState.publicActor || appState.actor;
+  if (!a) return;
+  try {
+    const vault = await a.getVaultValue();
+    set("home-kpi-tvl", fmtUsd(Number(vault.totalQuoteValue || 0)));
+  } catch (e) { console.warn("home figures: getVaultValue:", e); }
 }
 
 function renderStatsKpis({ pools, feedStats, marketsList, poolValues, vault, treasury }) {
@@ -7064,7 +8776,7 @@ function renderStatsPools({ pools, bookShares, vault }) {
           </div>
           <div class="pool-kv">
             <div class="pool-k">Config</div>
-            <div class="pool-v">spread ${p.spreadBps} bps · ${p.numLevels} levels<span class="pool-sub">window ${p.protectionWindowSec}s</span></div>
+            <div class="pool-v">spread ${p.spreadBps} bps · ${p.numLevels} levels</div>
           </div>
         </div>
       </div>
@@ -7109,13 +8821,9 @@ function oracleErrPopEl() {
   }
   return _oracleErrPop;
 }
-function showOracleErrPop(trigger, pin) {
-  cancelHideOraclePop();
-  const pop = oracleErrPopEl();
-  pop.querySelector(".oracle-err-pop-body").textContent = trigger.dataset.err || "(no message reported)";
-  pop.classList.toggle("pinned", !!pin);
-  pop._for = trigger;
-  pop.style.display = "block";
+// Viewport placement under (or, near the bottom edge, above) the trigger —
+// ONE helper for the first show and for the re-anchor after a re-render.
+function placeOracleErrPop(pop, trigger) {
   pop.style.left = "0px"; pop.style.top = "0px";   // reset before measuring
   const r = trigger.getBoundingClientRect();
   const pw = pop.offsetWidth, ph = pop.offsetHeight, m = 8;
@@ -7125,6 +8833,15 @@ function showOracleErrPop(trigger, pin) {
   pop.style.left = left + "px";
   pop.style.top = top + "px";
 }
+function showOracleErrPop(trigger, pin) {
+  cancelHideOraclePop();
+  const pop = oracleErrPopEl();
+  pop.querySelector(".oracle-err-pop-body").textContent = trigger.dataset.err || "(no message reported)";
+  pop.classList.toggle("pinned", !!pin);
+  pop._for = trigger;
+  pop.style.display = "block";
+  placeOracleErrPop(pop, trigger);
+}
 function hideOracleErrPop(force) {
   cancelHideOraclePop();
   if (!_oracleErrPop) return;
@@ -7133,8 +8850,74 @@ function hideOracleErrPop(force) {
   _oracleErrPop.classList.remove("pinned");
   _oracleErrPop._for = null;
 }
+// The fresh trigger for an (asset, source) key after a re-render — ONE lookup
+// for the popover re-anchor and the focus restore below, so the two cannot key
+// differently (one source fails under several assets; the pair is the key).
+function oracleErrTriggerFor(container, asset, src) {
+  return Array.from(container.querySelectorAll(".oracle-err-trigger"))
+    .find((t) => t.dataset.asset === asset && t.dataset.src === src) || null;
+}
+// renderStatsOracle rebuilds #stats-oracle's innerHTML on every 5 s stats
+// tick and re-mints every trigger, so an open popover's pop._for is a
+// DETACHED node the moment the table re-renders (1793512901): the next
+// click on the re-minted trigger compared `_for === t` false and re-showed a
+// pinned popover instead of toggling it off, and the popover sat at the old
+// row's position when the rows reordered. Run right after each re-render:
+// re-anchor an open popover on the fresh trigger for the same (asset,
+// source) key — pin state untouched, message and position refreshed, and an
+// unpinned hover popover keeps whatever mouseout hide is pending — or hide
+// it when that source recovered (no trigger to anchor to).
+function reanchorOracleErrPop(container) {
+  const pop = _oracleErrPop;
+  if (!pop || pop.style.display !== "block" || !pop._for || pop._for.isConnected) return;
+  const { asset, src } = pop._for.dataset;
+  const next = oracleErrTriggerFor(container, asset, src);
+  if (!next) { hideOracleErrPop(true); return; }
+  pop.querySelector(".oracle-err-pop-body").textContent = next.dataset.err || "(no message reported)";
+  pop._for = next;
+  placeOracleErrPop(pop, next);
+}
+// The same re-render dropped KEYBOARD focus (1793514706): a user who Tabbed to
+// a trigger, or pinned its popover with Enter / Space, had the focused span
+// replaced under them and landed on <body> within 5 s. renderStatsOracle reads
+// the focused trigger's (asset, source) key BEFORE its innerHTML write — after
+// it document.activeElement is already <body> — and restores focus to the
+// re-minted trigger afterwards, preventScroll so the page does not jump to it
+// (the popover's re-anchor just placed from that rect). Nothing when the row
+// recovered: there is no trigger to focus, and the re-anchor already hid the
+// popover. The lookup by key is oracleErrTriggerFor (above), shared with the
+// re-anchor, so the popover and the focus cannot land on different triggers.
+function focusedOracleErrKey(container) {
+  const a = document.activeElement;
+  if (!container || !a || !container.contains(a) || !a.classList.contains("oracle-err-trigger")) return null;
+  return { asset: a.dataset.asset, src: a.dataset.src };
+}
+function refocusOracleErrTrigger(container, key) {
+  if (!key) return;
+  const next = oracleErrTriggerFor(container, key.asset, key.src);
+  if (next) next.focus({ preventScroll: true });
+}
 // Wire delegated listeners once on the persistent #stats-oracle container so
 // they survive the table's innerHTML re-renders.
+//
+// NOT a makeDropdown instance, by design (audited under 1793511304): the
+// page's dropdowns are ONE trigger + ONE wrapper whose .open shows a popup
+// INSIDE it — that pair is what the shared outside-click closer walks
+// (wrap.contains(e.target)) and what wireMenuButton / wireDisclosure wire.
+// This is a toggletip: N triggers (one per failed source row, re-minted by
+// every renderStatsOracle) share ONE popover on <body> (position:fixed, so
+// no table ancestor clips it) that opens on hover, pins on tap / Enter /
+// Space, hides after a 150 ms mouseout grace unless pinned, and remembers
+// which trigger it is for (pop._for). No wrapper, no single trigger, nothing
+// to pick — so it keeps its own document-level closers below (a click
+// outside both the trigger and the popover, Escape), which must exempt the
+// popover itself because it lives outside every trigger. The re-render is
+// also why pop._for cannot be trusted across a stats tick: renderStatsOracle
+// hands the fresh triggers to reanchorOracleErrPop (above) after every
+// innerHTML write, and restores a keyboard user's focus to the re-minted
+// trigger (focusedOracleErrKey / refocusOracleErrTrigger). Between ticks the
+// follower at the end of this function keeps a shown popover on its trigger
+// through a page scroll or a resize.
 function setupOracleErrPopover(container) {
   if (!container || container.dataset.errPopWired) return;
   container.dataset.errPopWired = "1";
@@ -7163,14 +8946,41 @@ function setupOracleErrPopover(container) {
     hideOracleErrPop(true);
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideOracleErrPop(true); });
+  // position:fixed means the popover sat where show time placed it while the
+  // page scrolled under it — up to 5 s away from its trigger until the next
+  // stats tick re-anchored it (1793514706). Follow the trigger between ticks:
+  // one rAF-coalesced re-place on scroll (capture, so an inner scroller
+  // counts too; passive, there is nothing to cancel) and on resize, only
+  // while the popover is shown and its trigger is still in the document —
+  // re-checked inside the frame, a tick can land between the event and the
+  // paint. A scroll of the popover's own body moves no trigger, so it is
+  // skipped. Local to the popover on purpose: the page's other resize
+  // listeners each serve their own widget.
+  let followQueued = false;
+  const followTrigger = (e) => {
+    const pop = _oracleErrPop;
+    if (!pop || pop.style.display !== "block" || !pop._for?.isConnected) return;
+    if (e.target instanceof Node && pop.contains(e.target)) return;
+    if (followQueued) return;
+    followQueued = true;
+    requestAnimationFrame(() => {
+      followQueued = false;
+      if (pop.style.display === "block" && pop._for?.isConnected) placeOracleErrPop(pop, pop._for);
+    });
+  };
+  window.addEventListener("scroll", followTrigger, { capture: true, passive: true });
+  window.addEventListener("resize", followTrigger, { passive: true });
 }
 
 function renderStatsOracle({ feedStats, aggregates, sources, pools }) {
   const container = document.getElementById("stats-oracle");
   setupOracleErrPopover(container);
+  const focusKey = focusedOracleErrKey(container);   // BEFORE the innerHTML writes below — they blur
   const hasAny = aggregates.BTC || aggregates.ETH || aggregates.SOL || aggregates.ICP;
   if (!hasAny) {
     container.innerHTML = `<div class="stats-empty">No price readings yet. The feed refreshes every ${Number(feedStats.intervalSec)}s.</div>`;
+    reanchorOracleErrPop(container);
+    refocusOracleErrTrigger(container, focusKey);
     return;
   }
   const inFlight = feedStats.refreshInFlight ? `<span class="oracle-live">● refreshing</span>` : "";
@@ -7182,9 +8992,18 @@ function renderStatsOracle({ feedStats, aggregates, sources, pools }) {
       <div class="oracle-stat"><span class="oracle-k">Interval</span><span class="oracle-v">${Number(feedStats.intervalSec)}s</span></div>
       <div class="oracle-stat"><span class="oracle-k">Min sources</span><span class="oracle-v">${Number(feedStats.minSources)}</span></div>
       <div class="oracle-stat"><span class="oracle-k">Max stddev</span><span class="oracle-v">${fmtBps(Number(feedStats.maxStddevBps))}</span></div>
+      ${feedStats.fanoutQuorum !== undefined ? `
+      <div class="oracle-stat"><span class="oracle-k">Quorum</span><span class="oracle-v">${Number(feedStats.fanoutQuorum)} of ${Number(feedStats.fanoutSources)} · ${Number(feedStats.fanoutDeadlineSec)}s deadline${feedStats.stagingWindowSec !== undefined ? ` · ${Number(feedStats.stagingWindowSec)}s staging window` : ""}</span></div>
+      <div class="oracle-stat"><span class="oracle-k">Closed by</span><span class="oracle-v">quorum ${Number(feedStats.fanoutQuorumCount).toLocaleString()} · all ${Number(feedStats.fanoutCompleteCount).toLocaleString()} · deadline ${Number(feedStats.fanoutDeadlineCount).toLocaleString()} · late readings ${Number(feedStats.fanoutLateReadings).toLocaleString()}</span></div>` : ""}
       ${inFlight}
     </div>
   `;
+
+  // 1788471187: the per-asset USD/USDT signal keyed by asset. Empty until
+  // the first refresh after an upgrade (the backend map is transient).
+  const quoteSignals = {};
+  for (const [asset, sig] of (feedStats.quoteSignals || [])) quoteSignals[asset] = sig;
+  const depegAlarm = Number(feedStats.depegAlarmBps ?? 0);
 
   const aggHtml = ["BTC", "ETH", "SOL", "ICP"].map((asset) => {
     const agg = aggregates[asset];
@@ -7203,7 +9022,7 @@ function renderStatsOracle({ feedStats, aggregates, sources, pools }) {
       // hover (desktop) / tap (mobile). See setupOracleErrPopover.
       const priceCell = r.ok
         ? fmtUsd(Number(r.price))
-        : `<span class="oracle-err-trigger" tabindex="0" role="button" aria-label="Show ${r.sourceId} oracle error" data-err="${escapeAttr(r.errMessage?.[0] || "request failed")}">error</span>`;
+        : `<span class="oracle-err-trigger" tabindex="0" role="button" aria-label="Show ${r.sourceId} oracle error" data-asset="${asset}" data-src="${escapeAttr(r.sourceId)}" data-err="${escapeAttr(r.errMessage?.[0] || "request failed")}">error</span>`;
       return `
         <tr>
           <td class="oracle-src">${r.sourceId}</td>
@@ -7234,6 +9053,34 @@ function renderStatsOracle({ feedStats, aggregates, sources, pools }) {
           ${sidelined ? `<span class="oracle-sidelined" title="The applied refPrice is older than ${maxAge}s — the AMM refuses to quote on it. Fills fall back to users-only.">AMM SIDELINED</span>` : ""}
         </div>`;
     }
+    // USD vs USDT: the venue's mark is USD-denominated, but most sources
+    // quote in USDT, so a USDT depeg moves the pooled blend while the
+    // dispersion gate sees agreement. The backend aggregates the two quote
+    // groups separately and reports their divergence beside the mark; this
+    // line is the only place on the page that says WHICH basis priced the
+    // mark — otherwise a depeg is visible only in the event log.
+    const sig = quoteSignals[asset];
+    let quoteHtml = "";
+    if (sig) {
+      const usd = Number(sig.usdCount);
+      const usdt = Number(sig.usdtCount);
+      const depeg = Number(sig.depegBps);
+      const basis = "usdGroup" in sig.mark ? "mark follows the USD group" : "pooled mark";
+      const state = sig.diverged
+        ? `diverged ${depeg >= 1e15 ? "∞" : fmtBps(depeg)}`
+        : usd > 0 && usdt > 0 ? `agree (${fmtBps(depeg)})` : "no cross-check";
+      const title = sig.diverged
+        ? `The USD-quoted and USDT-quoted sources disagree by more than ${depegAlarm}bps — possible USDT depeg. ${basis}.`
+        : usd > 0 && usdt > 0
+          ? `USD-quoted and USDT-quoted sources agree within ${depegAlarm}bps; ${basis}.`
+          : "One quote group returned no readings, so there is no USD/USDT cross-check; pooled mark.";
+      quoteHtml = `
+        <div class="oracle-asset-quote${sig.diverged ? " oracle-quote-diverged" : ""}" title="${escapeAttr(title)}">
+          <span>USD/USDT ${state}</span>
+          <span>· USD ${usd} / USDT ${usdt}</span>
+          <span>· ${basis}</span>
+        </div>`;
+    }
     return `
       <div class="oracle-asset">
         <div class="oracle-asset-head">
@@ -7245,6 +9092,7 @@ function renderStatsOracle({ feedStats, aggregates, sources, pools }) {
           <span>· ${Number(agg.sourceCount)} of ${sources.length} sources</span>
           <span>· fetched ${fmtAgo(agg.timestamp)}</span>
         </div>
+        ${quoteHtml}
         ${appliedHtml}
         <table class="oracle-table">
           <tbody>${readings}</tbody>
@@ -7254,6 +9102,8 @@ function renderStatsOracle({ feedStats, aggregates, sources, pools }) {
   }).join("");
 
   container.innerHTML = `${globalStats}<div class="oracle-assets">${aggHtml}</div>`;
+  reanchorOracleErrPop(container);
+  refocusOracleErrTrigger(container, focusKey);
 }
 
 function renderStatsDepth({ marketsList, books }) {
@@ -7539,7 +9389,7 @@ async function renderPositionsHistory() {
       }
       if (!allRows.length) {
         wrap.innerHTML = afMore()
-          ? '<div class="empty-state">Searching the archive for older history…</div>'
+          ? `<div class="empty-state">${afProgressHTML()}</div>`
           : '<div class="empty-state">No position fills yet</div>';
         return;
       }
@@ -7616,6 +9466,7 @@ let _archTotal = 0;           // sum of known per-archive totals (for load-more)
 let _archSources = null;      // [{ id, actor, offset, total|null }]
 let _archPrincipals = [];     // [human, ...pool principals] — the deep-pagination key set
 let _archSidecarErr = null;   // surfaced when the durable archive can't be read
+let _archSkipped = [];        // task 1793569495: segments the federation answered `unavailable` for (named in the note, skipped by the pager)
 const ARCH_PAGE = 200;
 
 const archCoin = (mkt) => (mkt ? String(mkt).split("-")[0] : "");
@@ -7708,7 +9559,7 @@ async function loadArchive(opts) {
   const list = document.getElementById("archive-list");
   wireArchiveControls();
   if (reset) {
-    _archRows = []; _archSeen = new Set(); _archTradeIds = new Set(); _archOffset = 0; _archTotal = 0; _archSources = null;
+    _archRows = []; _archSeen = new Set(); _archTradeIds = new Set(); _archOffset = 0; _archTotal = 0; _archSources = null; _archSkipped = [];
     _archPrincipals = archPrincipalSet([]); // human-only until pools load below
     if (list) list.innerHTML = `<div class="empty-state">Loading your history…</div>`;
     // App-side, one-shot: the freshest (unshipped) events + records that never
@@ -7773,11 +9624,30 @@ async function loadArchive(opts) {
         // owner-gated, so getMyArchivedEvents resolves our principals (human +
         // pools) and reads the named archive AS the owner. One archive per call
         // keeps the chain paging (src.id walks getArchives newest→oldest).
-        const res = await appState.actor.getMyArchivedEvents(
-          Principal.fromText(src.id), BigInt(src.offset), BigInt(ARCH_PAGE));
-        src.total = Number(res.total);
-        archAddEvents(res.events || [], "archived");
-        src.offset += (res.events ? res.events.length : 0);
+        // Task 1793569495: a segment the federation cannot read answers
+        // `unavailable = opt <cause>` (its canister no longer exists — the
+        // engine's 2026-11-01 shape — or it is stopped/frozen); an older
+        // backend rejects the call instead. Either way the source is closed
+        // (total 0) and NAMED in the page's note, and the walk continues to
+        // the next segment — before this the whole page parked on the dead
+        // hop for good ("durable archive query failed").
+        let res;
+        try {
+          res = await appState.actor.getMyArchivedEvents(
+            Principal.fromText(src.id), BigInt(src.offset), BigInt(ARCH_PAGE));
+        } catch (e) {
+          res = { events: [], total: 0n, unavailable: [e && e.message ? e.message : String(e)] };
+        }
+        const why = res.unavailable && res.unavailable.length ? String(res.unavailable[0]) : null;
+        if (why !== null) {
+          src.total = 0; src.unavailable = why;
+          _archSkipped.push(`segment ${sources.indexOf(src) + 1} of ${sources.length} (${src.id}) unavailable — ${why}`);
+          console.warn("archive sidecar: segment", src.id, "unavailable —", why);
+        } else {
+          src.total = Number(res.total);
+          archAddEvents(res.events || [], "archived");
+          src.offset += (res.events ? res.events.length : 0);
+        }
       }
       _archTotal = sources.reduce((n, s) => n + (s.total ?? 0), 0);
       _archOffset = sources.reduce((n, s) => n + Math.min(s.offset, s.total ?? s.offset), 0);
@@ -7829,7 +9699,8 @@ function renderArchive() {
     const more = (_archTotal > _archOffset) ? ` of ${_archTotal}+ archived` : "";
     countEl.textContent = `${rows.length} shown · ${arch} archived${more}${pend ? ` · ${pend} pending` : ""}${live ? ` · ${live} live` : ""}`;
   }
-  const note = _archSidecarErr ? `<div class="archive-note">⚠ ${escH(_archSidecarErr)} — showing live + pending only.</div>` : "";
+  const note = (_archSidecarErr ? `<div class="archive-note">⚠ ${escH(_archSidecarErr)} — showing live + pending only.</div>` : "")
+    + _archSkipped.map((s) => `<div class="archive-note">⚠ archive ${escH(s)} — its rows are skipped.</div>`).join("");
   if (rows.length === 0) {
     list.innerHTML = note + `<div class="empty-state">No matching history.</div>`;
   } else {
@@ -7877,6 +9748,21 @@ function archFilteredRows() {
     .sort((a, b) => b.ts - a.ts);
 }
 
+// H-19 (F44): a CSV cell whose first character is `=`, `+`, `-` or `@` (or a
+// tab/CR hiding one) is evaluated as a FORMULA by a spreadsheet. Archive
+// summaries quote player-authored text (a pool name rides "…pool =HYPERLINK…"
+// into a controller's export), so such a cell gets a leading `'` — the
+// spreadsheet's "this is text" marker — and every cell stays quoted, as
+// before. A JS number cannot carry a formula, so `seq` passes through.
+// explorer.js's dxCsvCell is the same rule for the OQL export.
+const ARCH_CSV_FORMULA_LEAD = /^[=+\-@\t\r]/;
+function archCsvCell(v) {
+  if (v == null) return '""';
+  if (typeof v === "number" || typeof v === "bigint") return `"${String(v)}"`;
+  const s = String(v);
+  return `"${ARCH_CSV_FORMULA_LEAD.test(s) ? "'" : ""}${s.replace(/"/g, '""')}"`;
+}
+
 function archExport(fmt) {
   const rows = archFilteredRows();
   if (rows.length === 0) { showToast("Nothing to export with the current filters", "warning"); return; }
@@ -7891,10 +9777,9 @@ function archExport(fmt) {
     })), null, 2)], { type: "application/json" });
     name = "uplands-archive.json";
   } else {
-    const esc = (s) => `"${String(s).replace(/"/g, '""')}"`;
     const header = "time,type,market,detail,status,seq,prevHash\n";
     const body = rows.map((r) => [new Date(r.ts).toISOString(), ARCH_LABELS[r.category] || r.category,
-      r.market || "", r.summary, r.status, r.seq == null ? "" : r.seq, r.prevHash || ""].map(esc).join(",")).join("\n");
+      r.market || "", r.summary, r.status, r.seq == null ? "" : r.seq, r.prevHash || ""].map(archCsvCell).join(",")).join("\n");
     blob = new Blob([header + body], { type: "text/csv" });
     name = "uplands-archive.csv";
   }
@@ -8020,18 +9905,14 @@ function updateSwapBalances() {
 }
 
 function renderMarketDropdown() {
+  // The items are role=menuitem buttons at tabindex=-1 (the trigger is the
+  // tab stop; wireMenuButton moves focus inside and delegates activation from
+  // the menu, so they carry no listeners), rebuilt without losing the one the
+  // keyboard is on (setMenuItems).
   function renderItems(list, container) {
-    container.innerHTML = list
-      .map((m) => `<div class="market-dropdown-item ${selectedMarket === m.id ? "active" : ""}" data-market="${escH(m.id)}"><span class="dd-name"><img class="market-logo market-logo-sm" src="/assets/${escH(m.baseToken)}.svg" alt="" data-hide-on-error>${escH(m.baseToken)}<span class="market-quote">/${escH(m.quoteToken)}</span></span><span class="dd-price">${m.lastPrice > 0 ? formatPrice(m.lastPrice) : "—"}</span></div>`)
-      .join("");
-    container.querySelectorAll(".market-dropdown-item").forEach((item) => {
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        // User explicitly chose this market → push a new history entry so
-        // Back returns to the previously-viewed market.
-        selectMarket(item.dataset.market, { pushHistory: true });
-      });
-    });
+    setMenuItems(container, list
+      .map((m) => `<button type="button" class="market-dropdown-item ${selectedMarket === m.id ? "active" : ""}" role="menuitem" tabindex="-1" data-market="${escH(m.id)}"><span class="dd-name"><img class="market-logo market-logo-sm" src="/assets/${escH(m.baseToken)}.svg" alt="" data-hide-on-error>${escH(m.baseToken)}<span class="market-quote">/${escH(m.quoteToken)}</span></span><span class="dd-price">${m.lastPrice > 0 ? formatPrice(m.lastPrice) : "—"}</span></button>`)
+      .join(""), "market");
   }
 
   // Recent section
@@ -8147,15 +10028,21 @@ function granularityOptionsFor(bestPrice) {
   return [{ value: 0, label: "Exact" }, ...validSteps.map((s) => ({ value: s, label: s >= 1 ? s.toFixed(0) : String(s) }))];
 }
 
-// Populate a granularity <menu> element from the current best price, marking the
-// active step. Shared by the Markets toolbar and the Swap toolbar.
+// Populate a granularity menu from the current best price, marking the active
+// step. Shared by the Markets toolbar and the Swap toolbar. The items are
+// role=menuitem buttons at tabindex=-1 (wireMenuButton moves focus between
+// them); the book re-renders every poll, so an unchanged option set is left
+// alone and a changed one is rebuilt under the keyboard (setMenuItems).
 function fillGranMenu(menu, bestPrice, currentG) {
   if (!menu) return;
   const options = granularityOptionsFor(bestPrice);
   if (!options) return;
-  menu.innerHTML = options.map((o) =>
-    `<div class="ob-gran-option${o.value === currentG ? " active" : ""}" data-value="${o.value}">${o.label}</div>`
-  ).join("");
+  const sig = `${currentG}|${options.map((o) => o.value).join(",")}`;
+  if (menu.dataset.sig === sig) return;
+  menu.dataset.sig = sig;
+  setMenuItems(menu, options.map((o) =>
+    `<button type="button" class="ob-gran-option${o.value === currentG ? " active" : ""}" role="menuitem" tabindex="-1" data-value="${o.value}">${o.label}</button>`
+  ).join(""), "value");
 }
 
 // The dropdown's button label for a granularity value ("Exact" or the step).
@@ -8313,12 +10200,13 @@ function renderOrderBook(snapshot) {
   function renderRow(l, cls) {
     const pct = l.barPct;
     // Clay Tint / Mint Tint depth bars with a SHEEN: brightest (0.32) at the
-    // right edge where the bar is anchored, fading to a dim tip (0.10) —
+    // right edge where the bar is anchored, fading to a dim tip (0.10) — the
+    // --depth-* tokens (base.css), so the bars follow the theme by CSS alone —
     // dimensional instead of a flat slab. Average brightness ≈ the old flat
     // 0.25, and the change-flash keyframes in orderbook.css sit at 0.42 to
     // stay distinctly above the brightest resting edge.
-    const edge = cls === "ask" ? "rgba(240,122,108,0.32)" : "rgba(94,230,180,0.32)";
-    const tip  = cls === "ask" ? "rgba(240,122,108,0.10)" : "rgba(94,230,180,0.10)";
+    const edge = cls === "ask" ? "var(--depth-ask-edge)" : "var(--depth-bid-edge)";
+    const tip  = cls === "ask" ? "var(--depth-ask-tip)" : "var(--depth-bid-tip)";
     // Longhand background-image (not the `background` shorthand): the shorthand
     // would reset the background-size/position that .orderbook-row uses to inset
     // the depth bar vertically (background gap between consecutive bars).
@@ -8497,20 +10385,24 @@ function renderSwapOrders(orders) {
 // a position still OPEN when the tape churned past them stay unclassified —
 // they render as spot rows until the episode closes and a reload rejoins them.
 let _afForPrincipal = null;  // cache key: state rebuilds when the signed-in principal changes
-let _afRows = [];            // normalized archived fills, all markets, unordered
+let _afRows = [];            // normalized archived fills RELEASED to the views, all markets, unordered
 let _afSeen = new Set();     // archive event seqs merged (dedup across pages)
-let _afSources = null;       // [{ id, offset, total|null }] chain paging state
+let _afSources = null;       // [{ id, offset, total|null, filtered|null, rows: [], failed, unavailable|null }] chain paging state, newest → oldest
 let _afPoolByPrin = null;    // pool principal text → pool record
 let _afEpisodes = null;      // closed-position episodes (window join)
-let _afLoading = null;       // single-flight page fetch
+let _afLoading = null;       // single-flight pull
 let _afDone = false;         // chain exhausted (or unavailable)
+let _afLegacy = false;       // backend lacks getMyArchivedEventsFiltered — page the unfiltered twin
+let _afInFlight = 0;         // page requests of the wave in flight (progress line)
 const AF_PAGE = 200;               // server-side page cap
-const AF_MAX_PAGES_PER_PULL = 200; // runaway backstop only — one pull drains until it finds fills or exhausts the chain
+const AF_WAVE = 6;                 // segments probed per wave — the bounded fan-out
+const AF_MAX_WAVES_PER_PULL = 50;  // runaway backstop only — one pull drains until it finds fills or exhausts the chain
+const AF_KINDS = ["fill"];         // the kinds filter the archive pages by (OQL `kind` vocabulary)
 const AF_EPISODE_SLACK_MS = 5000;  // reap/settle lag tolerance around episode windows
 
 function afReset() {
   _afRows = []; _afSeen = new Set(); _afSources = null;
-  _afPoolByPrin = null; _afEpisodes = null; _afLoading = null; _afDone = false;
+  _afPoolByPrin = null; _afEpisodes = null; _afLoading = null; _afDone = false; _afInFlight = 0;
 }
 
 function afClassify(e) {
@@ -8546,18 +10438,110 @@ async function afEnsure() {
   _afEpisodes = eps || [];
   let chain = [];
   try { if (appState.actor.getArchives) chain = (await appState.actor.getArchives()).slice().reverse(); } catch (_) {}
-  _afSources = chain.map((s) => ({ id: s.canisterId, offset: 0, total: null }));
+  _afSources = chain.map((s) => ({ id: s.canisterId, offset: 0, total: null, filtered: null, rows: [], failed: false, unavailable: null }));
   if (!_afSources.length) _afDone = true;   // no sidecar (fresh deploy) — hot rows only
 }
 
 // True while older history may still be fetchable from the chain.
 function afMore() { return !_afDone; }
+// A source that may still answer rows: unprobed, or paged short of its total.
+function afOpen(s) { return !s.failed && (s.total === null || s.offset < s.total); }
 
-// Pull the caller's archived events; resolves true when new fill rows landed.
-// Single-flight: concurrent view renders share a fetch. The per-user index
-// mixes all event kinds, so one pull keeps paging until it finds fills or
-// exhausts the chain — so `false` means "nothing more will arrive without a
-// state change" (chain done, or the auth guard bounced).
+// ── Progress line ("Searching the archive…" was a static string for the whole
+// walk — the operator's complaint). The views render afProgressHTML() into
+// their empty state and the loading button; afNotifyProgress() rewrites
+// those elements' TEXT in place from the fetch loop. It never re-renders a
+// view, so it cannot re-kick the fetch (the caller contract below).
+function afProgressText() {
+  const base = "Searching the archive for older history…";
+  if (!_afSources || !_afSources.length) return base;
+  const n = _afSources.length;
+  const probed = _afSources.filter((s) => s.total !== null || s.failed).length;
+  // Task 1793569495: a segment the federation could not serve — its canister
+  // no longer exists (the engine's 2026-11-01 shape), or it is stopped/frozen
+  // — is NAMED here by its newest-first position ("segment 3 unavailable")
+  // and the walk goes on past it; before this the view had nothing to say
+  // about a dead hop but its console warning.
+  const down = _afSources.map((s, i) => (s.failed ? i + 1 : null)).filter((i) => i !== null);
+  const downNote = down.length ? ` · segment${down.length > 1 ? "s" : ""} ${down.join(", ")} unavailable` : "";
+  if (_afInFlight > 0) {
+    const lo = probed + 1, hi = Math.min(n, probed + _afInFlight);
+    return `${base} segment${hi > lo ? "s" : ""} ${lo}${hi > lo ? "–" + hi : ""} of ${n}${downNote}`;
+  }
+  return `${base} ${probed} of ${n} segment${n === 1 ? "" : "s"} checked${downNote}`;
+}
+function afProgressHTML() { return `<span class="af-progress">${escH(afProgressText())}</span>`; }
+function afNotifyProgress() {
+  const text = afProgressText();
+  document.querySelectorAll(".af-progress").forEach((el) => { el.textContent = text; });
+}
+
+// One page of one source. Fills-only through the kind-filtered federation;
+// `filtered = false` marks a pre-filter segment answered by the legacy pager
+// (all kinds, all-kinds offsets), which the client-side kind test below
+// handles exactly as the serial walk always did. A backend that lacks the
+// filtered twin altogether flips the module to the legacy method once.
+async function afCallPage(src) {
+  const id = Principal.fromText(src.id), off = BigInt(src.offset), lim = BigInt(AF_PAGE);
+  if (!_afLegacy && appState.actor.getMyArchivedEventsFiltered) {
+    try { return await appState.actor.getMyArchivedEventsFiltered(id, AF_KINDS, off, lim); }
+    catch (e) {
+      if (!/no (update|query|composite query) method|IC0536|method not found/i.test(String(e && e.message || e))) throw e;
+      _afLegacy = true;
+    }
+  }
+  const r = await appState.actor.getMyArchivedEvents(id, off, lim);
+  return { events: r.events, total: r.total, filtered: false };
+}
+async function afFetchPage(src) {
+  const res = await afCallPage(src);
+  // Task 1793569495: `unavailable = opt <cause>` — the federation could not
+  // read this segment (its canister no longer exists: "segment missing", the
+  // engine's 2026-11-01 shape; or it is stopped/frozen). Close the source
+  // and keep the walk going; the progress line names it (afProgressText).
+  const why = res.unavailable && res.unavailable.length ? String(res.unavailable[0]) : null;
+  if (why !== null) {
+    console.warn("archived-fills: segment", src.id, "unavailable —", why);
+    src.failed = true; src.unavailable = why; src.total = 0;
+    return;
+  }
+  src.total = Number(res.total);
+  src.filtered = !!res.filtered;
+  const evs = res.events || [];
+  src.offset += evs.length;
+  if (!evs.length) src.offset = src.total;   // drained/empty source — advance past it
+  for (const e of evs) {
+    const seq = Number(e.seq);
+    if (_afSeen.has(seq)) continue;
+    _afSeen.add(seq);
+    if (!("fill" in e.kind)) continue;       // legacy pages carry every kind
+    src.rows.push(afClassify(e));
+  }
+}
+
+// Release buffered rows to the views as a CONTIGUOUS newest-first prefix of
+// the chain: walk sources newest → oldest, hand over each one's rows, and
+// stop at the first source still open — rows from segments OLDER than a
+// partly-paged one wait (already fetched, nothing is re-requested), so the
+// views never show a gap in the middle of the timeline that a later pull
+// fills in. Resolves true when rows reached _afRows.
+function afRelease() {
+  let added = false;
+  for (const s of _afSources) {
+    if (s.rows.length) { _afRows.push(...s.rows); s.rows = []; added = true; }
+    if (afOpen(s)) break;
+  }
+  return added;
+}
+
+// Pull the caller's archived fills; resolves true when new fill rows landed.
+// Single-flight: concurrent view renders share a pull. One pull fires WAVES
+// of up to AF_WAVE page requests at once over the open sources (newest
+// first), releases what is contiguous, and keeps going until rows land or
+// the chain is exhausted — so `false` means "nothing more will arrive
+// without a state change" (chain done, or the auth guard bounced). A source
+// whose request fails is skipped (hot rows and the other segments still
+// render; a reload retries it), never the whole walk.
 //
 // CALLER CONTRACT: re-render from .then ONLY when `added || !afMore()`. The
 // guard below returns an INSTANTLY-resolved false while auth state is still
@@ -8571,33 +10555,28 @@ function afFetchNext() {
   _afLoading = (async () => {
     try {
       await afEnsure();
-      let added = false, pulls = 0;
-      while (!added && !_afDone && pulls < AF_MAX_PAGES_PER_PULL) {
-        const src = _afSources.find((s) => s.total === null || s.offset < s.total);
-        if (!src) { _afDone = true; break; }
-        const res = await appState.actor.getMyArchivedEvents(
-          Principal.fromText(src.id), BigInt(src.offset), BigInt(AF_PAGE));
-        src.total = Number(res.total);
-        const evs = res.events || [];
-        src.offset += evs.length;
-        if (!evs.length) src.offset = src.total;   // drained/empty source — advance past it
-        for (const e of evs) {
-          const seq = Number(e.seq);
-          if (_afSeen.has(seq)) continue;
-          _afSeen.add(seq);
-          if (!("fill" in e.kind)) continue;
-          _afRows.push(afClassify(e));
-          added = true;
-        }
-        if (!_afSources.some((s) => s.total === null || s.offset < s.total)) _afDone = true;
-        pulls += 1;
+      let added = false, waves = 0;
+      while (!added && !_afDone && waves < AF_MAX_WAVES_PER_PULL) {
+        const wave = _afSources.filter(afOpen).slice(0, AF_WAVE);
+        if (!wave.length) { _afDone = true; break; }
+        _afInFlight = wave.length;
+        afNotifyProgress();
+        await Promise.all(wave.map((src) => afFetchPage(src).catch((e) => {
+          console.warn("archived-fills fetch failed for segment", src.id, e);
+          src.failed = true; src.unavailable = String(e && e.message || e);
+        })));
+        _afInFlight = 0;
+        if (afRelease()) added = true;
+        if (!_afSources.some(afOpen)) _afDone = true;
+        waves += 1;
+        afNotifyProgress();
       }
       return added;
     } catch (e) {
       console.warn("archived-fills fetch failed:", e);
       _afDone = true;   // fail closed: hot rows still render; a reload retries
       return false;
-    } finally { _afLoading = null; }
+    } finally { _afLoading = null; _afInFlight = 0; afNotifyProgress(); }
   })();
   return _afLoading;
 }
@@ -8703,7 +10682,7 @@ async function renderUomPositionsHistory(content, pagination) {
 
     if (!allRows.length) {
       content.innerHTML = afMore()
-        ? '<div class="uom-empty">Searching the archive for older history…</div>'
+        ? `<div class="uom-empty">${afProgressHTML()}</div>`
         : `<div class="uom-empty">No position fills${uomScopeActive() ? " on this market" : ""}</div>`;
       pagination.innerHTML = "";
       return;
@@ -8732,22 +10711,12 @@ async function renderUomPositionsHistory(content, pagination) {
 }
 
 function renderUomOpenOrders(content, pagination) {
-  // Pending matches: crossing slices that hit a protected (AMM) maker and
-  // are awaiting settlement. Shown above open orders with a distinct row
-  // type so the user understands these aren't lost — they finalise into
-  // trades after the protection window (typically 5s).
-  const nowNs = BigInt(Date.now()) * 1_000_000n;
-  const pendings = uomPendingMatches.map((p) => {
-    const expiryNs = typeof p.expiryNs === "bigint" ? p.expiryNs : BigInt(p.expiryNs);
-    const remainingMs = Number((expiryNs - nowNs) / 1_000_000n);
-    return { ...p, remainingMs };
-  });
-
+  // (The "Settling in…" pending-match rows once rendered above the open
+  // orders are gone — task 1788516198 retired the machinery behind them.)
   // All markets by default; the panel checkbox narrows to the selected one.
-  const scopedPendings = uomScoped(pendings);
   const orders = uomScoped(uomOpenOrders);
   const poolOrders = uomScoped(uomPoolOrders || []);
-  const total = orders.length + scopedPendings.length + poolOrders.length;
+  const total = orders.length + poolOrders.length;
   const pages = Math.max(1, Math.ceil(orders.length / UOM_PAGE_SIZE));
   uomPage = Math.min(uomPage, pages - 1);
   const start = uomPage * UOM_PAGE_SIZE;
@@ -8758,20 +10727,6 @@ function renderUomOpenOrders(content, pagination) {
     pagination.innerHTML = "";
     return;
   }
-
-  const pendingRows = scopedPendings.map((p) => {
-    const isBuy = p.takerSide.buy !== undefined;
-    const secs = Math.max(0, Math.ceil(p.remainingMs / 1000));
-    const anchor = uomAnchor(p.marketId, p.price);
-    return `<div class="uom-row uom-row-pending" title="Pending match — settling against AMM-protected maker">
-      <span class="uom-cell-coin">${assetCellHTML(uomCoin(p.marketId))}</span>
-      <span>${sidePillHTML(isBuy ? "Buy" : "Sell")}</span>
-      <span>${formatBookPrice(p.price, anchor)}</span>
-      <span>${formatBookQty(p.quantity, anchor)}</span>
-      <span class="uom-settling">${secs > 0 ? `~${secs}s` : "now"}</span>
-      <span></span>
-    </div>`;
-  }).join("");
 
   const orderRows = orderPage.map((o) => {
     const isBuy = o.side.buy !== undefined;
@@ -8793,14 +10748,14 @@ function renderUomOpenOrders(content, pagination) {
   // Resting MARGIN orders (owned by a pool) — Long/Short in the Coin cell IS
   // the margin marker, opening a position when they fill. Shown here (not just
   // Account→Positions) so a margin limit placed on this page is visible on it.
-  // Cancel repays the borrow (cancelMyOrder routes pool orders through the
-  // deleveraging path backend-side, so the plain cancel handler is correct
-  // even when the pool tag is unresolved).
+  // Cancel repays nothing — leverage is borrowed at the FILL, so an unfilled
+  // entry holds no borrow (cancelMyOrder accepts pool orders backend-side, so
+  // the plain cancel handler is correct even when the pool tag is unresolved).
   const marginRows = poolOrders.map((o) => {
     const isBuy = o.side.buy !== undefined;
     const staged = stagedOrderIds.has(Number(o.id));
     const anchor = uomAnchor(o.marketId, o.price);
-    return `<div class="uom-row uom-row-margin" title="${staged ? "Pending — awaiting the next price update (~1s); " : ""}Margin order in pool &quot;${escH(o.poolName)}&quot; — opens a ${isBuy ? "long" : "short"} position when it fills">
+    return `<div class="uom-row uom-row-margin" title="${staged ? "Pending — awaiting the next price update (~1s); " : ""}Margin order in pool &quot;${escH(o.poolName)}&quot; — opens a ${isBuy ? "long" : "short"} position when it fills; leverage is borrowed at that fill, so while it rests it holds no debt and cancelling repays nothing">
       <span class="uom-cell-coin">${assetCellHTML(uomCoin(o.marketId))}</span>
       <span>${sidePillHTML(isBuy ? "Long" : "Short")}</span>
       <span>${formatBookPrice(o.price, anchor)}</span>
@@ -8812,7 +10767,7 @@ function renderUomOpenOrders(content, pagination) {
 
   content.innerHTML =
     '<div class="uom-header"><span>Asset</span><span>Side</span><span>Price</span><span>Qty</span><span>Filled</span><span></span></div>' +
-    pendingRows + marginRows + orderRows;
+    marginRows + orderRows;
 
   content.querySelectorAll("[data-uom-cancel]").forEach((btn) => {
     btn.addEventListener("click", () => cancelOrder(Number(btn.dataset.uomCancel)));
@@ -8878,7 +10833,7 @@ async function renderUomHistory(content, pagination) {
 
   if (!total) {
     content.innerHTML = afMore()
-      ? '<div class="uom-empty">Searching the archive for older history…</div>'
+      ? `<div class="uom-empty">${afProgressHTML()}</div>`
       : `<div class="uom-empty">No trade history${uomScopeActive() ? " on this market" : ""}</div>`;
     pagination.innerHTML = "";
     return;
@@ -8944,7 +10899,6 @@ function selectMarket(marketId, opts) {
   // No need to reset uomTradeHistoryByMarket — it's keyed per market and
   // the renderer reads the current market's bucket.
   uomOpenOrders = [];
-  uomPendingMatches = [];
 
   // Restore per-market order book granularity (default to Exact for new markets)
   obGranularity = obGranularityByMarket[marketId] || 0;
@@ -8964,10 +10918,10 @@ function selectMarket(marketId, opts) {
     appState.actor.setUserPreferences({ recentMarkets, lastMarket: [lastMarket] });
   }
 
-  // Close dropdowns
-  document.getElementById("market-selector").classList.remove("open");
-  document.getElementById("market-stats-toggle")?.classList.remove("open");
-  document.querySelector(".market-stat-more.open")?.classList.remove("open");
+  // Close dropdowns — through their setters, so aria-expanded follows .open
+  marketSelectorMenu.setOpen(false);
+  marketStatsPopup.setOpen(false);
+  marketStatMorePopup.setOpen(false);
 
   document.getElementById("market-detail").style.display = "";
   const market_ = markets.find((m) => m.id === marketId);
@@ -9049,10 +11003,15 @@ async function executeSwap() {
     return;
   }
 
-  // Defensive guard: if the last preview showed partial fill and the user has
-  // "No partial fulfillment" checked, refuse before calling the backend
-  // (which would reject with an error anyway). Handles the rare race where
-  // the book shrank between preview and click.
+  // ADVISORY guard (H-21): if the last preview showed partial fill and the
+  // user has "No partial fulfillment" checked, refuse before calling the
+  // backend — a courtesy that saves a round trip, NOT the enforcement point.
+  // The backend enforces all-or-nothing at RELEASE: every cross-swap stages
+  // (the reply is a staged id, watched by watchSwapOutcome below), and a FOK
+  // whose either leg is short at release is killed with nothing settled
+  // (outcome "Fill-or-kill swap killed at release: …"). The preview is a
+  // market estimate against the book as it stands; the release judges the
+  // book as it will be.
   const noPartial = document.getElementById("no-partial-fill").checked;
   if (noPartial && lastSwapEstimate && !lastSwapEstimate.filled &&
       lastSwapEstimate.fromAmount === amount &&
@@ -9085,11 +11044,20 @@ async function executeSwap() {
       // Sealed-until-GEPTOR: a partial-OK swap is STAGED (fromAmount 0 + a staged
       // order id) and clears at the next price update (~1s).
       const staged = Number(r.fromAmount) < 0.0000001 && (r.swapOrderId || []).length > 0;
+      // The budget actually STAGED (raw e8 — kept out of MONEY_KEYS): swap()
+      // accepts against the RAW balance, but only the caller's AVAILABLE
+      // ICPUSD converts — funds reserved by open orders do not (#55 silent
+      // "complete", task 1788465056). Say so up front instead of naming the
+      // full amount and letting the shortfall arrive unexplained.
+      const stagedBudget = (r.stagedBudget || []).length > 0 ? Number(r.stagedBudget[0]) / 1e8 : null;
+      const clamped = staged && stagedBudget !== null && stagedBudget < amount - 1e-8;
       showToast(
         staged
-          ? `Swap ${formatNum(amount)} ${fromToken} → ${toToken} staged — clears at next price (~1s)`
+          ? (clamped
+              ? `Swap staged — ${formatNum(stagedBudget)} of ${formatNum(amount)} ${fromToken} will convert to ${toToken} (${formatNum(amount - stagedBudget)} ${fromToken} is reserved by your open orders); clears at next price (~1s)`
+              : `Swap ${formatNum(amount)} ${fromToken} → ${toToken} staged — clears at next price (~1s)`)
           : `Swapped ${formatNum(r.fromAmount)} ${fromToken} for ${formatNum(r.toAmount)} ${toToken}${r.fullyFilled ? "" : " (partial)"}`,
-        "success"
+        clamped ? "warning" : "success"
       );
       // A staged swap releases asynchronously (on the next GEPTOR). Poll its
       // outcome so the user is told if it filled, partly filled, or couldn't fill
@@ -9115,9 +11083,27 @@ async function executeSwap() {
   }
 }
 
-// Poll a staged cross-swap's outcome and toast what actually happened. The
-// backend records the caller's latest swap outcome; we match on id so we report
-// THIS swap. ~24s window covers the GEPTOR release + the 15s users-only fallback.
+// Poll a staged swap's outcome and toast what actually happened. The backend
+// records the caller's latest swap outcome — a cross-swap's, or a DIRECT
+// swap's when it stopped short of the amount asked (#55 silent "complete",
+// task 1788465056) — with the engine's stop reason; we match on id so we
+// report THIS swap. ~24s window covers the GEPTOR release + the 15s
+// users-only fallback. A swap whose whole request converted records nothing,
+// so the staging toast stands as its report.
+const SWAP_STOP_TEXT = {
+  filled:          "",   // the stated quantity filled — nothing to add
+  budgetExhausted: "the available budget converted in full",
+  bookExhausted:   "no more liquidity within your slippage",
+  slippage:        "the book moved past your slippage cap",
+  unfunded:        "insufficient available balance",
+  workBound:       "the release hit its work bound",
+};
+function swapStopText(o) {
+  const v = (o && o.stopReason && o.stopReason[0]) || null;   // opt variant → [{ key: null }]
+  if (!v) return "";
+  const key = Object.keys(v)[0];
+  return key in SWAP_STOP_TEXT ? SWAP_STOP_TEXT[key] : key;
+}
 async function watchSwapOutcome(swapId) {
   if (!appState.actor || !appState.actor.getMyRecentSwap) return;
   for (let i = 0; i < 16; i++) {
@@ -9126,9 +11112,13 @@ async function watchSwapOutcome(swapId) {
     try { o = await appState.actor.getMyRecentSwap(); } catch { continue; }
     o = (o && o[0]) || null;
     if (!o || Number(o.id) !== swapId) continue;
+    const why = swapStopText(o);
     if (o.filled) {
-      const extra = o.note ? ` — ${o.note}` : "";
-      showToast(`Swapped ${formatNum(Number(o.fromAmount))} ${o.fromToken} → ${formatNum(Number(o.toAmount))} ${o.toToken}${extra}`, "success");
+      // The note already says how much of the request converted and why;
+      // fall back to the bare stop reason when the note is empty.
+      const extra = o.note ? ` — ${o.note}` : (why ? ` — ${why}` : "");
+      const stoppedShort = o.note !== "" || (why !== "" && why !== SWAP_STOP_TEXT.filled);
+      showToast(`Swapped ${formatNum(Number(o.fromAmount))} ${o.fromToken} → ${formatNum(Number(o.toAmount))} ${o.toToken}${extra}`, stoppedShort ? "warning" : "success");
     } else {
       showToast(`Swap didn't complete — ${o.note || "no liquidity within slippage; funds returned"}`, "error");
     }
@@ -9259,8 +11249,8 @@ function renderSwapBook(body, snap, market) {
   const row = (l, side) => {
     const pct = l.barPct;
     // Sheen matching the Markets book bars: bright anchored edge → dim tip.
-    const edge = side === "ask" ? "rgba(240,122,108,0.32)" : "rgba(94,230,180,0.32)";
-    const tip  = side === "ask" ? "rgba(240,122,108,0.10)" : "rgba(94,230,180,0.10)";
+    const edge = side === "ask" ? "var(--depth-ask-edge)" : "var(--depth-bid-edge)";
+    const tip  = side === "ask" ? "var(--depth-ask-tip)" : "var(--depth-bid-tip)";
     const bg = `background-image:linear-gradient(to left,${edge} 0%,${tip} ${pct}%,transparent ${pct}%)`;
     const flash = l.changed ? ` ob-flash-${side}` : "";
     return `<div class="swap-ob-row ${side}${flash}" style="${bg}"><span class="p">${fmtP(l.price)}</span><span class="q">${fmtQ(l.quantity)}</span><span class="v">${Math.round(l.price * l.quantity).toLocaleString("en-US")}</span></div>`;
@@ -9469,19 +11459,21 @@ function ensureSwapGraphChart() {
   if (swapGraphChart) return;
   const el = document.getElementById("swap-graph-canvas");
   if (!el) return;
+  // Colours come from the theme tokens (theme.js) — re-applied on mdx:theme.
+  const skin = chartThemeOptions();
   swapGraphChart = createChart(el, {
     width: el.clientWidth,
     height: el.clientHeight || 220,
     layout: {
       background: { type: "solid", color: "transparent" },
-      textColor: "#7A8699",
+      textColor: skin.layout.textColor,
       fontSize: 11,
     },
-    grid: { vertLines: { color: "rgba(34,46,64,0.4)" }, horzLines: { color: "rgba(34,46,64,0.4)" } },
+    grid: { vertLines: skin.grid.vertLines, horzLines: skin.grid.horzLines },
     crosshair: {
       mode: 0,
-      vertLine: { color: "rgba(59,184,212,0.5)", width: 1, style: 2 },
-      horzLine: { color: "rgba(59,184,212,0.5)", width: 1, style: 2 },
+      vertLine: { ...skin.crosshair.vertLine, width: 1, style: 2 },
+      horzLine: { ...skin.crosshair.horzLine, width: 1, style: 2 },
     },
     localization: {
       timeFormatter: (time) => {
@@ -9490,11 +11482,11 @@ function ensureSwapGraphChart() {
       },
     },
     timeScale: {
-      borderColor: "rgba(34,46,64,0.5)",
+      borderColor: skin.timeScale.borderColor,
       timeVisible: true,
       secondsVisible: false,
     },
-    rightPriceScale: { borderColor: "rgba(34,46,64,0.5)", scaleMargins: { top: 0.12, bottom: 0.10 } },
+    rightPriceScale: { borderColor: skin.rightPriceScale.borderColor, scaleMargins: { top: 0.12, bottom: 0.10 } },
     handleScroll: true,
     handleScale: true,
   });
@@ -9502,7 +11494,7 @@ function ensureSwapGraphChart() {
   // honest about what this is: a ref-price rate line, not a trade tape.
   swapGraphSeries = swapGraphChart.addSeries(
     LineSeries,
-    { color: "rgba(56, 189, 240, 0.9)", lineWidth: 2, priceLineVisible: true, lastValueVisible: true },
+    { color: chartTrackColor(), lineWidth: 2, priceLineVisible: true, lastValueVisible: true },
   );
   // Re-fit once on the first real layout: the chart may be created while the
   // tab is backgrounded (0×0), and a fitContent computed then leaves the data
@@ -9660,7 +11652,7 @@ function updateMarginPreview() {
       else {
         estLiq = r.estLiqPrice;
         if (r.maxSizeBase > 0) {
-          capacityRow = `<span class="mp-row"><span>Pool capacity</span><b>~${formatNum(r.maxSizeBase)} ${base}</b></span>`;
+          capacityRow = `<span class="mp-row"><span title="The largest size this pool could open right now — a check at today's prices, not a reservation. Leverage is borrowed at the fill, so the vault's capacity is consumed by live positions only and this is re-checked when the order fills.">Pool capacity</span><b>~${formatNum(r.maxSizeBase)} ${base}</b></span>`;
         }
         if (!r.canOpen) {
           poolBlocked = true;
@@ -9982,6 +11974,12 @@ function updateUI() {
   updateOrderSideUI();
   dxOnAuthChange();   // reflect sign-in/out in the Data explorer's gate
   applyIntelliAuthGate();
+  // #54.9: the demo/mock marker is re-derived from actor IDENTITY on every
+  // pass (isMockActor(appState.actor)), after the order-panel overlay above
+  // exists so its Sign In is gated too. The banner lives in #top-chrome, so
+  // its show/hide moves --chrome-h.
+  renderDemoMarker();
+  updateChromeHeight();
 }
 
 // ── AI section: signed-out gate ──────────────────────────────────
@@ -9998,10 +11996,8 @@ function applyIntelliAuthGate() {
   if (!prompt || !view) return;
   const authed = !!appState.isAuthenticated;
   prompt.style.display = authed ? "none" : "";
-  for (const sel of [".intelli-head", ".intelli-tabs"]) {
-    const el = view.querySelector(sel);
-    if (el) el.style.display = authed ? "" : "none";
-  }
+  const tabs = view.querySelector(".intelli-tabs");
+  if (tabs) tabs.style.display = authed ? "" : "none";
   // Panes: signed out BOTH hide; signed in, restore the ACTIVE one only.
   // Blanket-showing them would defeat showIntelliTab's choice and render the
   // assistant and the explorer stacked on top of each other, since this runs
@@ -10316,7 +12312,10 @@ function docsRoute(subpath) {
   if (changed) docsCollapseToDefault();
 }
 
-const VALID_TABS = new Set(["swap", "markets", "stats", "intelli", "ledger", "leaderboard", "account", "docs", "phase1"]);
+// "home" is the landing page (task 1793490812): the EMPTY hash and any unknown
+// hash land there; the logo (<a href="#home">) and the mobile drawer's Home
+// row are its controls — it has no nav tab by convention.
+const VALID_TABS = new Set(["home", "swap", "markets", "stats", "intelli", "ledger", "leaderboard", "account", "docs", "phase1"]);
 
 // URL-facing hash slug ↔ internal tab token. The nav labels were renamed to
 // Status / Intelligence, so the address bar should read #status / #intelligence
@@ -10333,15 +12332,24 @@ const TAB_TO_ROUTE = { stats: "system", intelli: "ai" };                        
 const ROUTE_ALIASES = { deposit: "account/deposit", earn: "account/earn" };
 // The sub-path a bare #<tab> lands on, so the URL always names the visible
 // pane (deep links and back/forward stay meaningful).
-const TAB_DEFAULT_SUB = { docs: "launch", stats: "overview", intelli: "assistant", account: "overview" };
+const TAB_DEFAULT_SUB = { docs: "launch", stats: "overview", intelli: "agent-chat", account: "overview" };
 // Intelligence inner tabs: URL slug ⇄ internal token (panes/gate keep ai|explorer).
-const INTELLI_SLUG_TO_TOKEN = { assistant: "ai", memory: "explorer" };
-const INTELLI_TOKEN_TO_SLUG = { ai: "assistant", explorer: "memory" };
+// `agent-chat` is the canonical chat slug — the spelling the app WRITES (the
+// nav click via TAB_DEFAULT_SUB, syncHashToState via INTELLI_TOKEN_TO_SLUG,
+// the explorer's Ask-AI jump, a tab click via the button's data-intelli).
+// `assistant` is its legacy alias (the tab's name until 2026-11-01): deep
+// links in posted public comments and older docs still carry it, so it is
+// accepted on the way IN and rewritten to the canonical spelling by
+// activateTab — never written out (INTELLI_TOKEN_TO_SLUG stays one-to-one).
+const INTELLI_SLUG_TO_TOKEN = { "agent-chat": "ai", assistant: "ai", memory: "explorer" };
+const INTELLI_TOKEN_TO_SLUG = { ai: "agent-chat", explorer: "memory" };
 
-// Parse the current URL hash into { tab, subpath }. Unknown tab → "swap".
+// Parse the current URL hash into { tab, subpath }. The empty hash is the
+// landing page (Home); an unknown tab falls back there too — a stale deep
+// link lands on the page that explains the others, not inside the Swap box.
 function routeFromHash() {
   const raw = (window.location.hash || "").slice(1);
-  if (!raw) return { tab: "swap", subpath: null };
+  if (!raw) return { tab: "home", subpath: null };
   const slash0 = raw.indexOf("/");
   const head = (slash0 < 0 ? raw : raw.slice(0, slash0)).toLowerCase();
   // #deposit / #play are aliases for a path inside another section.
@@ -10350,7 +12358,7 @@ function routeFromHash() {
   const tabRaw = (slash < 0 ? expanded : expanded.slice(0, slash)).toLowerCase();
   const tab = ROUTE_TO_TAB[tabRaw] || tabRaw;   // #status→stats, #ai→intelli
   const subpath = slash < 0 ? null : expanded.slice(slash + 1) || null;
-  return { tab: VALID_TABS.has(tab) ? tab : "swap", subpath };
+  return { tab: VALID_TABS.has(tab) ? tab : "home", subpath };
 }
 
 // Activate a tab by name, optionally with a sub-path (e.g. a market ID for
@@ -10395,7 +12403,7 @@ async function renderPhase1Leaders() {
 }
 
 function activateTab(tabName, subpath) {
-  if (!VALID_TABS.has(tabName)) tabName = "swap";
+  if (!VALID_TABS.has(tabName)) tabName = "home";
 
   const isSwitchingView = !(currentTab === tabName
     && document.getElementById(tabName + "-view")?.classList.contains("active"));
@@ -10443,15 +12451,23 @@ function activateTab(tabName, subpath) {
     showAccountTab(subpath || acctTab);
   }
   if (tabName === "intelli") {
-    // Subpath selects the inner tab: #ai/assistant|memory (legacy
-    // #intelligence/ai|explorer still resolves). A named subpath is an explicit
-    // choice (tab clicks route through the hash) — remember it so refreshAiGate
-    // doesn't yank the user off it, and remember an "assistant" wish so a click
-    // that lands before the gate resolves is honoured, not swallowed.
+    // Subpath selects the inner tab: #ai/agent-chat|memory (the legacy
+    // #ai/assistant alias and #intelligence/ai|explorer still resolve). A
+    // named subpath is an explicit choice (tab clicks route through the hash)
+    // — remember it so refreshAiGate doesn't yank the user off it, and
+    // remember an "agent-chat" wish so a click that lands before the gate
+    // resolves is honoured, not swallowed.
     const tok = INTELLI_SLUG_TO_TOKEN[subpath] || subpath;
     if (tok === "ai" || tok === "explorer") {
       intelliUserChose = true;
       intelliWishAi = tok === "ai";
+      // A legacy alias (#ai/assistant) is accepted but not kept: rewrite the
+      // address bar to the canonical slug in place — replaceState fires no
+      // hashchange and adds no history entry — so a copied link is current.
+      const canon = INTELLI_TOKEN_TO_SLUG[tok];
+      if (INTELLI_SLUG_TO_TOKEN[subpath] === tok && subpath !== canon) {
+        window.history.replaceState(null, "", `#ai/${canon}`);
+      }
     }
     showIntelliTab(tok || appState.intelliTab);
   }
@@ -10463,6 +12479,9 @@ function activateTab(tabName, subpath) {
   }
   if (tabName === "phase1") {
     renderPhase1Leaders();      // static snapshot — one fetch, then cached
+  }
+  if (tabName === "home" && isSwitchingView) {
+    refreshHomeFigures();       // the proof strip: the System page's reads, once per visit
   }
   if (tabName === "docs") {
     // Subpath selects the docs page: #docs/<slug> (missing/unknown → home).
@@ -10508,9 +12527,11 @@ function syncHashToState(opts) {
     want = `#ai/${INTELLI_TOKEN_TO_SLUG[appState.intelliTab] || appState.intelliTab}`;
   } else if (currentTab === "account" && acctTab) {
     want = `#account/${acctTab}`;
-  } else if (currentTab && currentTab !== "swap") {
+  } else if (currentTab && currentTab !== "swap" && currentTab !== "home") {
     want = `#${TAB_TO_ROUTE[currentTab] || currentTab}`;
   } else {
+    // Swap and Home never rewrite the hash: the bare URL is Home, and a
+    // visitor who arrived at "/" should not watch the address bar change.
     return;
   }
   if (window.location.hash === want) return;
@@ -10592,55 +12613,32 @@ function setupEventListeners() {
     header.classList.remove("acct-menu", "sys-menu");   // always reopen at the top level
   });
 
-  // Market selector dropdown toggle
-  document.getElementById("market-selector").addEventListener("click", (e) => {
-    // Don't toggle if clicking inside the dropdown itself (handled by item click)
-    if (e.target.closest(".market-dropdown")) return;
-    document.getElementById("market-selector").classList.toggle("open");
+  // Market selector — a menu button over the market list (makeDropdown /
+  // wireMenuButton; renderMarketDropdown rebuilds the items, selectMarket
+  // closes it through the same setter).
+  wireMenuButton(marketSelectorMenu, {
+    menu: document.getElementById("market-dropdown"),
+    itemSelector: ".market-dropdown-item",
+    // User explicitly chose this market → push a new history entry so Back
+    // returns to the previously-viewed market.
+    onActivate: (item) => selectMarket(item.dataset.market, { pushHistory: true }),
   });
 
-  // Mobile price/stats dropdown (price-over-change → labeled stats popup).
-  const statsToggle = document.getElementById("market-stats-toggle");
-  if (statsToggle) {
-    statsToggle.addEventListener("click", (e) => {
-      // Clicks inside the popup itself shouldn't re-toggle it.
-      if (e.target.closest(".market-stats-dropdown")) return;
-      statsToggle.classList.toggle("open");
-    });
-  }
+  // The price/stats popup (mobile, and the compact desktop header) and the
+  // desktop overflow popup: disclosures — rows to read, nothing to pick. The
+  // overflow trigger is one shared <button> that updateMarketHeaderMode parks
+  // in whichever cell is the trigger; its listeners travel with it.
+  wireDisclosure(marketStatsPopup);
+  wireDisclosure(marketStatMorePopup);
 
-  // Desktop overflow popup: the trigger cell moves as the header resizes
-  // (updateMarketHeaderMode), so delegate from the stats row.
-  const statsRow = document.querySelector(".market-content .market-stats");
-  if (statsRow) {
-    statsRow.addEventListener("click", (e) => {
-      if (e.target.closest(".market-stats-dropdown")) return;
-      const trigger = e.target.closest(".market-stat-more");
-      if (trigger) trigger.classList.toggle("open");
-    });
-  }
-
-  // Close dropdowns on click outside
+  // Close dropdowns on click outside — every dropdown on the page (the chart
+  // cell's view menu and the user menu included) through its own setter
+  // (makeDropdown), so aria-expanded follows .open, and only the ones that
+  // are open are touched: a document click writes nothing otherwise.
   document.addEventListener("click", (e) => {
-    const selector = document.getElementById("market-selector");
-    if (selector && !selector.contains(e.target)) {
-      selector.classList.remove("open");
-    }
-    const stats = document.getElementById("market-stats-toggle");
-    if (stats && !stats.contains(e.target)) {
-      stats.classList.remove("open");
-    }
-    const moreOpen = document.querySelector(".market-stat-more.open");
-    if (moreOpen && !moreOpen.contains(e.target)) {
-      moreOpen.classList.remove("open");
-    }
-    const userMenu = document.getElementById("user-menu");
-    if (userMenu && !userMenu.contains(e.target)) {
-      closeUserMenu();
-    }
-    const chartView = document.getElementById("mini-chart-view");
-    if (chartView && !chartView.contains(e.target)) {
-      chartView.classList.remove("open");
+    for (const d of DROPDOWNS) {
+      const wrap = d.wrapEl();
+      if (wrap && d.isOpen() && !wrap.contains(e.target)) d.setOpen(false);
     }
   });
 
@@ -10698,7 +12696,7 @@ function setupEventListeners() {
       }
       // Clicking "Markets" goes to the last-viewed market (if any) so the
       // URL captures a shareable state; every other section writes its full
-      // path (#docs/launch, #system/overview, #ai/assistant, #account/overview)
+      // path (#docs/launch, #system/overview, #ai/agent-chat, #account/overview)
       // so the URL always names the pane on screen.
       const slug = TAB_TO_ROUTE[name] || name;
       if (name === "markets" && selectedMarket) {
@@ -10732,33 +12730,29 @@ function setupEventListeners() {
     });
   });
 
-  // Signed-in user dropdown (desktop far right): the trigger toggles the menu;
-  // its items route to Account or sign out. Outside-click closes it (wired into
-  // the shared close-dropdowns listener above).
-  const userTrigger = document.getElementById("user-menu-trigger");
-  if (userTrigger) {
-    userTrigger.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const menu = document.getElementById("user-menu");
-      const open = menu.classList.toggle("open");
-      userTrigger.setAttribute("aria-expanded", open ? "true" : "false");
-    });
-  }
-  document.querySelectorAll(".user-menu-item").forEach((item) => {
-    item.addEventListener("click", () => {
+  // Signed-in user dropdown (desktop far right): a menu button over the
+  // Account shortcuts and Sign out (makeDropdown / wireMenuButton — the
+  // trigger toggles through the setter and is let bubble to the shared
+  // closer above like every other trigger's, so a menu open elsewhere
+  // closes; the keys are the router's; an activation closes and returns
+  // focus to the trigger, so the items carry no close of their own).
+  // renderProfileChip's sign-out path still closes through closeUserMenu.
+  wireMenuButton(userMenu, {
+    menu: document.getElementById("user-menu-dropdown"),
+    itemSelector: ".user-menu-item",
+    onActivate: (item) => {
       const action = item.dataset.useraction;
-      closeUserMenu();
       if (action === "account") {
         if (currentTab !== "account") window.location.hash = "account";
       } else if (action && action.startsWith("acct:")) {
         // Account section shortcuts (Value, Wallet, …) — hash-driven so
         // back/forward works; if we're already there the hash is unchanged
-        // and the click just closes the menu.
+        // and the activation just closes the menu.
         window.location.hash = "account/" + action.slice(5);
       } else if (action === "signout") {
         logout();
       }
-    });
+    },
   });
 
   // Publish the top chrome's height as --chrome-h (see updateChromeHeight).
@@ -10769,6 +12763,11 @@ function setupEventListeners() {
     new ResizeObserver(updateChromeHeight).observe(topChrome);
     updateChromeHeight();
   }
+  // Crossing the mobile breakpoint (≤ 900px) shows/hides the donation-asking
+  // fuel banner by stylesheet alone (stats.css, .fuel-banner.asks-cycles — no
+  // renderer runs), so recompute --chrome-h on the crossing itself (task
+  // 1793575742). uomMobileMQ is the app's one mobile MediaQueryList.
+  uomMobileMQ.addEventListener("change", updateChromeHeight);
 
   // Docs: build the sidebar once; page bodies render on route (docsRoute).
   // In-page table-of-contents links use data-docs-goto and scroll WITHOUT
@@ -10791,33 +12790,25 @@ function setupEventListeners() {
   document.getElementById("ph-mode-fills")?.addEventListener("click", () => setPhMode("fills"));
 
   window.addEventListener("hashchange", () => {
+    // #dev-login is a hook, not a view: on a #dev venue it signs the tab in
+    // (devLogin, posture-gated) while the route below lands on Home.
+    if (devLoginHashHit()) devLogin("hash");
     const r = routeFromHash();
     activateTab(r.tab, r.subpath);
   });
 
-  // Order book granularity dropdown (custom)
-  const granEl = document.getElementById("ob-granularity");
-  granEl.addEventListener("click", (e) => {
-    const opt = e.target.closest(".ob-gran-option");
-    if (opt) {
-      e.stopPropagation();
+  // Order book granularity dropdown — a menu button (makeDropdown /
+  // wireMenuButton; the setter parks the fixed-position menu above the
+  // trigger as it opens, the shared closer closes it). The step is per market.
+  wireMenuButton(obGranMenu, {
+    menu: document.getElementById("ob-gran-menu"),
+    itemSelector: ".ob-gran-option",
+    onActivate: (opt) => {
       obGranularity = Number(opt.dataset.value);
       if (selectedMarket) obGranularityByMarket[selectedMarket] = obGranularity;
       document.getElementById("ob-gran-label").textContent = opt.textContent;
-      granEl.classList.remove("open");
       if (lastOrderBookSnapshot) renderOrderBook(lastOrderBookSnapshot);
-      return;
-    }
-    if (e.target.closest(".ob-gran-menu")) return;
-    // Position menu above the button using fixed positioning
-    const menu = document.getElementById("ob-gran-menu");
-    const rect = granEl.getBoundingClientRect();
-    menu.style.left = rect.left + "px";
-    menu.style.bottom = (window.innerHeight - rect.top + 4) + "px";
-    granEl.classList.toggle("open");
-  });
-  document.addEventListener("click", (e) => {
-    if (!granEl.contains(e.target)) granEl.classList.remove("open");
+    },
   });
 
   // Mobile user orders tabs
@@ -10887,27 +12878,15 @@ function setupEventListeners() {
     if (lastOrderBookSnapshot) renderOrderBook(lastOrderBookSnapshot);
   });
 
-  // Swap market-box order book: the SAME granularity dropdown + Σ toggle as the
-  // Markets book, on the swap book's own swapObGranByMarket / swapObCumulative.
-  const swapGranEl = document.getElementById("swap-ob-granularity");
-  swapGranEl?.addEventListener("click", (e) => {
-    const opt = e.target.closest(".ob-gran-option");
-    if (opt) {
-      e.stopPropagation();
+  // Swap market-box order book: the SAME granularity menu button + Σ toggle as
+  // the Markets book, on the swap book's own swapObGranByMarket / swapObCumulative.
+  wireMenuButton(swapObGranMenu, {
+    menu: document.getElementById("swap-ob-gran-menu"),
+    itemSelector: ".ob-gran-option",
+    onActivate: (opt) => {
       if (swapBookMarket) swapObGranByMarket[swapBookMarket] = Number(opt.dataset.value);
-      swapGranEl.classList.remove("open");
       rerenderSwapBook();
-      return;
-    }
-    if (e.target.closest(".ob-gran-menu")) return;
-    const menu = document.getElementById("swap-ob-gran-menu");
-    const rect = swapGranEl.getBoundingClientRect();
-    menu.style.left = rect.left + "px";
-    menu.style.bottom = (window.innerHeight - rect.top + 4) + "px";
-    swapGranEl.classList.toggle("open");
-  });
-  document.addEventListener("click", (e) => {
-    if (swapGranEl && !swapGranEl.contains(e.target)) swapGranEl.classList.remove("open");
+    },
   });
   document.getElementById("swap-ob-cumulative")?.addEventListener("click", () => {
     swapObCumulative = !swapObCumulative;
@@ -10981,6 +12960,19 @@ function setupEventListeners() {
     const fromEl = document.getElementById("swap-from-amount");
     // Strip trailing zeros from fixed-precision output; numeric inputs accept
     // dot-separated decimals regardless of locale.
+    fromEl.value = Number(cap.toFixed(8)).toString();
+    fromEl.dispatchEvent(new Event("input", { bubbles: true }));
+    fromEl.focus();
+  });
+
+  // Click-to-fill on the reserve-clamp line (#55 preview half): copy the
+  // spendable amount — quoteSwap's availableFrom — into "From" and re-preview.
+  const availLine = document.getElementById("swap-preview-avail");
+  if (availLine) availLine.addEventListener("click", () => {
+    if (!lastSwapEstimate || !lastSwapEstimate.clampedByReserve) return;
+    const cap = lastSwapEstimate.availableFrom;
+    if (!(cap > 0)) return;
+    const fromEl = document.getElementById("swap-from-amount");
     fromEl.value = Number(cap.toFixed(8)).toString();
     fromEl.dispatchEvent(new Event("input", { bubbles: true }));
     fromEl.focus();
@@ -11066,7 +13058,7 @@ function setupEventListeners() {
   // Wallet: withdraw (deposits live on the Deposit page).
   // Use a custom dropdown for the asset selector: the native popup mispositions
   // in embedded/webview browsers.
-  enhanceSelectDropdown("wallet-token");
+  enhanceSelectDropdown("wallet-token", { label: "Withdraw asset" });
   // Clicking a balance figure pre-fills the Withdraw row: select that asset
   // (dispatch change so the enhanced dropdown re-labels) + fill the amount.
   // Delegated — the grid re-renders on every balance refresh.
@@ -11089,9 +13081,9 @@ function setupEventListeners() {
   });
   // Every asset/token selector uses the custom dropdown — native <select> popups
   // misposition in the embedded/webview gateway (the menu anchors to the button).
-  enhanceSelectDropdown("swap-from-token", { icons: true });
-  enhanceSelectDropdown("swap-to-token", { icons: true });
-  enhanceSelectDropdown("earn-vault-deposit-token");
+  enhanceSelectDropdown("swap-from-token", { icons: true, label: "Sell token" });
+  enhanceSelectDropdown("swap-to-token", { icons: true, label: "Buy token" });
+  enhanceSelectDropdown("earn-vault-deposit-token", { label: "Deposit token" });
   document.getElementById("wallet-wd-btn")?.addEventListener("click", onWalletWithdraw);
 
   // Regen username
@@ -11106,13 +13098,18 @@ function setupEventListeners() {
         await navigator.clipboard.writeText(appState.myPrincipalText);
         principalCopyBtn.textContent = "Copied!";
         setTimeout(() => { principalCopyBtn.textContent = "Copy"; }, 1500);
-      } catch { /* clipboard blocked (insecure context) — no-op */ }
+      } catch { /* writeText refused (a Permissions-Policy denying clipboard-write — the shipped policy did until task 1793506794 — no user activation, or an unfocused document; the context is secure, else navigator.clipboard would be undefined) — no-op */ }
     });
   }
 
-  // Chart overlay
-  document.getElementById("chart-btn").addEventListener("click", openChart);
+  // Chart overlay — opened from the chart cell's expand button (renderMiniChart);
+  // Escape closes it like the × does, and Tab cycles inside it (aria-modal —
+  // trapChartOverlayFocus) instead of walking the page beneath.
   document.getElementById("chart-close-btn").addEventListener("click", closeChart);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.getElementById("chart-overlay").style.display !== "none") closeChart();
+    if (e.key === "Tab" && document.getElementById("chart-overlay").style.display !== "none") trapChartOverlayFocus(e);
+  });
   document.querySelectorAll(".chart-interval-btn").forEach((btn) => {
     btn.addEventListener("click", () => changeChartInterval(Number(btn.dataset.interval)));
   });
@@ -11371,6 +13368,7 @@ function updateMarketHeaderMode() {
   if (!header) return;
   const cells = Array.from(header.querySelectorAll(".market-stats .market-stat"));
   const overflow = document.getElementById("market-stats-overflow");
+  const more = document.getElementById("market-stats-more");
   // Survive value refreshes: if the SAME cell ends up the trigger again, an
   // open popup stays open (reset() below necessarily closes it while
   // measuring — all within one synchronous pass, so nothing flickers).
@@ -11378,6 +13376,7 @@ function updateMarketHeaderMode() {
   const reset = () => {
     header.classList.remove("market-header-compact");
     for (const c of cells) { c.style.display = ""; c.classList.remove("market-stat-more", "open"); }
+    marketStatMorePopup.setOpen(false); // no trigger cell now: aria-expanded follows
   };
   if (!window.matchMedia("(min-width: 901px)").matches) {
     reset(); // mobile: CSS shows the compact dropdown; no progressive state
@@ -11403,14 +13402,23 @@ function updateMarketHeaderMode() {
     // and mirror the hidden cells into it (label + value, colour class and
     // all). Rebuilt on every pass so an open popup tracks live values.
     if (overflow) {
-      if (overflow.parentElement !== trigger) trigger.appendChild(overflow);
+      if (overflow.parentElement !== trigger) {
+        // The keyboard trigger (#market-stats-more, a real <button> carrying
+        // the disclosure's aria-expanded / aria-controls) travels with the
+        // popup, so Tab reaches exactly the cell that is the trigger;
+        // re-parenting drops focus, so it is handed back.
+        const hadFocus = more !== null && document.activeElement === more;
+        if (more) trigger.appendChild(more);
+        trigger.appendChild(overflow);
+        if (hadFocus) more.focus();
+      }
       overflow.innerHTML = cells.slice(cut).map((c) => {
         const v = c.querySelector(".ms-value");
         return `<div class="msd-row"><span class="ms-label">${escH(c.querySelector(".ms-label")?.textContent ?? "")}</span>` +
           `<span class="${escH(v?.className || "ms-value")}">${escH(v?.textContent ?? "")}</span></div>`;
       }).join("");
     }
-    if (openBefore === trigger) trigger.classList.add("open");
+    marketStatMorePopup.setOpen(openBefore === trigger);
     return;
   }
   // Regime 3: even the floor set overflows → single compact dropdown.
@@ -11550,10 +13558,21 @@ async function refreshMarketTele(marketId) {
     // High/Low match the Price/Mark cells: formatPrice, no "$" prefix.
     const px = (v) => (Number(v) > 0 ? formatPrice(Number(v)) : "—");
     // Nearest liquidation distance: opt bps (raw — not a MONEY_KEYS field),
-    // quantized canister-side to the side's disclosure precision. Longs
-    // liquidate below the mark, shorts above, hence the fixed signs.
-    const liq = (opt, sign) => (Array.isArray(opt) && opt.length
-      ? sign + (Number(opt[0]) / 100).toFixed(1) + "%" : "—");
+    // quantized canister-side to the side's disclosure precision. The SIGN
+    // is the direction the mark must move to reach it — read off the
+    // canister's liq direction (the health slope, #54.8), not off the side:
+    // a net-long book can liquidate on a RISING mark. A side with a leg
+    // already past maintenance prints "liquidatable" instead of a distance
+    // (the verdict is getHealth's, never mark-vs-price).
+    const liq = (opt, dirOpt, liquidatable, fallbackSign) => {
+      if (liquidatable === true) return "liquidatable";
+      if (!Array.isArray(opt) || !opt.length) return "—";
+      const sign = Array.isArray(dirOpt) && dirOpt.length ? ("up" in dirOpt[0] ? "+" : "−") : fallbackSign;
+      return sign + (Number(opt[0]) / 100).toFixed(1) + "%";
+    };
+    const lliq = liq(tele.longNearLiqBps, tele.longNearLiqDir, tele.longLiquidatable, "−");
+    const sliq = liq(tele.shortNearLiqBps, tele.shortNearLiqDir, tele.shortLiquidatable, "+");
+    const liqCls = (v) => (v === "liquidatable" ? "ms-value down" : "ms-value");
     const lh = fmtHealth(tele.longHealth);
     const sh = fmtHealth(tele.shortHealth);
     _marketTeleCache.set(marketId, [
@@ -11564,8 +13583,8 @@ async function refreshMarketTele(marketId) {
       ["dt-market-shorts", usd(tele.shortNotionalUsd), null], ["msd-shorts", usd(tele.shortNotionalUsd), null],
       ["dt-market-lhealth", lh.txt, lh.cls], ["msd-lhealth", lh.txt, lh.cls],
       ["dt-market-shealth", sh.txt, sh.cls], ["msd-shealth", sh.txt, sh.cls],
-      ["dt-market-lliq", liq(tele.longNearLiqBps, "-"), null], ["msd-lliq", liq(tele.longNearLiqBps, "-"), null],
-      ["dt-market-sliq", liq(tele.shortNearLiqBps, "+"), null], ["msd-sliq", liq(tele.shortNearLiqBps, "+"), null],
+      ["dt-market-lliq", lliq, liqCls(lliq)], ["msd-lliq", lliq, liqCls(lliq)],
+      ["dt-market-sliq", sliq, liqCls(sliq)], ["msd-sliq", sliq, liqCls(sliq)],
     ]);
     if (marketId === selectedMarket) paintMarketTele(marketId);
   } catch (e) { console.warn("getMarketTele failed:", e?.message || e); }
@@ -11587,23 +13606,23 @@ function showToast(message, type = "info") {
 }
 
 
-// ── Intelli section: AI Assistant + Data Explorer (OQL query browser) ─
+// ── Intelli section: Agent Chat + Data Explorer (OQL query browser) ──
 // The Data Explorer is a generic browser over the canister's OQL surface:
 // pick an entity from schema(), build a filter/sort/limit query (or hand-edit
 // the JSON), and run it via execute(). Results respect row-level scoping —
 // the caller sees public entities + only their own pools/positions.
 // active Intelli sub-tab now lives on appState (state.js) — shared with explorer.js.
 // Set once the user explicitly picks a sub-tab (#ai/<sub> — tab clicks
-// route through the hash). Until then the section default is the AI
-// Assistant, and refreshAiGate may move us onto it when the key resolves.
+// route through the hash). Until then the section default is Agent Chat,
+// and refreshAiGate may move us onto it when the key resolves.
 let intelliUserChose = false;
-// The user's LAST explicit sub-tab pick was the assistant. A click on the AI
+// The user's LAST explicit sub-tab pick was Agent Chat. A click on the AI
 // tab that lands while aiConfigured is still unknown/false demotes to the
 // explorer (showIntelliTab) — this flag lets refreshAiGate honour that click
 // as soon as the key resolves, instead of the click being silently swallowed.
 let intelliWishAi = false;
 // Query whether the backend AI assistant is configured and show/hide the
-// "AI Assistant" tab accordingly. When it's off, the tab button is hidden and
+// "Agent Chat" tab accordingly. When it's off, the tab button is hidden and
 // any attempt to route to it falls back to the Data Explorer. Called at
 // startup and after sign-in (the query is public, so anonymous works too);
 // a THROWN probe (transient network) retries once rather than leaving the
@@ -11616,12 +13635,21 @@ async function refreshAiGate() {
   const a = appState.actor || appState.publicActor;
   try { if (a?.aiConfigured) on = await a.aiConfigured(); } catch { on = false; threw = true; }
   appState.aiConfigured = !!on;
-  const btn = document.querySelector('.intelli-tab[data-intelli="assistant"]');
-  if (btn) btn.style.display = on ? "" : "none";
-  if (!on && appState.intelliTab === "ai") showIntelliTab("explorer");
-  // Key confirmed → move onto the assistant when either (a) the user never
+  assistantRefreshFooter();   // the chat's footer states what it can do under this gate
+  // With no key the Agent Chat tab STAYS reachable in help-only mode (task
+  // 1793489932 item 8): how-to questions are answered from the Docs index
+  // without a model call, the footer says so, and the tab wears a badge. It
+  // used to be hidden (and the sub-tab demoted to the explorer) whenever the
+  // probe said false — which also hid the help the chat can give keyless.
+  const btn = document.querySelector('.intelli-tab[data-intelli="agent-chat"]');
+  if (btn) {
+    btn.style.display = "";
+    btn.classList.toggle("intelli-tab-help-only", !on);
+    btn.title = on ? "" : "No AI key on this deployment — Agent Chat answers how-to questions from the Docs";
+  }
+  // Key confirmed → move onto Agent Chat when either (a) the user never
   // picked a sub-tab (it's the section default) or (b) their last explicit
-  // pick WAS the assistant but arrived before the gate resolved.
+  // pick WAS Agent Chat but arrived before the gate resolved.
   if (on && appState.intelliTab !== "ai" && (intelliWishAi || !intelliUserChose)) {
     if (document.getElementById("intelli-view")?.classList.contains("active")) {
       showIntelliTab("ai");
@@ -11633,12 +13661,12 @@ async function refreshAiGate() {
 }
 
 function showIntelliTab(name) {
-  // URL/button slugs are assistant|memory; the internal tokens stay ai|explorer
+  // URL/button slugs are agent-chat|memory (assistant = the legacy alias); the internal tokens stay ai|explorer
   // (pane ids, appState.intelliTab, the AI gate all key off them).
   name = INTELLI_SLUG_TO_TOKEN[name] || name;
   if (name !== "ai" && name !== "explorer") name = "ai";   // section default
-  // The assistant tab is unavailable when the backend has no AI key configured.
-  if (name === "ai" && !appState.aiConfigured) name = "explorer";
+  // No demotion when the backend has no AI key: Agent Chat runs in help-only
+  // mode there (refreshAiGate badges the tab; assistant.js answers from the Docs).
   appState.intelliTab = name;
   document.querySelectorAll(".intelli-tab").forEach((b) =>
     b.classList.toggle("active", (INTELLI_SLUG_TO_TOKEN[b.dataset.intelli] || b.dataset.intelli) === appState.intelliTab));
@@ -11661,4 +13689,28 @@ function showIntelliTab(name) {
 
 
 // ── Start ───────────────────────────────────────────────────────
+// ── Theme change: re-skin the surfaces that take colours as STRINGS ───
+// lightweight-charts and the heat-map canvas read the tokens once, at
+// creation/draw, and never watch CSS. theme.js fires mdx:theme after <html
+// data-theme> has flipped, so every themeToken() read below already answers
+// for the new theme. (Everything else — the depth bars included — is CSS and
+// follows the tokens by itself.)
+onThemeChange(() => {
+  if (chartInstance) {
+    chartInstance.applyOptions(chartThemeOptions());
+    if (chartCandleSeries) chartCandleSeries.applyOptions(candleThemeOptions());
+    if (chartCandleData) {
+      reskinChartData(chartCandleData);
+      if (chartCandleSeries) chartCandleSeries.setData(chartCandleData.candles);
+      if (chartVolumeSeries) chartVolumeSeries.setData(chartCandleData.volumes);
+    }
+  }
+  if (miniChartReskin) miniChartReskin();
+  if (swapGraphChart) {
+    swapGraphChart.applyOptions(chartThemeOptions());
+    if (swapGraphSeries) swapGraphSeries.applyOptions({ color: chartTrackColor() });
+  }
+  if (selectedMarket && document.getElementById("mini-chart-heat")?.dataset.hm2) renderHeatmap(selectedMarket);
+});
+
 init();

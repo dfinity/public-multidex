@@ -12,29 +12,29 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-u()   { icp canister call --identity w4_u backend "$@" 2>&1; }
-U=$(mkid w4_u)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+u()   { icp canister call --candid "$MDX_CANDID" --identity w4_u backend "$@" 2>&1; }
+mdx_identity_new w4_u; U=$(principal_of w4_u)
 
 STOPPER="$SCRIPT_DIR/../scripts/stop_bots_local.sh"
 [ -f "$STOPPER" ] && { bash "$STOPPER" >/dev/null 2>&1 || true; sleep 2; }
 
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1
-SEED=$(mkid w4_seed)
+mdx_identity_new w4_seed; SEED=$(principal_of w4_seed)
 adm createAmmPool '("ICP-ICPUSD")' >/dev/null 2>&1
-adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 100.0) : nat, 5:nat, 10:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 100.0) : nat, 5:nat, 10:nat)" >/dev/null
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICP\", $(e8 10000.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICPUSD\", $(e8 200000.0) : nat)" >/dev/null
-icp canister call --identity w4_seed backend seedAmmPool "(\"ICP-ICPUSD\", $(e8 10000.0) : nat, $(e8 100000.0) : nat)" >/dev/null 2>&1
+mdx_lp_deposit w4_seed "ICP-ICPUSD" "$(e8 10000.0)" "$(e8 100000.0)" >/dev/null 2>&1
 adm enableAmm '("ICP-ICPUSD", true)' >/dev/null
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null
 adm setTestBalance "(principal \"$U\", \"ICPUSD\", $(e8 100.0) : nat)" >/dev/null
@@ -61,10 +61,13 @@ adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null          # release: crossing buy fills or rests
 sleep 1
 ST=$(u getMyOrderStatus "(${OID:-0} : nat)")
-if echo "$ST" | grep -qi "err"; then nok "status by staging id lost after release" "$(echo "$ST" | head -c 150)"; else ok "status by staging id resolves after release"; fi
+# getMyOrderStatus is an `opt record` — it NEVER returns #err, so "no err" was a
+# vacuous oracle (#51 follow-up item 2). The positive shape: a present record
+# carrying the order + its phase; `(null)` is the not-found answer.
+if echo "$ST" | tr -s '[:space:]' ' ' | grep -q "opt record {" && echo "$ST" | grep -q "phase = variant"; then ok "status by staging id resolves after release (opt record with phase)"; else nok "status by staging id lost after release (want opt record{order; phase})" "$(echo "$ST" | tr -s '[:space:]' ' ' | head -c 150)"; fi
 R=$(u cancelMyOrder "(${OID:-0} : nat)")
 # Either the released remainder cancels (#ok) or it fully filled ("not open").
-if echo "$R" | grep -qE "ok|not open"; then ok "cancel by staging id resolves the released order (got: $(echo "$R" | tr -d '\n' | head -c 40))"; else nok "cancel by staging id says not-found (the finding)" "$(echo "$R" | head -c 150)"; fi
+if mdx_ok "$R" || echo "$R" | grep -q "not open"; then ok "cancel by staging id resolves the released order (got: $(echo "$R" | tr -d '\n' | head -c 40))"; else nok "cancel by staging id says not-found (the finding)" "$(echo "$R" | head -c 150)"; fi
 
 echo "── §4 W4-06: lapsed good-till kills at release ──"
 ICP_B=$(adm getTestBalance "(principal \"$U\", \"ICP\")" | tr -d '_' | grep -oE "[0-9]+ : nat" | head -1 | grep -oE "[0-9]+")
@@ -79,7 +82,7 @@ RR=$(u getMyReleaseRejections '()' --query | tr -d '\n')
 if echo "$RR" | grep -q "expired while staged\|Order expired"; then ok "kill recorded in release rejections"; else nok "no kill record" "$(echo "$RR" | head -c 200)"; fi
 
 echo "── §5 W4-01: reset refuses while the ledger journal is unshipped ──"
-icp canister call --identity w4_u backend withdraw '("ICPUSD", 100_000_000 : nat, "w4-journal-probe")' >/dev/null 2>&1
+icp canister call --candid "$MDX_CANDID" --identity w4_u backend withdraw '("ICPUSD", 100_000_000 : nat, "w4-journal-probe")' >/dev/null 2>&1
 R=$(adm resetSeason '()')
 if echo "$R" | grep -q "unshipped ledger journal"; then
   ok "reset refused, naming the journal depth"

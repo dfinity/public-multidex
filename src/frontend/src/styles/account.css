@@ -17,8 +17,8 @@
    highlight gradient + cyan hairline + 16px radius (matches .swap-input-group).
    Scoped to this one card; the other account cards keep the neutral surface. */
 #account-profile-card {
-  background: linear-gradient(160deg, rgba(56, 189, 240, 0.12), rgba(56, 189, 240, 0.04));
-  border: 1px solid rgba(56, 189, 240, 0.20);
+  background: var(--accent-panel);
+  border: 1px solid var(--accent-border);
   border-radius: 16px;
 }
 
@@ -142,8 +142,8 @@
 .access-shed-banner {
   margin: 10px 0 4px; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5;
 }
-.access-shed-banner.shed-affected { background: rgba(255, 120, 120, 0.12); border: 1px solid rgba(255, 120, 120, 0.4); color: var(--text); }
-.access-shed-banner.shed-safe { background: rgba(56, 189, 240, 0.08); border: 1px solid var(--accent-border); color: var(--text-dim); }
+.access-shed-banner.shed-affected { background: var(--red-tint); border: 1px solid var(--red-outline); color: var(--text); }
+.access-shed-banner.shed-safe { background: var(--accent-tint-1); border: 1px solid var(--accent-border); color: var(--text-dim); }
 
 /* min-order hint under the swap form */
 .min-order-hint { margin: 8px 2px 0; font-size: 11px; color: var(--text-dim); line-height: 1.5; }
@@ -172,8 +172,8 @@
    secondary tone, not the near-invisible muted one. Subordination to the
    title is carried by size and weight, never by dropping below legibility. */
 .badge-chip .badge-sub { font-size: 11px; line-height: 1.45; color: var(--text-dim); }
-.badge-chip.badge-earned { border-color: var(--cta); background: rgba(229, 169, 83, 0.08); }
-.badge-chip.badge-earned .badge-name { color: var(--cta); }
+.badge-chip.badge-earned { border-color: var(--cta); background: var(--cta-tint); }
+.badge-chip.badge-earned .badge-name { color: var(--cta-ink); }
 /* Locked chips read as locked via the greyscale icon and plain border only —
    a blanket chip opacity would drag the condition text back to illegible. */
 .badge-chip.badge-locked .badge-icon { filter: grayscale(1); opacity: 0.6; }
@@ -184,7 +184,7 @@
 .badge-mini-bar > span { display: block; height: 100%; border-radius: 2px; background: var(--accent); }
 .badge-next {
   margin: 10px 0 2px; padding: 10px 12px; border-radius: 8px;
-  border: 1px solid var(--accent-border); background: rgba(56, 189, 240, 0.06);
+  border: 1px solid var(--accent-border); background: var(--accent-tint-1);
   font-size: 13px; color: var(--text-dim); line-height: 1.5;
 }
 .badge-next b { color: var(--text); }

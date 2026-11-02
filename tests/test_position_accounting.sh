@@ -60,9 +60,7 @@ CTL="--identity anonymous"   # local controller for setTestBalance
 # pattern): position episodes survive resetExchange, so a reused principal
 # walks in with history and §6's "episode recorded" check (0 → 1) can only
 # ever pass for a virgin identity.
-newid() { echo "y" | icp identity delete "$1" >/dev/null 2>&1 || true
-          icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; }
-for id in "$A_ID" "$B_ID"; do newid "$id"; done
+for id in "$A_ID" "$B_ID"; do mdx_identity_new "$id"; done   # deleted on EXIT (tests/_lib.sh)
 A_PRIN=$(principal_of "$A_ID"); B_PRIN=$(principal_of "$B_ID")
 call setTestBalance "(principal \"$A_PRIN\", \"ICPUSD\", $(e8 200000) : nat)" $CTL >/dev/null
 call setTestBalance "(principal \"$B_PRIN\", \"ICP\",    $(e8 20000)  : nat)" $CTL >/dev/null
@@ -142,7 +140,7 @@ if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ] \
   # read book_edge mid-test catch grotesquely wide protection quotes — their
   # inside-spread prices then land miles off-market and settlement becomes a
   # race against the ladder's return (the §2 flake).
-  call setAmmConfig "(\"$MKT\", 20:nat, $(e8 200) : nat, 10:nat, 25:nat, 0:nat)" $CTL >/dev/null
+  call setAmmConfig "(\"$MKT\", 20:nat, $(e8 200) : nat, 10:nat, 25:nat)" $CTL >/dev/null
   # Anchor price. A RESIDUE venue (thin suite-fixture ladder, live book near
   # the real market price) re-anchors AT ITS CURRENT refPrice — freshness
   # re-stamp only, no movement — because quoting the cold default $10 into a
@@ -169,8 +167,59 @@ if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ] \
     cur=$(call getAmmPool "(\"$m\")" 2>/dev/null | tr -d '_' | grep -oE 'refPrice = [0-9]+' | grep -oE '[0-9]+' | head -1)
     [ -n "$cur" ] && [ "$cur" != "0" ] && call setAmmRefPrice "(\"$m\", $cur : nat)" $CTL >/dev/null 2>&1
   done
-  SEEDR=$(call seedAmmPool "(\"$MKT\", $(e8 10000) : nat, $(e8 100000) : nat)" --identity alice)
-  echo "$SEEDR" | grep -q "ok" || _fail "§0 seedAmmPool refused: $(echo "$SEEDR" | head -c 200)"
+  # The inventory the ladder quotes from — 10 × 200 needs 2,000 ICP + its
+  # quote a side. seedAmmPool as alice when the vault will take it (the LP
+  # lands inside I1's default holder set); a USED vault refuses it — the
+  # concentration cap ("<token> is at its vault concentration cap") over a
+  # basket a predecessor's setTestBalance skewed, or the LP-mint freshness
+  # gate — and a refusal used to leave the AMM with NO inventory: §0 then
+  # stared at a stray-orders-only book, or the invariants read Σ LP = 0
+  # against a supply a predecessor's throwaway minted (task 1788556083).
+  # So: skip the deposit when the AMM already holds enough to quote the
+  # ladder, else deposit, and on a refusal floor the AMM's ICP / ICPUSD
+  # through the dev balance hook instead — which mints NO LP, so I1's
+  # Σ holders == supply reads exactly what the predecessors left (honest
+  # either way). setTestBalance SETS a balance: the floors only raise — and
+  # they decide on a RE-READ, not the pre-read: a refused seedAmmPool at
+  # lpSupply 0 is not a no-op (see below).
+  amm_holding() {   # <basket leg: btc|eth|sol|icp|icpusd> → base units; the basket IS the AMM's balances
+    call getVaultValue '()' --query $CTL | tr -d '\n' | grep -oE "basket = record \{[^}]*\}" \
+      | grep -oE "$1 = [0-9_]+" | tr -d '_' | grep -oE '[0-9]+$'
+  }
+  AMM_P=$(call getAmmPrincipal '()' --query $CTL | grep -oE 'principal "[^"]+"' | head -1 | sed -E 's/principal "(.+)"/\1/')
+  [ -n "$AMM_P" ] || { _fail "§0 no AMM principal (getAmmPrincipal)"; finish_test "position_accounting"; }
+  ICP_NEED=$(e8 10000); QUOTE_NEED=$(e8 100000)
+  ICP_HAVE=$(amm_holding icp); QUOTE_HAVE=$(amm_holding icpusd)
+  if [ "${ICP_HAVE:-0}" -ge "$ICP_NEED" ] && [ "${QUOTE_HAVE:-0}" -ge "$QUOTE_NEED" ]; then
+    echo "  (AMM already holds $(from_e8 "$ICP_HAVE") ICP + $(from_e8 "$QUOTE_HAVE") ICPUSD — no deposit needed; LP set untouched)"
+  else
+    SEEDR=$(call seedAmmPool "(\"$MKT\", $ICP_NEED : nat, $QUOTE_NEED : nat)" --identity alice)
+    if mdx_ok "$SEEDR"; then
+      echo "  (seeded $(from_e8 "$ICP_NEED") ICP + $(from_e8 "$QUOTE_NEED") ICPUSD as alice — LP inside I1's default holder set)"
+    else
+      echo "  (seedAmmPool as alice refused — $(echo "$SEEDR" | tr -s '[:space:]' ' ' | head -c 160); flooring the AMM's inventory through the dev balance hook instead, no LP minted)"
+      # The refusal is NOT a no-op at lpSupply 0: performLpDeposit runs the
+      # GHSA-h888 zero-supply sweep (sweepZeroSupplyVaultToTreasury — every
+      # free AMM-principal balance to the treasury) BEFORE the gates that
+      # refused it, so the pre-read above can be stale by the whole residue
+      # a predecessor left. Re-read both legs before deciding the floors
+      # (task 1788732319: the pre-read said ICPUSD was ample, the sweep had
+      # emptied it, its floor was skipped, §0 read 10000 ICP + 0 ICPUSD).
+      ICP_PRE=${ICP_HAVE:-0}; QUOTE_PRE=${QUOTE_HAVE:-0}
+      ICP_HAVE=$(amm_holding icp); QUOTE_HAVE=$(amm_holding icpusd)
+      if [ "${ICP_HAVE:-0}" -ne "$ICP_PRE" ] || [ "${QUOTE_HAVE:-0}" -ne "$QUOTE_PRE" ]; then
+        echo "  (the refused deposit's zero-supply sweep moved the AMM's residue to the treasury — ICP $(from_e8 "$ICP_PRE") → $(from_e8 "${ICP_HAVE:-0}"), ICPUSD $(from_e8 "$QUOTE_PRE") → $(from_e8 "${QUOTE_HAVE:-0}"); flooring what the sweep took)"
+      fi
+      [ "${ICP_HAVE:-0}"   -lt "$ICP_NEED" ]   && call setTestBalance "(principal \"$AMM_P\", \"ICP\",    $ICP_NEED : nat)"   $CTL >/dev/null
+      [ "${QUOTE_HAVE:-0}" -lt "$QUOTE_NEED" ] && call setTestBalance "(principal \"$AMM_P\", \"ICPUSD\", $QUOTE_NEED : nat)" $CTL >/dev/null
+    fi
+  fi
+  ICP_HAVE=$(amm_holding icp); QUOTE_HAVE=$(amm_holding icpusd)
+  if [ "${ICP_HAVE:-0}" -ge "$ICP_NEED" ] && [ "${QUOTE_HAVE:-0}" -ge "$QUOTE_NEED" ]; then
+    _ok "§0 AMM inventory in place: $(from_e8 "$ICP_HAVE") ICP + $(from_e8 "$QUOTE_HAVE") ICPUSD"
+  else
+    _fail "§0 AMM inventory short after provisioning: $(from_e8 "${ICP_HAVE:-0}") ICP + $(from_e8 "${QUOTE_HAVE:-0}") ICPUSD (need $(from_e8 "$ICP_NEED") + $(from_e8 "$QUOTE_NEED"))"
+  fi
   call enableAmm "(\"$MKT\", true)" $CTL >/dev/null
   call requoteAmm "(\"$MKT\")" $CTL >/dev/null
   # Emulate the GEPTOR for the duration of the run. Freshness is load-bearing
@@ -188,7 +237,7 @@ if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ] \
   # so §2's one-shot sweep nudge (below) can steer it without racing the
   # keeper loop.
   COLD_FIXTURE=1
-  ANCHOR_FILE=$(mktemp /tmp/uplands-posacct-anchor-XXXXXX)
+  ANCHOR_FILE=$(scratch_new posacct-anchor) || exit 1
   echo "${ANCHOR_PX}" > "$ANCHOR_FILE"
   # setAmmRefPrice AND requoteAmm, as release()/freshrequote() do elsewhere
   # in the suite: the heartbeat's own requoter is drift/cooldown gated, so a
@@ -200,7 +249,7 @@ if [ -z "$(book_edge bid)" ] || [ -z "$(book_edge ask)" ] \
       sleep 2
     done ) &
   REFPRICE_KEEPER=$!
-  trap 'kill $REFPRICE_KEEPER 2>/dev/null; rm -f "$ANCHOR_FILE"' EXIT
+  on_exit 'kill $REFPRICE_KEEPER 2>/dev/null; rm -f "$ANCHOR_FILE"'   # H-04: registered, not an own EXIT trap — that would replace the scratch cleanup
   # Calm-book gate: a freshly created pool's first price samples blow up
   # volRegime, so for the first ~30s the ladder quotes at ±thousands of
   # bps (see calm_book above). Hard-require calm before the test runs.
@@ -234,7 +283,7 @@ lift_resting_reduce() { # $1 = resting price (e8); returns once size < $2
 }
 
 # ── §1 entry: buy via a limit inside the spread ──────────────────
-wait_for calm_book 30 2 || true   # never read edges mid vol-blowout
+wait_for calm_book 90 2 || true   # never read edges mid vol-blowout
 BB=$(book_edge bid); BA=$(book_edge ask)
 [ -n "$BB" ] && [ -n "$BA" ] || { _fail "§1 empty book on $MKT"; finish_test "position_accounting"; }
 E_LIM=$(( BB + (BA - BB) / 3 ))          # inside the spread: rests unless AMM moves
@@ -277,7 +326,7 @@ check_reduce() { # $1=label $2=sellPx $3=size_before $4=real_before
 }
 
 # ── §2 SLOW reduce: sell rests, counterparty lifts it later ──────
-wait_for calm_book 30 2 || true   # never read edges mid vol-blowout
+wait_for calm_book 90 2 || true   # never read edges mid vol-blowout
 BB=$(book_edge bid); BA=$(book_edge ask)
 S1=$(( BB + (BA - BB) * 2 / 3 )); [ "$S1" -le "$BB" ] && S1=$(( BB + 1 ))
 call openPosition "($POOL, \"$MKT\", variant { sell }, $(e8 300) : nat, 5000000 : nat, opt ($S1 : nat))" \
@@ -308,7 +357,7 @@ ROW=$(pos_read); SIZE2=$(pos_field "$ROW" size); REAL2=$(pos_field "$ROW" realiz
 # price, Δrealized == 0). The counter-bid must be resting before the
 # openPosition sell arrives, so the sell is marketable the moment it
 # releases and settles before any reconcile can repair a wiped size.
-wait_for calm_book 30 2 || true   # never read edges mid vol-blowout
+wait_for calm_book 90 2 || true   # never read edges mid vol-blowout
 BB=$(book_edge bid); BA=$(book_edge ask)
 S2=$(( BB + (BA - BB) / 2 )); [ "$S2" -le "$BB" ] && S2=$(( BB + 1 ))
 call placeLimitOrder "(\"$MKT\", variant { buy }, $S2 : nat, $(e8 300) : nat)" \
@@ -327,9 +376,19 @@ ROW=$(pos_read); SIZE3=$(pos_field "$ROW" size); REAL3=$(pos_field "$ROW" realiz
 # add-on resting forever). §3 has settled by here, so the cancel disturbs
 # nothing in flight. No-op warm: §2's bid FILLED there.
 [ "${COLD_FIXTURE:-0}" = "1" ] && call cancelAllMyOrders "(opt \"$MKT\")" --identity "$B_ID" >/dev/null 2>&1
-wait_for calm_book 30 2 || true   # never read edges mid vol-blowout
+wait_for calm_book 90 2 || true   # never read edges mid vol-blowout
 BB=$(book_edge bid); BA=$(book_edge ask)
 I1=$(( BB + (BA - BB) / 2 )); [ "$I1" -le "$BB" ] && I1=$(( BB + 1 ))
+# Snapshot the pool's fill cursor BEFORE the add-on: the blend law below is
+# computed from the add-on's ACTUAL fills, not from I1. I1 is only the
+# limit — when the calm gate lapses (`|| true`) or the keeper's requote
+# tightens the ladder inside the placement window, the buy legitimately
+# sweeps asks BELOW I1 and an I1-priced expectation reds a correct blend
+# (2026-09-01: entry 10.00 vs a mid-spread I1 of 12.00 read off a
+# vol-blown ladder — the fixture's race, not the accounting's).
+FCUR=$(call getMyPositionFills '()' --query --identity "$A_ID" | tr -d '_\n' \
+  | sed 's/record {/\n/g' | grep -oE '\bid = [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1)
+FCUR=${FCUR:-0}
 call placeLimitOrder "(\"$MKT\", variant { sell }, $I1 : nat, $(e8 200) : nat)" \
   --identity "$B_ID" >/dev/null
 call openPosition "($POOL, \"$MKT\", variant { buy }, $(e8 200) : nat, 5000000 : nat, opt ($I1 : nat))" \
@@ -338,15 +397,28 @@ wait_for '[ "$(pos_field "$(pos_read)" size)" -gt '"$SIZE3"' ]' 40 || _fail "§4
 ROW=$(pos_read)
 SIZE4=$(pos_field "$ROW" size); ENTRY4=$(pos_field "$ROW" entryPrice); REAL4=$(pos_field "$ROW" realizedPnl)
 DADD=$(( SIZE4 - SIZE3 ))
-# Blended VWAP law: entry4 == (size3·entry + added·fillPx) / size4. The
-# add-on's fill price is bounded by I1; with the whole fill at I1 the
-# expectation is exact — allow one e8 unit per division rounding.
-EXP_VWAP=$(awk -v s3="$SIZE3" -v e="$ENTRY" -v q="$DADD" -v p="$I1" -v s4="$SIZE4" \
+# Blended VWAP law: entry4 == (size3·entry + Σ fillPx·fillQty) / size4, the
+# sum over the add-on's actual fills (pool trades newer than the snapshot).
+# Fill prices are bounded by I1 but not pinned to it — see the note above —
+# so I1 stays only as the no-rows-parsed fallback. Tolerance: the engine
+# blends incrementally with one integer division per fill; allow a few e8
+# units of rounding headroom (dust at 1e-8/token scale).
+FILL_VWAP=$(call getMyPositionFills '()' --query --identity "$A_ID" | tr -d '_\n' \
+  | sed 's/record {/\n/g' | grep "\"$MKT\"" \
+  | while IFS= read -r ln; do
+      tid=$(echo "$ln" | grep -oE '\bid = [0-9]+' | head -1 | grep -oE '[0-9]+')
+      [ -n "$tid" ] && [ "$tid" -gt "$FCUR" ] || continue
+      px=$(echo "$ln" | grep -oE 'price = [0-9]+' | grep -oE '[0-9]+')
+      qt=$(echo "$ln" | grep -oE 'quantity = [0-9]+' | grep -oE '[0-9]+')
+      [ -n "$px" ] && [ -n "$qt" ] && echo "$px $qt"
+    done | awk '{ n += $1*$2; d += $2 } END { if (d > 0) printf "%.0f", n/d }')
+[ -z "$FILL_VWAP" ] && FILL_VWAP=$I1
+EXP_VWAP=$(awk -v s3="$SIZE3" -v e="$ENTRY" -v q="$DADD" -v p="$FILL_VWAP" -v s4="$SIZE4" \
   'BEGIN{ printf "%.0f", (s3*e + q*p)/s4 }')
-if [ "$ENTRY4" -ge $(( EXP_VWAP - 2 )) ] && [ "$ENTRY4" -le $(( EXP_VWAP + 2 )) ]; then
-  _ok "§4 increase blends VWAP ($ENTRY4 ≈ $EXP_VWAP, was $ENTRY)"
+if [ "$ENTRY4" -ge $(( EXP_VWAP - 8 )) ] && [ "$ENTRY4" -le $(( EXP_VWAP + 8 )) ]; then
+  _ok "§4 increase blends VWAP ($ENTRY4 ≈ $EXP_VWAP, was $ENTRY; fills @ $FILL_VWAP)"
 else
-  _fail "§4 entry [$ENTRY4] != blended VWAP [$EXP_VWAP] — add-on re-based the entry"
+  _fail "§4 entry [$ENTRY4] != blended VWAP [$EXP_VWAP] (fills @ $FILL_VWAP) — add-on re-based the entry"
 fi
 assert_eq "§4 increase leaves realized unchanged" "$REAL3" "$REAL4"
 
@@ -361,7 +433,7 @@ fi
 
 # ── §6 flat close: row drops, an episode is recorded ─────────────
 EPS_BEFORE=$(call getMyPositionEpisodes '()' --query --identity "$A_ID" | grep -c "\"$MKT\"")
-wait_for calm_book 30 2 || true   # a market close into a vol-widened ladder dies inside its slippage bound
+wait_for calm_book 90 2 || true   # a market close into a vol-widened ladder dies inside its slippage bound
 call closePosition "($POOL, \"$MKT\", 10000000 : nat, null)" --identity "$A_ID" >/dev/null
 wait_for '[ -z "$(pos_read)" ]' 60 || true
 if [ -z "$(pos_read)" ]; then _ok "§6 position row gone once flat"

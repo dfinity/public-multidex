@@ -86,10 +86,46 @@ Observed on the live seeded venue: BTC/ETH/SOL → `full`, **ICP → `coarse`**
   as `totals − Σ buckets`. (The pre-2026-08-01 design instead folded far
   exposure into the last bucket, stretching its mark-side edge to the window
   boundary — which corrupted the band's geometry for anything reading edges.)
-- A band's sign is its side (below the mark = long fault line, above = short),
-  with one deliberate exception: a position already past maintenance has its
-  liquidation price on the "wrong" side of the mark, and stays visible there —
-  that is a signal, not noise.
+- A band sits on the side of the mark its liquidation price lies on. Which way
+  a pool liquidates follows its **health slope**, not the sign of its net
+  size: `MarginPools.liqPrice` solves `coll(p) = M·debt(p)` and the sign of
+  `A = heldBase·ltv − M·debtBase` picks the direction — `A > 0` liquidates as
+  the mark FALLS (long-like), `A < 0` as it RISES (short-like). Because
+  `ltv < M`, a net-long pool carrying base debt can have `A < 0` and sit
+  ABOVE the mark as a long. One deliberate exception: a position already past
+  maintenance has its liquidation price on the "wrong" side of the mark, and
+  stays visible there — that is a signal, not noise.
+
+### Direction and "liquidatable" (#54.8)
+
+`liqPrice` returns the direction WITH the price (`{ price; dir : #down | #up }`,
+`#down` iff `heldLtv > maintDebtBase`), read off the same `A` the price derives
+from, so no consumer re-derives it. Two surfaces used to: the Markets bar's
+Long/Short Liq (`tickMarketSideAgg`) signed the distance by the side —
+`if net > 0 then mark − P else P − mark` — and the Positions row's `pctToLiq`
+was unsigned with the sign implied by the side pill. On the slope fixture
+(10 SOL held, 9 owed, $100 cash: `A = 8.5 − 10.35 < 0`, `P = $54.05`) a
+HEALTHY pool at $50 read "Long Liq −0.0%" and a liquidatable one at $60 read
+"−9.9%". Now:
+
+- `MarginPools.distBps(mark, liq)` is the one signed-distance routine: bps
+  toward the crossing on the side `dir` says (`#down`: `mark − P`, `#up`:
+  `P − mark`), clamped at 0 once the mark is past it. The fixture reads
+  +8.1% at $50.
+- "Already past" is **`getHealth.isLiquidatable`**, never `mark` vs `P`:
+  rounding puts the displayed price on the wrong side of the mark by dust.
+  `PositionView.isLiquidatable` and `MarketTele.{long,short}Liquidatable`
+  carry the verdict; both the row and the bar print the word **liquidatable**
+  instead of a distance on it. The fixture at $60 reads "liquidatable".
+- The direction is published as `PositionView.liqDir` and
+  `MarketTele.{long,short}NearLiqDir` (the direction of the leg that set the
+  side's minimum); the frontend signs the figure by it (`−` = the mark must
+  fall, `+` = rise). `pctToLiq` stays unsigned and byte-compatible.
+- `liqPrice = ?0` is the "liquidatable at every price" answer (short-like with
+  nothing price-independent left), not a dust artefact — the row no longer
+  maps it to the "no practical liquidation" glyph.
+- All additive on the candid surface; `getHealth.isLiquidatable` remains the
+  liquidation decision — this is display.
 
 ## Cost / DoS
 
@@ -138,7 +174,9 @@ venues (patched three times — sub-k coarsening, far-exposure folding,
 aggregate rendering), bucket edges stretched to the window boundary that broke
 any consumer reading band geometry, and telemetry stats that had to grow a
 second, separately-quantized disclosure policy. One exact policy replaced all
-of it; the bar's Long/Short Liq stats now share the map's 1% precision.
+of it; the bar's Long/Short Liq stats now share the map's 1% precision (and,
+since #54.8, take their sign from the health slope and print "liquidatable"
+on the health verdict — see "Direction and 'liquidatable'" above).
 
 ## LP risk panel — `getMarginRiskSummary` (implemented)
 
@@ -193,8 +231,11 @@ interest; we publish the real thing, already k-merged.
   does not paint hotter than a tight one just for being wide; white mark trace
   with the live mark labelled on the price axis; hover tooltip gives band price
   range, distance from mark, long/short split, position count. Bands above the
-  mark line are short liquidations, below are longs — the split-at-the-mark
-  sweep keeps every bucket unambiguously one side. A young ring renders wide
+  mark line are liquidations a RISING mark reaches, below them a falling one —
+  shorts and longs respectively in the common case, though the side of the mark
+  follows the health slope (a net-long pool carrying base debt can sit above,
+  see "Direction and 'liquidatable'") — and the split-at-the-mark sweep keeps
+  every bucket unambiguously one side of the mark. A young ring renders wide
   columns (min-48 grid) so the first minutes fill the plot, and says
   *"building — a column is added every 30s"*.
 - **Earn → AMM Vault card**: "What this vault underwrites", directly beneath the

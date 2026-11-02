@@ -14,6 +14,9 @@ capped play allowance. Balances there are valueless by construction.
 > **Status: research prototype under active development.** Not audited. Do not use
 > with real funds. See [SECURITY.md](SECURITY.md).
 
+**Release notes:** [`docs/release-notes.md`](docs/release-notes.md) — what changed in
+1.75.0 (2026-11-01), in user terms.
+
 ## What's inside
 
 - **Order-book trading** with GEPTOR, a sealed matching engine: orders are staged,
@@ -57,11 +60,15 @@ with a kill-matrix for test hooks — see `docs/deployment-modes.md`.
 Prerequisites: [Node.js](https://nodejs.org) 18+, [mops](https://mops.one)
 CLI 2.19.2 (Motoko package manager — it pins the `moc` toolchain, and
 `scripts/lint-ratchet.sh` pins *it*, since its defaults decide whether
-lockfile integrity is checked), the
+lockfile integrity is checked; install: `npm install -g ic-mops@2.19.2`), the
 [`icp` CLI](https://github.com/dfinity/icp-cli), and
 [`ic-wasm`](https://github.com/dfinity/ic-wasm) 0.11.0 on `PATH` (the
 `@dfinity/motoko` build recipe in `icp.yaml` shells out to it for the
-metadata passes — the installed wasm is its output, not `moc`'s).
+metadata passes — the installed wasm is its output, not `moc`'s; install:
+`cargo install ic-wasm --version 0.11.0`, or the release binary). The lint
+gate checks both versions and, on a miss, prints that install line and exits
+2 — a *toolchain* verdict, distinct from a broken tree's exit 1 — while still
+running every tree check, the candid gate included.
 
 ```bash
 npm install
@@ -74,7 +81,7 @@ bash scripts/gen-did.sh
 
 # start a local network and stand the whole exchange up in the repo's
 # default posture, #play: deploys all canisters, wires bridge + fuel,
-# injects price history, seeds a $1M AMM vault + a $50k insurance fund
+# injects price history, seeds a $5,125,000 AMM vault + a $144k insurance fund
 # and a maker ladder, and starts the sim bots (the players' standing
 # counterparties)
 icp network start --background
@@ -88,11 +95,12 @@ Frontend iteration is build-and-deploy (the app is served by the asset canister,
 not a dev server): `npm run build && icp deploy frontend --identity anonymous`,
 then hard-refresh. The `#play` seeding itself lives in `scripts/play_start.sh`
 (cold_start's default mode runs it); the `#dev` fixture modes
-(`cold_start.sh --mode full|matching|amm|pending|load`) refuse to run until
-`DEPLOY_MODE` in `src/backend/main.mo` is flipped to `#dev`.
+(`cold_start.sh --mode full|matching|amm|staged|load`) refuse to run until
+`DEPLOY_MODE` in `src/backend/main.mo` is flipped to `#dev`; `--mode empty`
+(deploy only, no data) is not posture-gated and runs on either posture.
 
 Every deploy target shares one entry point: `./scripts/deploy.sh local|cloud|subnet`.
-A first install deploys **and seeds** (the $1M AMM vault + $50k insurance fund);
+A first install deploys **and seeds** (the $5,125,000 AMM vault + $144k insurance fund);
 re-running the same command updates the wasm in place, state preserved. The
 dedicated-subnet runbook is `docs/deploy-to-subnet.md`.
 
@@ -125,7 +133,7 @@ src/xrc-mock/    dev-only exchange-rate canister mock
 src/fuel-mock/   dev-only ledger/CMC mock for the treasury→cycles loop
 scripts/         cold start, seeding, simulators, deploy, lint gate
 tests/           Motoko unit tests + shell integration suites
-docs/            design documents (AMM/vault, bridge/CKS, deployment modes…)
+docs/            design documents (AMM/vault, bridge/CKS, deployment modes…) + release notes
 ```
 
 ## License

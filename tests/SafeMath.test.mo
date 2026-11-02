@@ -53,4 +53,27 @@ for ((a, b) in [(0, 0), (1, 0), (0, 1), (7, 4), (4, 7), (1_000_000, 999_999), (9
 // ── result is never negative and never exceeds a (saturating downward only) ──
 truth("result <= a always", SafeMath.subOrZero(50, 20) <= 50 and SafeMath.subOrZero(20, 50) <= 20);
 
+// ── H-15 (F5-DEX): the relay ceiling + the clamped display ──
+// The ceiling is the Bridge's AMOUNT_CEILING (2^128) so both halves agree;
+// `natDisplay` is the ONE formatter the relay refusals may use: plain digits
+// at or below the ceiling (≤ 39 of them), the clamp text above it — never a
+// caller-sized Nat.toText.
+let ceil : Nat = 340_282_366_920_938_463_463_374_607_431_768_211_456;   // 2^128
+eqN("RELAY_CEILING is 2^128", SafeMath.RELAY_CEILING, ceil);
+truth("0 is within the ceiling",            SafeMath.withinRelayCeiling(0));
+truth("2^128 - 1 is within the ceiling",    SafeMath.withinRelayCeiling(ceil - 1));
+truth("2^128 itself is within (<=, not <)", SafeMath.withinRelayCeiling(ceil));
+truth("2^128 + 1 is above the ceiling",     not SafeMath.withinRelayCeiling(ceil + 1));
+truth("2^200 is above the ceiling",         not SafeMath.withinRelayCeiling(2 ** 200));
+func eqT(name : Text, a : Text, b : Text) {
+  if (a != b) { Runtime.trap("FAIL: " # name # " — expected " # b # " got " # a) };
+  Debug.print("  ✓ " # name);
+};
+eqT("natDisplay(0)",            SafeMath.natDisplay(0), "0");
+eqT("natDisplay(1_000)",        SafeMath.natDisplay(1_000), "1000");
+eqT("natDisplay(2^128) is the 39 plain digits", SafeMath.natDisplay(ceil), "340282366920938463463374607431768211456");
+eqT("natDisplay(2^128 + 1) is the clamp text",  SafeMath.natDisplay(ceil + 1), SafeMath.RELAY_CEILING_TEXT);
+eqT("natDisplay(2^4096) is the clamp text (no digits spelled)", SafeMath.natDisplay(2 ** 4096), "≥2^128");
+truth("the clamp text carries no digit run a bignum could produce", SafeMath.natDisplay(2 ** 4096).size() < 12);
+
 Debug.print("── SafeMath.test PASSED ──");

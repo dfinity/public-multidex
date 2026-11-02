@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_lib.sh"
 
 echo "── test_zombie_free ──"
-setup_mode pending
+setup_mode staged
 
 # Fire the cross.
 call placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 75000.0) : nat, $(e8 1.0) : nat)" --identity bob > /dev/null

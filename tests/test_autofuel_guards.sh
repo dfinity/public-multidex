@@ -18,11 +18,12 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 fm()  { icp canister call --identity anonymous fuel-mock "$@" 2>&1; }
 
 FUEL_MOCK_ID=$(icp canister status fuel-mock --identity anonymous 2>/dev/null | awk -F': ' '/^Canister Id/{print $2; exit}' | tr -d '[:space:]')
@@ -61,7 +62,7 @@ R=$(adm adminClearFuelAmbiguous '()')
 echo "$R" | grep -q "cleared" && ok "operator lever clears (logged)" || nok "clear failed" "$R"
 fm setTrapTransfers '(false)' >/dev/null
 R=$(adm burnTreasuryIcpToCycles '(150_000_000 : nat)')
-if echo "$R" | grep -q "ok"; then ok "healthy burn completes after the clear"; else nok "burn failed post-clear" "$(echo "$R" | head -c 200)"; fi
+if mdx_ok "$R"; then ok "healthy burn completes after the clear"; else nok "burn failed post-clear" "$(echo "$R" | head -c 200)"; fi
 
 echo "── §3 the lever refuses when nothing is pending ──"
 R=$(adm adminClearFuelAmbiguous '()')

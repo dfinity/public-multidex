@@ -54,19 +54,21 @@ fi
 # (requireAuth rejects anonymous, so the anonymous controller cannot be used.)
 
 # ── §1 the cap exists: 33,000 ASCII chars = 33,000 bytes > 32,768 ──
+ARGS=$(scratch_new aiguard_ascii.did) || exit 1
 python3 -c "
 import sys
-sys.stdout.buffer.write(b'(\"' + b'a' * 33000 + b'\")')" > /tmp/aiguard_ascii.did
-R=$(echo y | icp canister call --args-file /tmp/aiguard_ascii.did backend aiComplete --identity alice 2>&1)
+sys.stdout.buffer.write(b'(\"' + b'a' * 33000 + b'\")')" > "$ARGS" || { _fail "cannot write the args file $ARGS"; exit 1; }
+R=$(echo y | icp canister call --candid "$MDX_CANDID" --args-file "$ARGS" backend aiComplete --identity alice 2>&1)
 assert_contains "§1 over-cap ASCII prompt rejected" "$R" "Prompt too long"
 
 # ── §2 bytes, not chars: 16,000 x '€' (U+20AC, 3 UTF-8 bytes) ──
 # 16,000 chars is HALF the 32,768 ceiling — a char-counted guard passes it —
 # but 48,000 bytes is 1.5x the byte ceiling and must be refused.
+ARGS=$(scratch_new aiguard_mb.did) || exit 1
 python3 -c "
 import sys
-sys.stdout.buffer.write(('(\"' + '€' * 16000 + '\")').encode('utf-8'))" > /tmp/aiguard_mb.did
-R=$(echo y | icp canister call --args-file /tmp/aiguard_mb.did backend aiComplete --identity alice 2>&1)
+sys.stdout.buffer.write(('(\"' + '€' * 16000 + '\")').encode('utf-8'))" > "$ARGS" || { _fail "cannot write the args file $ARGS"; exit 1; }
+R=$(echo y | icp canister call --candid "$MDX_CANDID" --args-file "$ARGS" backend aiComplete --identity alice 2>&1)
 assert_contains "§2 multibyte prompt over the BYTE cap rejected (char count would pass)" "$R" "Prompt too long"
 assert_not_contains "§2 ...and never proceeds toward the provider outcall" "$R" "outcall"
 
@@ -76,10 +78,11 @@ assert_not_contains "§2 ...and never proceeds toward the provider outcall" "$R"
 # body is ~96,000 bytes, 1.4x the 69,632 serialized ceiling, and must be
 # refused BEFORE the outcall (on the raw-only guard this call reached the
 # provider and the canister paid for ~96 KB of request bytes).
+ARGS=$(scratch_new aiguard_ctrl.did) || exit 1
 python3 -c "
 import sys
-sys.stdout.buffer.write(b'(\"' + b'\\\\01' * 16000 + b'\")')" > /tmp/aiguard_ctrl.did
-R=$(echo y | icp canister call --args-file /tmp/aiguard_ctrl.did backend aiComplete --identity alice 2>&1)
+sys.stdout.buffer.write(b'(\"' + b'\\\\01' * 16000 + b'\")')" > "$ARGS" || { _fail "cannot write the args file $ARGS"; exit 1; }
+R=$(echo y | icp canister call --candid "$MDX_CANDID" --args-file "$ARGS" backend aiComplete --identity alice 2>&1)
 assert_contains "§3 under-raw-cap control-char prompt refused once serialized" "$R" "too large once serialized"
 assert_not_contains "§3 ...and never proceeds toward the provider outcall" "$R" "outcall"
 assert_not_contains "§3 ...and never reaches the provider (no http status)" "$R" "http"
@@ -91,10 +94,11 @@ assert_not_contains "§3 ...and never reaches the provider (no http status)" "$R
 # (dummy key), which is exactly the proof we want. Run only when the key is
 # our own dummy — never spend a real key.
 if [ "$DUMMY_SET" = "1" ]; then
+  ARGS=$(scratch_new aiguard_legit.did) || exit 1
   python3 -c "
 import sys
-sys.stdout.buffer.write(b'(\"' + b'a' * 32000 + b'\")')" > /tmp/aiguard_legit.did
-  R=$(echo y | icp canister call --args-file /tmp/aiguard_legit.did backend aiComplete --identity alice 2>&1)
+sys.stdout.buffer.write(b'(\"' + b'a' * 32000 + b'\")')" > "$ARGS" || { _fail "cannot write the args file $ARGS"; exit 1; }
+  R=$(echo y | icp canister call --candid "$MDX_CANDID" --args-file "$ARGS" backend aiComplete --identity alice 2>&1)
   assert_not_contains "§4 legitimate near-cap prompt passes the raw guard" "$R" "Prompt too long"
   assert_not_contains "§4 legitimate near-cap prompt passes the serialized guard" "$R" "too large once serialized"
 else

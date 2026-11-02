@@ -16,7 +16,7 @@ where a bot author would find it:
 | Maker volume counts **2×** toward the earned level score W | `MAKER_W_MULT = 2`, 15–30d rolling window |
 | Maker fee **0.0 bps at L4** (5.0 at L0); taker 10.0 → 6.0 | `MAKER/TAKER_TENTH_BPS`, quote-leg both sides |
 | **Volume-scaled level bars with a 1% floor** — on today's young venue, L4 needs only ~$100k of W | `scaleBps`, `REF_EXCHANGE_VOL` |
-| **L4 quote-freshness shield** — resting quotes non-takeable while a staged reprice is in flight; whole book protected during oracle stalls | `isMMShieldedFresh/Stale`, 30s TTL |
+| **L4 quote-freshness shield** — resting quotes on a market non-takeable while a GENUINE repricing intent for it is in flight (a staged limit within 2% of the mark, notional ≥ 20% of what rests there); lapses the moment that intent lands, is killed or cancelled; whole book protected during oracle stalls; shielded depth counts for neither `getTakeableDepth` nor uptime; the AMM sweep honours it for non-AMM makers (H-24, 2026-09-05) | `isRepricingIntent`, `isMMShieldedFresh/Stale`, `landMmShield`, 30s TTL |
 | **Release priority** — L3/L4 staged orders execute before lower tiers within each sealed batch | `sortDeferredByPriority` |
 | **Load-shed immunity** — under load, L0 (then L1–L2) ingress is refused at the gate; L3/L4 keep trading | `_shedFloor` + inspect |
 | Full self-introspection: level, fees, thresholds, uptime, shed floor, MM quality constants | `getAccessPolicy` (one query) |
@@ -77,7 +77,7 @@ that a staged id is REBORN as a fresh order id when the remainder rests; a bound
 `stagedReleasedAs` link map now bridges it (`releasedAsId` in the result), and
 `replaceMyOrder`/`cancelOwnSpotOrder` resolve placement ids through the same link. (8)
 `getMarketSpecs` (constants incl. band factor, caps, seal delay, stp policy, `apiVersion`
-"1.1.0"). (9) `getReleaseInfo(market)` (armed GEPTOR deadline + delay + oracle age). (10)
+"1.1.0"). (9) `getReleaseInfo(market)` (armed GEPTOR deadline + delay + oracle age + `releaseRefNs`, the dispatch clock of the standing mark — a staged entry releases only if its `ts` precedes it). (10)
 `getAccessPolicy` gained counts/caps, `myUptimeQualified`, `myDeadmanArmed`, `stpPolicy`,
 `apiVersion` — but NOT `myQuoteSampleNow`: the pass/fail sampler is slated for replacement
 (guardrail 2), so cementing it in the API would be wrong; ships with the proximity-weighted
@@ -97,6 +97,10 @@ a breaking parse for bots reading those three. Own-fill flows (`getMyTradesSince
 `getUserBadges(principal)` is now self-or-controller (privacy batch). Additive in the same bump:
 `getMarginHeatmap(s)`, `getMarginHeatmapHistory`, `getMarginRiskSummary` — see
 docs/margin-heatmap-design.md.*
+
+*Additive bump to `apiVersion` "5.1.0" (H-35, September 2026): `getMyInsuranceStake` gains
+`unlockAtNs` — insurance stakes carry a 10 min unstake cooldown from the holder's latest stake
+(a top-up restarts it); `unstakeInsurance` before that instant returns `#err` naming it.*
 
 6. **Fills with fees, by cursor** — add `feeQuoteBuyer/feeQuoteSeller` to `Types.Trade` (stable-type
    change → reinstall/migration) and `getMyTradesSinceId(sinceTradeId, limit)`. Today PnL
@@ -128,8 +132,13 @@ docs/margin-heatmap-design.md.*
 
 ### Corrections the audit surfaced
 
-- `placeProtectedLimitOrder`'s window is a validated **no-op** (sealed matching superseded it) —
-  deprecate in docs, keep for compat.
+- `placeProtectedLimitOrder`'s window was a **no-op** (sealed matching superseded it). Documented
+  as dormant 2026-09-04 (task 1788515326), the machinery behind it **retired** 2026-09-06
+  (task 1788516198, operator option 2, inert stubs kept for a byte-identical 5.x candid), and the
+  surfaces **removed at apiVersion 6.0.0** (task 1788731608): `placeProtectedLimitOrder`,
+  `getMyPendingMatches`, the `pendingMatches` result fields, `setAmmConfig`'s
+  `protectionWindowSec` parameter and `AmmPool.protectionWindowSec` are gone — the sealed release
+  is the anti-snipe. `candid/README.md` "Major bumps so far" records it.
 - The public tape for markout analysis: `getPublicTradesSince` exists and aggressor side is
   derivable (zero-orderId side), but document it as *the* toxicity data source; the archive is the
   deep-history path.
@@ -228,7 +237,9 @@ capital-normalized P&L (+40% in 48h) as a **beat-the-house benchmark** rather th
   (min(depth, cap) × closeness-to-touch, two-sided, random sample offsets) and pay a capped
   per-market stipend pro-rata per epoch. Pays for *standing* liquidity the way fills pay for
   *consumed* liquidity. This scoring upgrade also fixes the audit's abuse finding that today's
-  ±1%/±$500 pass-fail sampler lets a wide-quoter farm L4 on a sleepy market.
+  ±1%/±$500 pass-fail sampler lets a wide-quoter farm L4 on a sleepy market. (The *funding* half
+  of that finding is closed: since H-14 a sample credits each side only with the depth the
+  owner's available balance could honour — quotes whose backing has moved away earn nothing.)
 - **Epoch fee-share pool** — a fixed slice (~20–25%) of epoch taker fees redistributed by filled
   maker volume, each payout journaled as ledger events with a **per-maker machine-readable epoch
   statement** that reconciles against the public fold. "Auditable rebates" is a differentiator no
@@ -298,8 +309,10 @@ capital-normalized P&L (+40% in 48h) as a **beat-the-house benchmark** rather th
 2. **Fix wide-quote farming before paying for uptime**: replace the binary ±1%/$500 sample with
    proximity-weighted, randomly-offset, fill-through-obligated scoring.
 3. **Shield transparency**: publish shield-denial stats and TTL per market (else "snipe-proof
-   quoting" reads as house-sanctioned fading to takers); verify staged-then-cancelled orders don't
-   stamp freshness (free shield refresh) — charge or exclude them.
+   quoting" reads as house-sanctioned fading to takers). *Shipped 2026-09-05 (H-24 / D1):* the
+   free shield refresh is closed — only a commensurate near-mid intent stamps (`isRepricingIntent`),
+   the stamp lapses on landing (`landMmShield`) as well as on kills/cancels, and shielded quotes earn
+   neither takeable depth nor uptime; the stats/TTL publication half is still open.
 4. **Budget equation, live**: maker pool ≤ X% of epoch taker fees + fixed allowance, shown as a
    counting-up Season Pool ticker on the treasury tile. Unverifiable "capped pools" would betray
    the venue's whole pitch.

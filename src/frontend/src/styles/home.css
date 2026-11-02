@@ -1,0 +1,276 @@
+/* ── Home (#home) — the landing page ──────────────────────────────────
+   DESIGN NOTE (task 1793490812, 2026-11-01). The first thing a visitor sees.
+   · Reached from the LOGO (an <a href="#home">) and the mobile drawer's Home
+     row. No nav tab: the logo is the Home control by convention, and a
+     "Home" tab beside Swap/Markets would spend the nav's first slot on a
+     page that explains the others. The EMPTY hash lands here.
+   · The strap "Actually decentralized. Secure. Yours." MOVED here from Swap
+     (task 1793489949 had set it there); Swap now reads "Any asset. Any
+     other. No middleman." so the two pages do not repeat each other. Both
+     use the shared .strap (swap.css); .home-strap only sizes it up.
+   · The honesty badge ("Live in play mode — trade with free dummy crypto")
+     ships in the markup — true on every live target today — and
+     renderHomePostureBadge() (main.js) corrects it from getDeployMode: a
+     #dev venue names itself, any other posture hides the badge rather than
+     guess. Nothing fabricated on screen (#54.9): the proof strip's tiles
+     keep "—" until a real figure lands.
+   · TOKENS ONLY — no new colour literals. Tints are color-mix() of the
+     accent/green tokens, so a theme that redefines the tokens (the light
+     theme, task 1793489931) recolours this page for free. No aurora behind
+     the hero: the Docs aurora's clipping fix (1793490294) had not landed.
+   · Content width 1130px like .docs-shell; mobile-first at 375px; the
+     feature boxes stack at ≤768px, the proof strip at ≤640px. Every CTA is
+     an <a href="#…"> the router handles; .stats-cta (stats.css) is the
+     link idiom; the amber .btn-primary is the one primary action. */
+
+/* The lockup is now an anchor: inherit the brand colours (the SVG fills are
+   tokens), no underline, a visible keyboard focus ring. Lives here, not in
+   header.css, to keep that file's edits to the theme work. */
+a.logo { text-decoration: none; color: inherit; border-radius: 6px; }
+a.logo:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+
+.home-shell {
+  max-width: 1130px;
+  margin: 0 auto;
+  padding: 8px 4px 96px;
+}
+
+/* ── 1. Hero ─────────────────────────────────────────────────────── */
+.home-hero {
+  text-align: center;
+  padding: 44px 0 40px;
+}
+/* The shared .strap, sized up for a landing hero (Swap's stays 26–40px). */
+.home-strap {
+  font-size: clamp(30px, 5.2vw, 56px);
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+  max-width: 980px;
+  margin: 0 auto;
+}
+.home-hero-sub {
+  max-width: 760px;
+  margin: 22px auto 0;
+  font-size: 17px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.home-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 12px 14px;
+  margin-top: 28px;
+}
+/* Anchors styled as the app's buttons (.btn / .btn-primary / .btn-secondary
+   in shell.css): pill-shaped and a step larger than the form buttons. */
+.home-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 11px 22px;
+  font-size: 15px;
+  font-weight: 500;
+  border-radius: 999px;
+  text-decoration: none;
+  line-height: 1.2;
+}
+.home-btn.btn-secondary { border-color: var(--accent-border); }
+.home-btn.btn-secondary:hover { border-color: var(--accent); }
+.home-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 13px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.home-badge-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent);
+  animation: home-dot 2.4s ease-in-out infinite;
+}
+@keyframes home-dot {
+  0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent); }
+  50%      { box-shadow: 0 0 0 5px color-mix(in srgb, var(--green) 10%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) { .home-badge-dot { animation: none; } }
+
+/* ── 2. Eyebrow — shared label; the open-source box uses it ──────── */
+.home-eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+
+/* ── 3. Feature boxes ────────────────────────────────────────────── */
+.home-features {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  /* 24px, not the 44px the later sections use: with the intro and its divider gone
+     (1793554905) the boxes follow the hero's 40px bottom padding directly, and 84px of
+     air under the centred CTA row read as a void on the seat venue — 64px sits right,
+     and matches the ≤900px seam (30px + the shared 32px step below = 62px). */
+  margin-top: 24px;
+}
+.home-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 24px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+@media (hover: hover) {
+  .home-card:hover {
+    border-color: var(--accent-border);
+    box-shadow: 0 0 28px color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+}
+/* The figure at the top of every card (1793554661): the Swap and Markets
+   product screenshots (800px WebP under public/assets/home/, dark-UI
+   captures) and the Earn rising-value SVG share ONE aspect box, so the three
+   titles and CTAs line up whatever the capture's own ratio. The 1px frame and
+   the small radius make the dark captures read as framed pictures on the
+   light page too, not a bleed. cover + top left keeps the Swap card / the
+   Markets chart in frame where the taller Markets capture is cropped. The
+   box's color is what the Earn SVG paints in (currentColor). */
+.home-card-thumb {
+  aspect-ratio: 800 / 459;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--accent);
+}
+.home-card-thumb img, .home-card-thumb svg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top left;
+  display: block;
+}
+.home-card-title {
+  font-size: 21px;
+  font-weight: 640;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+.home-card-copy {
+  font-size: 14.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+/* The CTA sits on the card's bottom edge whatever the copy length — the
+   stats.css idiom's 16px bottom margin becomes the flex "push down". */
+.home-card .stats-cta { margin: auto 0 0; }
+
+/* ── 4. Proof strip — live figures, "—" until loaded ─────────────── */
+.home-proof {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 44px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.home-proof-tile {
+  padding: 20px 24px;
+  border-left: 1px solid var(--border);
+}
+.home-proof-tile:first-child { border-left: 0; }
+.home-proof-label {
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+.home-proof-value {
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.home-proof-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+.home-proof-more {
+  grid-column: 1 / -1;
+  padding: 11px 24px;
+  border-top: 1px solid var(--border);
+  text-align: right;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+}
+.home-proof-more:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+
+/* ── 5. Open source ──────────────────────────────────────────────── */
+.home-open {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  gap: 28px 40px;
+  align-items: center;
+  margin-top: 44px;
+  padding: 30px 32px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.home-open-text p {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+.home-open-text p:last-child { margin-bottom: 0; }
+.home-open-text a { color: var(--accent); text-decoration: none; }
+.home-open-text a:hover { text-decoration: underline; }
+.home-open-actions { display: flex; flex-direction: column; gap: 12px; }
+.home-open-actions .stats-cta { margin: 0; }
+
+/* ── Responsive ──────────────────────────────────────────────────── */
+@media (max-width: 1023px) {
+  .home-card { padding: 18px; }
+  .home-open { grid-template-columns: 1fr; gap: 20px; padding: 24px; }
+}
+@media (max-width: 900px) {
+  /* .view is 12px here (responsive.css); the shell drops its own gutter. */
+  .home-shell { padding: 0 0 72px; }
+  .home-hero { padding: 26px 0 30px; }
+  .home-hero-sub { font-size: 15.5px; margin-top: 16px; }
+  .home-hero-actions { margin-top: 22px; }
+  .home-features, .home-proof, .home-open { margin-top: 32px; }
+}
+@media (max-width: 768px) {
+  .home-features { grid-template-columns: 1fr; gap: 12px; }
+}
+@media (max-width: 640px) {
+  .home-proof { grid-template-columns: 1fr; }
+  .home-proof-tile { border-left: 0; border-top: 1px solid var(--border); padding: 16px 18px; }
+  .home-proof-tile:first-child { border-top: 0; }
+  .home-proof-more { padding: 11px 18px; text-align: left; }
+  .home-open { padding: 20px 16px; }
+}
+@media (max-width: 480px) {
+  .home-hero-actions .home-btn { flex: 1 1 100%; justify-content: center; }
+  .home-badge { white-space: normal; text-align: center; justify-content: center; }
+}

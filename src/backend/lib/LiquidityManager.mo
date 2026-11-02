@@ -199,6 +199,33 @@ module {
     Iter.toArray(List.values(adjList))
   };
 
+  // H-34 / D5 option (d): the MARGIN-POOL adjuster. A pool's exposure-
+  // increasing entries borrow their shortfall AT THE FILL (main.mo's
+  // fundForFill hook), so cash on hand says nothing about whether they can
+  // settle — `entryAtFill(order, baseToken)` names them and they are left
+  // alone. Every other resting order of the pool (an EXIT: a close funded by
+  // the pool's holdings) gets the same per-order balance shrink a wallet
+  // gets (step 1 of the adjusters above); the 2.5× per-market and cross-
+  // market bid caps are wallet-shaped and do not bind a pool (openPosition
+  // exempts pools from them by design — pool exposure is governed by the
+  // borrow gate and the release clamp).
+  public func adjustPoolOrders(
+    store : OrderBook.OrderStore,
+    accounts : Accounts.AccountState,
+    pool : Principal,
+    markets : [(Types.MarketId, Types.TokenId)],
+    entryAtFill : (Types.Order, Types.TokenId) -> Bool,
+    timestamp : Int,
+  ) : [Types.OrderAdjustment] {
+    let adjList = List.empty<Types.OrderAdjustment>();
+    let icpusdBalance = Accounts.getBalance(accounts, pool, Types.QUOTE_TOKEN);
+    for ((marketId, baseToken) in markets.vals()) {
+      shrinkBuysToBalance(store, pool, marketId, icpusdBalance, func(o : Types.Order) : Bool { entryAtFill(o, baseToken) }, timestamp, adjList);
+      shrinkSellsToBalance(store, accounts, pool, marketId, baseToken, func(o : Types.Order) : Bool { entryAtFill(o, baseToken) }, timestamp, adjList);
+    };
+    Iter.toArray(List.values(adjList))
+  };
+
   // ── Cross-market bid cap enforcement ───────────────────────────
   // Called after per-market adjustments. If the user's gross buy value
   // still exceeds `maxGross`, shrink or cancel their open buy orders
@@ -325,34 +352,7 @@ module {
     adjList   : List.List<Types.OrderAdjustment>,
   ) {
     // Step 1: Individual order check
-    let ids = getOpenBuyOrderIds(store, user, marketId);
-    for (id in ids.vals()) {
-      switch (OrderBook.getOrder(store, id)) {
-        case null {};
-        case (?o) {
-          if (OrderBook.isOpen(o)) {
-            let rem = OrderBook.remaining(o);
-            let orderValue = Fixed.mul(rem, o.price, true);
-            if (orderValue > icpusdBalance) {
-              if (icpusdBalance < Types.MIN_ORDER_ICPUSD) {
-                recordCancel(adjList, o, timestamp, #balanceShrank);
-                ignore OrderBook.cancelOrder(store, id);
-              } else {
-                let newQty = o.filled + Fixed.div(icpusdBalance, o.price, false);
-                let newRem : Nat = newQty - o.filled;
-                if (Fixed.mul(newRem, o.price, true) < Types.MIN_ORDER_ICPUSD) {
-                  recordCancel(adjList, o, timestamp, #balanceShrank);
-                  ignore OrderBook.cancelOrder(store, id);
-                } else {
-                  recordAdjust(adjList, o, newQty, timestamp, #balanceShrank);
-                  ignore OrderBook.adjustOrderQuantity(store, id, newQty);
-                };
-              };
-            };
-          };
-        };
-      };
-    };
+    shrinkBuysToBalance(store, user, marketId, icpusdBalance, func(_ : Types.Order) : Bool { false }, timestamp, adjList);
 
     // Step 2: Per-market total constraint — re-fetch fresh state
     let totalBuy = OrderBook.getUserMarketBuyTotal(store, user, marketId);
@@ -397,25 +397,69 @@ module {
     };
   };
 
-  // ── Sell-side adjustment ────────────────────────────────────────
-  func adjustSellOrders(
+  // The per-order balance shrink (step 1 of adjustBuyOrders), factored so the
+  // pool adjuster (H-34) can run it alone: a resting buy whose remaining
+  // value exceeds the owner's quote balance is shrunk to what the balance
+  // funds, or cancelled below the min notional. `skip` names orders the rule
+  // does not apply to (a pool's borrow-at-fill entries); wallets pass none.
+  func shrinkBuysToBalance(
+    store     : OrderBook.OrderStore,
+    user      : Principal,
+    marketId  : Types.MarketId,
+    icpusdBalance : Nat,
+    skip      : (Types.Order) -> Bool,
+    timestamp : Int,
+    adjList   : List.List<Types.OrderAdjustment>,
+  ) {
+    let ids = getOpenBuyOrderIds(store, user, marketId);
+    for (id in ids.vals()) {
+      switch (OrderBook.getOrder(store, id)) {
+        case null {};
+        case (?o) {
+          if (OrderBook.isOpen(o) and not skip(o)) {
+            let rem = OrderBook.remaining(o);
+            let orderValue = Fixed.mul(rem, o.price, true);
+            if (orderValue > icpusdBalance) {
+              if (icpusdBalance < Types.MIN_ORDER_ICPUSD) {
+                recordCancel(adjList, o, timestamp, #balanceShrank);
+                ignore OrderBook.cancelOrder(store, id);
+              } else {
+                let newQty = o.filled + Fixed.div(icpusdBalance, o.price, false);
+                let newRem : Nat = newQty - o.filled;
+                if (Fixed.mul(newRem, o.price, true) < Types.MIN_ORDER_ICPUSD) {
+                  recordCancel(adjList, o, timestamp, #balanceShrank);
+                  ignore OrderBook.cancelOrder(store, id);
+                } else {
+                  recordAdjust(adjList, o, newQty, timestamp, #balanceShrank);
+                  ignore OrderBook.adjustOrderQuantity(store, id, newQty);
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+  };
+
+  // The sell-side per-order balance shrink (step 1 of adjustSellOrders),
+  // factored for the pool adjuster exactly like shrinkBuysToBalance.
+  func shrinkSellsToBalance(
     store     : OrderBook.OrderStore,
     accounts  : Accounts.AccountState,
     user      : Principal,
     marketId  : Types.MarketId,
     baseToken : Types.TokenId,
+    skip      : (Types.Order) -> Bool,
     timestamp : Int,
     adjList   : List.List<Types.OrderAdjustment>,
   ) {
     let assetBalance = Accounts.getBalance(accounts, user, baseToken);
-
-    // Step 1: Individual order check
     let ids = getOpenSellOrderIds(store, user, marketId);
     for (id in ids.vals()) {
       switch (OrderBook.getOrder(store, id)) {
         case null {};
         case (?o) {
-          if (OrderBook.isOpen(o)) {
+          if (OrderBook.isOpen(o) and not skip(o)) {
             let rem = OrderBook.remaining(o);
             if (rem > assetBalance) {
               let newRem = assetBalance;
@@ -432,6 +476,22 @@ module {
         };
       };
     };
+  };
+
+  // ── Sell-side adjustment ────────────────────────────────────────
+  func adjustSellOrders(
+    store     : OrderBook.OrderStore,
+    accounts  : Accounts.AccountState,
+    user      : Principal,
+    marketId  : Types.MarketId,
+    baseToken : Types.TokenId,
+    timestamp : Int,
+    adjList   : List.List<Types.OrderAdjustment>,
+  ) {
+    let assetBalance = Accounts.getBalance(accounts, user, baseToken);
+
+    // Step 1: Individual order check
+    shrinkSellsToBalance(store, accounts, user, marketId, baseToken, func(_ : Types.Order) : Bool { false }, timestamp, adjList);
 
     // Step 2: Per-market total constraint
     let totalSell = OrderBook.getUserMarketSellTotal(store, user, marketId);

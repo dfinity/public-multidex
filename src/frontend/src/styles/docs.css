@@ -17,19 +17,53 @@
   line-height: 1.65;
 }
 #docs-view .docs-page { max-width: 860px; min-width: 0; position: relative; }
+/* The aurora box (below) reaches 200px past the page column on each side so
+   its blur has room to run off; clip the VIEW sideways so that run-off never
+   widens the document on a narrow screen. overflow-x: clip is not a scroll
+   container (hidden would be, and would swallow the page's own scrolling),
+   so the viewport keeps scrolling and the TOC's scroll-margin anchors are
+   untouched. The box itself was never clipped by anything before this —
+   overflow: hidden on it clips its BLOBS, not the box — so even at its old
+   -60px reach it widened the docs page to 423px at a 375px viewport. */
+#docs-view { overflow-x: clip; }
 
 /* ── Welcome-page aurora ───────────────────────────────────────────
-   Two blurred colour blobs drifting slowly behind the hero (the welcome
-   page only — the div ships in that page's html). Decorative: behind the
-   text, no pointer events, transform-only animation, and prefers-reduced-
-   motion freezes it. Alphas stay low so body text keeps its contrast. */
+   Two blurred colour blobs drifting slowly behind the hero (the pages whose
+   html ships the div: The launch, What is MULTI/DEX?, Prizes). Decorative:
+   behind the text, no pointer events, transform-only animation, and
+   prefers-reduced-motion freezes it. Alphas stay low so body text keeps its
+   contrast; the blob colours are tokens, so both themes get their own tint.
+
+   THE RUN-OFF (task 1793490294). A 70px blur needs ~200px past a blob's own
+   edge before it has faded to nothing, so the box reaches 200px beyond the
+   page column on each side and 160px deeper than its old 340px, and it
+   still clips (overflow: hidden) — but the clip is made invisible by a mask
+   that fades every edge the clip sits on: the outer 200px left and right
+   (exactly the run-off, so inside the page column the glow is untouched),
+   the 40px above the page (under the sticky header) and the bottom 200px.
+   Before the mask the clip sliced the right blob's soft gradient along a
+   straight vertical line 60px past the page's right edge, and the line
+   moved as the blob drifted (operator report 2026-11-01). The mask is
+   alpha-only — black and transparent are not theme colours, which is why
+   they may sit outside base.css's token tables — and the two axes are
+   intersected (-webkit-mask-composite: source-in is the same operation in
+   the legacy grammar). The blobs keep their old page positions: their
+   offsets grew by the 140px the box grew on each side. */
 .docs-aurora {
   position: absolute;
-  inset: -40px -60px auto -60px;
-  height: 340px;
+  inset: -40px -200px auto -200px;
+  height: 500px;
   overflow: hidden;
   pointer-events: none;
   z-index: -1;
+  -webkit-mask-image:
+    linear-gradient(to right, transparent, black 200px, black calc(100% - 200px), transparent),
+    linear-gradient(to bottom, transparent, black 40px, black calc(100% - 200px), transparent);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    linear-gradient(to right, transparent, black 200px, black calc(100% - 200px), transparent),
+    linear-gradient(to bottom, transparent, black 40px, black calc(100% - 200px), transparent);
+  mask-composite: intersect;
 }
 .docs-aurora i {
   position: absolute;
@@ -40,15 +74,15 @@
   will-change: transform;
 }
 .docs-aurora i:first-child {
-  left: -60px;
+  left: 80px;       /* page-left − 120px, where it sat before the box widened */
   top: -40px;
-  background: radial-gradient(closest-side, rgba(56, 189, 240, 0.16), transparent);
+  background: radial-gradient(closest-side, var(--accent-tint-3), transparent);
   animation: aurora-a 22s ease-in-out infinite alternate;
 }
 .docs-aurora i:last-child {
-  right: -40px;
+  right: 100px;     /* page-right + 100px, as before */
   top: 20px;
-  background: radial-gradient(closest-side, rgba(196, 139, 217, 0.12), transparent);
+  background: radial-gradient(closest-side, var(--heather-tint), transparent);
   animation: aurora-b 26s ease-in-out infinite alternate;
 }
 @keyframes aurora-a {
@@ -123,7 +157,7 @@
 }
 #docs-view .docs-side-link:hover { background: var(--bg-hover); color: var(--text); }
 #docs-view .docs-side-link.active {
-  background: rgba(56, 189, 240, 0.12);
+  background: var(--accent-tint-2);
   color: var(--accent);
   font-weight: 600;
 }
@@ -174,7 +208,7 @@
 #docs-view .docs-start {
   margin: 22px 0 26px;
   padding: 18px 22px 20px;
-  background: rgba(56, 189, 240, 0.06);
+  background: var(--accent-tint-1);
   border: 1px solid var(--accent-border);
   border-radius: 12px;
 }
@@ -303,10 +337,10 @@
 #docs-view table { border-collapse: collapse; width: 100%; font-size: 14px; }
 #docs-view th, #docs-view td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
 #docs-view th { background: var(--bg-card); color: var(--text-dim); font-weight: 600; white-space: nowrap; }
-#docs-view td { background: rgba(18, 30, 51, 0.45); color: var(--text); }
+#docs-view td { background: var(--bg-row); color: var(--text); }
 #docs-view td.docs-c, #docs-view th.docs-c { text-align: center; }
 #docs-view .docs-lvl { color: var(--accent); font-weight: 700; white-space: nowrap; }
-#docs-view .docs-badge-name { color: var(--cta); font-weight: 600; white-space: nowrap; }
+#docs-view .docs-badge-name { color: var(--cta-ink); font-weight: 600; white-space: nowrap; }
 #docs-view .docs-good { color: var(--green); }
 #docs-view .docs-bad { color: var(--red); }
 #docs-view .docs-anchor { color: var(--accent); text-decoration: none; cursor: pointer; }
@@ -366,6 +400,6 @@
 }
 #docs-view .docs-callout--warn {
   border-left-color: var(--red);
-  background: rgba(240, 122, 108, 0.09);
+  background: var(--red-dim);
 }
 #docs-view .docs-callout--warn b { color: var(--red); }

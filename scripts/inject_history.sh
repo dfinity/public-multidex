@@ -120,14 +120,69 @@ fi
 # ── Inter-request delay ─────────────────────────────────────────
 # CoinGecko's free tier is ~30 req/min on a shared pool. Three rapid
 # calls back-to-back routinely trip the limit on busy shared IPs.
-# Space them 5s apart plus exponential backoff on 429.
+# Space them 5s apart; a 429 drops straight to the fallback sources.
 CG_PACE_SEC=5
 
-# Fetch with up to `tries` attempts, exponential backoff on any failure.
-# Success requires a 200 whose body actually contains the "prices" array —
-# anything else (error JSON, HTML interstitials, truncation) retries rather
-# than counting as success. NOTE: this function runs inside command
-# substitution, so it must write NOTHING but the body to stdout — see warn().
+# CoinGecko API base. Overridable so a test can point cg_fetch at a stub
+# (e.g. a local server that always answers 429) without touching the network.
+CG_BASE="${CG_BASE:-https://api.coingecko.com/api/v3}"
+
+# ── Per-asset history cache (machine-shared, hour-keyed) ─────────
+# Every factory seat's cold_start fetches the SAME 14-day series for the same
+# four assets, from a free tier that is one shared pool per machine — N seats
+# reseeding means N upstream fetches and N chances at a 429. The cache makes
+# it one: the first seat to fetch (from CoinGecko OR a fallback — both are in
+# the normalised {"prices":[...]} shape) writes the body, later seats read it.
+#   Location  $MDX_HISTORY_CACHE_DIR, default ~/.cache/multidex/history — a
+#             machine-wide dir the operator owns (NOT .run/, which is per
+#             worktree and so would dedupe nothing; NOT /tmp, sticky+plantable).
+#             Set it EMPTY to disable (the 429 test does).
+#   Key       <ASSET>-<DAYS>d-<UTC YYYYMMDDHH>.json — HOUR-keyed, not day-
+#             keyed: the series' last anchor becomes the AMM opening mark
+#             (seed.sh step 3 prefers this snapshot over the live aggregate),
+#             and a day-stale mark can sit outside the breaker band and pend
+#             every leg of the first post-seed tick (task 3088500128). Sources
+#             update hourly anyway, so an hour key loses no freshness.
+#   Safety    write = mktemp in the dir + mv -f (atomic on one filesystem), so
+#             a concurrent seat reads a whole old file or a whole new one,
+#             never a torn one; entries older than a day are pruned on start.
+#             Best effort: two seats fetching in the same second both go
+#             upstream — fine, that is today's behaviour.
+MDX_HISTORY_CACHE_DIR="${MDX_HISTORY_CACHE_DIR-$HOME/.cache/multidex/history}"
+if [ -n "$MDX_HISTORY_CACHE_DIR" ]; then
+  mkdir -p "$MDX_HISTORY_CACHE_DIR" 2>/dev/null || MDX_HISTORY_CACHE_DIR=""
+fi
+[ -n "$MDX_HISTORY_CACHE_DIR" ] && \
+  find "$MDX_HISTORY_CACHE_DIR" -maxdepth 1 -name '*.json' -mmin +1440 -delete 2>/dev/null
+cache_path() { echo "${MDX_HISTORY_CACHE_DIR}/$1-${DAYS}d-$(date -u +%Y%m%d%H).json"; }
+# stdout = the cached body (same contract as cg_fetch: NOTHING else on stdout).
+cache_get() {
+  [ -n "$MDX_HISTORY_CACHE_DIR" ] || return 1
+  local f; f=$(cache_path "$1")
+  [ -s "$f" ] && grep -q '"prices"' "$f" || return 1
+  warn "  serving $1 from the history cache ($f)"
+  cat "$f"
+}
+cache_put() {
+  [ -n "$MDX_HISTORY_CACHE_DIR" ] || return 0
+  local f tmp; f=$(cache_path "$1")
+  [ -s "$f" ] && return 0
+  tmp=$(mktemp "${MDX_HISTORY_CACHE_DIR}/.tmp.XXXXXX") || return 0
+  printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$f" || rm -f "$tmp"
+}
+
+# Fetch with up to `tries` attempts, exponential backoff on transport errors
+# and 200-but-garbage (HTML interstitials, truncation) — the cases where
+# retrying the SAME source is what actually helps. A 429 (or an error_code
+# body, CoinGecko's other way of saying it) is different: the free tier is one
+# shared pool per machine, so on a factory host a 429 means the pool is busy
+# for the next minute or more and backing off 8/16/32/64s just burns two
+# minutes per asset before the fallbacks inject the identical series
+# (measured 2026-09-04: ~4 min of a ~16 min reseed). So a 429 returns non-zero
+# AT ONCE and the caller drops to fallback_fetch (Binance / Coinbase — keyless,
+# separate rate pools). Success requires a 200 whose body actually contains
+# the "prices" array. NOTE: this function runs inside command substitution, so
+# it must write NOTHING but the body to stdout — see warn().
 cg_fetch() {
   local url="$1" tries=4 wait_s=8
   local attempt=1
@@ -141,12 +196,12 @@ cg_fetch() {
       return 0
     fi
     if [ "$http_code" = "429" ] || echo "$body" | grep -q '"error_code"'; then
-      warn "  rate-limited (attempt $attempt/$tries) — sleeping ${wait_s}s"
-    else
-      # 200-but-garbage / transport error — log the head so the cause is
-      # visible, then retry like a rate limit.
-      warn "  unexpected response (HTTP ${http_code:-none}: $(echo "$body" | head -c 80 | tr -d '\n')…) — attempt $attempt/$tries, sleeping ${wait_s}s"
+      warn "  rate-limited (HTTP ${http_code:-none}, attempt $attempt/$tries) — CoinGecko pool busy, dropping to fallback sources"
+      return 1
     fi
+    # 200-but-garbage / transport error — log the head so the cause is
+    # visible, then retry the same source with backoff.
+    warn "  unexpected response (HTTP ${http_code:-none}: $(echo "$body" | head -c 80 | tr -d '\n')…) — attempt $attempt/$tries, sleeping ${wait_s}s"
     sleep "$wait_s"
     wait_s=$(( wait_s * 2 ))
     attempt=$(( attempt + 1 ))
@@ -197,9 +252,13 @@ inject_one() {
   local asset="$1" market_id="$2" coin_id="$3" qty="$4"
   log "$asset ($market_id) — fetching $DAYS days hourly from CoinGecko"
 
-  local url="https://api.coingecko.com/api/v3/coins/${coin_id}/market_chart?vs_currency=usd&days=${DAYS}&interval=hourly"
+  local url="${CG_BASE}/coins/${coin_id}/market_chart?vs_currency=usd&days=${DAYS}&interval=hourly"
   local raw
-  raw=$(cg_fetch "$url") || raw=$(fallback_fetch "$asset" "$DAYS") || return 1
+  raw=$(cache_get "$asset") \
+    || raw=$(cg_fetch "$url") \
+    || raw=$(fallback_fetch "$asset" "$DAYS") \
+    || return 1
+  cache_put "$asset" "$raw"
 
   # CoinGecko returns `{"prices":[[ts_ms,price], ...], ...}` — ONE price per
   # hour. Injecting one trade per hour makes every 1h candle a single point

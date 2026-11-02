@@ -3,6 +3,18 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Both colour schemes ship; the active one is data-theme on <html>
+       (dark-first — base.css's bare :root is the dark token table). -->
+  <meta name="color-scheme" content="dark light" />
+  <!-- Browser chrome colour (the mobile address bar): the theme's --bg-card.
+       /theme-boot.js sets it pre-paint; theme.js re-stamps it on every change. -->
+  <meta name="theme-color" content="#151B24" />
+  <!-- THEME BOOTSTRAP — stays ABOVE the stylesheet link. A render-blocking
+       classic script (the CSP is script-src 'self', so never an inline block)
+       that stamps data-theme on <html> from the saved choice (localStorage
+       mdx.theme), else prefers-color-scheme, BEFORE any CSS arrives — so a
+       light-mode reload never flashes dark. Served verbatim from public/. -->
+  <script src="/theme-boot.js"></script>
   <title>MULTI/DEX — Multi-Chain Decentralized Exchange</title>
   <!-- Served from public/ at a STABLE root path — the cloud-engine console
        loads the app icon from /favicon.svg (__META_ICON_PATH), so this must
@@ -25,6 +37,12 @@
          height — so the banner (any height, any text wrap) can never push
          page content off-screen. -->
     <div id="top-chrome">
+      <!-- Demo/mock marker (#54.9). Lit by renderDemoMarker() (demo-mode.js,
+           from updateUI) whenever the app is running on the built-in mock
+           actor — the init fallback when the SDK or the canister can't be
+           reached. Topmost, persistent and NOT dismissible: every figure on
+           the page is fabricated while it shows, and sign-in is disabled. -->
+      <div id="demo-banner" class="demo-banner" role="alert" style="display:none"></div>
       <!-- Out-of-fuel banner. The DEX is a public good — if it freezes for
            want of cycles the heartbeat stops and trading halts, but query
            calls still serve, so the UI can detect the stall and tell anyone
@@ -44,12 +62,16 @@
     <!-- Header -->
     <header class="header">
       <div class="header-left">
-        <div class="logo">
+        <!-- The lockup is the Home control (convention: the logo returns you to
+             the landing page) — an anchor the hash router handles, so it is
+             keyboard-reachable and needs no click handler. The one-shot
+             .logo-shimmer sweep stays on the inner span. -->
+        <a class="logo" href="#home" aria-label="MULTI/DEX home">
           <!-- MULTI/DEX — full brand lockup (Asset 7), outlined vector. Fills map to
                the theme: icon + slash -> --accent, letters -> --text.
                .logo-shimmer: one-shot light sweep when the app reveals. -->
           <span class="logo-shimmer"><svg class="logo-lockup" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176.99 37.93" role="img" aria-label="MULTI/DEX"><g><rect style="fill:var(--accent)" x="23.59" y="14.22" width="1.15" height="23.7"/><rect style="fill:var(--accent)" x="17.4" y="11.3" width="1.15" height="16.88"/><path style="fill:var(--accent)" d="M22.53,22.1h3.27c.45,0,.82.37.82.82v11.29c0,.45-.37.82-.82.82h-3.27c-.45,0-.82-.37-.82-.82v-11.29c0-.45.37-.82.82-.82Z"/><rect style="fill:var(--accent)" x="15.52" y="14.3" width="4.91" height="10.24" rx=".82" ry=".82"/><rect style="fill:var(--accent)" x="35.98" y="11.3" width="1.15" height="16.88"/><rect style="fill:var(--accent)" x="29.79" y="14.22" width="1.15" height="23.7"/><path style="fill:var(--accent)" d="M28.73,22.1h3.27c.45,0,.82.37.82.82v11.29c0,.45-.37.82-.82.82h-3.27c-.45,0-.82-.37-.82-.82v-11.29c0-.45.37-.82.82-.82Z"/><rect style="fill:var(--accent)" x="34.1" y="14.3" width="4.91" height="10.24" rx=".82" ry=".82"/><rect style="fill:var(--accent)" x="11.21" y="11.52" width="1.15" height="7.93"/><rect style="fill:var(--accent)" x="9.32" y="13.22" width="4.91" height="5.01" rx=".76" ry=".76"/><path style="fill:var(--accent);fill-rule:evenodd" d="M9.91,13.22c-7.7,0-8.34-8.29.09-12.43.77-.38.47-.94-.14-.75-13.73,4.14-12.47,17.72-.28,17.72h1.62l-.57-4.54h-.73Z"/><rect style="fill:var(--accent)" x="42.18" y="11.52" width="1.15" height="7.93"/><rect style="fill:var(--accent)" x="40.29" y="13.22" width="4.91" height="5.01" rx=".76" ry=".76"/><path style="fill:var(--accent);fill-rule:evenodd" d="M44.62,13.22c7.7,0,8.34-8.29-.09-12.43-.77-.38-.47-.94.14-.75,13.73,4.14,12.47,17.72.28,17.72h-1.62l.57-4.54h.73Z"/><path style="fill:var(--text)" d="M68.14,12.8v.89c.48-.88.93-1.48,1.35-1.82s.95-.5,1.59-.5c1.3,0,2.25.77,2.86,2.32.45-.85.91-1.46,1.37-1.8s1.06-.52,1.79-.52,1.43.25,2.03.73c.66.55,1.12,1.33,1.37,2.33.17.67.26,1.73.26,3.18v5.26c0,.84,0,1.35.02,1.53.07.73.24,1.1.51,1.1.09,0,.23-.04.41-.11.18-.07.32-.11.41-.11.46,0,.69.31.69.92,0,.71-.27,1.07-.79,1.07-.2,0-.5-.04-.9-.11-.4-.07-.71-.11-.92-.11-.23,0-.55.04-.98.11-.43.07-.76.11-.98.11-.56,0-.83-.36-.83-1.07,0-.61.21-.92.64-.92.05,0,.19.02.4.06.08.04.19.06.32.06.23,0,.37-.17.43-.52.06-.35.1-1.21.11-2.59v-3.88c0-1.4-.07-2.43-.21-3.07-.14-.64-.4-1.15-.78-1.51s-.82-.55-1.31-.55c-.94,0-1.59.5-1.96,1.5-.29.79-.44,2.18-.44,4.15v2.17c0,1.91.03,3.11.09,3.59.06.48.22.72.47.72.08,0,.2-.02.35-.06s.27-.06.35-.06c.19,0,.34.1.47.29.13.19.19.43.19.71,0,.66-.31.99-.93.99-.2,0-.49-.04-.88-.12s-.69-.12-.88-.12c-.28,0-.58.04-.91.12s-.62.12-.87.12c-.54,0-.81-.35-.81-1.04,0-.63.2-.95.6-.95.15,0,.26.03.34.08.19.09.32.13.42.13.32,0,.48-.52.5-1.56l.06-1.44v-4.45c0-1.78-.16-3.02-.47-3.71-.31-.7-.86-1.04-1.66-1.04-.87,0-1.54.49-2.01,1.47-.38.8-.58,2.19-.58,4.17v4.08c0,.82,0,1.3.02,1.44.05.7.2,1.04.44,1.04.07,0,.21-.06.42-.17.03,0,.07-.01.12-.04h.14c.52,0,.77.34.77,1.01s-.3.98-.89.98c-.23,0-.5-.03-.83-.09-.45-.08-.83-.12-1.15-.12-.16,0-.45.03-.87.09-.57.08-.91.12-1.03.12-.53,0-.79-.35-.79-1.04,0-.63.26-.95.77-.95h.12c.05.02.09.03.12.03l.51.15s.04.03.08.03c.36,0,.56-.5.59-1.5v-6.41c0-1.73-.03-2.81-.09-3.24-.06-.43-.22-.64-.49-.64-.05,0-.24.05-.56.15-.13.04-.24.06-.32.06-.49,0-.73-.33-.73-.98,0-.69.27-1.04.81-1.04.15,0,.34.02.6.06.25.04.47.06.66.06h.36l.48-.12h.06c.32,0,.48.29.48.88Z"/><path style="fill:var(--text)" d="M91.41,26.38v-.95c-.72,1.49-1.78,2.23-3.18,2.23-1.59,0-2.7-.74-3.32-2.23-.27-.65-.42-1.41-.45-2.29-.01-.43-.02-1.32-.02-2.69v-2.53c0-2.79-.2-4.18-.59-4.18-.08,0-.21.02-.39.05-.18.03-.31.05-.41.05-.48,0-.72-.33-.72-.99s.29-.96.87-.96c.13,0,.33.03.6.08s.46.08.6.08c.12,0,.33-.03.63-.09.2-.04.32-.06.34-.06.42,0,.63.39.63,1.16v2.62l-.06,2.26v1.98c0,1.77.09,3.04.28,3.82.31,1.28,1.05,1.92,2.23,1.92.58,0,1.09-.2,1.54-.59.45-.4.76-.92.93-1.57.22-.79.32-2.3.32-4.52v-3.66c-.07-.98-.24-1.47-.53-1.47h-.61c-.47,0-.71-.31-.71-.92,0-.69.26-1.04.79-1.04.12,0,.31.02.56.06.25.04.44.06.56.06.11,0,.27-.02.49-.06.22-.04.38-.06.49-.06.41,0,.61.33.61.98,0,.29-.01.51-.04.67-.07.77-.1,1.92-.1,3.43v4.71c0,1.24,0,1.94.02,2.08.07,1.08.26,1.62.57,1.62.09,0,.23-.03.41-.08.18-.05.31-.08.41-.08.46,0,.69.34.69,1.01s-.28,1.04-.85,1.04c-.12,0-.3-.02-.53-.06-.34-.06-.55-.09-.63-.09-.04,0-.18.02-.43.06-.16.06-.3.09-.43.09-.38,0-.57-.29-.57-.89Z"/><path style="fill:var(--text)" d="M100.42,14.4v9.48c.01,1.04.2,1.55.56,1.55.08,0,.26-.05.52-.15.17-.04.28-.06.33-.06.46,0,.69.35.69,1.04s-.28,1.01-.84,1.01c-.22,0-.57-.04-1.05-.12-.48-.08-.85-.12-1.11-.12-.22,0-.55.04-.99.12-.44.08-.76.12-.97.12h-.1c-.58,0-.86-.37-.86-1.1,0-.63.24-.95.71-.95h.15c.08.03.15.04.19.04.35.11.55.17.6.17.25,0,.41-.16.47-.47.06-.32.1-1.14.11-2.47l.02-2.14v-10.2c-.01-.61-.03-1.02-.06-1.23-.1-.47-.29-.7-.58-.7-.04,0-.22.04-.54.12-.15.04-.28.06-.37.06-.47,0-.7-.33-.7-.98s.28-1.01.83-1.01c.15,0,.28,0,.39.03l.5.09c.22.04.41.06.56.06.14,0,.34-.03.62-.09.28-.06.48-.09.62-.09.32,0,.48.29.48.88,0,.2,0,.36-.02.46-.1,1.57-.14,3.78-.14,6.64Z"/><path style="fill:var(--text)" d="M110.67,22.93v-1.95c.01-.83.27-1.25.76-1.25s.74.47.74,1.4c0,2.22-.2,3.76-.59,4.64-.53,1.18-1.4,1.77-2.61,1.77-1.12,0-1.91-.52-2.38-1.56-.35-.75-.52-2.04-.52-3.85v-7.33c0-.43-.14-.64-.41-.64h-.69c-.23,0-.42-.11-.57-.32-.15-.21-.23-.47-.23-.78,0-.29.07-.54.22-.76.15-.22.31-.33.49-.33h.82c.24,0,.36-.19.36-.58v-3.14c0-.77.27-1.16.82-1.16.51,0,.76.39.76,1.16v3.27c0,.3.13.46.38.46h2.29c.53,0,.8.36.8,1.07,0,.75-.29,1.13-.86,1.13h-2.32c-.2,0-.29.21-.29.64v7.51c0,2.14.49,3.21,1.47,3.21s1.52-.86,1.56-2.59Z"/><path style="fill:var(--text)" d="M118.88,18.29v3.97c0,1.02,0,1.62.02,1.8.07.92.26,1.37.58,1.37.07,0,.25-.05.54-.15.07-.04.18-.06.32-.06.54,0,.81.34.81,1.01,0,.29-.09.53-.27.73-.18.2-.41.31-.68.31-.23,0-.58-.05-1.04-.14-.47-.09-.81-.14-1.04-.14-.37,0-.79.04-1.25.12-.56.1-.93.15-1.12.15-.57,0-.86-.35-.86-1.04s.25-1.01.74-1.01c.12,0,.28.03.51.09.22.06.39.09.51.09.35,0,.56-.65.63-1.95v-7.82c-.07-1.28-.29-1.92-.65-1.92-.12,0-.28.04-.49.11-.21.07-.36.11-.47.11-.52,0-.78-.33-.78-.98,0-.69.31-1.04.94-1.04.27,0,.46.01.58.03.46.08.75.12.88.12.11,0,.29-.03.53-.08.24-.05.41-.08.53-.08.41,0,.62.4.62,1.19,0,.08,0,.2-.02.37-.01.16-.02.29-.02.37-.01.16-.02.79-.03,1.89-.01.83-.02,1.69-.02,2.56ZM117.76,10.29c-.33,0-.61-.17-.85-.5-.24-.34-.35-.74-.35-1.21s.12-.87.35-1.19c.24-.33.52-.49.85-.49s.61.16.85.49.35.72.35,1.19-.12.87-.35,1.21c-.24.33-.52.5-.85.5Z"/><path style="fill:var(--accent)" d="M125.42,29.92c-.09.33-.18.67-.27,1.02-.1.36-.19.74-.29,1.15-.16.67-.46,1.01-.9,1.01h-.68c-.44,0-.66-.24-.66-.73,0-.08,0-.16.01-.23,0-.07.03-.15.05-.23l.22-.7.24-.85v.03l5.46-19.51.13-.46.59-2.26v.03c.04-.2.09-.4.14-.58.05-.18.1-.38.14-.58.15-.59.46-.89.94-.89h.63c.42,0,.63.24.63.73,0,.16-.07.48-.22.95l-.17.67v-.03l-6.01,21.46Z"/><path style="fill:var(--text)" d="M138.5,11.36c1.47,0,2.57.78,3.29,2.35v-3.08c0-.81-.02-1.31-.04-1.5-.07-.63-.28-.95-.62-.95-.12,0-.29.03-.5.09-.22.06-.38.09-.5.09-.55,0-.82-.33-.82-.98s.37-1.01,1.11-1.01c.12,0,.33.02.65.06.47.06.72.09.73.09.13,0,.33-.03.58-.08.25-.05.44-.08.58-.08.42,0,.62.41.62,1.22v.34c-.01.06-.03.6-.04,1.62,0,.12-.02.91-.07,2.35-.03,1.02-.04,1.79-.04,2.32v8.1c.02,1.35.06,2.18.14,2.51.08.33.26.49.54.49.2,0,.35-.02.45-.06.24-.04.41-.06.5-.06.56,0,.84.34.84,1.01s-.33,1.04-1,1.04c-.15,0-.37-.03-.68-.08-.3-.05-.53-.08-.68-.08-.04,0-.22.02-.51.06-.18.06-.33.09-.47.09-.4,0-.6-.37-.6-1.1v-.67c-.78,1.45-1.92,2.17-3.42,2.17s-2.72-.75-3.64-2.26c-.92-1.51-1.38-3.48-1.38-5.92s.45-4.43,1.36-5.91c.9-1.48,2.11-2.21,3.63-2.21ZM141.71,22.14c.06-.67.09-1.54.09-2.59,0-1.36-.04-2.29-.11-2.78-.13-1.02-.46-1.81-.96-2.38-.6-.67-1.28-1.01-2.06-1.01-1.05,0-1.86.54-2.45,1.62-.59,1.08-.88,2.55-.88,4.43s.31,3.46.92,4.56c.61,1.11,1.45,1.66,2.51,1.66.81,0,1.48-.32,2.02-.96.54-.64.85-1.49.94-2.55Z"/><path style="fill:var(--text)" d="M159.29,18.17c0,.77-.04,1.25-.11,1.42-.08.17-.29.26-.66.26h-7.2c-.2,0-.32.04-.38.11-.06.07-.09.19-.09.35,0,1.53.34,2.8,1.02,3.82.68,1.02,1.52,1.53,2.54,1.53.66,0,1.27-.24,1.82-.73.55-.49.91-1.11,1.08-1.86l.2-.88c.11-.49.35-.73.75-.73.56,0,.84.39.84,1.16,0,1.32-.5,2.5-1.49,3.53-1,1.03-2.13,1.54-3.4,1.54-1.58,0-2.85-.72-3.78-2.15-.94-1.43-1.4-3.36-1.4-5.78s.5-4.5,1.49-6.04c1-1.55,2.29-2.32,3.89-2.32,1.42,0,2.59.64,3.51,1.92.92,1.28,1.38,2.91,1.38,4.88ZM151.07,17.38c0,.29.17.43.5.43h5.41c.32,0,.48-.14.48-.43,0-1.08-.3-2.01-.91-2.81-.6-.79-1.31-1.19-2.13-1.19s-1.62.41-2.31,1.24-1.04,1.75-1.04,2.76Z"/><path style="fill:var(--text)" d="M165.58,24.08l3.2-4.88-3.2-5.03c-.22-.33-.48-.49-.78-.49-.12,0-.22.01-.28.04l-.39.14c-.06.02-.17.04-.32.04-.51,0-.76-.33-.76-.98,0-.69.31-1.04.94-1.04h.07s.4.03,1.15.09c.38.08.71.12.97.12s.64-.04,1.13-.11c.49-.07.86-.11,1.11-.11.63,0,.94.35.94,1.04,0,.65-.29.98-.88.98-.12,0-.24-.02-.35-.07l-.35-.14h-.14c-.06,0-.09.02-.09.06.03.12.1.27.21.43l2.1,3.41,2.19-3.41c.14-.21.21-.35.21-.43-.02-.04-.05-.06-.11-.06-.08,0-.2.04-.38.11-.17.07-.31.11-.4.11-.55,0-.82-.34-.82-1.02s.32-.99.97-.99c-.03,0,.38.05,1.22.15.34.04.7.06,1.08.06s.79-.04,1.22-.11.74-.11.92-.11c.68,0,1.01.34,1.01,1.02s-.26.99-.79.99c-.12,0-.3-.04-.53-.11-.23-.07-.41-.11-.53-.11-.37,0-.88.49-1.53,1.47l-2.68,4.04,3.59,5.63c.21.35.48.52.78.52.09,0,.23-.02.43-.06s.33-.06.43-.06c.55,0,.83.33.83.98,0,.71-.32,1.07-.97,1.07h-.18l-.9-.15c-.25-.04-.61-.06-1.11-.06-.42,0-.83.03-1.24.09l-.83.12h-.25c-.72,0-1.08-.33-1.08-.98,0-.71.28-1.07.85-1.07.2,0,.48.04.85.12.03.02.08.03.16.03.15,0,.23-.08.23-.24,0-.06-.02-.12-.07-.18l-.07-.12-2.56-3.97-2.6,3.97c-.11.16-.16.29-.16.37,0,.1.08.15.23.15.11,0,.27-.02.48-.06.21-.04.38-.06.48-.06.66,0,.99.36.99,1.07,0,.65-.33.98-.99.98h-.32l-.92-.12c-.46-.06-.87-.09-1.22-.09-.28,0-.61.03-.99.09-.52.08-.91.12-1.15.12-.65,0-.97-.35-.97-1.04s.28-1.01.83-1.01c.09,0,.23.02.42.05.18.03.32.05.41.05.29,0,.71-.41,1.24-1.23Z"/></g></svg></span>
-        </div>
+        </a>
         <!-- Mobile-only account value, sitting just before the hamburger.
              Populated by renderBalances alongside the desktop pill's figure
              (both carry .balance-display); CSS shows exactly one per
@@ -60,7 +82,23 @@
         </button>
       </div>
       <nav class="tabs">
-        <button class="tab active" data-tab="swap">Swap</button>
+        <!-- Mobile drawer only (desktop hides it — the round toggle at the
+             far right of the header serves there): the same sun/moon switch as
+             a full-width row at the TOP of the list. Deliberately not a .tab:
+             the tab click handler routes by data-tab, and this navigates
+             nowhere. theme.js keeps its label in step. -->
+        <button class="drawer-theme" id="theme-toggle-mobile" type="button" data-theme-toggle aria-label="Switch to light mode" aria-pressed="false" title="Switch to light mode">
+          <svg class="theme-icon theme-icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+          <svg class="theme-icon theme-icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>
+          <span class="theme-toggle-label">Switch to light mode</span>
+        </button>
+        <!-- Home: the landing page. On desktop the logo is the Home control (no
+             nav tab, by convention); the lockup is small in the mobile drawer,
+             so the drawer carries an explicit Home row at the top of the NAV list
+             (right under the theme-toggle row) — desktop-hidden like the Account pill. No tab is active in the static markup:
+             activateTab() lights the routed one (Home lights none on desktop). -->
+        <button class="tab tab-mobile-only" data-tab="home">Home</button>
+        <button class="tab" data-tab="swap">Swap</button>
         <button class="tab" data-tab="markets">Markets</button>
         <!-- data-tab is the INTERNAL token (view ids + CSS + tabName logic all
              key off "stats"/"intelli"); the URL hash is mapped to #status /
@@ -122,29 +160,41 @@
         <!-- Signed-in user menu (desktop far-right dropdown): trigger pill +
              Account / Sign out. Hidden on mobile (the drawer carries Account
              as a tab and Sign out as the auth button). Pill BEFORE the account
-             value, per review. -->
+             value, per review. A menu button (makeDropdown / wireMenuButton in
+             main.js): the trigger is the one tab stop, aria-expanded follows
+             the wrapper's .open, the items are role=menuitem at tabindex=-1. -->
         <div id="user-menu" class="user-menu">
-          <button id="user-menu-trigger" class="user-menu-trigger" aria-haspopup="true" aria-expanded="false">
+          <button type="button" id="user-menu-trigger" class="user-menu-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="user-menu-dropdown">
             <span class="user-menu-avatar" id="user-menu-avatar">?</span>
             <span class="user-menu-name" id="user-menu-name">—</span>
-            <svg class="user-menu-caret" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <svg class="user-menu-caret" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
-          <div class="user-menu-dropdown" id="user-menu-dropdown">
-            <button class="user-menu-item" data-useraction="acct:overview">Overview</button>
-            <button class="user-menu-item" data-useraction="acct:deposit">Deposit</button>
-            <button class="user-menu-item" data-useraction="acct:wallet">Wallet</button>
-            <button class="user-menu-item" data-useraction="acct:spot">Spot</button>
-            <button class="user-menu-item" data-useraction="acct:positions">Positions</button>
-            <button class="user-menu-item" data-useraction="acct:earn">Earn</button>
-            <button class="user-menu-item" data-useraction="acct:archive">Archive</button>
-            <button class="user-menu-item" data-useraction="acct:status">Fee Level</button>
-            <button class="user-menu-item" data-useraction="acct:ai">AI usage</button>
+          <div class="user-menu-dropdown" id="user-menu-dropdown" role="menu" aria-label="Account menu">
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:overview">Overview</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:deposit">Deposit</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:wallet">Wallet</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:spot">Spot</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:positions">Positions</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:earn">Earn</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:archive">Archive</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:status">Fee Level</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="acct:ai">AI usage</button>
             <div class="user-menu-sep" role="separator"></div>
-            <button class="user-menu-item" data-useraction="signout">Sign out</button>
+            <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="signout">Sign out</button>
           </div>
         </div>
         <div id="balance-display" class="balance-display" style="display:none"></div>
         <button id="auth-btn" class="btn btn-primary">Sign In</button>
+        <!-- Theme toggle (sun / moon) — the FAR RIGHT of the header, visible
+             signed in or out. The glyph is the DESTINATION (a sun while dark,
+             a moon while light); theme.js keeps aria-label / aria-pressed /
+             title in step and persists the pick (localStorage mdx.theme).
+             Hidden on mobile — the drawer carries its own row at the top of
+             the list (responsive.css). -->
+        <button id="theme-toggle" class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to light mode" aria-pressed="false" title="Switch to light mode">
+          <svg class="theme-icon theme-icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+          <svg class="theme-icon theme-icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>
+        </button>
       </div>
     </header>
     </div><!-- /#top-chrome -->
@@ -162,16 +212,113 @@
            the loading line (no separate "Loading…" text). -->
       <!-- Kept EMPTY in source (a hand-written literal drifted once already:
            read 1.51 while the build was 1.52) and filled at BUILD time by
-           vite.config.js transformIndexHtml from package.json, so the badge
+           vite.config.mjs transformIndexHtml from package.json, so the badge
            shows from the first paint of every refresh. main.js re-stamps the
            same text at boot (and starts the update checker); the build fails
            if this span's empty-markup contract changes. -->
       <span class="app-version"></span>
     </div>
 
+    <!-- Home (#home) — the landing page, reached from the logo and from the
+         mobile drawer's Home row (no nav tab: the logo is the Home control, by
+         convention). One h1 on the page. Every CTA is a hash anchor the router
+         handles — no click handlers; external links open in a new tab with
+         rel="noopener noreferrer" and point at the PUBLIC repository only.
+         The posture badge ships the play-mode line (true on every live target
+         today) and renderHomePostureBadge() corrects it from getDeployMode;
+         the proof-strip figures are filled by refreshHomeFigures() from the
+         same reads the System page makes — "—" until a real figure lands,
+         never a placeholder number. Design note: src/styles/home.css. -->
+    <main id="home-view" class="view">
+      <div class="home-shell">
+
+        <section class="home-hero">
+          <h1 class="strap home-strap">Actually decentralized. Secure. <span class="strap-accent">Yours.</span></h1>
+          <p class="home-hero-sub">MULTI/DEX isn't owned by a company, involves no servers, and uses
+            no custodian. Everything, including matching engine, order books, AMM, margin, vaults,
+            your trade history, and this very page, is tamperproof code on the Internet Computer
+            that is updated through votes by its autonomous Network Nervous System governance
+            framework. Everything is decentralized, including the multichain asset technology used,
+            there is no one to trust, and nothing to hack but the chain itself.</p>
+          <div class="home-hero-actions">
+            <a class="btn btn-primary home-btn" href="#swap">Start swapping</a>
+            <a class="btn btn-secondary home-btn" href="#docs/welcome">Read how it works</a>
+            <span class="home-badge" id="home-posture-badge"><span class="home-badge-dot" aria-hidden="true"></span>Live in play mode — trade with free dummy crypto</span>
+          </div>
+        </section>
+
+        <section class="home-features" aria-label="What you can do here">
+          <article class="home-card">
+            <div class="home-card-thumb">
+              <img src="/assets/home/swap.webp" width="800" height="459" alt="The Swap page: a sell/buy card beside a BTC/ICP price chart and the BTC order book" loading="lazy" decoding="async">
+            </div>
+            <h2 class="home-card-title">Swap</h2>
+            <p class="home-card-copy">Directly swap digital asset tokens you own for others, without the
+              hassle of first selling into a currency token, then using that to buy the other.</p>
+            <a class="stats-cta" href="#swap">Open Swap <span class="stats-cta-arrow">→</span></a>
+          </article>
+
+          <article class="home-card">
+            <div class="home-card-thumb">
+              <img src="/assets/home/markets.webp" width="800" height="556" alt="The Markets page: an ICP/ICPUSD candle chart beside the order book and the Place Order form" loading="lazy" decoding="async">
+            </div>
+            <h2 class="home-card-title">Markets</h2>
+            <p class="home-card-copy">Powerful traditional order book markets where you can instantly trade
+              at spot, or automatically create short and long positions using leverage.</p>
+            <a class="stats-cta" href="#markets">Open Markets <span class="stats-cta-arrow">→</span></a>
+          </article>
+
+          <article class="home-card">
+            <div class="home-card-thumb">
+              <svg viewBox="0 0 800 459" aria-hidden="true" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><defs><linearGradient id="home-earn-grad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="currentColor" stop-opacity=".32"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs><path stroke-opacity=".14" stroke-width="2" d="M40 100H760M40 175H760M40 250H760M40 325H760M40 400H760"/><path fill="url(#home-earn-grad)" stroke="none" d="M40 372 105 348 170 362 235 318 300 296 365 324 430 262 495 236 560 258 625 190 690 150 760 96V400H40Z"/><path stroke-width="6" d="M40 372 105 348 170 362 235 318 300 296 365 324 430 262 495 236 560 258 625 190 690 150 760 96"/><circle cx="760" cy="96" r="18" fill="currentColor" fill-opacity=".2" stroke="none"/><circle cx="760" cy="96" r="8" fill="currentColor" stroke="none"/></svg>
+            </div>
+            <h2 class="home-card-title">Earn</h2>
+            <p class="home-card-copy">If you don't want to trade, you can earn yield on your assets by
+              depositing them into the Automated Market Maker's vault, or the Insurance Fund.</p>
+            <a class="stats-cta" href="#account/earn">Open Earn <span class="stats-cta-arrow">→</span></a>
+          </article>
+        </section>
+
+        <section class="home-proof" aria-label="Live figures">
+          <div class="home-proof-tile">
+            <div class="home-proof-label">Total Value Locked</div>
+            <div class="home-proof-value" id="home-kpi-tvl">—</div>
+            <div class="home-proof-sub">the AMM vault, at live prices</div>
+          </div>
+          <div class="home-proof-tile">
+            <div class="home-proof-label">24h Volume</div>
+            <div class="home-proof-value" id="home-kpi-24vol">—</div>
+            <div class="home-proof-sub">across all markets</div>
+          </div>
+          <div class="home-proof-tile">
+            <div class="home-proof-label">Markets</div>
+            <div class="home-proof-value" id="home-kpi-markets">—</div>
+            <div class="home-proof-sub">order books quoted</div>
+          </div>
+          <a class="home-proof-more" href="#system/overview">Every figure, live, on the System page →</a>
+        </section>
+
+        <section class="home-open" aria-labelledby="home-open-head">
+          <div class="home-open-text">
+            <div class="home-eyebrow" id="home-open-head">Open source and verifiable</div>
+            <p>MULTI/DEX is the world's only order book exchange whose software code is open source. Access its
+              latest onchain code at
+              <a href="https://github.com/dfinity/public-multidex" target="_blank" rel="noopener noreferrer">github.com/dfinity/public-multidex</a>.</p>
+            <p>It's also the only exchange whose actions and balances are truly verifiable because it's
+              fully onchain and tamperproof, and maintains a tape of everything that happens.</p>
+          </div>
+          <div class="home-open-actions">
+            <a class="stats-cta" href="https://github.com/dfinity/public-multidex" target="_blank" rel="noopener noreferrer">The repository <span class="stats-cta-arrow">↗</span></a>
+            <a class="stats-cta" href="#ledger">Verify the tape yourself <span class="stats-cta-arrow">→</span></a>
+          </div>
+        </section>
+
+      </div>
+    </main>
+
     <!-- Swap Tab -->
     <main id="swap-view" class="view">
-      <h1 class="swap-strap">100% onchain. 100% native assets. <span class="strap-accent">Yours.</span></h1>
+      <h1 class="strap swap-strap">Directly swap digital assets. <span class="strap-accent">No middleman.</span></h1>
       <div class="swap-container">
         <div class="swap-card">
           <h2>Swap</h2>
@@ -216,6 +363,9 @@
                 <span class="swap-preview-rate" id="swap-preview-rate"></span>
                 <span class="swap-preview-impact" id="swap-preview-impact"></span>
               </div>
+              <!-- #55 preview half: "only $399.40 of this $1,000 is available" — the
+                   quoteSwap reply's availableFrom/clampedByReserve, rendered while typing. -->
+              <div class="swap-preview-avail" id="swap-preview-avail" style="display:none"></div>
             </div>
 
             <!-- Market orders only for now. Limit mode was removed 2026-07-08
@@ -285,9 +435,11 @@
                Shown only while a Book tab is active. -->
           <div class="orderbook-toolbar swap-ob-toolbar" id="swap-ob-toolbar" style="display:none">
             <div class="ob-granularity" id="swap-ob-granularity">
-              <span class="ob-gran-label" id="swap-ob-gran-label">Exact</span>
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-              <div class="ob-gran-menu" id="swap-ob-gran-menu"></div>
+              <button type="button" class="ob-gran-trigger" id="swap-ob-gran-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="swap-ob-gran-menu">
+                <span class="ob-gran-label" id="swap-ob-gran-label">Exact</span>
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              </button>
+              <div class="ob-gran-menu" id="swap-ob-gran-menu" role="menu" aria-label="Swap book price grouping"></div>
             </div>
             <button id="swap-ob-cumulative" class="ob-cumulative-btn active" title="Cumulative depth">Σ</button>
           </div>
@@ -309,16 +461,25 @@
             <!-- Market header — lives inside the grid so it occupies only the
                  chart column (desktop), matching Hyperliquid's framing. -->
             <div class="market-header">
+              <!-- Market selector: a MENU BUTTON (main.js wireMenuButton,
+                   1793506246). The trigger sits inside the h2 so the title
+                   keeps its heading; #market-title is the text selectMarket
+                   writes; aria-expanded mirrors the wrapper's .open through
+                   one setter; the menu's two sections are named groups. -->
               <div class="market-selector" id="market-selector">
-                <h2 id="market-title">BTC-ICPUSD</h2>
-                <svg class="market-selector-chevron" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <div class="market-dropdown" id="market-dropdown">
-                  <div id="market-dropdown-recent" class="market-dropdown-section" style="display:none">
-                    <div class="market-dropdown-label">Recent</div>
+                <h2>
+                  <button type="button" class="market-selector-trigger" id="market-selector-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="market-dropdown">
+                    <span id="market-title">BTC-ICPUSD</span>
+                    <svg class="market-selector-chevron" width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                </h2>
+                <div class="market-dropdown" id="market-dropdown" role="menu" aria-label="Market">
+                  <div id="market-dropdown-recent" class="market-dropdown-section" role="group" aria-labelledby="market-dropdown-recent-label" style="display:none">
+                    <div class="market-dropdown-label" id="market-dropdown-recent-label">Recent</div>
                     <div id="market-dropdown-recent-list"></div>
                   </div>
-                  <div class="market-dropdown-section">
-                    <div class="market-dropdown-label">All</div>
+                  <div class="market-dropdown-section" role="group" aria-labelledby="market-dropdown-all-label">
+                    <div class="market-dropdown-label" id="market-dropdown-all-label">All</div>
                     <div id="market-dropdown-all-list"></div>
                   </div>
                 </div>
@@ -327,11 +488,16 @@
                    stacked over the 24h change; tapping opens a popup with all
                    the labeled stats shown on the desktop bar. -->
               <div class="market-stats-mobile" id="market-stats-toggle">
-                <div class="msm-summary">
-                  <span id="market-header-price" class="market-header-price">—</span>
-                  <span id="market-price-change" class="market-price-change">—</span>
-                </div>
-                <svg class="market-selector-chevron" width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <!-- A disclosure (main.js wireDisclosure, 1793506246): the
+                     <button> is the tab stop, Enter / Space toggle, Escape
+                     closes; aria-expanded mirrors the wrapper's .open. -->
+                <button type="button" class="msm-trigger" id="market-stats-trigger" aria-expanded="false" aria-controls="market-stats-dropdown">
+                  <span class="msm-summary">
+                    <span id="market-header-price" class="market-header-price">—</span>
+                    <span id="market-price-change" class="market-price-change">—</span>
+                  </span>
+                  <svg class="market-selector-chevron" width="12" height="12" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
                 <div class="market-stats-dropdown" id="market-stats-dropdown">
                   <div class="msd-row"><span class="ms-label">Price</span><span class="ms-value" id="msd-price">—</span></div>
                   <div class="msd-row"><span class="ms-label">Mark</span><span class="ms-value" id="msd-mark">—</span></div>
@@ -370,8 +536,13 @@
                 <div class="market-stat">
                   <span class="ms-label">24h Change<svg class="ms-more-chevron" width="10" height="10" viewBox="0 0 14 14" fill="none"><path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
                   <span class="ms-value" id="dt-market-change">—</span>
-                  <!-- Shared overflow popup; JS re-parents it into whichever
-                       cell is the current trigger and fills in the rows. -->
+                  <!-- Shared overflow trigger + popup; JS (updateMarketHeaderMode)
+                       re-parents both into whichever cell is the current
+                       trigger and fills in the rows. The button is the
+                       keyboard half — a disclosure (main.js wireDisclosure,
+                       1793506246), transparent over its cell and shown only
+                       there (markets.css .ms-more-btn). -->
+                  <button type="button" class="ms-more-btn" id="market-stats-more" aria-label="More market stats" aria-expanded="false" aria-controls="market-stats-overflow"></button>
                   <div class="market-stats-dropdown" id="market-stats-overflow"></div>
                 </div>
                 <div class="market-stat">
@@ -416,9 +587,6 @@
                 </div>
               </div>
               <div class="market-header-spacer"></div>
-              <button id="chart-btn" class="btn btn-secondary btn-sm" title="Price Chart">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" style="vertical-align:middle;margin-right:4px"><rect x="1" y="8" width="3" height="6" rx="0.5" fill="currentColor" opacity="0.5"/><rect x="5" y="4" width="3" height="10" rx="0.5" fill="currentColor" opacity="0.7"/><rect x="9" y="6" width="3" height="8" rx="0.5" fill="currentColor" opacity="0.6"/><rect x="13" y="2" width="2" height="12" rx="0.5" fill="currentColor" opacity="0.8"/></svg>Chart
-              </button>
             </div>
 
             <!-- Chart cell (primary, widest) -->
@@ -457,10 +625,18 @@
                   <div class="orderbook-spread" id="orderbook-spread">—</div>
                   <div id="orderbook-bids" class="orderbook-bids"></div>
                   <div class="orderbook-toolbar">
+                    <!-- Price grouping: a MENU BUTTON (main.js wireMenuButton,
+                         1793506246) — the wrapper carries .open, the <button>
+                         is the tab stop (aria-expanded mirrors .open through
+                         one setter), the role=menu holds the role=menuitem
+                         buttons fillGranMenu builds. The Swap book's toolbar
+                         is its twin. -->
                     <div class="ob-granularity" id="ob-granularity">
-                      <span class="ob-gran-label" id="ob-gran-label">Exact</span>
-                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-                      <div class="ob-gran-menu" id="ob-gran-menu"></div>
+                      <button type="button" class="ob-gran-trigger" id="ob-gran-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="ob-gran-menu">
+                        <span class="ob-gran-label" id="ob-gran-label">Exact</span>
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                      </button>
+                      <div class="ob-gran-menu" id="ob-gran-menu" role="menu" aria-label="Order book price grouping"></div>
                     </div>
                     <button id="ob-cumulative" class="ob-cumulative-btn active" title="Cumulative depth">Σ</button>
                   </div>
@@ -1162,6 +1338,15 @@
                 <code id="archive-id-value" class="canister-id-value">—</code>
                 <button id="archive-id-copy" class="btn btn-secondary canister-id-copy">Copy</button>
               </div>
+              <!-- The spawn slot (W4-16 / #55): a successor archive the DEX
+                   created whose install has not completed. Hidden while empty;
+                   renderSpawnSlot shows principal + age, amber past 60 s, red
+                   past 5 min ("reconciler overdue"). -->
+              <div class="canister-id-row spawn-slot-row" id="archive-spawn-slot" style="display:none">
+                <span class="spawn-slot-label">Spawn slot</span>
+                <code id="archive-spawn-id" class="canister-id-value">—</code>
+                <span id="archive-spawn-age" class="spawn-slot-age">—</span>
+              </div>
               <div class="canister-id-hint">
                 Anyone can keep the archive running, or restart the archive when it's out of fuel,
                 by sending cycles to this canister. If it does run dry, history is buffered in the
@@ -1501,15 +1686,14 @@
         </div>
         </div>
 
-        <!-- AI usage — how much of the assistant this account has used, what
+        <!-- AI usage — how much of Agent Chat this account has used, what
              kinds of steps those were, and the abuse-guard state. Rendered by
              refreshAiUsageTab() from getMyAiUsage(); the allowances and the
              refusal/suspension policy are enforced by the backend AI proxy. -->
         <div id="acct-pane-ai" class="acct-pane" style="display:none">
-          <p class="acct-intro">Your use of the MULTI/DEX AI Assistant. The assistant runs on shared
+          <p class="acct-intro">Your use of the MULTI/DEX Agent Chat. Agent Chat runs on shared
             infrastructure, so each account has sliding-window allowances. Harmful or jailbreak
-            prompts are refused, and repeated refusals suspend AI access for 24 hours.
-            <a class="pos-docs-link" href="#docs/mcp">Prefer your own AI? Use MCP →</a></p>
+            prompts are refused, and repeated refusals suspend AI access for 24 hours.</p>
 
           <div id="ai-suspended-banner" class="access-shed-banner" style="display:none"></div>
 
@@ -1714,8 +1898,9 @@
                 both sides of every book; the spread it earns lifts the value of each
                 LP token, so your share grows with its P&amp;L. The vault targets a fixed
                 basket — deposit an asset it's <strong>under-weight</strong> in for a
-                bonus, <strong>over-weight</strong> in for a fee. Withdraw any time for
-                your pro-rata slice of the basket.
+                bonus, <strong>over-weight</strong> in for a fee. Withdraw any time at full
+                vault value (NAV), paid in kind from the basket — instantly up to your share of
+                what the vault holds, the rest as its margin loans repay.
               </p>
               <div class="earn-stats">
                 <div class="margin-stat"><div class="margin-stat-label">Your LP</div><div class="margin-stat-value" id="earn-vault-lp">—</div></div>
@@ -1723,11 +1908,20 @@
                 <div class="margin-stat"><div class="margin-stat-label">Pool share</div><div class="margin-stat-value" id="earn-vault-share">—</div></div>
                 <div class="margin-stat"><div class="margin-stat-label">Value / LP</div><div class="margin-stat-value" id="earn-vault-vplp">—</div></div>
               </div>
-              <!-- Loan-book haircut (#50.1): "Value" above is f × NAV and NAV
-                   counts the vault's loan book, but withdrawals pay in kind
-                   from physical holdings — the utilisation-adjusted figure is
-                   the honest one. Populated by renderVaultHaircut. -->
-              <div id="earn-vault-haircut" class="margin-risk-note" style="display:none"></div>
+              <!-- Instant liquidity (task 1788465539): "Value" above is your
+                   slice of NAV (loan book included) and every share redeems at
+                   exactly that, net of the exit fee — but paid in kind from what
+                   the vault physically holds, so what you can take NOW is your
+                   pro-rata share of the holdings; the rest as margin loans
+                   repay. Tiles + note populated by renderVaultLiquidity from
+                   getMaxInstantWithdraw. -->
+              <div class="earn-stats">
+                <div class="margin-stat"><div class="margin-stat-label">Withdrawable now / total</div><div class="margin-stat-value" id="earn-vault-now">—</div></div>
+                <div class="margin-stat"><div class="margin-stat-label">Vault lent out</div><div class="margin-stat-value" id="earn-vault-lent">—</div></div>
+                <div class="margin-stat"><div class="margin-stat-label">Provisioned for expected loss</div><div class="margin-stat-value" id="earn-vault-provision">—</div></div>
+              </div>
+              <div id="earn-vault-liquidity" class="margin-risk-note" style="display:none"></div>
+              <div id="earn-vault-staged" class="margin-risk-note" style="display:none"></div>
               <!-- Target-weight table: shows what the vault needs + the live
                    deposit bonus/fee per asset. Populated by renderEarnCard. -->
               <div id="earn-vault-weights"></div>
@@ -1736,6 +1930,10 @@
                    LP is exposed to every leveraged position on the venue.
                    Populated by renderMarginRisk from getMarginRiskSummary. -->
               <div id="earn-margin-risk" class="margin-risk" style="display:none"></div>
+              <!-- Informed consent BEFORE depositing (F6): what fraction of a
+                   deposit made now would be instantly withdrawable, given how
+                   much of the vault is lent out. Populated by renderVaultLiquidity. -->
+              <div id="earn-vault-deposit-liquidity" class="margin-risk-note" style="display:none"></div>
               <div class="margin-row">
                 <select id="earn-vault-deposit-token" class="margin-token-select">
                   <option value="ICPUSD">ICPUSD</option>
@@ -1746,7 +1944,12 @@
                 </select>
                 <input id="earn-vault-deposit-input" type="number" min="0" step="any" placeholder="Amount to deposit" class="margin-amount-input" />
                 <button id="earn-vault-deposit-btn" class="btn btn-primary btn-sm">Deposit</button>
+                <!-- The one-tap Max (task 1793553361) fills the field with the
+                     placeholder's "max now" figure through lpWithdrawMaxFill;
+                     applyWithdrawMax owns its state — disabled until a quote
+                     lands, at a cap of 0, and while the submit is paused. -->
                 <input id="earn-vault-withdraw-input" type="number" min="0" step="any" placeholder="LP to withdraw" class="margin-amount-input" />
+                <button type="button" id="earn-vault-withdraw-max" class="btn btn-secondary btn-sm" title="Fill the field with the maximum LP you can withdraw now" disabled>Max</button>
                 <button id="earn-vault-withdraw-btn" class="btn btn-secondary btn-sm">Withdraw</button>
               </div>
             </div>
@@ -1766,6 +1969,8 @@
               <div class="earn-stats">
                 <div class="margin-stat"><div class="margin-stat-label">Your shares</div><div class="margin-stat-value" id="earn-ins-shares">—</div></div>
                 <div class="margin-stat"><div class="margin-stat-label">Value</div><div class="margin-stat-value" id="earn-ins-value">—</div></div>
+                <!-- H-35: shown only while the unstake cooldown (10 min after the latest stake) is running. -->
+                <div class="margin-stat" id="earn-ins-unlock-tile" style="display:none"><div class="margin-stat-label">Unstake opens</div><div class="margin-stat-value" id="earn-ins-unlock">—</div></div>
                 <div class="margin-stat"><div class="margin-stat-label">Share value</div><div class="margin-stat-value" id="earn-ins-sharevalue">—</div></div>
                 <div class="margin-stat"><div class="margin-stat-label">Pool size</div><div class="margin-stat-value" id="earn-ins-pool">—</div></div>
                 <!-- Shown only while the vault owes the fund: penalties are
@@ -1855,7 +2060,7 @@
       </div>
     </main>
 
-    <!-- ── Intelli: data/query browser + AI assistant ──────────────── -->
+    <!-- ── Intelli: data/query browser + Agent Chat ─────────────────── -->
     <main id="intelli-view" class="view">
       <div class="intelli-container">
         <!-- Signed-out gate. The whole AI section is caller-scoped — the
@@ -1866,14 +2071,11 @@
         <div id="intelli-signin-prompt" class="account-card" style="display:none;text-align:center;padding:48px 24px">
           <div style="font-size:32px;margin-bottom:12px">⛰</div>
           <div style="font-size:18px;font-weight:600;margin-bottom:8px">Sign in to use AI</div>
-          <div style="font-size:14px;color:var(--text-dim);margin-bottom:20px">The assistant and the memory explorer answer as <em>you</em> — your positions, your orders, your history. Sign in to use them.</div>
+          <div style="font-size:14px;color:var(--text-dim);margin-bottom:20px">Agent Chat and the memory explorer answer as <em>you</em> — your positions, your orders, your history. Sign in to use them.</div>
           <button id="intelli-signin-btn" class="btn btn-primary">Sign In</button>
         </div>
-        <div class="intelli-head">
-          <p class="intelli-sub">Connect your favorite AI chat to interrogate and <a href="#docs/mcp">instruct MULTI/DEX using MCP</a>, or use the default tools below.</p>
-        </div>
         <div class="intelli-tabs">
-          <button class="intelli-tab active" data-intelli="assistant">Assistant</button>
+          <button class="intelli-tab active" data-intelli="agent-chat">Agent Chat</button>
           <button class="intelli-tab" data-intelli="memory">Memory Explorer</button>
         </div>
 
@@ -1950,7 +2152,7 @@
                   <button id="dx-run" class="btn btn-accent">Run query</button>
                   <button id="dx-raw-toggle" class="btn btn-secondary btn-sm">Show query</button>
                   <button id="dx-share" class="btn btn-secondary btn-sm" title="Copy a shareable link to this query">Copy link</button>
-                  <button id="dx-ask-ai" class="btn btn-secondary btn-sm" style="display:none" title="Send this query to the AI Assistant to run and interpret">Ask AI</button>
+                  <button id="dx-ask-ai" class="btn btn-secondary btn-sm" style="display:none" title="Send this query to Agent Chat to run and interpret">Ask AI</button>
                   <span class="dx-actions-spacer"></span>
                   <button id="dx-export-csv" class="btn btn-secondary btn-sm" title="Download results as CSV">Export CSV</button>
                   <button id="dx-export-json" class="btn btn-secondary btn-sm" title="Download results as JSON">Export JSON</button>
@@ -1971,7 +2173,13 @@
           <!-- visibility (not display): the line keeps its height when hidden,
                so toggling it can't shrink the flex-sized message list and clip
                the just-sent prompt bubble at the bottom. -->
-          <div id="asst-thinking" class="asst-thinking" style="visibility:hidden">Thinking…</div>
+          <!-- Suggested prompts (assistant.js assistantRenderPresets): grouped
+               chips shown while the transcript is empty — OUTSIDE the message
+               list so the greeting stays the list's one seeded child. -->
+          <div id="asst-presets" class="asst-presets" aria-label="Suggested prompts" style="display:none"></div>
+          <!-- The live step label: "Queried order: 12 rows", "Waiting for your
+               confirmation…", "Running: …" — announced politely as it changes. -->
+          <div id="asst-thinking" class="asst-thinking" style="visibility:hidden" aria-live="polite">Thinking…</div>
           <div class="asst-input-row">
             <textarea id="asst-input" class="asst-input" rows="1" placeholder="Ask about the exchange, or tell me what to do…"></textarea>
             <button id="asst-send" class="asst-send" title="Send" aria-label="Send">
@@ -1981,6 +2189,9 @@
               </svg>
             </button>
           </div>
+          <!-- Capability footer (assistant.js assistantFooterText): what the chat
+               can do RIGHT NOW — signed out / key off / unregistered / read + act. -->
+          <div id="asst-footer" class="asst-footer"></div>
         </div>
       </div>
     </main>
@@ -2117,8 +2328,12 @@
       </div>
     </div>
 
-    <!-- Chart overlay -->
-    <div id="chart-overlay" class="chart-overlay" style="display:none">
+    <!-- Chart overlay — the full-size chart, opened by the expand button on the
+         chart cell's bar (main.js renderMiniChart → openChart). A dialog: focused
+         on open, Escape or the × closes it (closeChart), focus goes back to the
+         opener. The header button that used to own it (#chart-btn) had been
+         display:none since the initial commit and is retired (1793498839). -->
+    <div id="chart-overlay" class="chart-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="chart-title" tabindex="-1">
       <div class="chart-overlay-header">
         <span id="chart-title" class="chart-title">BTC-ICPUSD</span>
         <div class="chart-intervals" id="chart-intervals">
@@ -2130,7 +2345,7 @@
           <button class="chart-interval-btn" data-interval="86400000">1D</button>
           <button class="chart-interval-btn" data-interval="604800000">1W</button>
         </div>
-        <button id="chart-close-btn" class="chart-close-btn" title="Close">&times;</button>
+        <button id="chart-close-btn" class="chart-close-btn" title="Close" aria-label="Close the chart">&times;</button>
       </div>
       <div id="chart-container" class="chart-container"></div>
     </div>

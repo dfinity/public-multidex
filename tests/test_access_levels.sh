@@ -21,7 +21,7 @@ source "$SCRIPT_DIR/_lib.sh"
 echo "── test_access_levels ──"
 setup_mode matching   # markets exist; alice/bob funded; no AMM
 
-icp identity new lvlu --storage plaintext 2>/dev/null || true
+mdx_identity_new lvlu
 LU=$(principal_of lvlu)
 call setTestBalance "(principal \"$LU\", \"ICPUSD\", $(e8 10000000) : nat)" --identity alice > /dev/null
 
@@ -101,8 +101,8 @@ assert_contains "getUserBadges carries awardedNs"    "$UBDG" "awardedNs"
 
 # (7) REAL trades: maker/taker attribution off the trade record + exchange
 # window volume. AMM-seeded market, maker rests, taker crosses on release.
-icp identity new lvl_mkr --storage plaintext 2>/dev/null || true
-icp identity new lvl_tkr --storage plaintext 2>/dev/null || true
+mdx_identity_new lvl_mkr
+mdx_identity_new lvl_tkr
 KM=$(principal_of lvl_mkr); KT=$(principal_of lvl_tkr); AL=$(principal_of alice)
 call setTestBalance "(principal \"$KM\", \"ICP\", $(e8 10000) : nat)" --identity alice > /dev/null
 call setTestBalance "(principal \"$KT\", \"ICPUSD\", $(e8 10000) : nat)" --identity alice > /dev/null
@@ -162,7 +162,7 @@ call cancelMyOrder "(${OID:-0} : nat)" --identity lvlu > /dev/null
 POL6=$(call getAccessPolicy '()' --identity lvlu --query)
 assert_contains "cancel decremented the staged count" "$POL6" "myStagedCount = 31"
 AGAIN=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 60051) : nat, $(e8 0.001) : nat)" --identity lvlu)
-assert_contains "slot freed — placement accepted again" "$AGAIN" "ok"
+assert_ok "slot freed — placement accepted again" "$AGAIN"
 call setTestTimersPaused '(false)' > /dev/null   # resume venue dynamics
 
 finish_test "test_access_levels"

@@ -18,10 +18,13 @@
 #
 # ── The in-flight guards (Bridge side) ──
 # `claiming` / `admitting` are set before an `await` and cleared in the
-# continuation. They are implicitly STABLE (persistent actor), so an upgrade
-# landing mid-call used to leave the flag `true` forever and permanently lock
-# that (user, asset) out of claiming. `postupgrade` now clears both: no
-# continuation survives an upgrade, so a surviving flag can only be a lie.
+# continuation. They are implicitly STABLE (persistent actor), so a flag whose
+# continuation never ran its clear (a trap after the set — the strand was told
+# as an upgrade landing mid-call, which #55 (d) measured cannot happen: an
+# upgrade waits for the message) locked that (user, asset) out of claiming
+# forever. `postupgrade` now clears both: no continuation is outstanding
+# across an upgrade, so a surviving flag can only be a stale latch — and the
+# redeploy is its recovery.
 #
 # What this pins:
 #   §1 a consistent (amount, seq) pair PASSES the divergence guard
@@ -62,14 +65,10 @@ source "$SCRIPT_DIR/_lib.sh"
 
 echo "── test_deposit_ledger_guard ──"
 
-# `icp identity delete X --yes` is NOT valid ("unexpected argument"), so it
-# silently fails and the name survives — a later `identity new` then no-ops and
-# the run silently REUSES the previous principal, carrying its balance and its
-# email binding. That made §6 pass once and fail on every rerun. Confirm-by-pipe
-# is the form that actually deletes.
-newid() { echo "y" | icp identity delete "$1" >/dev/null 2>&1 || true
-          icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; }
-delid() { echo "y" | icp identity delete "$1" >/dev/null 2>&1 || true; }
+# Throwaway identities come from mdx_identity_new (tests/_lib.sh): deleted
+# first, so a leftover name cannot hand back the previous run's principal (its
+# balance and email binding made §6 pass once and fail on every rerun), and
+# deleted again on EXIT.
 
 MODE=$(call getDeployMode '()' --query 2>/dev/null | grep -oE 'dev|play|production' | head -1)
 if [ "$MODE" = "production" ]; then
@@ -77,17 +76,21 @@ if [ "$MODE" = "production" ]; then
 fi
 echo "  (deploy mode: ${MODE:-unknown})"
 
-newid dlg_u1; U1=$(principal_of dlg_u1)
-newid dlg_u2; U2=$(principal_of dlg_u2)
-newid dlg_u3; U3=$(principal_of dlg_u3)
-newid dlg_u4; U4=$(principal_of dlg_u4)
+mdx_identity_new dlg_u1; U1=$(principal_of dlg_u1)
+mdx_identity_new dlg_u2; U2=$(principal_of dlg_u2)
+mdx_identity_new dlg_u3; U3=$(principal_of dlg_u3)
+mdx_identity_new dlg_u4; U4=$(principal_of dlg_u4)
 
 # Controller-called creditAndRegister, so we drive (amount, seq) directly.
-credit() { call creditAndRegister "(principal \"$1\", \"ICP\", $2 : nat, $3 : nat)" --identity anonymous; }
+credit() { call creditAndRegister "(principal \"$1\", \"ICP\", $2 : nat, $3 : nat, null)" --identity anonymous; }
 # Read balances AS THE OWNER — getTestBalance is self-or-controller, so an
 # unidentified read silently returns 0 and would make every "minted nothing"
 # check below pass for the wrong reason.
-balof() { extract_first_nat "$(call getTestBalance "(principal \"$1\", \"ICP\")" --identity "$2")"; }
+# --query: getTestBalance IS a query, and these owners are UNREGISTERED (their
+# credit was refused) — since H-30 an unregistered principal's update-mode
+# ingress reaches only the pre-registration set, so a query method called in
+# update mode is refused at the gate. Read it the way a query is meant to be read.
+balof() { extract_first_nat "$(call getTestBalance "(principal \"$1\", \"ICP\")" --query --identity "$2")"; }
 
 DIVERGENCE="Deposit ledger divergence"
 VERIFY="verified Google-linked"
@@ -131,7 +134,7 @@ assert_contains "§3 off-by-one divergence is refused too" "$R" "$DIVERGENCE"
 # principal, so seq 0 is a replay on either posture — the short-circuit
 # precedes the divergence guard and the verification gate alike.
 R=$(credit "$U4" 50 0)
-assert_contains "§4 replayed seq is a silent no-op" "$R" "ok"
+assert_ok "§4 replayed seq is a silent no-op" "$R"
 assert_not_contains "§4 ...not reported as divergence" "$R" "$DIVERGENCE"
 assert_eq "§4 ...and minted nothing" "0" "$(balof "$U4" dlg_u4)"
 
@@ -143,35 +146,53 @@ assert_eq "§4 ...and minted nothing" "0" "$(balof "$U4" dlg_u4)"
 # compile-time constant (getSupportedAssets) and an unset latch key — neither
 # could fail if every ledger map was wiped. Now the section SETS state the
 # upgrade must carry: a pending deposit row (the W3-04 write-ahead — the
-# parked mid-flow shape a lost continuation leaves) and the DEX-side
+# parked mid-flow shape an unfinished admission leaves; per #55 (d) that is a
+# trapped continuation, never an upgrade, which waits for the message) and the DEX-side
 # allowance charge; upgrades; and asserts both survive byte-for-byte, the
 # ledger keeps working (a post-upgrade deposit charges exactly its mark
 # value), and the confirm path then finishes exactly-once.
-newid dlg_u5; U5P=$(principal_of dlg_u5)   # FRESH principal — the bridge ledger is cumulative per identity
+mdx_identity_new dlg_u5; U5P=$(principal_of dlg_u5)   # FRESH principal — the bridge ledger is cumulative per identity
 call createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1
 call setAmmRefPrice '("BTC-ICPUSD", 10_000_000_000 : nat)' >/dev/null 2>&1   # $100 mark
 call requoteAmm '("BTC-ICPUSD")' >/dev/null 2>&1
 BIND5=$(call setTestEmailBinding "(principal \"$U5P\", \"dlgu5${RANDOM}$$@gmail.com\")" --identity anonymous)
-assert_contains "§5 fresh principal bound (anti-sybil hook)" "$BIND5" "ok"
-u5_used() { call getPlayDepositAllowance '()' --identity dlg_u5 | tr -d '_\n' | tr -s ' ' | grep -oE "usedUsd = [0-9]+" | awk '{print $3}'; }
+assert_ok "§5 fresh principal bound (anti-sybil hook)" "$BIND5"
+u5_used() { call getPlayDepositAllowance '()' --query --identity dlg_u5 | tr -d '_\n' | tr -s ' ' | grep -oE "usedUsd = [0-9]+" | awk '{print $3}'; }
 u5_pend() { icp canister call bridge getMyDeposits '()' --query --identity dlg_u5 2>&1 | tr -d '_\n' | tr -s ' ' | grep -oE "asset = \"BTC\"[^}]*" | grep -oE "pending = [0-9]+" | awk '{print $3}'; }
 u5_conf() { icp canister call bridge getMyDeposits '()' --query --identity dlg_u5 2>&1 | tr -d '_\n' | tr -s ' ' | grep -oE "asset = \"BTC\"[^}]*" | grep -oE "confirmed = [0-9]+" | awk '{print $3}'; }
 R=$(icp canister call bridge devSimulateDeposit '("BTC", 100_000_000 : nat)' --identity dlg_u5 2>&1)
-assert_contains "§5 pre-upgrade deposit admitted" "$R" "ok"
+assert_ok "§5 pre-upgrade deposit admitted" "$R"
 PEND0=$(u5_pend); USED0=$(u5_used)
 assert_eq "§5 write-ahead pending row SET before the upgrade (1.0 BTC)" "100000000" "${PEND0:-0}"
-icp deploy bridge --identity anonymous >/dev/null 2>&1
+# POSTURE-AWARE (task 1788474497). This was a bare `icp deploy bridge`, which
+# BUILDS from the tree: on a factory seat (tree #play between deploys, venue
+# #dev) it flipped the venue's Bridge to #play and every later Bridge-hook
+# suite went red. The shared guard rebuilds + upgrades only when the two
+# postures agree and says so loudly otherwise. The row-survival assertions
+# hold without the upgrade too (nothing else touches the row), so they stay
+# unconditional — only their wording stops claiming an upgrade that did not run.
+bridge_upgrade_if_posture_matches "§5 in-place Bridge upgrade"; BUP_RC=$?
+case "$BUP_RC" in
+  0) _ok "§5 $BRIDGE_UPGRADE_NOTE" ;;
+  1) : ;;   # the skip line is already printed by the guard (its marker is what run_all counts)
+  *) _fail "§5 Bridge upgrade failed — $BRIDGE_UPGRADE_NOTE" ;;
+esac
 PEND1=$(u5_pend); USED1=$(u5_used)
-assert_eq "§5 pending row SURVIVES the upgrade (stable ledger intact)" "${PEND0:-x}" "${PEND1:-y}"
-assert_eq "§5 allowance charge survives, charged exactly once" "${USED0:-x}" "${USED1:-y}"
+if [ "$BUP_RC" = "0" ]; then
+  assert_eq "§5 pending row SURVIVES the upgrade (stable ledger intact)" "${PEND0:-x}" "${PEND1:-y}"
+  assert_eq "§5 allowance charge survives, charged exactly once" "${USED0:-x}" "${USED1:-y}"
+else
+  assert_eq "§5 pending row unchanged (no upgrade ran — skipped above)" "${PEND0:-x}" "${PEND1:-y}"
+  assert_eq "§5 allowance charge unchanged, charged exactly once" "${USED0:-x}" "${USED1:-y}"
+fi
 # ledger continuity: the surface is not just readable, it still BOOKS —
 # 0.5 BTC at the $100 mark must move usedUsd by exactly $50.
 R=$(icp canister call bridge devSimulateDeposit '("BTC", 50_000_000 : nat)' --identity dlg_u5 2>&1)
-assert_contains "§5 post-upgrade deposit admitted (ledger still books)" "$R" "ok"
+assert_ok "§5 post-upgrade deposit admitted (ledger still books)" "$R"
 USED2=$(u5_used)
 assert_eq "§5 post-upgrade charge is exactly the mark value (+\$50)" "$(( ${USED1:-0} + 5000000000 ))" "${USED2:-0}"
 # the parked rows then FINISH exactly-once through the confirm path — the
-# W3-04 lost-continuation recovery: nothing doubled, nothing stranded.
+# W3-04 parked-admission recovery (#55 (d)): nothing doubled, nothing stranded.
 # devConfirmDeposits confirms the CALLER's own parked rows (it iterates
 # ASSETS under msg.caller's key) — so the depositor drives it.
 call_bridge_confirm=$(icp canister call bridge devConfirmDeposits '()' --identity dlg_u5 2>&1)
@@ -188,7 +209,7 @@ assert_not_contains "§5 no stranded claim guard after upgrade" "$R" "already in
 # the full credit LIFECYCLE — land, overlap, replay, refuse — at one balance.
 # A verified identity is required for a credit to land on #play, so bind one
 # through the real normalize→hash→bind hook.
-newid dlg_paid
+mdx_identity_new dlg_paid
 PAID=$(icp identity principal --identity dlg_paid 2>/dev/null | tail -1)
 BIND=$(call setTestEmailBinding "(principal \"$PAID\", \"dlgpaid${RANDOM}$$@gmail.com\")" --identity anonymous)
 if [ "$MODE" != "dev" ] && echo "$BIND" | grep -q "dev-only hook"; then
@@ -197,19 +218,19 @@ if [ "$MODE" != "dev" ] && echo "$BIND" | grep -q "dev-only hook"; then
   # below is posture-independent and every #dev run covers it (doctrine).
   skip_section "§6 slice-at-the-wallet — setTestEmailBinding is #dev-only, no verified binding possible on #$MODE"
 else
-  assert_contains "§6 test identity bound to a verified email" "$BIND" "ok"
+  assert_ok "§6 test identity bound to a verified email" "$BIND"
 
   # Read the balance AS THE OWNER — getTestBalance is self-or-controller, so an
   # unidentified read silently returns 0 and would make every check below pass
   # for the wrong reason. (That is exactly what broke test_play_deposit_cap.)
-  bal() { extract_first_nat "$(call getTestBalance "(principal \"$PAID\", \"ICPUSD\")" --identity dlg_paid)"; }
-  paycredit() { call creditAndRegister "(principal \"$PAID\", \"ICPUSD\", $1 : nat, $2 : nat)" --identity anonymous; }
+  bal() { extract_first_nat "$(call getTestBalance "(principal \"$PAID\", \"ICPUSD\")" --query --identity dlg_paid)"; }
+  paycredit() { call creditAndRegister "(principal \"$PAID\", \"ICPUSD\", $1 : nat, $2 : nat, null)" --identity anonymous; }
 
   assert_eq "§6 fresh wallet starts empty" "0" "$(bal)"
 
   # First claim: 100 units confirmed, none applied → credit 100.
   R=$(paycredit 100 100)
-  assert_contains "§6 first credit accepted" "$R" "ok"
+  assert_ok "§6 first credit accepted" "$R"
   assert_eq "§6 ...wallet moved by the slice (100)" "100" "$(bal)"
 
   # THE DOUBLE-MINT CASE. A lost #ok makes the Bridge re-send an OVERLAPPING,
@@ -217,12 +238,12 @@ else
   # high-water is only 150. The slice is 50. Crediting `amount` would mint 500
   # and hand the user 350 units of free money.
   R=$(paycredit 500 150)
-  assert_contains "§6 overlapping re-send accepted" "$R" "ok"
+  assert_ok "§6 overlapping re-send accepted" "$R"
   assert_eq "§6 ...credited the 50-unit SLICE, not the 500 reported" "150" "$(bal)"
 
   # Replay of an already-applied high-water is a silent no-op — no second mint.
   R=$(paycredit 500 150)
-  assert_contains "§6 replayed high-water no-ops" "$R" "ok"
+  assert_ok "§6 replayed high-water no-ops" "$R"
   assert_eq "§6 ...wallet unchanged by the replay" "150" "$(bal)"
 
   # And the inverse guard still bites on a real balance: refused, nothing minted.
@@ -230,8 +251,5 @@ else
   assert_contains "§6 divergent claim refused" "$R" "$DIVERGENCE"
   assert_eq "§6 ...and minted nothing" "150" "$(bal)"
 fi
-
-delid dlg_paid
-delid dlg_u1; delid dlg_u2; delid dlg_u3; delid dlg_u4
 
 finish_test "deposit_ledger_guard"

@@ -26,6 +26,7 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -33,11 +34,10 @@ ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-ua() { icp canister call --identity sidx_a backend "$@" 2>&1; }
-ub() { icp canister call --identity sidx_b backend "$@" 2>&1; }
-A=$(mkid sidx_a); B=$(mkid sidx_b)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+ua() { icp canister call --candid "$MDX_CANDID" --identity sidx_a backend "$@" 2>&1; }
+ub() { icp canister call --candid "$MDX_CANDID" --identity sidx_b backend "$@" 2>&1; }
+mdx_identity_new sidx_a; A=$(principal_of sidx_a); mdx_identity_new sidx_b; B=$(principal_of sidx_b)
 
 # The sim must be dead (it would stage/trade underneath the counts).
 # PID-file stopper only — never a pattern kill (see scripts/lib/bots.sh).
@@ -57,15 +57,15 @@ adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1
 setup_pool() { # market token ref baseAmt quoteAmt
   adm createAmmPool "(\"$1\")" >/dev/null 2>&1
-  adm setAmmConfig "(\"$1\", 20:nat, $(e8 100.0) : nat, 5:nat, 10:nat, 5:nat)" >/dev/null
+  adm setAmmConfig "(\"$1\", 20:nat, $(e8 100.0) : nat, 5:nat, 10:nat)" >/dev/null
   adm setAmmRefPrice "(\"$1\", $(e8 $3) : nat)" >/dev/null
   adm setTestBalance "(principal \"$SEED\", \"$2\", $(e8 $4) : nat)" >/dev/null
   adm setTestBalance "(principal \"$SEED\", \"ICPUSD\", $(e8 200000.0) : nat)" >/dev/null
-  icp canister call --identity sidx_seed backend seedAmmPool "(\"$1\", $(e8 $4) : nat, $(e8 $5) : nat)" >/dev/null 2>&1
+  mdx_lp_deposit sidx_seed "$1" "$(e8 $4)" "$(e8 $5)" >/dev/null 2>&1
   adm enableAmm "(\"$1\", true)" >/dev/null
   adm requoteAmm "(\"$1\")" >/dev/null
 }
-SEED=$(mkid sidx_seed)
+mdx_identity_new sidx_seed; SEED=$(principal_of sidx_seed)
 setup_pool "ICP-ICPUSD" "ICP" 10.0  10000.0 100000.0
 setup_pool "BTC-ICPUSD" "BTC" 100.0  1000.0 100000.0
 adm setTestBalance "(principal \"$A\", \"ICPUSD\", $(e8 10000.0) : nat)" >/dev/null
@@ -84,15 +84,35 @@ assert_consistent "§1"
 EX=$(afield execLive); SWL=$(afield swapLive)
 [ "$EX" = "5" ] && ok "execLive = 5" || nok "execLive" "got $EX"
 [ "$SWL" = "1" ] && ok "swapLive = 1" || nok "swapLive" "got $SWL"
+# H-13: the per-owner staged counter (the STAGED_CAP_PER_OWNER gate) counts
+# the staged cross-swap too — B holds 2 staged (crossing) sells + 1 swap.
+BC=$(ub getAccessPolicy '()' --query | tr -d '_\n' | tr -s ' ' | grep -oE "myStagedCount = [0-9]+" | grep -oE '[0-9]+' | head -1)
+[ "${BC:-x}" = "3" ] && ok "B myStagedCount = 3 (2 staged sells + 1 staged cross-swap — H-13)" || nok "myStagedCount ignores the staged cross-swap (H-13)" "got ${BC:-?}, want 3"
 
 echo "── §2 cancel one after the 3s commit window ──"
 sleep 4
 OID=$(ua getMyStagedOrderIds '()' | tr -d '_' | grep -oE "[0-9]+ : nat" | head -1 | grep -oE "[0-9]+")
 CR=$(ua cancelMyOrder "(${OID:-0} : nat)")
-echo "$CR" | grep -q "ok" && ok "cancelMyOrder(${OID:-?})" || nok "cancel refused" "$CR"
+mdx_ok "$CR" && ok "cancelMyOrder(${OID:-?})" || nok "cancel refused" "$CR"
 assert_consistent "§2"
 EX=$(afield execLive)
 [ "$EX" = "4" ] && ok "execLive = 4 after cancel" || nok "execLive after cancel" "got $EX"
+
+# Task 1788552852: the expiry-keyed index (deferredIdsByExpiry). The
+# setTestDeferredExpiry re-put is the one site where a staged entry's
+# expiresAt changes, so it must MOVE the id (audit (g) reds a forgotten
+# move as wrong-expiry + unindexed-by-expiry); the expiry pass then reads
+# the backdated entry off the index head and releases it (users-only), and
+# the audit stays consistent with the id gone from the index.
+echo "── §2b the expiry re-put moves the expiry index; the expiry pass drains off it ──"
+OID2=$(ua getMyStagedOrderIds '()' | tr -d '_' | grep -oE "[0-9]+ : nat" | head -1 | grep -oE "[0-9]+")
+adm setTestDeferredExpiry "(${OID2:-0} : nat, 1 : int)" >/dev/null
+assert_consistent "§2b after the expiry re-put"
+adm adminRunDeferredExpiry "()" >/dev/null 2>&1
+assert_consistent "§2b after the expiry pass"
+EX=$(afield execLive)
+[ "$EX" = "3" ] && ok "execLive = 3: the backdated entry released off the expiry index" || nok "the expiry pass did not release the backdated entry" "got $EX"
+ua getMyStagedOrderIds '()' | tr -d '_' | grep -qE "(^|[^0-9])${OID2:-0} : nat" && nok "backdated id ${OID2:-?} still staged" "" || ok "backdated id ${OID2:-?} no longer staged"
 
 echo "── §3 release everything (fresh fetch + requote, both markets) ──"
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null
@@ -107,6 +127,8 @@ EX=$(afield execLive); SWL=$(afield swapLive); ACC=$(afield accEntries)
 [ "$EX" = "0" ] && ok "all staged execs drained" || nok "execs left" "got $EX"
 [ "$SWL" = "0" ] && ok "staged swap drained" || nok "swap left" "got $SWL"
 [ "$ACC" = "0" ] && ok "accumulator empty" || nok "accumulator leaks" "got $ACC entries: $(echo "$AUDIT" | head -c 200)"
+BC=$(ub getAccessPolicy '()' --query | tr -d '_\n' | tr -s ' ' | grep -oE "myStagedCount = [0-9]+" | grep -oE '[0-9]+' | head -1)
+[ "${BC:-x}" = "0" ] && ok "B myStagedCount = 0 after release (swap slot returned — H-13)" || nok "staged counter leaks after the cross-swap released (H-13)" "got ${BC:-?}"
 
 echo "── §4 timers running: staged state drains through the chokepoints ──"
 ua placeLimitOrder "(\"ICP-ICPUSD\", variant { buy }, $(e8 10.30) : nat, $(e8 1.0) : nat)" >/dev/null

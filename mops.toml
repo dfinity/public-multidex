@@ -29,7 +29,8 @@ args = [ "--default-persistent-actors", "--implicit-package=core", "--public-met
 # task 1786991553): `mops generate candid <name>` REWRITES this whole file —
 # comments stripped — whenever it must ADD a missing candid= key. With the
 # key present it leaves the file alone. All five .did outputs are gitignored
-# intermediates; candid/backend.did stays the only PUBLISHED copy.
+# intermediates; the PUBLISHED copies are the three under candid/ (backend,
+# archive, bridge — written by scripts/gen-did.sh, never by this key).
 [canisters.bridge]
 main = "src/bridge/main.mo"
 candid = "src/bridge/bridge.did"

@@ -29,7 +29,9 @@
 # (run scripts/cold_start.sh once first if not). This script then:
 #   1. verifies src/backend/main.mo says DEPLOY_MODE = #play, builds, and
 #      REINSTALLS backend + bridge — fresh play state; ALL dev data is wiped
-#   2. re-wires setBridge/setDex + the fuel-mock route, and UNWIRES XRC:
+#   2. wiring: Bridge ↔ DEX auto-wire from the PUBLIC_CANISTER_ID:* env vars
+#      icp injects on every deploy (setBridge/setDex stay break-glass — this
+#      script does NOT call them), sets the fuel-mock route, and UNWIRES XRC:
 #      play keeps XRC unwired by design, and locally the xrc-mock's canned
 #      prices would diverge from the live feed and trip the oracle banner
 #   3. seeds: price history, a $5.125M AMM ($1,281,250/market, half base half
@@ -43,6 +45,16 @@
 # Usage: bash scripts/play_start.sh
 # Env:   HISTORY_DAYS (default 9, 0 skips)  AMM_TVL_TOTAL (default 5125000)
 #        INSURANCE_USD (default 144000)  ARB_USD (default 1281250)
+#        MDX_NO_SIMULATE=1  skip step 7's fleet START (a recorded local fleet
+#                           is still STOPPED first). cold_start.sh exports it
+#                           for an explicit --no-simulate in play mode, so a
+#                           factory seat can run the canonical #play bring-up
+#                           without a bot fleet (task 1788479256).
+#        MDX_PLAY_MIN_SEEDED  how many of the $MARKETS must come up with a
+#                           seeded, enabled vault before step 5 counts as
+#                           done (default: ALL of them). Below it the script
+#                           dies — the demo venue never silently comes up
+#                           with one pool (task 1788502351).
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -55,6 +67,11 @@ cd "$(dirname "$0")/.."
 # Target table + the shared posture reader (mdx_posture_of) — see W1-02.
 # shellcheck source=scripts/lib/targets.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/targets.sh"
+# The Candid reply predicates (mdx_reply_ok / mdx_reply_unit / mdx_reply_nat /
+# mdx_one_line / mdx_vault_nat) — ONE copy shared with seed.sh and deploy.sh
+# (task 1788503030); the doctrine lives in the lib's header.
+# shellcheck source=scripts/lib/reply.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/reply.sh"
 export PATH="$HOME/.local/bin:$PATH"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -75,7 +92,100 @@ LADDER_MAKERS="mdex-play-mm-1 mdex-play-mm-2"
 # Integer-money: ledger amounts go on the wire as Nat base units (10^8).
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 
-adm() { icp canister call backend "$@" --identity anonymous 2>&1; }
+# Every backend call carries the checked-in Candid contract (`--candid`, icp
+# 1.2.0): icp encodes arguments and decodes replies BY NAME from the file
+# instead of fetching the canister's candid:service metadata per call — a
+# fetch that missed transiently on 2026-09-04 (task 1788507289, seed.sh's
+# twin of this block) and made icp spell a successful unit `#ok` by its field
+# HASH, `(variant { 24_860 })`, so the name-only matcher aborted a half-seeded
+# venue. A checkout without the file falls back to the fetch; mdx_reply_ok's
+# hashed spelling then still carries the verdict.
+PLAY_CANDID="$(cd "$(dirname "$0")" && pwd)/../candid/backend.did"
+adm() {
+  if [ -f "$PLAY_CANDID" ]; then icp canister call backend "$@" --candid "$PLAY_CANDID" --identity anonymous 2>&1
+  else icp canister call backend "$@" --identity anonymous 2>&1; fi
+}
+
+# ── Reply oracles (task 1788502351; predicates in scripts/lib/reply.sh) ──
+# A Candid REFUSAL — `variant { err = "..." }` — is a SUCCESSFUL call as far
+# as icp is concerned (exit 0), and a controller trap ("Caller is not a
+# canister controller") is a non-zero exit with the reject text on stdout —
+# so `adm … > /dev/null || true` discarded both, and a refused
+# createAmmPool / setAmmConfig / enableAmm printed "markets live" over a
+# hollow venue. Every money-moving / lifecycle reply (step 3's operator
+# funding, step 5's AMM lifecycle) now goes through must_ok / must_unit,
+# which assert the reply SHAPE via the shared mdx_reply_ok / mdx_reply_unit
+# (named or hash-spelled ok; err refused — scripts/lib/reply.sh) and die
+# loudly with the reply text otherwise; the two wiring calls in step 2 warn
+# with the reply. Same helper names and semantics as seed.sh, so the two
+# seeding paths read alike.
+call() {   # call <method> <args> … --identity <name>  (the pin is mandatory: mdex-process-safety §5)
+  case " $* " in
+    *" --identity "*) ;;
+    *) echo -e "  ${RED}✗${NC} call() without --identity (mdex-process-safety §5): $*" >&2; return 1 ;;
+  esac
+  if [ -f "$PLAY_CANDID" ]; then
+    echo "y" | icp canister call backend "$@" --candid "$PLAY_CANDID" 2>&1
+  else
+    echo "y" | icp canister call backend "$@" 2>&1
+  fi
+}
+
+# seed_fail <what> <reply> — the loud exit. Resumes the timers if step 5 had
+# paused them, so an aborted bring-up does not strand a paused venue.
+TIMERS_PAUSED=false
+seed_fail() {
+  echo -e "  ${RED}✗${NC} $1: $(mdx_one_line "$2")" >&2
+  if [ "$TIMERS_PAUSED" = "true" ]; then
+    call setTestTimersPaused "(false)" --identity anonymous > /dev/null 2>&1 || true
+    TIMERS_PAUSED=false
+  fi
+  die "play bring-up ABORTED — the venue is NOT seeded (see the ✗ line above)"
+}
+# must_ok <label> <call args...>   — the call must answer `variant { ok ... }`
+must_ok() {
+  local label="$1"; shift
+  local out rc
+  out=$(call "$@"); rc=$?
+  if [ "$rc" -ne 0 ] || ! mdx_reply_ok "$out"; then
+    seed_fail "$label refused (rc=$rc)" "$out"
+  fi
+}
+# must_unit <label> <call args...> — a unit-returning admin call must answer `()`
+must_unit() {
+  local label="$1"; shift
+  local out rc
+  out=$(call "$@"); rc=$?
+  if [ "$rc" -ne 0 ] || ! mdx_reply_unit "$out"; then
+    seed_fail "$label failed (rc=$rc)" "$out"
+  fi
+}
+# vault_value — getVaultValue as one whitespace-normalized line.
+vault_value() {
+  echo "y" | icp canister call backend getVaultValue '()' --query --identity anonymous 2>&1 \
+    | tr -s '[:space:]' ' '
+}
+# assert_vault_seeded <base tokens...> — the post-condition the AMM seed
+# promises: LP supply minted AND every seeded pool's base leg present in the
+# basket. A refused deposit that somehow slipped past the per-market gate
+# shows up here as lpSupply 0 / an empty leg.
+assert_vault_seeded() {
+  local vault lp basket tok fld amt
+  vault=$(vault_value)
+  lp=$(mdx_vault_nat "$vault" lpSupply)
+  case "$lp" in
+    ''|0) seed_fail "post-seed lpSupply = ${lp:-unreadable} (expected > 0) — the vault deposits did not land" "$vault" ;;
+  esac
+  basket=$(printf '%s' "$vault" | sed -n 's/.*basket = record {\([^}]*\)}.*/\1/p')
+  for tok in "$@"; do
+    fld=$(printf '%s' "$tok" | tr 'A-Z' 'a-z')
+    amt=$(mdx_vault_nat "$basket" "$fld")
+    case "$amt" in
+      ''|0) seed_fail "post-seed basket has no $tok leg (${fld} = ${amt:-unreadable}) — the $tok pool's deposit did not land" "$vault" ;;
+    esac
+  done
+  ok "vault post-condition: lpSupply $lp · base legs present: $*"
+}
 
 # ── 0. Preflight ──────────────────────────────────────────────────
 hdr "Preflight"
@@ -112,6 +222,14 @@ ok "canisters present (backend=$BACKEND_ID bridge=$BRIDGE_ID)"
 
 # ── 1. Build + reinstall (fresh play state) ───────────────────────
 hdr "Build + reinstall"
+# Candid freshness (W5-20, task 1788483105): mops.toml embeds
+# src/backend/backend.did as PUBLIC candid:service metadata and gen-did.sh is
+# its only writer, so a build here after an API edit would ship the previous
+# interface. Same gate and wording as deploy.sh/cold_start.sh. The cwd is the
+# repo root (the cd at the top), so the script path is stable.
+log "regenerating candid interface (gen-did.sh) so the build ships what the source says"
+bash scripts/gen-did.sh > /dev/null \
+  || die "scripts/gen-did.sh failed — refusing to deploy a stale candid:service interface. Run it by hand to see why."
 log "icp build (backend + bridge wasm)"
 icp build > "$MDX_PLAY_BUILD_LOG" 2>&1 || die "build failed — see $MDX_PLAY_BUILD_LOG"
 ok "built"
@@ -137,17 +255,27 @@ ok "Bridge ↔ DEX auto-wired via canister env vars"
 
 FUEL_MOCK_ID=$(icp canister status fuel-mock --identity anonymous 2>/dev/null | awk -F': ' '/^Canister Id/{print $2; exit}' | tr -d '[:space:]')
 if [ -n "$FUEL_MOCK_ID" ]; then
-  adm setFuelRoute "(opt principal \"$FUEL_MOCK_ID\", opt principal \"$FUEL_MOCK_ID\")" > /dev/null || true
+  # Wiring, not money: setFuelRoute answers `()`, so anything else (a trap's
+  # reject text, a CLI error) is a warn that NAMES the reply, not a die.
+  fr_out=$(adm setFuelRoute "(opt principal \"$FUEL_MOCK_ID\", opt principal \"$FUEL_MOCK_ID\")"); fr_rc=$?
   icp canister top-up --amount 20t fuel-mock --identity anonymous > /dev/null 2>&1 || true
-  ok "fuel route wired (fuel-mock as ledger+CMC, topped 20T)"
+  if [ "$fr_rc" -eq 0 ] && mdx_reply_unit "$fr_out"; then
+    ok "fuel route wired (fuel-mock as ledger+CMC, topped 20T)"
+  else
+    warn "setFuelRoute did not answer () (rc=$fr_rc) — auto-fuel Stage 2 may be unwired: $(mdx_one_line "$fr_out")"
+  fi
 else
   warn "fuel-mock not found — auto-fuel Stage 2 unwired"
 fi
 
 # Play posture: NO XRC fallback (mainnet-play would use none; locally the mock
 # would fight the live feed). Explicit unwire in case a dev run left it set.
-adm setXrcCanister "(null)" > /dev/null || true
-ok "XRC unwired (play uses the multi-source feed only)"
+xrc_out=$(adm setXrcCanister "(null)"); xrc_rc=$?
+if [ "$xrc_rc" -eq 0 ] && mdx_reply_unit "$xrc_out"; then
+  ok "XRC unwired (play uses the multi-source feed only)"
+else
+  warn "setXrcCanister (null) did not answer () (rc=$xrc_rc) — a dev XRC wiring may survive: $(mdx_one_line "$xrc_out")"
+fi
 
 # Google (Gemini) assistant key — from GOOGLE_API_KEY env (legacy alias
 # AI_API_KEY) or the git-ignored scripts/.google-api-key. Wiped by the
@@ -179,7 +307,10 @@ for t in $LADDER_MAKERS; do icp identity new "$t" --storage plaintext >/dev/null
 for t in $LADDER_MAKERS; do
   tp=$(icp identity principal --identity "$t" 2>/dev/null | tail -1)
   [ -n "$tp" ] || { warn "no principal for $t"; continue; }
-  adm setTestBalance "(principal \"$tp\", \"ICPUSD\", $(e8 40000.0))" > /dev/null || warn "fund $t ICPUSD failed"
+  # setTestBalance answers `()` — asserted (a controller trap or a CLI
+  # failure is a die carrying the reply, not a warn a refused seedAmmPool
+  # would re-report one screen later).
+  must_unit "fund $t ICPUSD" setTestBalance "(principal \"$tp\", \"ICPUSD\", $(e8 40000.0))" --identity anonymous
 done
 ok "ladder makers funded (\$40k cash each; base legs sized per market below)"
 
@@ -192,8 +323,10 @@ ok "ladder makers funded (\$40k cash each; base legs sized per market below)"
 LP_IDENTITY="alice"
 LP_PRINCIPAL=$(icp identity principal --identity "$LP_IDENTITY" 2>/dev/null | tail -1)
 [ -n "$LP_PRINCIPAL" ] || die "identity '$LP_IDENTITY' not found — run scripts/cold_start.sh once first"
-adm setTestBalance "(principal \"$LP_PRINCIPAL\", \"ICPUSD\", $(e8 $(( TVL_TOTAL / 2 + 50000 )).0))" > /dev/null \
-  || die "funding the LP quote leg failed — is anonymous a controller?"
+# setTestBalance answers `()`: asserted like the other funding lines — a
+# controller trap ("is anonymous a controller?") or a CLI failure is a die
+# carrying the reply text.
+must_unit "fund LP ICPUSD quote leg" setTestBalance "(principal \"$LP_PRINCIPAL\", \"ICPUSD\", $(e8 $(( TVL_TOTAL / 2 + 50000 )).0))" --identity anonymous
 ok "LP quote leg funded (\$$(( TVL_TOTAL / 2 + 50000 )) ICPUSD)"
 
 # ── 4. Price history (chart backdrop) ─────────────────────────────
@@ -213,14 +346,25 @@ fi
 
 # ── 5. AMM + order book, per market ───────────────────────────────
 # Timers paused for the whole block so the heartbeat requoter/rebalancer
-# doesn't act on half-configured pools mid-seed.
+# doesn't act on half-configured pools mid-seed. Every lifecycle reply in
+# this block is asserted (must_ok / must_unit, above); a per-market shortfall
+# (no live price, a refused vault deposit) is warned and COUNTED, and the
+# final gate below dies unless at least MDX_PLAY_MIN_SEEDED markets (default:
+# all of them) came up seeded + enabled.
 hdr "AMM vault + maker ladder"
-adm setTestTimersPaused "(true)" > /dev/null || true
-SEEDED=0
+MIN_SEEDED="${MDX_PLAY_MIN_SEEDED:-$NMARKETS}"
+case "$MIN_SEEDED" in
+  ''|*[!0-9]*) die "MDX_PLAY_MIN_SEEDED must be an integer in 1..$NMARKETS (got '$MIN_SEEDED')" ;;
+esac
+{ [ "$MIN_SEEDED" -ge 1 ] && [ "$MIN_SEEDED" -le "$NMARKETS" ]; } \
+  || die "MDX_PLAY_MIN_SEEDED must be an integer in 1..$NMARKETS (got '$MIN_SEEDED')"
+must_unit "setTestTimersPaused(true)" setTestTimersPaused "(true)" --identity anonymous
+TIMERS_PAUSED=true
+SEEDED=0; SEEDED_TOKS=""; SHORTFALL=""
 for market in $MARKETS; do
   base_tok="${market%%-*}"
-  adm createAmmPool "(\"$market\")" > /dev/null || true
-  adm setAmmConfig "(\"$market\", 20:nat, $(e8 1.0):nat, 15:nat, 35:nat, 8:nat)" > /dev/null || true
+  must_ok "createAmmPool $market" createAmmPool "(\"$market\")" --identity anonymous
+  must_ok "setAmmConfig $market"  setAmmConfig "(\"$market\", 20:nat, $(e8 1.0):nat, 15:nat, 35:nat)" --identity anonymous
 
   # REAL price: on #play the manual override is dead by design; the multi-source
   # feed (HTTPS outcalls) is the only price authority.
@@ -240,6 +384,7 @@ for market in $MARKETS; do
   done
   if [ -z "${px_e8:-}" ] || [ "$px_e8" = "0" ]; then
     warn "$market — no live price after 3 attempts (fetchAndSetRefPrice said: $(echo "$fetch_out" | head -1)); SKIPPING this market"
+    SHORTFALL="$SHORTFALL $market: no live price (fetchAndSetRefPrice said: $(mdx_one_line "$fetch_out"));"
     continue
   fi
   px=$(awk -v p="$px_e8" 'BEGIN{ printf "%.8f", p/100000000 }')
@@ -258,7 +403,7 @@ for market in $MARKETS; do
   mm_base=$(awk -v p="$px" 'BEGIN{ printf "%.6f", 15000/p }')
   for t in $LADDER_MAKERS; do
     tp=$(icp identity principal --identity "$t" 2>/dev/null | tail -1)
-    [ -n "$tp" ] && adm setTestBalance "(principal \"$tp\", \"$base_tok\", $(e8 $mm_base))" > /dev/null
+    [ -n "$tp" ] && must_unit "fund $t $base_tok" setTestBalance "(principal \"$tp\", \"$base_tok\", $(e8 $mm_base))" --identity anonymous
   done
 
   # Non-crossing maker ladder: 2 makers × 2 levels/side at ±0.4%·k, ~$2500·k
@@ -277,20 +422,34 @@ for market in $MARKETS; do
   base_amt=$(awk -v t="$TVL" -v p="$px" 'BEGIN{ printf "%.6f", t/p/2 }')
   quote_amt=$(awk -v t="$TVL" 'BEGIN{ printf "%.2f", t/2 }')
   base_fund=$(awk -v b="$base_amt" 'BEGIN{ printf "%.6f", b*1.05 }')
-  adm setTestBalance "(principal \"$LP_PRINCIPAL\", \"$base_tok\", $(e8 $base_fund))" > /dev/null || true
-  seed_out=$(icp canister call backend seedAmmPool "(\"$market\", $(e8 $base_amt):nat, $(e8 $quote_amt):nat)" --identity "$LP_IDENTITY" 2>&1)
-  if echo "$seed_out" | grep -q "err"; then
-    warn "$market — vault seed FAILED: $(echo "$seed_out" | head -2 | tr '\n' ' ')"
+  # The LP's base leg: setTestBalance answers `()`, so the funding is asserted
+  # here instead of surfacing one line later as a refused seedAmmPool.
+  must_unit "fund LP $base_tok leg" setTestBalance "(principal \"$LP_PRINCIPAL\", \"$base_tok\", $(e8 $base_fund))" --identity anonymous
+  # The deposit's reply is asserted by SHAPE (`variant { ok = <lpMinted> }`):
+  # a refusal (`variant { err }`, exit 0) or a trap (non-zero exit, reject
+  # text on stdout) is a warn here and a counted shortfall for the gate below
+  # — the market's pool is left DISABLED, never enabled over an empty vault.
+  seed_out=$(call seedAmmPool "(\"$market\", $(e8 $base_amt):nat, $(e8 $quote_amt):nat)" --identity "$LP_IDENTITY"); seed_rc=$?
+  if [ "$seed_rc" -ne 0 ] || ! mdx_reply_ok "$seed_out"; then
+    warn "$market — vault seed REFUSED (rc=$seed_rc): $(mdx_one_line "$seed_out")"
+    SHORTFALL="$SHORTFALL $market: seedAmmPool refused (rc=$seed_rc): $(mdx_one_line "$seed_out");"
   else
-    adm setAmmSkewConfig "(\"$market\", $(e8 $base_amt):nat, 200:nat)" > /dev/null || true
-    adm enableAmm "(\"$market\", true)" > /dev/null || true
-    SEEDED=$((SEEDED + 1))
+    must_ok "setAmmSkewConfig $market" setAmmSkewConfig "(\"$market\", $(e8 $base_amt):nat, 200:nat)" --identity anonymous
+    must_ok "enableAmm $market"        enableAmm "(\"$market\", true)" --identity anonymous
+    SEEDED=$((SEEDED + 1)); SEEDED_TOKS="$SEEDED_TOKS $base_tok"
     ok "$market — book laddered, vault \$$TVL ($base_amt $base_tok + $quote_amt ICPUSD @ $px)"
   fi
 done
-adm setAmmAutoInventory "(true)" > /dev/null || true
-adm setTestTimersPaused "(false)" > /dev/null || true
-[ "$SEEDED" -gt 0 ] || die "no market seeded — the live price feed is unreachable?"
+must_unit "setAmmAutoInventory(true)"  setAmmAutoInventory "(true)" --identity anonymous
+must_unit "setTestTimersPaused(false)" setTestTimersPaused "(false)" --identity anonymous
+TIMERS_PAUSED=false
+# The honest gate: a shortfall below the knob is a die carrying every skipped
+# market's reason, never a "markets live" over a one-pool venue.
+[ "$SEEDED" -ge "$MIN_SEEDED" ] \
+  || seed_fail "only $SEEDED/$NMARKETS markets seeded (MDX_PLAY_MIN_SEEDED=$MIN_SEEDED)" "$SHORTFALL"
+# Post-seed vault: LP supply minted and every seeded market's base leg in the
+# basket — the deposits actually landed, not merely answered ok.
+assert_vault_seeded $SEEDED_TOKS
 ok "$SEEDED/$NMARKETS markets live (auto-inventory on, timers running)"
 
 # ── 6. Insurance fund ─────────────────────────────────────────────
@@ -299,11 +458,14 @@ ok "$SEEDED/$NMARKETS markets live (auto-inventory on, timers running)"
 # AMM LP position) — never un-owned free value for a later staker.
 hdr "Insurance fund"
 INS_USD="${INSURANCE_USD:-144000}"
-ins_out=$(icp canister call backend seedInsuranceFund "($(e8 $INS_USD):nat)" --identity "$LP_IDENTITY" 2>&1)
-if echo "$ins_out" | grep -q "nat"; then
+# seedInsuranceFund is `async Nat` — a bare `(N : nat)`, never a variant —
+# so the gate is the (N : nat) shape (deploy.sh's mdx_call_nat), not a
+# substring `nat` that a reject text could also carry.
+ins_out=$(call seedInsuranceFund "($(e8 $INS_USD):nat)" --identity "$LP_IDENTITY")
+if mdx_reply_nat "$ins_out"; then
   ok "insurance fund seeded (\$$INS_USD ICPUSD, shares → $LP_IDENTITY)"
 else
-  warn "insurance fund seed failed: $(echo "$ins_out" | head -1)"
+  warn "insurance fund seed failed: $(mdx_one_line "$ins_out")"
 fi
 
 # ── 6b. Arbitrage canister ────────────────────────────────────────
@@ -341,9 +503,20 @@ fi
 # the env vars that choose the venue (IC_ENV) are NOT in argv, so no pattern
 # can tell the fleets apart. It killed the live engine fleet on 2026-08-01,
 # the fourth loss to this bug class.
+#
+# MDX_NO_SIMULATE=1 (cold_start --no-simulate in play mode, task 1788479256)
+# skips only the START. The stop stays unconditional: a stale recorded fleet
+# trading under the reinstall above is exactly what this step exists to
+# prevent, and stopping goes by recorded PID, so it can touch nothing else.
 hdr "Trading bots"
 bash scripts/stop_bots_local.sh >/dev/null 2>&1 || true
-bash scripts/start_bots_local.sh || warn "bot start failed — run scripts/start_bots_local.sh by hand"
+if [ "${MDX_NO_SIMULATE:-0}" = "1" ]; then
+  BOTS_STARTED=false
+  warn "fleet NOT started (MDX_NO_SIMULATE=1) — start it by hand with: bash scripts/start_bots_local.sh"
+else
+  BOTS_STARTED=true
+  bash scripts/start_bots_local.sh || warn "bot start failed — run scripts/start_bots_local.sh by hand"
+fi
 
 # ── 8. Frontend ───────────────────────────────────────────────────
 hdr "Frontend"
@@ -360,9 +533,13 @@ echo "  Deposit allowance: \$${allowance:-?} per user, lifetime, mark-valued at 
 echo "  AMM              : $SEEDED markets × \$$TVL vault (live-feed prices)"
 echo "  Insurance fund   : \$$INS_USD ICPUSD"
 echo "  Arbitrageur      : \$${ARB_USD} working capital (pins venue ↔ mark)"
-echo "  Bots             : 20 sim traders + 2 makers, \$100k value each (player parity)"
+if $BOTS_STARTED; then
+  echo "  Bots             : 20 sim traders + 2 makers, \$100k value each (player parity)"
+else
+  echo "  Bots             : NOT started (MDX_NO_SIMULATE=1) — bash scripts/start_bots_local.sh"
+fi
 echo "  Frontend         : http://frontend.local.localhost:$GW_PORT/"
 echo ""
 echo "  NOTE: #play is the repo's DEFAULT posture (DEPLOY_MODE, src/backend/main.mo)."
-echo "        Dev fixtures (cold_start --mode full|matching|amm|pending|load) need a"
+echo "        Dev fixtures (cold_start --mode full|matching|amm|staged|load) need a"
 echo "        temporary flip to #dev there; flip back to #play when done."

@@ -1,12 +1,36 @@
 <!-- ic-app-connect drop-in bridge page, served at /ai-connect.html on the app
-     origin. Implements Internet Computer App Connect v1 (docs/spec-app-connect.md).
+     origin. Implements Internet Computer App Connect v1 (the ic-app-connect
+     project's spec-app-connect.md; this app's additions to that contract are
+     stated in the CONTRACT block below).
+
+     CONTRACT (App Connect v=1 as this page speaks it) — what the connector
+     MUST do with the session this page hands it. Internet Identity mints the
+     delegation with NO canister restriction: its authorize flow takes no
+     target list, and every delegation II constructs carries `targets: None`
+     (measured against the II release backend on a local replica — advisory
+     GHSA-63hp-3pxg-9mcc). The `targets` this page sends is best-effort and
+     inert today, so the ONLY scope is the one the connector enforces:
+       1. A connector MUST sign calls only to the canister named by the
+          ic:canister-id meta below (this app's backend). Signing a call to
+          ANY other canister with this session is OUT OF CONTRACT: the user
+          consented to an assistant acting on this app, and the consent text
+          on this page tells them exactly that.
+       2. A connector MUST honour a delegation's own `targets` when one is
+          present — a provider that does enforce the scope narrows the
+          credential for free, and a connector must not widen it back.
+       3. The session is this app's principal only (II seeds the user key
+          with the derivation origin), so the user's NNS, wallet and other
+          dapps' identities are out of reach; what IS reachable is whatever
+          this principal holds on other canisters — nothing under #play, its
+          ledger accounts in a value-bearing posture. Rule 1 is what keeps
+          that reach theoretical.
 
      THIS IS A TEMPLATE. An App Connect connector reads the RAW served HTML (it
      fetches the markup like curl and does NOT run this page's JavaScript), so
      the ic:canister-id meta below must already hold the real backend id in the
      served bytes. The committed value is the literal placeholder
      `place-deployed-canister-id-here`; the build replaces it with the deployed
-     backend id for the target network — see vite.config.js
+     backend id for the target network — see vite.config.mjs
      (bake-ai-connect-canister-id), fed by scripts/deploy.sh on a cloud/mainnet
      deploy and by the local replica's id mapping for `npm run build`. A backend
      gets a DIFFERENT id per network, so never commit a real id here. Delete the
@@ -15,7 +39,7 @@
      The handshake script at the bottom mints the user's real identity
      credential, so treat edits to it as security changes. Its exact bytes are
      pinned by a 'sha256-…' source expression in the Content-Security-Policy for
-     this file in src/frontend/public/.ic-assets.json5 — CHANGE THE SCRIPT AND
+     this file in src/frontend/public/_headers — CHANGE THE SCRIPT AND
      THE DEPLOYED PAGE STOPS WORKING until that hash is updated. Run
      `node tests/frontend_security.test.mjs`: it recomputes the digest, fails if
      the two have drifted, and prints the value to paste in. -->
@@ -38,6 +62,8 @@
   button { font-size: 16px; padding: 10px 22px; border-radius: 8px; cursor: pointer;
            border: 1px solid #3b00b9; background: #3b00b9; color: white; }
   button:disabled { opacity: 0.5; cursor: default; }
+  button.secondary { background: white; color: #3b00b9; margin-left: 8px; }
+  #confirm { border: 2px solid #b00020; border-radius: 8px; padding: 4px 16px 16px; }
   pre { white-space: pre-wrap; color: #444; background: #f5f5f5; padding: 12px;
         border-radius: 8px; min-height: 1em; }
   .note { font-size: 13px; color: #666; }
@@ -52,10 +78,33 @@ to act as the signed-in principal until the session expires
 <p class="note">Session keys never leave the connector — this page only relays the
 signed delegation. The principal is derived from <em><span id="origin"></span></em>
 — the same identity derivation the app's own sign-in uses — so the AI acts as the
-same principal you have in that app. The session is limited to this app's backend
-canister (<span id="target">?</span>).</p>
+same principal you have in that app, and <strong>only</strong> as that principal: it
+cannot act as your NNS, wallet, or other dapps' identities.</p>
+<p class="note"><strong>What is minted:</strong> Internet Identity issues this session
+with <strong>no canister restriction</strong> — it is valid for <strong>every canister
+on the Internet Computer, as this app's principal</strong>. The App Connect contract
+(v1) requires the connector to sign calls only to this app's backend
+(<span id="target">?</span>); a connector that signs anything else is out of contract.
+Whatever this principal holds outside this app is reachable through the session, so
+connect only a connector you trust. If Internet Identity returns a session that is
+canister-restricted it is handed on as-is; otherwise you will be asked to confirm once
+more, below, before it leaves this page.</p>
 <button id="go">Continue with Internet Identity</button>
 <pre id="status"></pre>
+<!-- The decision point (GHSA-63hp-3pxg-9mcc). Shown only when the delegation
+     that came back is unscoped, BEFORE it is handed to the connector; nothing
+     is POSTed until #send is pressed. Hidden by the attribute, toggled by the
+     script via el.hidden. -->
+<div id="confirm" hidden>
+<p><strong>Confirm before the session leaves this page.</strong> Internet Identity
+returned a session with <strong>no canister restriction</strong>: it is valid for every
+canister on the Internet Computer as this app's principal, not only
+<span id="confirm-target">?</span>. <strong>Nothing has been sent yet.</strong> The
+connector is contract-bound to use it only against this app's backend — hand it over
+only if you trust the connector running on this machine.</p>
+<button id="send">Hand the unrestricted session to the connector</button>
+<button id="discard" class="secondary">Discard it</button>
+</div>
 <script>
 // Parameters arrive in the URL fragment so they never leave the browser:
 //   #v=1&pubkey=<hex DER session public key>&nonce=<hex>&port=<loopback port>
@@ -155,19 +204,35 @@ function ttlText(ns) {
 }
 document.getElementById("ttl").textContent = TTL_NS === null ? "—" : ttlText(TTL_NS);
 
-// ── Delegation scope ──
-// With no `targets`, Internet Identity mints a delegation valid for EVERY
-// canister on the IC: the connector would hold the user's identity against the
-// NNS, their ledger account, every DAO they belong to — not just this exchange.
-// The scope is one canister, and its id is already in the served markup (the
-// ic:canister-id meta the App Connect connector itself reads, baked at build
-// time by vite.config.js). Refuse to mint anything if it is missing or still
-// the unsubstituted placeholder: an unscoped delegation is not a degraded
-// success, it is a different and much larger credential.
+// ── Delegation scope (BEST-EFFORT — read this before trusting `targets`) ──
+// The authorize-client request below carries `targets: [BACKEND_ID]`. It is
+// SENT and it is NOT HONOURED: the Internet Identity release backend's
+// prepare_delegation takes no target list and every delegation II constructs
+// has `targets: None` (measured on a local replica — GHSA-63hp-3pxg-9mcc).
+// It is kept because it costs nothing, a provider that does honour it would
+// narrow the credential for free, and the success handler adapts to what
+// actually came back: a scoped delegation is handed on directly; an unscoped
+// one STOPS at an explicit confirmation (the decision point, below) before
+// anything is POSTed. The consent text above therefore states what is
+// MINTED — a session valid for every canister, as this app's principal — not
+// what was asked for. The real limit is the origin-bound derivation: II
+// seeds the user key with the derivation origin, so the principal exists for
+// this app only and the NNS, wallets and other dapps are out of reach; what
+// IS reachable is whatever this principal holds on other canisters (nothing
+// under #play; ledger accounts in a value-bearing posture). Scope where the
+// key actually is: the CONTRACT in the header comment obliges the connector
+// to sign only calls to BACKEND_ID. The id comes from the served markup (the
+// ic:canister-id meta the connector itself reads, baked at build time by
+// vite.config.mjs). With no valid id there is no canister for the contract
+// to confine the session to and no honest consent text — refuse.
 const backendMeta = document.querySelector('meta[name="ic:canister-id"]');
 const BACKEND_ID = ((backendMeta && backendMeta.content) || "").trim();
 const BACKEND_OK = /^[a-z0-9]{5}(-[a-z0-9]{5})*-[a-z0-9]{3}$/.test(BACKEND_ID);
 document.getElementById("target").textContent = BACKEND_OK ? BACKEND_ID : "not configured";
+document.getElementById("confirm-target").textContent = BACKEND_OK ? BACKEND_ID : "not configured";
+const confirmEl = document.getElementById("confirm");
+const sendBtn = document.getElementById("send");
+const discardBtn = document.getElementById("discard");
 
 if (V !== CONTRACT_V) {
   refuse("Version mismatch: this sign-in page speaks App Connect v" + CONTRACT_V +
@@ -188,8 +253,10 @@ if (V !== CONTRACT_V) {
       "somewhere else — so nothing has been signed and nothing has been sent.");
 } else if (!BACKEND_OK) {
   refuse("Refusing to continue: this page carries no valid backend canister id, so the " +
-      "sign-in could only be minted with access to EVERY canister rather than just this " +
-      "app. The deployment is misconfigured (ic:canister-id was never substituted).");
+      "connector would have no canister to confine the session to (the App Connect " +
+      "contract scopes the session at the connector, by this id) and this page could not " +
+      "tell you which app the session is for. The deployment is misconfigured " +
+      "(ic:canister-id was never substituted).");
 } else if (ttlClamped) {
   log("Note: the requested session lifetime was shortened to the " + ttlText(TTL_MAX_NS) +
       " maximum. That is the session you are about to approve.");
@@ -230,7 +297,8 @@ goBtn.onclick = () => {
         kind: "authorize-client",
         sessionPublicKey: hexToBytes(SESSION_PUBKEY_HEX),
         maxTimeToLive: TTL_NS,
-        // Scope the delegation to this app's backend — see BACKEND_ID above.
+        // Best-effort scope to this app's backend — NOT honoured by Internet
+        // Identity today; see "Delegation scope" above for what that means.
         targets: [BACKEND_ID],
         // Derive the SAME principal the app itself signs in as — see
         // DERIVATION_ORIGIN above. Omitted entirely (never sent as undefined)
@@ -240,19 +308,14 @@ goBtn.onclick = () => {
     } else if (msg.kind === "authorize-client-success") {
       window.removeEventListener("message", handler);
       try { ii.close(); } catch (_) {}
-      log("Delegation received; handing it to the connector…");
       const delegations = Array.isArray(msg.delegations) ? msg.delegations : [];
-      // Report honestly if what came back is broader than what was asked for
-      // (an identity provider is free to ignore `targets`). Not fatal — the
-      // connector still decides — but the user should not be told the session
-      // is limited to this app when it is not.
+      // What actually came back. An identity provider is free to ignore
+      // `targets`, and Internet Identity does (see "Delegation scope").
       const scoped = delegations.length > 0 && delegations.every(
         (d) => d.delegation.targets && d.delegation.targets.length);
-      if (!scoped) {
-        log("⚠ Internet Identity returned a session with NO canister restriction: it is " +
-            "valid for every canister, not only " + BACKEND_ID + ".");
-      }
-      const body = {
+      // Held in a `let` so a discard can drop the credential, not just hide
+      // the buttons: after discard there is nothing left for send() to send.
+      let payload = {
         nonce: NONCE,
         user_public_key: bytesToHex(msg.userPublicKey),
         delegations: delegations.map(d => ({
@@ -267,34 +330,67 @@ goBtn.onclick = () => {
           signature: bytesToHex(d.signature),
         })),
       };
-      // The one place a signed delegation LEAVES this page. Re-derive the
-      // destination from the parsed URL and check it again here, next to the
-      // send, so no later edit can reintroduce a relay to an arbitrary host.
-      const dest = new URL(CALLBACK);
-      if (dest.protocol !== "http:" || dest.hostname !== "127.0.0.1" ||
-          dest.pathname !== "/callback" || dest.username || dest.password) {
-        log("Refusing to send the session to " + dest.origin + " — that is not the " +
-            "connector on this machine. Nothing was sent.");
-        return;
-      }
-      try {
-        const resp = await fetch(dest.href, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const out = await resp.json();
-        if (out.ok) {
-          log("Connected as " + out.principal);
-          log("You can close this tab and return to your AI assistant.");
-        } else {
-          log("Connector rejected the session: " + out.error);
+      const send = async () => {
+        if (payload === null) return;
+        const body = payload;
+        payload = null;
+        // The one place a signed delegation LEAVES this page. Re-derive the
+        // destination from the parsed URL and check it again here, next to the
+        // send, so no later edit can reintroduce a relay to an arbitrary host.
+        const dest = new URL(CALLBACK);
+        if (dest.protocol !== "http:" || dest.hostname !== "127.0.0.1" ||
+            dest.pathname !== "/callback" || dest.username || dest.password) {
+          log("Refusing to send the session to " + dest.origin + " — that is not the " +
+              "connector on this machine. Nothing was sent.");
+          return;
+        }
+        try {
+          const resp = await fetch(dest.href, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const out = await resp.json();
+          if (out.ok) {
+            log("Connected as " + out.principal);
+            log("You can close this tab and return to your AI assistant.");
+          } else {
+            log("Connector rejected the session: " + out.error);
+            goBtn.disabled = false;
+          }
+        } catch (e) {
+          log("Could not reach the connector on 127.0.0.1:" + PORT + " — is it still " +
+              "waiting for login? (" + e + ")");
           goBtn.disabled = false;
         }
-      } catch (e) {
-        log("Could not reach the connector on 127.0.0.1:" + PORT + " — is it still " +
-            "waiting for login? (" + e + ")");
-        goBtn.disabled = false;
+      };
+      if (scoped) {
+        log("Delegation received, restricted to " + BACKEND_ID + "; handing it to the connector…");
+        await send();
+      } else {
+        // THE DECISION POINT (GHSA-63hp-3pxg-9mcc). The delegation is minted
+        // and unscoped: valid for every canister as this app's principal. It
+        // does not leave this page on a log line — the user confirms, or
+        // discards, and only #send performs the POST. (The operator may
+        // tighten this branch to an outright refusal; the confirmation is
+        // the default.)
+        log("Delegation received with NO canister restriction — it is valid for every " +
+            "canister, not only " + BACKEND_ID + ". Nothing has been sent. Confirm below " +
+            "to hand it to the connector, or discard it.");
+        confirmEl.hidden = false;
+        sendBtn.onclick = async () => {
+          sendBtn.disabled = true;
+          confirmEl.hidden = true;
+          log("Handing the unrestricted session to the connector…");
+          await send();
+        };
+        discardBtn.onclick = () => {
+          payload = null;
+          confirmEl.hidden = true;
+          log("Discarded: the session was never handed to the connector, and this page has " +
+              "dropped it. You can sign in again, or close this tab.");
+          goBtn.disabled = false;
+        };
       }
     } else if (msg.kind === "authorize-client-failure") {
       window.removeEventListener("message", handler);

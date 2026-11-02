@@ -112,8 +112,8 @@ remembers the wallet identity + subnet id (`scripts/.subnet.conf`), keeps cycles
 (`VITE_CLOUD_ENGINE=false`), endows the backend CREATE with `SUBNET_CYCLES` (default `5000t`) on a
 FIRST install, deploys backend→bridge→frontend, wires `setBridge`/`setDex` (never
 `setFuelRoute`/`setXrcCanister`), injects the AI keys, applies the anti-sybil env vars when
-`TRUSTED_ATTRIBUTE_SIGNERS`/`FRONTEND_ORIGINS` are exported, and seeds (idempotent — history + $1M
-AMM vault + $50k insurance fund). **Re-running the same command is the UPDATE path**: upgrade
+`TRUSTED_ATTRIBUTE_SIGNERS`/`FRONTEND_ORIGINS` are exported, and seeds (idempotent — history + $5,125,000
+AMM vault + $144k insurance fund, `AMM_TVL_TOTAL` / `INSURANCE_USD` override). **Re-running the same command is the UPDATE path**: upgrade
 install, state preserved, seeding self-skips because the pools exist. The skeleton below is the
 manual reference for what the script does; the domain (§3.5), the topup cron (§1) and the bots
 (§3.6) remain manual steps.
@@ -124,6 +124,23 @@ manual reference for what the script does; the domain (§3.5), the topup cron (�
 self-healing but noisy — the ship fails candid decode, the failure streak trips, and the L1 roll
 seals the old archive and spawns a fresh one (new wasm) on its own. Sealed archives never receive
 new events and can be upgraded at leisure.
+
+**Read its reply before moving on** (#54.7). It is
+`N archive(s) upgraded, B skipped (blackholed), F failed[ — <cid>: <cause>; …]`: `B` counts segments the
+blackhole-at-seal policy made immutable — a design skip, classified from the seal-time record, so
+it is zero unless `setBlackholeAtSeal(true)` has run (never on #play); any non-zero `F` is a REAL
+failed hop (frozen, mid-upgrade, wasm-incompatible, controllers changed by hand — or a canister
+that no longer EXISTS) and the reply itself names each failed segment with the IC's reject text
+(task 1793569495; the ring log, `getRecentEvents`, carries the same `ARCHIVE UPGRADE: <cid>
+failed: <cause>` warn line per hop) — fix the cause and re-run, the call is idempotent. A
+`Canister <cid> not found` cause is the one state an upgrade can never fix: the segment is gone
+(the engine lost its first sealed segment on 2026-11-01). `adminDropMissingArchive(<cid>)`
+(controller) retires its routing row after the management canister confirms the not-found class
+inside the call, and declares the lost seq range on the tape as a `#gap` (+ `#config` + a balance
+re-baseline) so `verify_ledger.mjs` accepts the coverage jump; until then the federation answers
+`unavailable` for that segment and the history views skip it. It walks the whole chain (prior seasons'
+segments included) and refuses only an EMPTY chain, so it also runs right after a season reset,
+before a new active tip exists.
 
 ```sh
 # 1. Build. gen-did.sh first: mops.toml declares src/backend/backend.did
@@ -167,8 +184,8 @@ bash scripts/set_ai_key.sh --provider anthropic -e subnet --identity <wallet>   
 #    IDEMPOTENT (bails if AMM pools exist) and does, in order: posture check →
 #    fund the LP/insurance identity → inject N days of CoinGecko price history →
 #    create+configure AMM pools, price them via fetchAndSetRefPrice (multi-source
-#    HTTPS feed = the only price authority) → $1M AMM vault deposits (halves per
-#    market) → seed the insurance fund. Knobs: AMM_TVL_TOTAL=1000000 HISTORY_DAYS=9.
+#    HTTPS feed = the only price authority) → $5,125,000 AMM vault deposits (halves per
+#    market) → seed the insurance fund. Knobs: AMM_TVL_TOTAL=5125000 HISTORY_DAYS=9.
 #    The $100k creditAndRegister on-ramp cap binds for real users regardless.
 
 # 5. Fund + start monitoring
@@ -202,8 +219,9 @@ create/sync, not plain redeploys).
 Registering `<PLACEHOLDER-domain>` with the IC HTTP gateways:
 
 1. **Serve the claim file from the frontend**: add `src/frontend/public/.well-known/ic-domains`
-   containing exactly the domain name (one per line), make sure the asset sync doesn't ignore
-   dotfiles (`.ic-assets.json5` needs `.well-known` allowed), and redeploy the frontend.
+   containing exactly the domain name (one per line) and redeploy the frontend. The static-site
+   recipe's sync plugin uploads `.well-known/` on its own (the one dot-directory it does not
+   skip; the legacy asset canister needed an `.ic-assets.json5` un-ignore rule — gone with it).
 2. **DNS** (at the registrar):
    - `CNAME <domain> → <frontend-id>.icp1.io` (apex domains need ALIAS/ANAME/CNAME-flattening),
    - `TXT _canister-id.<domain> → <frontend-canister-id>`,
@@ -301,7 +319,7 @@ Print this. Each row has its detail section above.
 - [ ] **Domain**: `.well-known/ic-domains` in the frontend → DNS records → boundary registration → TLS `Available` (§3.5)
 - [ ] **Decide the canonical origin** (the domain), advertise only it — II principals are per-origin (§3.5)
 - [ ] **AI key**: `scripts/set_ai_key.sh --provider <anthropic|google>` with the high-limit key; `aiConfigured()` = true (§3c) — rotatable post-launch any time
-- [ ] **Seed**: `deploy.sh cloud_seed` equivalent — history + $1M AMM + insurance; idempotent (§3.4)
+- [ ] **Seed**: `deploy.sh cloud_seed` equivalent — history + $5,125,000 AMM + insurance; idempotent (§3.4)
 - [ ] **Cycles cron**: `topup.sh` every 15 min from the funded wallet (backend + archives + bridge) (§1)
 - [ ] **Bots**: `IC_ENV=subnet sim_trading.sh 12 2` under tmux/systemd with `CE_IDENTITY` in the conf; confirm mood line + first refills (§3.6)
 - [ ] **Smoke**: run §6 end-to-end, ESPECIALLY the fresh-Google player journey on the canonical domain

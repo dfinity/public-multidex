@@ -16,8 +16,8 @@ source "$SCRIPT_DIR/_lib.sh"
 echo "── test_tier_shed ──"
 setup_mode matching
 
-icp identity new shed_dep --storage plaintext 2>/dev/null || true
-icp identity new shed_mm  --storage plaintext 2>/dev/null || true
+mdx_identity_new shed_dep
+mdx_identity_new shed_mm
 DP=$(principal_of shed_dep); MP=$(principal_of shed_mm)
 # Funding via setTestBalance REGISTERS both principals (the gate's precondition).
 call setTestBalance "(principal \"$DP\", \"ICPUSD\", $(e8 100000) : nat)" --identity alice > /dev/null
@@ -29,7 +29,7 @@ call setTestTimersPaused '(true)' --identity alice > /dev/null
 
 # (0) floor open: both can place
 A=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 60000) : nat, $(e8 0.01) : nat)" --identity shed_dep)
-assert_contains "floor 0: L0 update passes" "$A" "ok"
+assert_ok "floor 0: L0 update passes" "$A"
 
 # (1) floor 1: L0 refused AT THE GATE, the L4 quoter passes
 call setTestShedFloor '(opt (1 : nat))' --identity alice > /dev/null
@@ -37,7 +37,7 @@ B=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 60001) : nat, $
 assert_not_contains "floor 1: L0 update refused (no ok)" "$B" "ok = "
 assert_contains "floor 1: refusal is the inspect gate itself" "$B" "explicitly refused message"
 C=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 70000) : nat, $(e8 0.01) : nat)" --identity shed_mm)
-assert_contains "floor 1: L4 update passes" "$C" "ok"
+assert_ok "floor 1: L4 update passes" "$C"
 
 # (2) queries stay open to the shed principal (inspect gates UPDATE calls only)
 Q=$(call getAccessPolicy '()' --identity shed_dep --query)
@@ -47,12 +47,12 @@ assert_contains "policy shows their level" "$Q" "myLevel = 0"
 # (3) floor 2: L4 (rank 2) still passes
 call setTestShedFloor '(opt (2 : nat))' --identity alice > /dev/null
 D=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 70001) : nat, $(e8 0.01) : nat)" --identity shed_mm)
-assert_contains "floor 2: L4 update still passes" "$D" "ok"
+assert_ok "floor 2: L4 update still passes" "$D"
 
 # (4) pin released → L0 readmitted
 call setTestShedFloor '(null)' --identity alice > /dev/null
 E=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 60002) : nat, $(e8 0.01) : nat)" --identity shed_dep)
-assert_contains "floor released: L0 passes again" "$E" "ok"
+assert_ok "floor released: L0 passes again" "$E"
 
 call setTestTimersPaused '(false)' --identity alice > /dev/null
 finish_test "test_tier_shed"

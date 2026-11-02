@@ -114,9 +114,11 @@ function bakeAiConnectCanisterId() {
 // domain can find the backend (the App Connect meta tag in ai-connect.html
 // only names the single main backend; this covers the multi-canister case —
 // the format is the MCP-connector proposal for that spec gap, understood by
-// IMCP2 today). Same deploy-time id rules as the meta tag above, and the
-// dot-directory must be exempted from the asset sync's dotfile skip — see
-// src/frontend/public/.ic-assets.json5.
+// IMCP2 today). Same deploy-time id rules as the meta tag above. The
+// static-site sync plugin uploads .well-known/ on its own (the one
+// dot-directory it does not skip — the legacy asset canister needed an
+// explicit un-ignore rule in .ic-assets.json5 for it); its headers come from
+// src/frontend/public/_headers (the /.well-known/* block).
 function emitWellKnownManifest() {
   return {
     name: "emit-well-known-ic-app-manifest",
@@ -145,9 +147,42 @@ function emitWellKnownManifest() {
   };
 }
 
+// Stamp the id of the frontend canister this build is deployed to into
+// index.html as <meta name="mdx:frontend-canister-id"> (task 1793503326).
+// src/frontend/src/canister-env.js (readCanisterEnv) uses it to pick, among
+// several `ic_env` rows at a shared host NAME, the row written by the canister
+// that actually served the page: the certified-assets canister leaves a
+// `Secure; SameSite=None; Partitioned` row that a legacy venue's response at
+// the same name cannot overwrite — and that row lists FIRST (Chrome,
+// 2026-11-01). At an id host the host name says who served the page; at
+// frontend.local.localhost or a custom domain only this stamp can. Same id
+// rules as ic-app.json above (AI_CONNECT_FRONTEND_ID from deploy.sh, else the
+// local replica's mapping); on a fresh venue's first build neither exists, so
+// nothing is stamped and the picker falls back to cookie order until the next
+// frontend deploy (play_start's follow-up `icp deploy frontend` stamps it).
+function bakeFrontendCanisterId() {
+  return {
+    name: "bake-frontend-canister-id",
+    apply: "build",
+    transformIndexHtml() {
+      const id = resolveCanisterId("frontend");
+      if (!id) {
+        console.warn(
+          "[frontend-canister-id] ⚠ frontend canister id unresolved — index.html carries no mdx:frontend-canister-id meta "
+          + "(readCanisterEnv falls back to cookie order at a shared host name). Set AI_CONNECT_FRONTEND_ID (cloud/subnet) "
+          + "or deploy once to the local replica first.",
+        );
+        return [];
+      }
+      console.log(`[frontend-canister-id] stamped ${id} into index.html`);
+      return [{ tag: "meta", attrs: { name: "mdx:frontend-canister-id", content: id }, injectTo: "head-prepend" }];
+    },
+  };
+}
+
 export default defineConfig({
   root: "src/frontend",
-  plugins: [bakeAiConnectCanisterId(), emitWellKnownManifest(), emitVersionJson()],
+  plugins: [bakeAiConnectCanisterId(), emitWellKnownManifest(), emitVersionJson(), bakeFrontendCanisterId()],
   define: {
     __CLOUD_ENGINE__: JSON.stringify(CLOUD_ENGINE),
     __APP_VERSION__: JSON.stringify(APP_VERSION),

@@ -43,11 +43,18 @@ honest when the primary feed degrades, and a slow cross-check on the primary.
 
 ## 2. What the primary feed already is (current code)
 
-`refreshMultiSourcePrice` fans out parallel non-replicated HTTPS outcalls to
-**three independent providers** (Coinbase, CoinGecko, Kraken —
-`PRICE_SOURCES`), takes the median, computes stddev, and edge-logs health
-against `PRICE_MIN_SOURCES = 2`. The **periodic** path (`tickPriceRefresh`)
-already enforces the full quality gate:
+The primary fetch is a **fan-out** (H-37, F34): `openPriceFanout` registers a
+per-refresh accumulator and `fetchAndRecord` fires one non-replicated HTTPS
+outcall per provider (`PRICE_SOURCES` — eight venues today) as its own
+self-call; each records into the accumulator as it lands, and
+`finalizePriceFanout` takes the median, computes stddev, and edge-logs health
+against `PRICE_MIN_SOURCES` in whichever message first sees a **robust
+quorum** (a majority, never below the floor) with acceptable dispersion — or
+the last arrival, or the heartbeat's **deadline sweep**
+(`PRICE_FANOUT_DEADLINE_NS`, 8s, well under the 15s staging window). One
+provider trickling its body no longer sets the cadence of every mark; a
+reading that lands after finalization attaches for observability only. The
+**periodic** path (`tickPriceRefresh`) already enforces the full quality gate:
 
     sourceCount >= PRICE_MIN_SOURCES  AND  stddevBps <= PRICE_MAX_STDDEV_BPS
     AND acceptOrPendPrice (the ±2.5% jump breaker)
@@ -71,10 +78,25 @@ A single helper now owns aggregate acceptance:
 - jump breaker: `acceptOrPendPrice` unchanged;
 - **fallback**: if the quality gate FAILS, try the XRC anchor (§3.2) instead —
   if a fresh anchor exists, it is applied *through the same jump breaker* and
-  the application is event-logged as a fallback;
-- callers: `geptorFetchAndSweep`, `tickPriceRefresh`, `fetchAndSetRefPrice`.
-  GEPTOR's latency is untouched: the helper is synchronous state logic; the
-  only await in the hot path remains the primary fetch it always did.
+  the application is event-logged as a fallback. The fallback writer obeys
+  the same monotonic-in-sample-time rule as the aggregate apply (W3-06): an
+  anchor whose effective clock (its XRC pricing minute) is at or before the
+  standing mark's `refPriceUpdatedNs` is refused before the breaker sees it.
+  Without that, a below-floor fan-out a second after a healthy apply moved
+  the mark to an older single-source value and its clock back ~90 s, and a
+  straggling primary sampled in between then passed the W3-06 guard (issue
+  #55 "fallback clock rewinds"). In practice an anchor becomes admissible as
+  a fallback only once its pricing minute postdates the last accepted sample;
+- callers: `geptorFetchAndSweep`, `tickPriceRefresh`, `fetchAndSetRefPrice`
+  — each opens a fan-out (the GEPTOR and the admin fetch their own, the tick
+  joins the asset's open one) and the apply runs in `finalizePriceFanout`.
+  GEPTOR's latency is bounded by the quorum or the deadline, never the
+  slowest provider (H-37). The fan-out captures the oracle epoch at dispatch
+  (`openPriceFanout`) and the finalizer abandons the result unwritten —
+  neither `lastAggregates` nor the health edge — when a wipe bumped the epoch
+  while it was parked (W4-13's guard, moved from one caller into the callee:
+  issue #55 "epoch guard on one caller"); the admin fetch reports the
+  abandonment, the other callers have nothing to apply.
 
 `minSources()` = `PRICE_MIN_SOURCES` (2) with a controller-only,
 non-production override (`setTestMinSources`) so tests can force the
@@ -177,10 +199,24 @@ trim/median machinery:
   aggregate prices the mark (maximal sources; the groups corroborate each
   other);
 - groups **diverge** → the divergence IS the depeg signal: a loud `warn`
-  event names the magnitude and both group sizes, and the mark follows the
-  **USD group** with its own dispersion and source count (which may drop it
-  below the source floor — then the XRC fallback applies, and that anchor is
-  USD-quoted too, so anchor and mark sit on the same side);
+  event names the magnitude and both group sizes. The mark follows the
+  **USD group** (its own dispersion and source count) **only when that group
+  is robust on its own** — its surviving count reaches `minSources()`, the
+  same floor `applyFreshAggregate` enforces. Otherwise the **pooled trim keeps
+  the mark** and the divergence is reported as a signal only (`diverged`,
+  `depegBps`, `mark = #pooled`). The decision to discard the USDT venues must
+  be robust *before* it may discard them: with the shipped fleet (two USD
+  venues, six USDT) the USD group could never pass the floor, so pre-#55
+  every divergence — a lagging coinbase/coingecko print as much as a real
+  depeg — handed the mark to a group the floor then refused and froze it on
+  six healthy venues (issue #55 "oracle split"). Under a real depeg the
+  pooled mark is USDT-dominated; the USD-quoted XRC anchor's divergence
+  cross-check (§3.3) is the backstop on that side, and the XRC fallback
+  still applies whenever the primary as a whole fails its gates. The
+  divergence magnitude is computed behind a finiteness gate (`Float.toInt`
+  traps on inf/NaN — a ~1e-302 USD reading makes the quotient infinite);
+  an unrepresentable divergence saturates to `DEPEG_BPS_SATURATED` and is
+  reported as diverged, never zeroed;
 - one group **empty** → the other prices alone; no cross-check, no false
   signal.
 

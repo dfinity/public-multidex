@@ -8,9 +8,13 @@
 ## What's wrong
 
 `devSimulateDeposit` admits units by yielding to the DEX and only then advancing `admittedUnits`.
-If the continuation is lost — an upgrade landing in the await window, which the file's own note
-calls *"the routine act of deploying"* — the counter stays at its old value, `l.pending` is never
-credited, and `postupgrade` clears `admitting` so the user can retry.
+If the DEX call does not come back `#ok` — the report's premise was an upgrade landing in the
+await window, which the file's own note then called *"the routine act of deploying"*; #55 (d) later
+measured that an upgrade cannot land inside an `await` on this toolchain (the Motoko runtime
+refuses it while a message is outstanding), and the trigger that is real is the DEX call failing
+into the `catch` arm (a stopped or rejecting DEX — #55 "phantom pending", task `1788465034`) — the
+counter stays at its old value, `l.pending` is never credited, and `admitting` is cleared so the
+user can retry.
 
 The retry then computes a **different** seq (nothing pins the retry amount), so the DEX's replay
 gate (`if (seq <= existing) { return #ok }`) does not fire, and a second `markValue` is debited from
@@ -55,12 +59,14 @@ reasoning wants checking by someone who owns the Bridge before it ships.
 
 ## Done when
 
-- [x] A deposit whose continuation is destroyed by an upgrade leaves the counter reproducible
+- [x] A deposit whose continuation never advances the counter (the report said: destroyed by an
+      upgrade; the real trigger is the `catch` arm — see the addendum) leaves the counter reproducible
 - [x] The retry computes the **same** seq and the DEX replay gate absorbs it
 - [x] The allowance is debited exactly once across the lost-continuation sequence
 - [x] `claim` is demonstrably untouched
-- [x] A test drives an upgrade inside the await window — **in its observable equivalent form**
-      (see note)
+- [x] A test drives the lost-continuation state — **in its observable equivalent form** (see
+      note; the upgrade-inside-the-await-window form the report asked for cannot occur on this
+      toolchain — #55 (d))
 
 ## Completed 2026-08-15
 
@@ -74,12 +80,23 @@ reasoning wants checking by someone who owns the Bridge before it ships.
   landing inside the await window would confirm the written-ahead pending, stranding the explicit
   rollback (refused units already moved to `confirmed`). It now skips assets whose admission is
   mid-flight.
-- **On the upgrade-window test**: with write-ahead, the post-upgrade state after a mid-await
-  upgrade is byte-identical to the state after a completed deposit plus `postupgrade` clearing
-  `admitting` — there is no distinct lost-continuation state left to reproduce. The test drives
-  the equivalent observable: deposit → real bridge upgrade → deposit again, asserting the second
-  charge equals the first exactly and pending accumulates exactly (the pre-fix defect showed here
-  as a doubled charge).
+- **On the upgrade-window test**: with write-ahead, the state a lost continuation would leave is
+  byte-identical to the state after a completed deposit plus `postupgrade` clearing `admitting` —
+  there is no distinct lost-continuation state left to reproduce (and the mid-await upgrade the
+  report framed it as cannot be staged at all: #55 (d) measured that the Motoko runtime refuses an
+  upgrade while a message is outstanding). The test drives the equivalent observable: deposit →
+  real bridge upgrade → deposit again, asserting the second charge equals the first exactly and
+  pending accumulates exactly (the pre-fix defect showed here as a doubled charge).
 - `tests/test_bridge_write_ahead.sh` (12 green on #dev): one-deposit-one-charge, upgrade
   reproducibility, over-allowance refusal with used AND pending byte-identical, counter healthy
   after rollback, claim path green. Regressions: bridge_deposit_claim, deposit_ledger_guard.
+
+**Addendum 2026-11-02** (task `1793577101`, the round-18 comments-only pass): #55 (d) measured on
+this build that an upgrade cannot land inside an `await` — `install_code` in upgrade mode traps in
+`canister_pre_upgrade` ("attempted with outstanding message callbacks") while a call is
+outstanding — so the "upgrade landing in the await window" premise above is retired: the defect
+was real for its other trigger, the DEX call failing into the `catch` arm. That arm's post-W3-04
+KEEP of the written-ahead pair was itself revised by #55 "phantom pending" (task `1788465034`,
+merged `b672db8`): the `catch` arm now rolls back `admittedUnits` + `pending`, and
+`devConfirmDeposits` reconciles a pending against the DEX's `playDepositReservation` before
+promoting it. `tests/test_bridge_write_ahead.sh` stands as the equivalent-observable test.

@@ -74,28 +74,14 @@ module {
     takerOrderType : ?OrderType;
   };
 
-  // ── Settlement-window matching (Phase 1 of the AMM spec) ─────────
-  public type PendingMatchStatus = { #pending; #finalized; #voided };
-
-  public type PendingMatch = {
-    id              : Nat;
-    marketId        : MarketId;
-    makerOrderId    : Nat;
-    makerPrincipal  : Principal;
-    takerPrincipal  : Principal;
-    takerSide       : Side;       // the taker's side; maker is the opposite
-    takerOrderType  : OrderType;
-    price           : Nat;
-    quantity        : Nat;
-    // Tokens + amounts the taker/maker owe, already moved to the reserved ledger.
-    takerDebitToken  : TokenId;
-    takerDebitAmount : Nat;
-    makerDebitToken  : TokenId;
-    makerDebitAmount : Nat;
-    createdAtNs : Int;
-    expiryNs    : Int;
-    status      : PendingMatchStatus;
-  };
+  // ── Settlement-window matching — RETIRED (task 1788516198) ─────────
+  // (The PendingMatch / PendingMatchStatus records outlived apiVersion
+  // 6.0.0 only as the element type of main.mo's fossil stable
+  // `pendingMatches` map — enhanced orthogonal persistence refuses to drop
+  // or retype a stable field on a plain upgrade (IC0503). The sixth
+  // one-shot migration, task 1788744109, consumed and dropped that map and
+  // the types went with it; their FROZEN shape lives in
+  // src/backend/migration.mo until the migration's retirement.)
 
   public type MarketInfo = {
     id : MarketId;
@@ -140,6 +126,14 @@ module {
     toAmount : Nat;
     fullyFilled : Bool;
     swapOrderId : ?Nat;
+    // The ICPUSD budget actually STAGED for a budgeted (non-FOK market #buy)
+    // direct swap: min(amount, the caller's AVAILABLE ICPUSD) — swap()
+    // pre-checks the RAW balance, so a caller with funds reserved by open
+    // orders is accepted for `amount` while only this much can convert
+    // (task 1788465056, #55 silent "complete": the toast can say "$400 of
+    // $1,000 will convert; $600 is reserved"). null on every other path
+    // (sell, FOK, limit, cross) — nothing is budget-clamped there.
+    stagedBudget : ?Nat;
   };
 
   // ── User profiles & history ───────────────────────────────────
@@ -170,28 +164,15 @@ module {
     newQuantity : Nat;  // 0 when cancelled
     cancelled   : Bool;
     timestamp   : Int;
-    reason      : ?AdjustmentReason; // null: fossil row recorded before reasons existed
+    reason      : ?AdjustmentReason; // null: row recorded before reasons existed
   };
 
-  // FROZEN pre-reason shape — pins the fossil-parked stable map
-  // `userAdjustments` (main.mo) at its deployed layout. That map lives inside
-  // mutable containers (Map/List are invariant in their element type), so
-  // adding `reason` in place is an EOP-incompatible change (IC0503 on
-  // upgrade); and the actor's one-shot migration slot is occupied by the
-  // ACTIVE W2-04 migration (see migration.mo's retirement note — its domain
-  // refuses post-W2-04 state, so it cannot be extended to serve every live
-  // target). New records go to `userAdjustmentsV2`; getMyAdjustments merges
-  // fossil rows first with reason = null. A sweep can consolidate the fossil
-  // into V2 in the one-shot slot AFTER W2-04 retires (task filed).
-  public type OrderAdjustmentLegacy = {
-    orderId     : Nat;
-    marketId    : MarketId;
-    side        : Side;
-    oldQuantity : Nat;
-    newQuantity : Nat;
-    cancelled   : Bool;
-    timestamp   : Int;
-  };
+  // (The FROZEN pre-reason OrderAdjustmentLegacy shape and its fossil-parked
+  // stable map `userAdjustments` were SWEPT into `userAdjustmentsV2` by the
+  // fifth one-shot migration — tasks 1787222803 + 1787207569, applied to
+  // both mainnet targets 2026-09-03 and RETIRED with 1788285811 (the NOTE
+  // above the actor in main.mo keeps the record). Legacy rows surface with
+  // reason = null.)
 
   public type DepositRecord = {
     token     : TokenId;

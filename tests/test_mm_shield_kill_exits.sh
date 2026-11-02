@@ -17,7 +17,9 @@
 #   B. FOK kill at release              (releaseDeferred, depth short)
 #   C. post-only maker-or-kill          (releaseDeferred, book crosses)
 #   D. FOK oracle-stall kill            (processDeferredExpiry FOK branch)
-#   E. LANDING retains the shield       (control: a landed intent still shields)
+#   E. LANDING lapses the shield        (H-24 / D1: a landed intent no longer shields —
+#                                        this section was the opposite control until 2026-09-05)
+#   F. IN FLIGHT holds the shield       (control: a commensurate staged intent shields)
 # The initial-margin #none kill exit is cleared in code too but is not
 # exercisable here: clampToInitialMargin returns #full for any owner without a
 # margin account, margin accounts are pool-only, and pool principals never call
@@ -27,6 +29,7 @@
 # ⚠️ Calls resetExchange.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -35,23 +38,22 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-MM=$(mkid ms_mm); PLN=$(mkid ms_pln); WHL=$(mkid ms_whl)
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-mm()  { icp canister call --identity ms_mm  backend "$@" 2>&1; }
-pln() { icp canister call --identity ms_pln backend "$@" 2>&1; }
-whl() { icp canister call --identity ms_whl backend "$@" 2>&1; }
+mdx_identity_new ms_mm; MM=$(principal_of ms_mm); mdx_identity_new ms_pln; PLN=$(principal_of ms_pln); mdx_identity_new ms_whl; WHL=$(principal_of ms_whl)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mm()  { icp canister call --candid "$MDX_CANDID" --identity ms_mm  backend "$@" 2>&1; }
+pln() { icp canister call --candid "$MDX_CANDID" --identity ms_pln backend "$@" 2>&1; }
+whl() { icp canister call --candid "$MDX_CANDID" --identity ms_whl backend "$@" 2>&1; }
 release() { adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null; adm requoteAmm '("BTC-ICPUSD")' >/dev/null; }
 last_trade_id() { adm getRecentTrades '("BTC-ICPUSD")' | grep -oE "id = [0-9_]+ : nat" | tail -1 | grep -oE "[0-9_]+" | tr -d '_'; }
-fills_since()   { icp canister call --identity "$1" backend getMyTradesSinceId "(${2:-0} : nat, 50 : nat)" 2>&1 | tr -d '_'; }
-staged_id()     { icp canister call --identity "$1" backend getMyStagedOrderIds '()' 2>&1 | tr -d '_' | grep -oE "[0-9]+" | head -1; }
+fills_since()   { icp canister call --candid "$MDX_CANDID" --identity "$1" backend getMyTradesSinceId "(${2:-0} : nat, 50 : nat)" 2>&1 | tr -d '_'; }
+staged_id()     { icp canister call --candid "$MDX_CANDID" --identity "$1" backend getMyStagedOrderIds '()' 2>&1 | tr -d '_' | grep -oE "[0-9]+" | head -1; }
 
 # Fresh fixture per section: the shield stamps are owner-level with a 30s TTL,
 # so each section re-arms and probes well inside one TTL window.
 fixture() {
   adm resetExchange "()" >/dev/null 2>&1 || true
   adm createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1 || true
-  adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, 0 : nat, 0:nat, 10:nat, 5:nat)" >/dev/null
+  adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, 0 : nat, 0:nat, 10:nat)" >/dev/null
   adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
   adm enableAmm '("BTC-ICPUSD", true)' >/dev/null 2>&1 || true
   for P in "$MM" "$PLN" "$WHL"; do
@@ -61,8 +63,9 @@ fixture() {
   # Earn L4 (the shielded tier): W = 2×$50k ≥ the $100k bar + qualified uptime.
   adm setTestScorecard "(principal \"$MM\", $(e8 50000) : nat, 0 : nat, 30 : nat, 25 : nat)" >/dev/null
   # The book the probe chooses from: MM's BETTER ask vs the plain user's WORSE
-  # ask; both rest. (The MM placement arms a stamp too — irrelevant: the kill
-  # under test deletes the owner-level stamp outright, whoever wrote it last.)
+  # ask; both rest. (Since H-24 the MM placement arms NO stamp — nothing of
+  # theirs is resting yet, so it is not a repricing intent; the killer intents
+  # below are sized/priced to be one: ≥ 20% of the $10,016 book, within 2%.)
   mm  placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 50080) : nat, $(e8 0.2) : nat)" >/dev/null
   pln placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 50120) : nat, $(e8 0.2) : nat)" >/dev/null
   release
@@ -102,7 +105,8 @@ fixture
 # Killer intent: non-crossing buy with a 2s good-till; by release time it has
 # lapsed → the W4-06 kill fires (record + return), which must clear the stamps.
 # (GTD 2s + sleep 4 is the proven test_w4_correctness_batch §4 pattern.)
-mm placeLimitOrderExp "(\"BTC-ICPUSD\", variant { buy }, $(e8 49000) : nat, $(e8 0.05) : nat, opt (2 : nat))" >/dev/null
+# 0.05 @ 49600 = $2,480 (24.8% of the book), 0.8% off the mark → stamps (H-24).
+mm placeLimitOrderExp "(\"BTC-ICPUSD\", variant { buy }, $(e8 49600) : nat, $(e8 0.05) : nat, opt (2 : nat))" >/dev/null
 sleep 4
 release
 if [ -z "$(staged_id ms_mm)" ]; then ok "A: the expired intent was killed at release (nothing staged)"
@@ -141,14 +145,27 @@ if [ -z "$(staged_id ms_mm)" ]; then ok "D: the stalled FOK intent was killed by
 else nok "D: killer intent still staged" "$(staged_id ms_mm)"; fi
 probe_expect_cleared "D"
 
-echo "── E. control: a LANDED intent keeps its shield ──"
+echo "── E. a LANDED intent no longer shields (H-24 / D1) ──"
 fixture
-# Fresh intent that lands cleanly (non-crossing sell rests on the book): the
-# stamp is the repricing intent that just landed — the fallback must still
-# skip the MM's book and fill the plain user's worse ask.
+# A commensurate intent (0.05 @ 50090 = $2,504.5, 25% of the book, 0.18% off
+# the mark) that lands cleanly (non-crossing sell rests on the book). Until
+# 2026-09-05 this section was the POSITIVE control — "the stamp IS the
+# repricing intent that just landed, so it still shields". D1 reversed it:
+# once the intent has landed nothing is in flight, so landMmShield drops the
+# stamp and the fallback takes the MM's better ask.
 mm placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 50090) : nat, $(e8 0.05) : nat)" >/dev/null
 release
-probe_expect_shielded "E"
+if [ -z "$(staged_id ms_mm)" ]; then ok "E: the intent landed (nothing staged)"
+else nok "E: intent still staged" "$(staged_id ms_mm)"; fi
+probe_expect_cleared "E"
+
+echo "── F. control: a commensurate intent IN FLIGHT shields ──"
+fixture
+# The same intent, staged but NOT released: the probe must skip the MM's book.
+# (Proves the probe still detects a shield — the sections above are not
+# passing because the shield stopped existing.)
+mm placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 50090) : nat, $(e8 0.05) : nat)" >/dev/null
+probe_expect_shielded "F"
 
 adm setTestTimersPaused '(false)' >/dev/null 2>&1 || true
 echo ""

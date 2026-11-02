@@ -18,6 +18,7 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -25,7 +26,7 @@ ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 refpx() { adm getAmmPool '("ICP-ICPUSD")' --query | tr -d '_' | grep -oE "refPrice = [0-9]+" | head -1 | grep -oE "[0-9]+"; }
 
 # The sim must be dead (header: it moves refPrice mid-assertion).
@@ -44,6 +45,15 @@ fi
 
 adm setTestTimersPaused '(true)' >/dev/null 2>&1 || true
 adm resetExchange "()" >/dev/null 2>&1 || true
+# EXIT HYGIENE (task 1788541235): every pin this suite sets is venue-global
+# and outlives it — a floor of 99 sources rejects EVERY later fetch on the
+# venue (marks frozen, "no fresh XRC anchor"), a test anchor feeds every
+# later fallback, a pend widens the AMM, paused timers stop the finaliser —
+# and the success path restored them only at its end. Restore on ANY exit,
+# through _lib.sh's on_exit (a bare `trap … EXIT` would replace the scratch
+# cleanup); the venue keeps the synthetic ICP mark this suite leaves, which
+# later fixtures pin for themselves (mdx_pin_mark).
+on_exit 'adm setTestMinSources "(null)" >/dev/null 2>&1; adm setTestXrcRate "(\"ICP\", null, null)" >/dev/null 2>&1; adm setTestPendingJump "(\"ICP\", null, null)" >/dev/null 2>&1; adm setXrcCanister "(null)" >/dev/null 2>&1; adm setTestTimersPaused "(false)" >/dev/null 2>&1'
 adm createAmmPool '("ICP-ICPUSD")' >/dev/null 2>&1 || true
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 3.0) : nat)" >/dev/null
 adm enableAmm '("ICP-ICPUSD", true)' >/dev/null 2>&1 || true
@@ -60,7 +70,7 @@ if [ "${P1:-x}" = "$(e8 3.0)" ]; then ok "refPrice frozen at \$3.00"; else nok "
 echo "── §2 floor unmet, in-breaker anchor → fallback applies ──"
 adm setTestXrcRate "(\"ICP\", opt ($(e8 2.95) : nat), null)" >/dev/null   # −1.7% vs 3.00 — inside the ±2.5% breaker
 R2=$(adm fetchAndSetRefPrice '("ICP-ICPUSD")')
-if echo "$R2" | grep -q "ok"; then ok "refresh succeeded via the fallback"; else nok "fallback should apply" "$R2"; fi
+if mdx_ok "$R2"; then ok "refresh succeeded via the fallback"; else nok "fallback should apply" "$R2"; fi
 P2=$(refpx)
 if [ "${P2:-x}" = "$(e8 2.95)" ]; then ok "refPrice = the XRC anchor (\$2.95)"; else nok "refPrice != anchor" "px=$P2"; fi
 EV=$(adm getRecentEvents '(30 : nat)' --query 2>/dev/null | grep -c "XRC FALLBACK")
@@ -87,7 +97,7 @@ R4=$(adm fetchAndSetRefPrice '("ICP-ICPUSD")')
 # from the test's synthetic \$2.95 mark (the breaker holding a big jump is
 # correct); with providers down it's the frozen-price error. All are correct —
 # what must NOT happen is a trap or a fallback application (no anchor exists).
-if echo "$R4" | grep -qE "ok|no fresh XRC anchor|below floor|pending confirmation"; then
+if mdx_ok "$R4" || echo "$R4" | grep -qE "no fresh XRC anchor|below floor|pending confirmation"; then
   ok "primary path restored (result: $(echo "$R4" | head -c 60)…)"
 else nok "unexpected outcome with the pin released" "$R4"; fi
 
@@ -134,7 +144,7 @@ if [ -n "$LIVE" ]; then
   adm setTestXrcRate "(\"ICP\", opt ($FAR : nat), null)" >/dev/null
   R6=$(adm fetchAndSetRefPrice '("ICP-ICPUSD")')
   DIV=$(adm getCanisterInfo '()' --query | tr -d '\n' | tr -s ' ' | grep -oE "oracleDivergence = vec \{[^}]*\}" | head -1)
-  if echo "$R6" | grep -q "ok"; then
+  if mdx_ok "$R6"; then
     if echo "$DIV" | grep -q '"ICP"'; then
       ok "healthy accept vs far anchor raised the divergence alarm"
     else nok "accept happened but no alarm" "div=[$DIV] r=[$R6]"; fi

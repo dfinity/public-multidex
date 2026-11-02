@@ -11,9 +11,11 @@ Two related lifecycle leaks at the same three spawn sites.
 
 **(a) Unrecorded spawn.** `archive0 := ?fresh` / `_archiveNext := ?fresh` happen only in the
 *continuation* of `await Archive.Archive(...)`. The canister exists the moment the call returns; the
-record of it exists only if the continuation runs. An upgrade landing in that window leaks a
+record of it exists only if the continuation runs. A continuation that never runs leaks a
 3T-cycle canister that main controls but can no longer fund (`allArchivePrincipals` never learns of
-it), list, or delete.
+it), list, or delete. (The report's trigger was an upgrade landing in that window; #55 (d) later
+measured that an upgrade cannot land inside an `await` on this toolchain — the real triggers are an
+install that throws or traps, and a wipe racing the spawn: see the addendum.)
 
 **(b) Swallowed cleanup.** When a reset races a spawn, the epoch guard destroys the orphan with
 `try { await ic00.stop_canister(…); await ic00.delete_canister(…) } catch (_) {}`. A bare swallow: if
@@ -43,7 +45,8 @@ fixes are wanted.
 
 ## Done when
 
-- [x] A spawn interrupted by an upgrade leaves a reconcilable record
+- [x] A spawn whose install continuation never runs (the report said: interrupted by an upgrade —
+      see the addendum) leaves a reconcilable record
 - [x] A failed epoch-race cleanup logs the principal
 - [x] The reconciler is idempotent and cannot adopt someone else's canister
 - [x] A test drives spawn-then-lost-continuation and asserts the principal is recoverable
@@ -55,6 +58,21 @@ Spawns are TWO-STEP (`spawnArchive`): `create_canister` first, the principal rec
 `#install`. All three sites use the helper (hygiene §6j pins that no one-shot spawn remains). A
 heartbeat reconciler (60s, isolated) stops-and-deletes a recorded orphan older than 5 minutes —
 idempotent, and it can only ever touch principals it recorded itself. The three epoch-race
-cleanups log the principal on failure instead of swallowing it. The upgrade-mid-await scenario
-itself cannot be staged deterministically from a test; the structure is pinned and the reconciler
-path is exercised by inspection (`_pendingSpawn` null in steady state).
+cleanups log the principal on failure instead of swallowing it. The lost-continuation scenario
+itself cannot be staged deterministically from a test (and its upgrade-mid-await form cannot occur
+on this toolchain at all — #55 (d), measured); the structure is pinned and the reconciler path is
+exercised by inspection (`_pendingSpawn` null in steady state).
+
+**Addendum 2026-11-02** (task `1793577101`, the round-18 comments-only pass): #55 (d) measured on
+this build that an upgrade cannot land inside an `await` — `install_code` in upgrade mode traps in
+`canister_pre_upgrade` ("attempted with outstanding message callbacks") while a call is
+outstanding — so the "upgrade landing in that window" premise above is retired; the leak was real
+for its other triggers. The one that bit was a wipe racing a spawn: `performWorldWipe` zeroed the
+spawn cooldown mid-install, the next beat re-spawned and overwrote the record (no spawn site checked
+it, and the reconciler cleared it unconditionally) — #55 "orphan slot overwritten", task
+`1788465033` (merged `6eea73c`): the slot is now a busy guard (`spawnSlotBusy`, a transient
+`_spawnInFlight` latch over the whole create+install span), both clears compare-and-clear, an
+install failure logs the principal, and `getCanisterInfo.pendingSpawn` lists the slot. The stable
+record and the 5-minute reconciler stay, for an install that throws or traps and for an orphan
+whose record must outlive an upgrade landing between the failed install and the reaper's gate.
+Live twin: `tests/test_archive_failover.sh` §S; hygiene §6x pins the structure.

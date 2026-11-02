@@ -19,6 +19,7 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
@@ -29,8 +30,7 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 # call args; from_e8 converts base→human so the human-scale assertions stay valid.
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm()  { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm()  { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 # The AMM's inventory lives under its own principal — resolve it LIVE (a
 # hardcoded id goes stale on every redeploy and silently zeroes the AMM's
 # side of the conservation sums).
@@ -42,25 +42,25 @@ bal()  { local n; n=$(adm getTestBalance "(principal \"$1\", \"$2\")" | tr -d '_
 treas() { local n; n=$(adm getTreasury '()' | tr -d '_' | grep -oE "balanceUsd = [0-9]+" | grep -oE "[0-9]+"); [ -z "$n" ] && n=0; from_e8 "$n"; }
 freshrequote() { adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null; adm requoteAmm '("ICP-ICPUSD")' >/dev/null; }
 # Count of UA's staged (off-book) orders, and whether the book has a price ≈ arg (human).
-ua_staged() { icp canister call --identity amm_uA backend getMyStagedOrderIds '()' 2>&1 | grep -oE "[0-9_]+ : nat" | wc -l | tr -d ' '; }
+ua_staged() { icp canister call --candid "$MDX_CANDID" --identity amm_uA backend getMyStagedOrderIds '()' 2>&1 | grep -oE "[0-9_]+ : nat" | wc -l | tr -d ' '; }
 # Book prices are base-unit Nats now — compare against e8(threshold) with an e8(0.02) band.
 book_has_price() { local t; t=$(e8 "$1"); adm getOrderBook '("ICP-ICPUSD")' 2>&1 | tr -d '_' | grep -oE "price = [0-9]+" | grep -oE "[0-9]+" | awk -v t="$t" 'function abs(x){return x<0?-x:x} abs($1-t)<2000000{f=1} END{print (f?"yes":"no")}'; }
 
-S=$(mkid amm_seed); UA=$(mkid amm_uA); UB=$(mkid amm_uB)
-seed(){ icp canister call --identity amm_seed backend "$@" 2>&1; }
-u()   { icp canister call --identity amm_uA backend "$@" 2>&1; }
-v()   { icp canister call --identity amm_uB backend "$@" 2>&1; }
-uorders_market() { icp canister call --identity amm_uA backend getMyOrdersOnMarket '("ICP-ICPUSD")' 2>&1; }
+mdx_identity_new amm_seed; S=$(principal_of amm_seed); mdx_identity_new amm_uA; UA=$(principal_of amm_uA); mdx_identity_new amm_uB; UB=$(principal_of amm_uB)
+seed(){ icp canister call --candid "$MDX_CANDID" --identity amm_seed backend "$@" 2>&1; }
+u()   { icp canister call --candid "$MDX_CANDID" --identity amm_uA backend "$@" 2>&1; }
+v()   { icp canister call --candid "$MDX_CANDID" --identity amm_uB backend "$@" 2>&1; }
+uorders_market() { icp canister call --candid "$MDX_CANDID" --identity amm_uA backend getMyOrdersOnMarket '("ICP-ICPUSD")' 2>&1; }
 
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1   # quiesce background timers for a deterministic run
 adm createAmmPool '("ICP-ICPUSD")' >/dev/null 2>&1
 # (quoteDepthBase is a base-unit Nat quantity now; spread/levels/spacing/window stay plain nats.)
-adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 100.0) : nat, 5:nat, 10:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 100.0) : nat, 5:nat, 10:nat)" >/dev/null
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICP\", $(e8 10000.0) : nat)"     >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICPUSD\", $(e8 100000.0) : nat)" >/dev/null
-seed seedAmmPool "(\"ICP-ICPUSD\", $(e8 10000.0) : nat, $(e8 100000.0) : nat)" >/dev/null
+mdx_lp_deposit amm_seed "ICP-ICPUSD" "$(e8 10000.0)" "$(e8 100000.0)" >/dev/null
 adm enableAmm '("ICP-ICPUSD", true)' >/dev/null
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null
 for t in ICP ICPUSD; do adm setTestBalance "(principal \"$UA\", \"$t\", $(e8 0.0) : nat)" >/dev/null; adm setTestBalance "(principal \"$UB\", \"$t\", $(e8 0.0) : nat)" >/dev/null; done
@@ -83,7 +83,7 @@ echo ""
 echo "── 1. Limit buy 5 @ 10.3 → STAGED (off-book, in Open Orders as #staged, 0 filled) ──"
 RES=$(u placeLimitOrder "(\"ICP-ICPUSD\", variant { buy }, $(e8 10.3) : nat, $(e8 5.0) : nat)")
 ICP_P=$(bal "$UA" ICP); NST=$(ua_staged); ON_BOOK=$(book_has_price 10.3)
-if echo "$RES" | grep -q "ok" \
+if mdx_ok "$RES" \
    && awk -v x="$ICP_P" 'BEGIN{exit (x<0.0000001?0:1)}' \
    && [ "$NST" -ge 1 ] && [ "$ON_BOOK" = "no" ]; then
   ok "staged: 0 filled, in owner's staged list ($NST), NOT on public book (no bid @ 10.3)"

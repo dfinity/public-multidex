@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/_lib.sh"
 echo "── test_min_order ──"
 setup_mode matching   # BTC-ICPUSD market, no AMM pool
 
-icp identity new dusty --storage plaintext 2>/dev/null || true
+mdx_identity_new dusty
 DU=$(principal_of dusty)
 # Rich in ICPUSD; a DUST BTC balance worth ~$6 at the test price of 60,000.
 call setTestBalance "(principal \"$DU\", \"ICPUSD\", $(e8 100000) : nat)" --identity alice > /dev/null
@@ -27,14 +27,14 @@ A=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 60000) : nat, $
 assert_contains "limit buy \$6 refused" "$A" "below the"
 # …at the minimum → accepted
 B=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 60000) : nat, $(e8 0.0002) : nat)" --identity dusty)   # $12
-assert_contains "limit buy \$12 accepted" "$B" "ok"
+assert_ok "limit buy \$12 accepted" "$B"
 
 # (2) limit SELL of HALF the dust balance → refused (not a full dust-out)
 C=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 60000) : nat, $(e8 0.00005) : nat)" --identity dusty) # $3 of $6
 assert_contains "half-dust sell refused" "$C" "below the"
 # …selling the ENTIRE remaining BTC → exempt, accepted ($6 < $10 but it's all of it)
 D=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 60000) : nat, $(e8 0.0001) : nat)" --identity dusty)
-assert_contains "full dust-out sell accepted" "$D" "ok"
+assert_ok "full dust-out sell accepted" "$D"
 
 # (3) market SELL below the minimum with a rich balance → refused.
 #     Needs an AMM ref price for the notional anchor: create+price the pool

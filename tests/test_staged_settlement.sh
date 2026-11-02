@@ -16,9 +16,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_lib.sh"
 
 echo "── test_staged_settlement ──"
-setup_mode pending   # alice: BUY 1.0 BTC @ 75000 (staged→resting); bob: 5 BTC
+setup_mode staged    # alice: BUY 1.0 BTC @ 75000 (staged→resting); bob: 5 BTC
 
-# Treasury baseline (the pending seed resets the exchange, so this is 0).
+# Treasury baseline (the staged seed resets the exchange, so this is 0).
 TRE0=$(extract_nat lifetimeFeesUsd "$(call getTreasury '()')")
 # Alice's BTC baseline: the fixture sets her ICPUSD but does NOT zero her BTC
 # (identities persist across seeds), so assert the DELTA of the buy, not an

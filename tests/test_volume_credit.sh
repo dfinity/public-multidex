@@ -16,6 +16,7 @@
 # Needs #dev. ⚠️ resetExchange for a clean scorecard.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
@@ -23,21 +24,20 @@ pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-A=$(mkid vc_a); B=$(mkid vc_b); M=$(mkid vc_m)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mdx_identity_new vc_a; A=$(principal_of vc_a); mdx_identity_new vc_b; B=$(principal_of vc_b); mdx_identity_new vc_m; M=$(principal_of vc_m)
 
 STOPPER="$SCRIPT_DIR/../scripts/stop_bots_local.sh"
 [ -f "$STOPPER" ] && { bash "$STOPPER" >/dev/null 2>&1 || true; sleep 2; }
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1
-SEED=$(mkid vc_seed)
+mdx_identity_new vc_seed; SEED=$(principal_of vc_seed)
 adm createAmmPool '("ICP-ICPUSD")' >/dev/null 2>&1
-adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 300.0) : nat, 5:nat, 10:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 300.0) : nat, 5:nat, 10:nat)" >/dev/null
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICP\", $(e8 20000.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICPUSD\", $(e8 300000.0) : nat)" >/dev/null
-icp canister call --identity vc_seed backend seedAmmPool "(\"ICP-ICPUSD\", $(e8 20000.0) : nat, $(e8 200000.0) : nat)" >/dev/null 2>&1
+mdx_lp_deposit vc_seed "ICP-ICPUSD" "$(e8 20000.0)" "$(e8 200000.0)" >/dev/null 2>&1
 adm enableAmm '("ICP-ICPUSD", true)' >/dev/null
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null
 
@@ -47,9 +47,9 @@ echo "── §1 direct fill credits BOTH parties ──"
 adm setTestBalance "(principal \"$B\", \"ICP\", $(e8 2000.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$A\", \"ICPUSD\", $(e8 45000.0) : nat)" >/dev/null
 # B rests a passive ask at 10.5 (non-crossing); A lifts it with a staged buy.
-icp canister call --identity vc_b backend placeLimitOrder "(\"ICP-ICPUSD\", variant { sell }, $(e8 10.40) : nat, $(e8 1100.0) : nat)" >/dev/null 2>&1
+icp canister call --candid "$MDX_CANDID" --identity vc_b backend placeLimitOrder "(\"ICP-ICPUSD\", variant { sell }, $(e8 10.40) : nat, $(e8 1100.0) : nat)" >/dev/null 2>&1
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null; adm requoteAmm '("ICP-ICPUSD")' >/dev/null   # release → rests
-icp canister call --identity vc_a backend placeLimitOrder "(\"ICP-ICPUSD\", variant { buy }, $(e8 10.45) : nat, $(e8 2700.0) : nat)" >/dev/null 2>&1
+icp canister call --candid "$MDX_CANDID" --identity vc_a backend placeLimitOrder "(\"ICP-ICPUSD\", variant { buy }, $(e8 10.45) : nat, $(e8 2700.0) : nat)" >/dev/null 2>&1
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null; adm requoteAmm '("ICP-ICPUSD")' >/dev/null   # release → crosses B
 # Badges award on the (heartbeat-cadenced) volume pass — resume timers and
 # poll one tier tick.
@@ -69,7 +69,7 @@ adm setTestBalance "(principal \"$M\", \"ICPUSD\", $(e8 30000.0) : nat)" >/dev/n
 # M rests a passive bid at 9.60 (below the AMM band), then the mark FALLS so
 # the AMM's fresh asks land under M's bid → the GEPTOR sweep fills M vs the
 # AMM. M never takes; only the sweep path settles this.
-icp canister call --identity vc_m backend placeLimitOrder "(\"ICP-ICPUSD\", variant { buy }, $(e8 9.60) : nat, $(e8 1100.0) : nat)" >/dev/null 2>&1
+icp canister call --candid "$MDX_CANDID" --identity vc_m backend placeLimitOrder "(\"ICP-ICPUSD\", variant { buy }, $(e8 9.60) : nat, $(e8 1100.0) : nat)" >/dev/null 2>&1
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null; adm requoteAmm '("ICP-ICPUSD")' >/dev/null   # release → rests at 9.60
 R=$(adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 9.40) : nat)")   # mark drops 6% — M's bid is now rich vs the AMM ask
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null                     # requote + sweep takes M's bid
@@ -87,7 +87,7 @@ else nok "sweep fill still uncredited (the finding)" "badges: $(adm getUserBadge
 # the SPECIFIC series the fix moves: the swept fill must land in MAKER
 # volume (engine stamps the re-homed order's pre-reserved id; attribution
 # keys off a non-zero id).
-MVOL=$(icp canister call --identity vc_m backend getAccessPolicy '()' --query 2>/dev/null | tr -d '_\n' | tr -s ' ' | grep -oE 'myMakerVolUsd = [0-9]+' | grep -oE '[0-9]+$')
+MVOL=$(icp canister call --candid "$MDX_CANDID" --identity vc_m backend getAccessPolicy '()' --query 2>/dev/null | tr -d '_\n' | tr -s ' ' | grep -oE 'myMakerVolUsd = [0-9]+' | grep -oE '[0-9]+$')
 if [ "${MVOL:-0}" -gt 0 ]; then
   ok "swept fill landed in MAKER volume (myMakerVolUsd=$MVOL) — the role, not just the volume"
 else nok "swept maker still binned as taker (the R2 role bug)" "myMakerVolUsd=${MVOL:-unreadable}"; fi
@@ -101,7 +101,7 @@ echo "── §3 the swept maker pays the MAKER rate (W4-22: 'never pays taker')
 # venue physics — jump breaker, vol-EWMA clamp, pend widening, GEPTOR
 # staging, spread geometry — and lives as its own fixture now:
 # tests/test_po_sweep_fee.sh, which documents how each trap is dodged.)
-ROW=$(icp canister call --identity vc_m backend getMyTradesSinceId '(0 : nat, 5 : nat)' --query 2>/dev/null | tr -d '_\n' | tr -s ' ')
+ROW=$(icp canister call --candid "$MDX_CANDID" --identity vc_m backend getMyTradesSinceId '(0 : nat, 5 : nat)' --query 2>/dev/null | tr -d '_\n' | tr -s ' ')
 FEE=$(echo "$ROW" | grep -oE 'buyer = [0-9]+' | head -1 | grep -oE '[0-9]+$')
 QTY=$(echo "$ROW" | grep -oE 'quantity = [0-9]+' | head -1 | grep -oE '[0-9]+$')
 PRC=$(echo "$ROW" | grep -oE 'price = [0-9]+' | head -1 | grep -oE '[0-9]+$')

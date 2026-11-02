@@ -80,6 +80,39 @@ if [ ${#ALL_TESTS[@]} -eq 0 ] && [ "$BUILTIN_MATCH" = "false" ]; then
   exit 2
 fi
 
+# STALE SCRATCH SWEEP (task 1788742727). Every _lib suite gets ONE private
+# per-run directory `$MDX_RUN_DIR/test-<suite>.XXXXXX` (tests/_scratch.sh:
+# mktemp -d, 0700) that is removed ONLY by its EXIT trap — and a suite that
+# dies by SIGKILL (a harness timeout, the 30-min reaper, an operator killing a
+# wedged icp call, a reboot mid-run) never runs EXIT, so the directory stays.
+# Each orphan is harmless on its own (empty, gitignored) but they accumulate
+# silently on every seat; four sat under one seat's .run/ on 2026-09-07 and
+# were found only because someone happened to ls it. Sweep the ones that
+# cannot belong to a live run: a running suite's dir is minutes old, so
+# anything older than six hours is an orphan. DIRECTORIES ONLY, matched on the
+# six-char mktemp suffix: `.run/test-seed.log` (MDX_TEST_SEED_LOG) is a STABLE
+# FILE the operator reads after a failed fixture and must survive. Never
+# silent: one loud line per removal, with the age. MDX_RUN_DIR comes from its
+# ONE definition in scripts/lib/runfiles.sh (repo-local .run/, resolved from
+# that file's own location, so the cd above does not matter). BSD find on
+# bash 3.2: -mindepth/-maxdepth/-type d/-mmin are all portable there.
+# shellcheck source=../scripts/lib/runfiles.sh
+source "$SCRIPT_DIR/../scripts/lib/runfiles.sh"
+if [ -d "${MDX_RUN_DIR:-}" ]; then
+  _sweep_now=$(date +%s)
+  find "$MDX_RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name 'test-*.??????' -mmin +360 2>/dev/null \
+  | while IFS= read -r _stale; do
+      _m=$(stat -f %m "$_stale" 2>/dev/null || stat -c %Y "$_stale" 2>/dev/null || echo "$_sweep_now")
+      _age_min=$(( (_sweep_now - _m) / 60 ))
+      _age="$(( _age_min / 60 ))h $(( _age_min % 60 ))m"
+      if rm -rf "$_stale"; then
+        echo -e "${YELLOW}⚠ removed stale scratch dir ${_stale} (${_age} old) — a suite exited without its EXIT trap${NC}"
+      else
+        echo -e "${RED}⚠ could NOT remove stale scratch dir ${_stale} (${_age} old) — a suite exited without its EXIT trap; remove it by hand${NC}"
+      fi
+    done
+fi
+
 # Stop the trading simulator if it's running. Tests assert exact trade
 # counts and zero-order-book invariants; a 1Hz background simulator
 # would inject noise that flakes them. The simulator is started by
@@ -195,7 +228,7 @@ fi
 #   · frontend_security          — the certificate check is actually wired
 #     up and fails closed, the root key is never fetched from the host being
 #     verified, ai-connect.html cannot be pointed at another origin, no
-#     third-party script is loaded, the .ic-assets.json5 that SHIPS sets a CSP.
+#     third-party script is loaded, the _headers file that SHIPS sets the CSP.
 #   · frontend_display_integrity — the e8 money boundary (which fields scale,
 #     what a round trip preserves, no second divide at a render site), the
 #     units contract handed to the assistant vs what the backend projects,

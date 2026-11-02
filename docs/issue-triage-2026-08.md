@@ -98,6 +98,15 @@ real identity credential and is unscoped here. Their decision to withhold was co
 
 Credit: OhShii #11.4.
 
+**Follow-up (GHSA-63hp-3pxg-9mcc, 2026-09-03):** the `targets` remedy adopted for the third
+bullet is inert — the reporter measured that II's `prepare_delegation` takes no target list and
+every delegation carries `targets: None`. Resolved by making the consent text state what is
+minted (every canister, as this app's principal), turning the unscoped branch into an explicit
+confirmation BEFORE the POST (a discard drops the credential), labelling `targets` best-effort
+in the page, and stating the connector-side scope as an App Connect v1 contract requirement
+(the page's header comment; docs/session-policy.md "Security notes"). Pinned by
+`tests/frontend_security.test.mjs` §C6/C7.
+
 ### 1.3 One dust payment makes a short pool permanently un-liquidatable
 `pickCollateral` prefers ICPUSD unconditionally on `balance > 0` with no value floor; the
 derived repay floors to zero; `writeOffLoan` rejects zero; the driver does `break L` instead of
@@ -244,7 +253,7 @@ neither:
   `pre-mainnet-checklist.md:49` lists it as a required verification step. (OhShii #10.6c)
 
 Code-side privacy gaps that don't conflict with the doctrine: the `capitalUsd` join
-(OhShii #8.3), `order.id` de-anonymising partially-filled resting orders (#8.4a), and the
+(OhShii #8.3 — **decided 2026-09-05, D9: stays exact, see §6**), `order.id` de-anonymising partially-filled resting orders (#8.4a), and the
 `_nameEntropySeeded` latch with no `postupgrade` — a shape `src/bridge/main.mo` already
 documents and fixes (#8.4b).
 
@@ -355,6 +364,8 @@ Recorded for scoring, and because it calibrates how much to trust the rest.
 Both teams also flagged confidence honestly where they had not established a precondition
 (OhShii on the vault arrears window; Menese on the `capitalUsd` join's uniqueness), and
 verification could not close those either. That restraint is worth more than the errors cost.
+(The `capitalUsd` join was later closed by decision rather than verification — D9,
+2026-09-05, recorded in §6: the linkage is derivable by design, the columns stay exact.)
 
 ---
 
@@ -369,6 +380,17 @@ Recorded so the gaps are visible rather than assumed closed.
   `orderId`), but the archive's raw `getEventsRange` still returns the whole `#fill` variant, so
   the join survives there. Closing it properly means per-kind redaction on the archive surface —
   a larger change than this pass, tracked in §3.
+- **(DECISION RECORDED 2026-09-05, D9 / F18: the same doctrine — the linkage is derivable by
+  design, the columns stay exact; no bucketing)** **The `capitalUsd` join (OhShii #8.3) is not
+  closed.** `PublicLeaderRow` and the `#public_` OQL `leaderboard` entity publish
+  `profitUsd`/`capitalUsd`/`equityUsd`/`returnBps` at e8 precision, and the quote leg of
+  `capitalUsd` is the exact net public deposit/withdrawal flow, so one observed ICPUSD deposit
+  on the tape joins its principal to the row whose `capitalUsd` moved by that amount. The tape
+  is public and principal-attributed as a requirement of the transparency doctrine, so exact
+  columns add no exposure it does not already carry; bucketing (USD to $10, `returnBps` to
+  10 bps) would degrade auditor fidelity while implying a privacy the venue does not offer.
+  Consistent with W4-21 (above) and W6-10.1 (the pool ↔ owner join). Stated in `getApiDoc()`
+  beside those two and in `docs/oracle-settlement-and-transparency.md` §4.1.
 - ~~**The async-dispatch question in §1.6 is still open.**~~ **SETTLED 2026-08-04, by the
   compiler rather than the replica.** Moving the dispatch into a plain (non-`async`) helper made
   moc reject `ignore tickLiquidations()` with `M0047, send capability required, but not
@@ -576,7 +598,7 @@ was answered in writing rather than by code, with the reasoning recorded.
 |---|---|---|---|
 | #4 item 2 | W4-20 | CSP is verified by configuration, never by response headers | fixed |
 | #6 item 5 | W4-18 | Volume credit reaches the scorecard on exactly one settlement path | fixed |
-| #8 item 4a | W4-21 | The `order.id` ↔ `fill.orderId` join is only half-closed | decision — the join STAYS: the standalone verifier needs it, and the transparency doctrine outranks the privacy nicety; recorded in the design docs |
+| #8 item 4a | W4-21 | The `order.id` ↔ `fill.orderId` join is only half-closed | decision — the join STAYS: the standalone verifier needs it, and the transparency doctrine outranks the privacy nicety; recorded in §6 of this document (the "DECISION RECORDED 2026-08-15, W4-21" paragraph) |
 | #13 item 1 | W2-03 | `executeSwapCross` settles the sell leg, returns `#err`, and skips the fill-capture hooks | fixed |
 | #13 item 3 | W4-04 | `swap()` / `quoteSwap()` never range-check `maxSlippage` | fixed |
 | #14 | W4-05 | `cancelMyOrder` never consults `stagedReleasedAs` | fixed |
@@ -634,14 +656,15 @@ was answered in writing rather than by code, with the reasoning recorded.
 | #41 item 1 | W5-06 | Neither published build path works on a clean checkout | fixed |
 | #41 item 2 | W6-02 | The production gate does not match the code it gates | fixed |
 | found internally | W1-06 | Pocket-ic reaper trio: owner-resolution assumes port 8000, misfires under worktree parallelism | fixed |
-| found internally | W3-06 | The jump breaker judges independence on arrival clocks, and its candidate never ages | fixed |
-| found internally | W3-08 | Nine heartbeat subtasks run inline, so a trap in any one stops maintenance permanently | fixed |
+| #27 item 3, #17 item 2 | W3-06 | The jump breaker judges independence on arrival clocks, and its candidate never ages | fixed |
+| #5 item 7 | W3-08 | Nine heartbeat subtasks run inline, so a trap in any one stops maintenance permanently | fixed |
 | found internally | W3-09 | The deploy path never reads the Bridge's posture literal | fixed |
 | found internally | W4-19 | `_minSourcesOverride` can pin the source floor below the robustness floor | fixed |
 | found internally | W5-20 | The deploy path ships whatever candid is lying around | fixed |
 | found internally | W6-05 | Acknowledge rounds 2–6, and publish the scoring basis | open |
 | found internally | W6-06 | Answer the disclosure-channel question | open |
-| found internally | W6-08 | Latent OQL defects: a watch item, not work | open |
+| #21 part two, #39 correction | W6-08 | Latent OQL defects: a watch item, not work | open |
+| #53 → GHSA-h888-fcww-xq25 | round 18 | LP shares mint 1:1 at supply 0 against a vault still holding value — the residue of the last exit accrues to whoever deposits next; clause 4: board equity credits the non-withdrawable loan book | fixed — the final LP exit settles insurance arrears and sweeps any unreserved residue to the treasury, and the genesis deposit re-runs the sweep before minting, so the first post-zero depositor is minted against their own funds only; `tests/test_vault_lp.sh` (zero-supply case, red pre-fix; the GHSA-3j44 round-trip property kept beside it). Clause 4: decision — the NAV basis STAYS (§5 "LP equity on the leaderboard" in `docs/amm-vault-design.md`, 2026-09-03): the measured inflation was entirely the mint bug; instant withdrawability is a separate liquidity limit, and redemption at NAV with a pro-rata instant cap (locked-share model) shipped so board equity is realisable over time. Mirrored on fix, GHSA id kept (SECURITY.md) |
 
 ### 8.2 Corrections to this document made in this refresh
 
@@ -687,3 +710,4 @@ Recorded because the document promised to hold everyone to the same standard, in
   the change moves the failure rather than fixing it. Kept visible in §7.1; the eventual fix
   was the per-quote aggregation + depeg alarm (W3-05) and the floor-refusing override clamp
   (W4-19).
+- **GHSA-h888 / their `#7` clearance (OhShii, corrected their own clearance):** the `supply > 0 ∧ value == 0` refusal they had cited as closing the zero-supply class named one door and not the other — the mirror case (`supply == 0 ∧ value > 0`) was open. They reopened it themselves, reproduced it on a seeded local `#play` replica with the predictions written first, rated it three times against the published rubric's wording, and said so in the advisory. Fixed; row above.

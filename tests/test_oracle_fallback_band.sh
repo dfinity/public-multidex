@@ -15,6 +15,7 @@
 # (cap 8.0) expires into the users-only fallback. Expect: 9.85 fills, 8.5 intact.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -26,10 +27,9 @@ MKT="ICP-ICPUSD"
 # e8: human → base units (call args, grep needles); from_e8: base units → human.
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm()  { icp canister call --identity anonymous backend "$@" 2>&1; }
-a()    { icp canister call --identity ofb_user backend "$@" 2>&1; }
-w()    { icp canister call --identity ofb_whale backend "$@" 2>&1; }
+adm()  { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+a()    { icp canister call --candid "$MDX_CANDID" --identity ofb_user backend "$@" 2>&1; }
+w()    { icp canister call --candid "$MDX_CANDID" --identity ofb_whale backend "$@" 2>&1; }
 # Balances are Nat base units now — strip underscores, take the nat, → human.
 bal()  { local v; v=$(adm getTestBalance "(principal \"$1\", \"$2\")" | tr -d '_' | grep -oE "[0-9]+" | head -1); [ -n "$v" ] && from_e8 "$v"; }
 # quantity (human) resting at a given HUMAN bid price (or empty). Book qty/price
@@ -37,17 +37,25 @@ bal()  { local v; v=$(adm getTestBalance "(principal \"$1\", \"$2\")" | tr -d '_
 bid_qty() { local v; v=$(adm getOrderBook "(\"$MKT\")" | tr -d '_' | tr '\n' ' ' | tr -s ' ' | sed -E 's/.*bids = vec \{//' | grep -oE "quantity = [0-9]+ : nat; price = $(e8 "$1") " | grep -oE "quantity = [0-9]+" | grep -oE "[0-9]+" | head -1); [ -n "$v" ] && from_e8 "$v"; }
 freshrequote() { adm setAmmRefPrice "(\"$MKT\", $(e8 10.0):nat)" >/dev/null; adm requoteAmm "(\"$MKT\")" >/dev/null; }
 
-S=$(mkid ofb_seed); U=$(mkid ofb_user); W=$(mkid ofb_whale)
+mdx_identity_new ofb_seed; S=$(principal_of ofb_seed); mdx_identity_new ofb_user; U=$(principal_of ofb_user); mdx_identity_new ofb_whale; W=$(principal_of ofb_whale)
 
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1
+# EXIT HYGIENE (task 1788541235): this suite wipes the venue and quotes ICP at
+# a synthetic $10 on an ENABLED pool; a failure path used to leave the timers
+# paused for every later suite (the finaliser off), and the synthetic mark
+# stays a pend magnet for the live feed either way. Resume the timers and
+# clear ICP's breaker pend on ANY exit — through _lib.sh's on_exit (a bare
+# `trap … EXIT` would replace the scratch cleanup). Later fixtures that need
+# a live-agreeing mark pin it themselves (mdx_pin_mark).
+on_exit 'adm setTestTimersPaused "(false)" >/dev/null 2>&1; adm setTestPendingJump "(\"ICP\", null, null)" >/dev/null 2>&1'
 adm createAmmPool "(\"$MKT\")" >/dev/null 2>&1
 # setAmmConfig: only quoteDepthBase (2nd arg) is a base-unit Nat → e8.
-adm setAmmConfig "(\"$MKT\", 20:nat, $(e8 5.0):nat, 5:nat, 15:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"$MKT\", 20:nat, $(e8 5.0):nat, 5:nat, 15:nat)" >/dev/null
 adm setAmmRefPrice "(\"$MKT\", $(e8 10.0):nat)" >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICP\", $(e8 10000.0):nat)"     >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICPUSD\", $(e8 200000.0):nat)" >/dev/null
-icp canister call --identity ofb_seed backend seedAmmPool "(\"$MKT\", $(e8 10000.0):nat, $(e8 200000.0):nat)" >/dev/null 2>&1
+mdx_lp_deposit ofb_seed "$MKT" "$(e8 10000.0)" "$(e8 200000.0)" >/dev/null 2>&1
 adm enableAmm "(\"$MKT\", true)" >/dev/null
 adm setTestBalance "(principal \"$U\", \"ICPUSD\", $(e8 100000.0):nat)" >/dev/null
 adm setTestBalance "(principal \"$W\", \"ICP\", $(e8 1000.0):nat)"      >/dev/null

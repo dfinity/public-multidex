@@ -156,3 +156,93 @@ switch (BE.borrow(st5, mg5, acc5, noReserved, vault, bob, ICPUSD, 10_000_000_000
   case (#err(e)) { Runtime.trap("FAIL: over-boundary borrow refused: " # e) };
 };
 Debug.print("W5-03 fixtures green");
+
+// ── Task 1788516128: a SHORT close — accrue BEFORE sizing, then settle the
+// settlement-message base residue from quote under a cap. The close's buy-back
+// is sized from base held − base DEBT; read at the last accrual it under-asks
+// by the interest booked since, and the fill (a later message) leaves that
+// interest as base debt the pool holds no base to pay. Numbers: 1 BTC at 8 %
+// books 5 units over 21 s (round-down) and 1 more over the next 5 s.
+Debug.print("── 1788516128: short close — accrue-then-size + capped base-residue cash settle ──");
+let st6 = BE.emptyState();
+let mg6 = ME.emptyState();
+let acc6 = Accounts.emptyState();
+Accounts.setBalance(acc6, vault, "BTC", 1_000_000_000);               // the vault lends BTC (10)
+Accounts.setBalance(acc6, vault, ICPUSD, 0);
+switch (ME.open(mg6, bob, 0)) { case (#ok(_)) {}; case (#err(e)) { Runtime.trap(e) } };
+Accounts.setBalance(acc6, bob, ICPUSD, 10_000_000_000_000);           // $100k collateral
+switch (BE.borrow(st6, mg6, acc6, noReserved, vault, bob, "BTC", 100_000_000, 0, px)) { // short 1 BTC
+  case (#ok(_)) { Debug.print("  ✓ short: borrowed 1 BTC against $100k") };
+  case (#err(e)) { Runtime.trap("FAIL short borrow: " # e) };
+};
+// The pool sells the borrowed BTC: base 0, quote +$100k.
+Accounts.setBalance(acc6, bob, "BTC", 0);
+Accounts.setBalance(acc6, bob, ICPUSD, 20_000_000_000_000);
+let T_CALL : Int = 21_000_000_000;   // closePosition 21 s later
+eqN("stale read: loanOf at the last accrual is the bare principal (what the old close sized on)", BE.loanOf(st6, bob, "BTC"), 100_000_000);
+BE.accrueAll(st6, bob, T_CALL);
+eqN("accrue-then-size: the call-time debt carries 5 units of interest (1 BTC × 8 % × 21 s, round-down)", BE.loanOf(st6, bob, "BTC"), 100_000_005);
+let sized = BE.loanOf(st6, bob, "BTC");
+// The fill lands 5 s later: the pool bought exactly `sized` base; deleveragePool
+// accrues first (1788515291), repays in kind, and a residue of 1 unit remains.
+let T_FILL : Int = T_CALL + 5_000_000_000;
+Accounts.setBalance(acc6, bob, "BTC", sized);
+BE.accrueAll(st6, bob, T_FILL);
+eqN("settlement message: 1 more unit booked in flight", BE.loanOf(st6, bob, "BTC"), 100_000_006);
+switch (BE.repay(st6, acc6, vault, bob, "BTC", sized, T_FILL, px)) {
+  case (#ok(_)) {}; case (#err(e)) { Runtime.trap("FAIL in-kind repay: " # e) };
+};
+eqN("in-kind repay leaves the in-flight interest as BASE debt (1 unit)", BE.loanOf(st6, bob, "BTC"), 1);
+eqN("…and the pool holds no base to pay it", Accounts.getBalance(acc6, bob, "BTC"), 0);
+let CAP5 : Nat = 500_000_000;   // $5 — main.mo's BASE_RESIDUE_CASH_SETTLE_CAP_USD
+switch (BE.settleFromQuote(st6, acc6, vault, bob, "BTC", T_FILL, px, CAP5)) {
+  case (#ok(paid)) { eqN("cash settle: 1 unit at $100k costs $0.001, rounded UP against the borrower", paid, 100_000) };
+  case (#err(e)) { Runtime.trap("FAIL cash settle: " # e) };
+};
+eqN("cash settle: base debt gone", BE.loanOf(st6, bob, "BTC"), 0);
+truth("cash settle: loan entry deleted outright (no dust record survives)", not BE.hasLoanEntry(st6, bob));
+eqN("cash settle: the vault received the quote", Accounts.getBalance(acc6, vault, ICPUSD), 100_000);
+eqN("cash settle: the borrower paid it", Accounts.getBalance(acc6, bob, ICPUSD), 20_000_000_000_000 - 100_000);
+eqN("cash settle: idempotent — nothing left settles nothing", switch (BE.settleFromQuote(st6, acc6, vault, bob, "BTC", T_FILL, px, CAP5)) { case (#ok(p)) { p }; case (#err(_)) { 999 } }, 0);
+
+// A REAL short is never cash-settled: 1 BTC of debt at $100k is far over the
+// cap — refused, the loan and both balances untouched. And the cap is exact:
+// a residue worth exactly the cap settles, one worth a unit more does not.
+let st7 = BE.emptyState();
+let mg7 = ME.emptyState();
+let acc7 = Accounts.emptyState();
+Accounts.setBalance(acc7, vault, "BTC", 1_000_000_000);
+switch (ME.open(mg7, bob, 0)) { case (#ok(_)) {}; case (#err(e)) { Runtime.trap(e) } };
+Accounts.setBalance(acc7, bob, ICPUSD, 10_000_000_000_000);
+switch (BE.borrow(st7, mg7, acc7, noReserved, vault, bob, "BTC", 100_000_000, 0, px)) {
+  case (#ok(_)) {}; case (#err(e)) { Runtime.trap("FAIL real-short borrow: " # e) };
+};
+Accounts.setBalance(acc7, bob, "BTC", 0);
+Accounts.setBalance(acc7, bob, ICPUSD, 20_000_000_000_000);
+switch (BE.settleFromQuote(st7, acc7, vault, bob, "BTC", 0, px, CAP5)) {
+  case (#err(_)) { Debug.print("  ✓ cap: a real 1 BTC short ($100k) is REFUSED, not cash-settled") };
+  case (#ok(_)) { Runtime.trap("FAIL: a real short was cash-settled under the cap") };
+};
+eqN("cap refusal: debt untouched", BE.loanOf(st7, bob, "BTC"), 100_000_000);
+eqN("cap refusal: borrower's quote untouched", Accounts.getBalance(acc7, bob, ICPUSD), 20_000_000_000_000);
+eqN("cap refusal: vault's quote untouched", Accounts.getBalance(acc7, vault, ICPUSD), 0);
+switch (BE.settleFromQuote(st7, acc7, vault, bob, "BTC", 0, pxNone, 100_000_000_000_000)) {
+  case (#err(_)) { Debug.print("  ✓ no mark: refused even under an unbounded cap (never a free write-off)") };
+  case (#ok(_)) { Runtime.trap("FAIL: settled a debt with no mark") };
+};
+// Exactly-at-cap: 5_000 units at $100k = $5.00 settles under a $5 cap; 5_001 does not.
+Accounts.setBalance(acc7, bob, "BTC", 100_000_000 - 5_001);
+switch (BE.repay(st7, acc7, vault, bob, "BTC", 100_000_000 - 5_001, 0, px)) { case (#ok(_)) {}; case (#err(e)) { Runtime.trap("FAIL trim repay: " # e) } };
+eqN("boundary: 5_001 units of residue", BE.loanOf(st7, bob, "BTC"), 5_001);
+switch (BE.settleFromQuote(st7, acc7, vault, bob, "BTC", 0, px, CAP5)) {
+  case (#err(_)) { Debug.print("  ✓ boundary: $5.001 of residue is over the $5 cap — refused") };
+  case (#ok(_)) { Runtime.trap("FAIL: over-cap residue settled") };
+};
+Accounts.setBalance(acc7, bob, "BTC", 1);
+switch (BE.repay(st7, acc7, vault, bob, "BTC", 1, 0, px)) { case (#ok(_)) {}; case (#err(e)) { Runtime.trap("FAIL unit repay: " # e) } };
+switch (BE.settleFromQuote(st7, acc7, vault, bob, "BTC", 0, px, CAP5)) {
+  case (#ok(paid)) { eqN("boundary: exactly $5.00 of residue settles under the $5 cap", paid, 500_000_000) };
+  case (#err(e)) { Runtime.trap("FAIL at-cap settle: " # e) };
+};
+truth("boundary: entry deleted", not BE.hasLoanEntry(st7, bob));
+Debug.print("1788516128 fixtures green");

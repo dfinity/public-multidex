@@ -85,8 +85,9 @@
      hides it because Sign out lives in the dropdown). The parent header-right
      is display:none until the menu opens, so this only shows in the drawer. */
   .header.authed #auth-btn { display: block; }
-  /* All menu items — tabs and auth btn — share the same row style */
+  /* All menu items — tabs, the theme row and the auth btn — share the same row style */
   .header.menu-open .tabs .tab,
+  .header.menu-open .tabs .drawer-theme,
   .header.menu-open .header-right #auth-btn {
     width: 100%;
     text-align: left;
@@ -101,10 +102,15 @@
     transition: background 0.15s, color 0.15s;
   }
   .header.menu-open .tabs .tab:hover,
+  .header.menu-open .tabs .drawer-theme:hover,
   .header.menu-open .header-right #auth-btn:hover {
     background: var(--bg-input);
     color: var(--text);
   }
+  /* The theme switch heads the drawer as a row — icon + "Switch to … mode".
+     One control per breakpoint: the round header toggle is hidden here. */
+  .header.menu-open .tabs .drawer-theme { display: flex; align-items: center; gap: 10px; }
+  .header.menu-open .header-right .theme-toggle { display: none; }
   .header.menu-open .tabs .tab.active {
     background: var(--accent);
     color: var(--accent-text);
@@ -266,7 +272,7 @@
     overflow-y: auto;
     /* Same treatment as desktop: transparent + stronger cyan outline. */
     background: transparent;
-    border: 1.5px solid rgba(56, 189, 240, 0.45);
+    border: 1.5px solid var(--accent-outline);
     border-radius: var(--radius);
     padding: 10px;
   }
@@ -364,7 +370,7 @@
   .orderbook-asks::-webkit-scrollbar,
   .orderbook-bids::-webkit-scrollbar { width: 0; height: 0; display: none; }
   .orderbook-panel h3 { display: none; }
-  .ob-granularity { font-size: 12px; padding: 4px 8px; }
+  .ob-gran-trigger { font-size: 12px; padding: 4px 8px; }
   .ob-gran-option { padding: 12px 16px; font-size: 16px; }
   .ob-cumulative-btn { font-size: 11px; padding: 2px 6px; }
   .orderbook-toolbar { padding: 4px 0 0; }
@@ -430,8 +436,6 @@
   .market-header-spacer { display: none; }
   .market-header-price { font-size: 16px; font-weight: 600; }
   .market-price-change { font-size: 12px; }
-
-  .market-header #chart-btn { flex-shrink: 0; }
 
   /* ── View padding ────────────────────────────────────────────── */
   .view { padding: 12px; }

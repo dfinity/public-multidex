@@ -1,8 +1,12 @@
 // BorrowEngine.mo — borrow/repay primitives + health, in integer base units
 // (10^8 — see lib/Fixed.mo).
 //
-// Interest: lazy + linear, principal × apr × elapsed / YEAR, rounded UP (owed by
-// the user). Debt valued UP and collateral valued DOWN everywhere a health
+// Interest: lazy + linear, principal × apr × elapsed / YEAR, rounded DOWN with
+// carry-forward — deliberately: the clock (lastAccrualNs) only advances when at
+// least one whole unit books, so the un-booked fraction keeps accruing and
+// nothing is lost, it just books later (accrueLoan below; the earlier round-UP
+// minted a phantom minimum unit per touch and made dust shorts unclosable).
+// Debt is still VALUED up and collateral valued DOWN everywhere a health
 // decision is made — both push toward "more likely to be stopped/liquidated",
 // the protocol-safe direction.
 
@@ -57,7 +61,11 @@ module {
   // phantom interest, and it made dust shorts UNCLOSABLE: every close
   // bought the derived size at call time, and by settlement the debt had
   // regrown a unit (seen live: a 0.0000026 SOL short surviving repeated
-  // closes).
+  // closes). The remaining half of that shape — the interest a LARGE short
+  // books between the close's call and its settlement message — is closed
+  // by closePosition accruing before it sizes and deleveragePool settling
+  // the in-flight base residue from quote under a cap (settleFromQuote,
+  // task 1788516128).
   func accrueLoan(loan : Types.Loan, now : Int) : Types.Loan {
     if (now <= loan.lastAccrualNs) { return loan };
     let apr = switch (Types.borrowApr(loan.token)) { case (?r) { r }; case null { 0 } };
@@ -102,6 +110,13 @@ module {
       case (?m) { for ((token, loan) in Map.entries(m)) { sum += Fixed.mul(loan.principal, priceOf(token, priceLookup), true) } };
     };
     sum;
+  };
+
+  // Does this principal have a loan record at all (any token, any principal
+  // amount — a repaid loan whose entry survived counts)? Conservative
+  // emptiness input for the pool scans (H-30).
+  public func hasLoanEntry(state : LoanState, user : Principal) : Bool {
+    switch (userLoans(state, user)) { case null { false }; case (?_) { true } }
   };
 
   public func loanOf(state : LoanState, user : Principal, token : Types.TokenId) : Nat {
@@ -217,25 +232,61 @@ module {
     now            : Int,
     priceLookup    : PriceLookup,
   ) : Nat {
-    switch (Types.borrowApr(token)) { case (?_) { }; case null { return 0 } };
-    switch (MarginEngine.get(margin, user)) { case (?_) { }; case null { return 0 } };
+    switch (roomState(state, margin, accounts, reserved, vaultPrincipal, user, token, now, priceLookup)) {
+      case null { 0 };
+      case (?r) { Nat.min(healthRoom(r.collUsd, r.debtUsd, r.ltv, r.price), r.vaultRoom) };
+    };
+  };
+
+  // 1788652744: maxBorrowable's two halves, exposed so a book-walking probe
+  // can re-score a pool's room per SLICE from a carried (collateralUsd,
+  // debtUsd) pair "as if settled" — the same closed form the fill-time
+  // borrowCheck's inequality reduces to, evaluated on the state each settled
+  // slice leaves rather than once at current marks. roomState is the
+  // per-walk snapshot (accrueAll + the ≤5-token valuation, once per pool);
+  // healthRoom is the pure closed form (health = (C + a·ltv)/(D + a) ≥ R ⇒
+  // a ≤ (C − R·D)/(R − ltv), in `token` units) the walker re-runs per slice.
+  // null = the token cannot be borrowed at all (no APR, no margin account,
+  // no mark) — the caller scores cash alone.
+  public type RoomState = {
+    collUsd   : Nat;   // LTV-weighted collateral (reserved included), USD
+    debtUsd   : Nat;   // debt valued UP, USD
+    vaultRoom : Nat;   // vault cap − outstanding, in `token` units
+    ltv       : Nat;   // `token`'s margin LTV
+    price     : Nat;   // `token`'s mark (Fixed.SCALE for the quote)
+  };
+  public func roomState(
+    state          : LoanState,
+    margin         : MarginEngine.MarginState,
+    accounts       : Accounts.AccountState,
+    reserved       : MarginEngine.ReservedLookup,
+    vaultPrincipal : Principal,
+    user           : Principal,
+    token          : Types.TokenId,
+    now            : Int,
+    priceLookup    : PriceLookup,
+  ) : ?RoomState {
+    switch (Types.borrowApr(token)) { case (?_) { }; case null { return null } };
+    switch (MarginEngine.get(margin, user)) { case (?_) { }; case null { return null } };
     let price = priceOf(token, priceLookup);
-    if (price == 0) { return 0 };
+    if (price == 0) { return null };
     let ltv = switch (Types.marginLTV(token)) { case (?x) { x }; case null { 0 } };
-    if (Types.INITIAL_HEALTH_RATIO <= ltv) { return 0 };
     accrueAll(state, user, now);
-    let d = debtUsdTotal(state, user, priceLookup);
-    let c = MarginEngine.collateralValueUsd(
+    let debtUsd = debtUsdTotal(state, user, priceLookup);
+    let collUsd = MarginEngine.collateralValueUsd(
       MarginEngine.valuations(margin, accounts, reserved, user, priceLookup));
-    let rd = Fixed.mul(d, Types.INITIAL_HEALTH_RATIO, true);
-    let healthRoom : Nat = if (c > rd) {
-      Fixed.div(Fixed.div(c - rd, Types.INITIAL_HEALTH_RATIO - ltv, false), price, false)
-    } else { 0 };
     let vaultHolds  = Accounts.getBalance(accounts, vaultPrincipal, token);
     let maxOnLoan   = Fixed.mul(vaultHolds, Types.VAULT_BORROW_FRACTION_CAP, false);
     let outstanding = totalOutstanding(state, token);
     let vaultRoom : Nat = if (maxOnLoan > outstanding) { maxOnLoan - outstanding } else { 0 };
-    Nat.min(healthRoom, vaultRoom);
+    ?{ collUsd; debtUsd; vaultRoom; ltv; price };
+  };
+  public func healthRoom(collUsd : Nat, debtUsd : Nat, ltv : Nat, price : Nat) : Nat {
+    if (Types.INITIAL_HEALTH_RATIO <= ltv or price == 0) { return 0 };
+    let rd = Fixed.mul(debtUsd, Types.INITIAL_HEALTH_RATIO, true);
+    if (collUsd > rd) {
+      Fixed.div(Fixed.div(collUsd - rd, Types.INITIAL_HEALTH_RATIO - ltv, false), price, false)
+    } else { 0 };
   };
 
   public func borrow(
@@ -361,6 +412,46 @@ module {
     if (not Accounts.subtractBalance(accounts, user, Types.QUOTE_TOKEN, costUsd)) { return #err("Balance subtraction failed") };
     Accounts.addBalance(accounts, vaultPrincipal, Types.QUOTE_TOKEN, costUsd);
     ignore Map.delete(state, Text.compare, userKey(user));
+    #ok(costUsd)
+  };
+
+  // ── Settle ONE token's debt from QUOTE cash (task 1788516128) ──
+  // The per-token sibling of settleAllFromQuote: accrues `token`'s loan to
+  // `now`, values it at the mark ROUNDED UP against the borrower, refuses
+  // when the cost exceeds `maxUsd` (the caller's cap — the discriminator
+  // between an interest residue and a real position) or when no mark is
+  // known (a free write-off is never a settlement), moves the quote to the
+  // vault and deletes the entry outright. Other tokens' loans are untouched.
+  // Returns #ok(0) when there is nothing to settle.
+  public func settleFromQuote(
+    state          : LoanState,
+    accounts       : Accounts.AccountState,
+    vaultPrincipal : Principal,
+    user           : Principal,
+    token          : Types.TokenId,
+    now            : Int,
+    priceLookup    : PriceLookup,
+    maxUsd         : Nat,
+  ) : { #ok : Nat; #err : Text } {
+    let loans = switch (userLoans(state, user)) { case (?m) { m }; case null { return #ok(0) } };
+    let loan = switch (Map.get(loans, Text.compare, token)) {
+      case (?l) { accrueLoan(l, now) };
+      case null { return #ok(0) };
+    };
+    if (loan.principal == 0) { return #ok(0) };
+    let price = priceOf(token, priceLookup);
+    if (price == 0) { return #err("No mark for " # token # " — cannot value the debt.") };
+    let costUsd = Fixed.mul(loan.principal, price, true);
+    if (costUsd > maxUsd) {
+      return #err("Outstanding " # token # " debt exceeds the cash-settle limit — repay it in-kind first.");
+    };
+    if (Accounts.getBalance(accounts, user, Types.QUOTE_TOKEN) < costUsd) {
+      return #err("Insufficient " # Types.QUOTE_TOKEN # " to settle " # token # " debt from cash.");
+    };
+    if (not Accounts.subtractBalance(accounts, user, Types.QUOTE_TOKEN, costUsd)) { return #err("Balance subtraction failed") };
+    Accounts.addBalance(accounts, vaultPrincipal, Types.QUOTE_TOKEN, costUsd);
+    ignore Map.delete(loans, Text.compare, token);
+    if (Map.size(loans) == 0) { ignore Map.delete(state, Text.compare, userKey(user)) };
     #ok(costUsd)
   };
 };

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# pre-commit - the law-5 primary-checkout guard (ported from the open-saas
+# factory 2026-09-17; re-synced 2026-10-31 with guard C, the no-identity belt).
+#
+#   B. the law-5 guard: a CONSUMER SEAT identity (FACTORY_WORKER, else the
+#      nearest .factory-worker pin at/above the cwd) committing on main in
+#      the PRIMARY checkout is refused - consumers never develop in the
+#      primary (law 5, .claude/skills/mdex-software-factory/SKILL.md).
+#   C. the no-identity belt (open-saas task 1791133471, the 1dc9df2fa breach
+#      class): a commit on the primary's main with NO seat identity while
+#      any seat is pinned is refused too - a drifted executor subagent
+#      commits exactly like that. The operator's direct round declares
+#      itself with FACTORY_DIRECT=1 (or the identity 'operator').
+#
+# Guarded repo: the PRIMARY checkout only (git-dir == common-dir). Any
+# resolution failure fails OPEN. FACTORY_FORCE=1 overrides with a warning.
+# Wired by `git config core.hooksPath .githooks` (tests/test_deploy_hygiene.sh
+# pins the wiring and the refusal).
+set -u
+# ---- B. the law-5 primary-checkout guard (+ C, the no-identity belt) --------
+# Guarded repo: the PRIMARY checkout only. In the primary, git-dir and the
+# common dir are the same path (".git"); in a linked worktree the git-dir is
+# .git/worktrees/<name>. Any resolution failure fails OPEN.
+gd="$(git rev-parse --git-dir 2>/dev/null || true)"
+gc="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+[ -n "$gd" ] && [ -n "$gc" ] || exit 0
+[ "$gd" = "$gc" ] || exit 0
+
+branch="$(git branch --show-current 2>/dev/null || true)"
+[ "$branch" = "main" ] || exit 0
+
+# Seat identity: FACTORY_WORKER env, else the nearest .factory-worker pin
+# at/above the cwd (mirrors factory.sh's resolution; hooks run at the top of
+# the target working tree, where the primary legitimately has no pin).
+seat="${FACTORY_WORKER:-}"
+if [ -z "$seat" ]; then
+  d="$(pwd -P 2>/dev/null || pwd)"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/.factory-worker" ]; then
+      seat="$(head -1 "$d/.factory-worker" 2>/dev/null | tr -d '[:space:]')"
+      break
+    fi
+    d="$(dirname "$d")"
+  done
+fi
+if [ -z "$seat" ] || [ "$seat" = "operator" ] || [ "$seat" = "claude-operator" ]; then   # MULTI/DEX: the operator seat is pinned claude-operator
+  # ---- C. the no-identity belt --------------------------------------------
+  [ "${FACTORY_DIRECT:-}" = "1" ] && exit 0      # the operator's declared direct round
+  case "$seat" in operator|claude-operator) exit 0 ;; esac   # the operator's declared identity (our seat pin is claude-operator)
+  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$top" ] || exit 0
+  pins=""
+  for f in "$top"/.factory/seats/*/.factory-worker "$top"/.claude/worktrees/*/.factory-worker; do
+    [ -f "$f" ] && pins="$pins $(basename "$(dirname "$f")")"
+  done
+  # Linked worktrees anywhere else (a seat minted at an unusual path).
+  while IFS= read -r w; do
+    [ -n "$w" ] && [ "$w" != "$top" ] && [ -f "$w/.factory-worker" ] || continue
+    case " $pins " in *" $(basename "$w") "*) ;; *) pins="$pins $(basename "$w")" ;; esac
+  done <<EOF
+$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+EOF
+  [ -n "$pins" ] || exit 0                        # no factory running: plain checkout, fail-open
+  if [ "${FACTORY_FORCE:-}" = "1" ]; then
+    echo "pre-commit: warning: no-identity belt overridden (FACTORY_FORCE=1) on the primary's main while seats are pinned:$pins" >&2
+    exit 0
+  fi
+  {
+    echo "pre-commit: REFUSED - a commit on main in the PRIMARY checkout with NO seat identity while a factory is running (seat pins:$pins)."
+    echo "  A drifted executor subagent commits exactly like this (the 1dc9df2fa breach class, task 1791133471): its shell"
+    echo "  carries no FACTORY_WORKER and its cd target left the seat worktree, so the law-5 guard cannot see it."
+    echo "  If you ARE an executor or a consumer seat: cd to YOUR seat worktree (.factory/seats/<seat> - older seats:"
+    echo "  .claude/worktrees/<seat>), redo the change there, commit on your claude/<seat> branch, and land it through"
+    echo "  the merge protocol (scripts/factory.sh merge-lock acquire <branch>; .claude/skills/mdex-software-factory/SKILL.md TaskConsumer step 6). Put the"
+    echo "  line 'scripts/factory.sh executor-env' prints at the head of every Bash call so your identity travels with you."
+    echo "  If you ARE the operator's direct round on main (main.done rounds, tag-release): declare it -"
+    echo "    FACTORY_DIRECT=1 git commit ..."
+    echo "  Nothing is staged differently - your index is untouched. FACTORY_FORCE=1 overrides."
+  } >&2
+  exit 1
+fi
+
+if [ "${FACTORY_FORCE:-}" = "1" ]; then
+  echo "pre-commit: warning: law-5 primary-checkout guard overridden (FACTORY_FORCE=1) for seat '$seat'" >&2
+  exit 0
+fi
+
+{
+  echo "pre-commit: REFUSED - consumer seat '$seat' committing on main in the PRIMARY checkout (law 5)."
+  echo "  Consumers never do work in the primary: your cd target drifted (the 76e5c40d breach class)."
+  echo "  Remedy: cd to YOUR seat worktree (.claude/worktrees/<seat> (or .factory/seats/<seat>)), redo the change there,"
+  echo "  commit on your claude/<seat> branch, and land it through the merge protocol"
+  echo "  (scripts/factory.sh merge-lock acquire <branch>; .claude/skills/mdex-software-factory/SKILL.md TaskConsumer step 6)."
+  echo "  Nothing is staged differently - your index is untouched. FACTORY_FORCE=1 overrides."
+} >&2
+exit 1

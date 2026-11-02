@@ -31,6 +31,7 @@
 # Floor math: target=100 ICP, FLOOR_FRACTION=0.15 → floor=15 ICP.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -44,11 +45,10 @@ FLOOR=15.0   # 0.15 × target(100)
 # e8: human → base units (call args); from_e8: base units → human (reading money).
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm()  { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm()  { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 # Resolve the AMM principal LIVE — a hardcoded id goes stale on every redeploy.
 AMM=$(adm getAmmPrincipal '()' | grep -oE '"[a-z0-9-]+"' | tr -d '"')
-u()    { icp canister call --identity flr_whale backend "$@" 2>&1; }
+u()    { icp canister call --candid "$MDX_CANDID" --identity flr_whale backend "$@" 2>&1; }
 # Balances are Nat base units now — strip underscores, take the nat, → human.
 bal()  { local v; v=$(adm getTestBalance "(principal \"$1\", \"$2\")" | tr -d '_' | grep -oE "[0-9]+" | head -1); [ -n "$v" ] && from_e8 "$v"; }
 freshrequote() { adm setAmmRefPrice "(\"$MKT\", $(e8 10.0):nat)" >/dev/null; adm requoteAmm "(\"$MKT\")" >/dev/null; }
@@ -60,7 +60,7 @@ ask_levels() { adm getOrderBook "(\"$MKT\")" | tr '}' '\n' | sed -n '/asks =/,/b
 ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a >= b ? 0 : 1)}'; }    # a >= b
 lt() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a <  b ? 0 : 1)}'; }    # a <  b
 
-W=$(mkid flr_whale)
+mdx_identity_new flr_whale; W=$(principal_of flr_whale)
 
 # ── Setup: a fresh pool with skew/floor enabled (target=100, intensity=200) ──
 adm resetExchange "()" >/dev/null 2>&1 || true
@@ -68,11 +68,11 @@ adm setTestTimersPaused '(true)' >/dev/null 2>&1     # deterministic: no heartbe
 adm createAmmPool "(\"$MKT\")" >/dev/null 2>&1
 # spread 20bps · depth 10/level · 8 levels · spacing 15bps · window 5s
 # (setAmmConfig: only quoteDepthBase — the 2nd arg — is a base-unit Nat → e8.)
-adm setAmmConfig "(\"$MKT\", 20:nat, $(e8 10.0):nat, 8:nat, 15:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"$MKT\", 20:nat, $(e8 10.0):nat, 8:nat, 15:nat)" >/dev/null
 adm setAmmRefPrice "(\"$MKT\", $(e8 10.0):nat)" >/dev/null
 adm setTestBalance "(principal \"$AMM\", \"ICP\", $(e8 100.0):nat)"       >/dev/null
 adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", $(e8 300000.0):nat)" >/dev/null
-icp canister call --identity flr_whale backend whoami >/dev/null 2>&1
+icp canister call --candid "$MDX_CANDID" --identity flr_whale backend whoami >/dev/null 2>&1
 adm setTestBalance "(principal \"$W\", \"ICPUSD\", $(e8 50000000.0):nat)" >/dev/null
 adm setTestBalance "(principal \"$W\", \"ICP\", $(e8 0.0):nat)"           >/dev/null
 # target=100 (the seeded base), intensity=200bps → floor = 15 ICP

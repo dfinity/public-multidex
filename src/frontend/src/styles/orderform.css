@@ -28,9 +28,9 @@
    Active states: lighter weight (600 → 520) compensated by DARKER on-colour
    text (≈45% darker than the --*-text tokens, hue kept) — thinner strokes stay
    crisp against the colour fill. Scoped here; the global tokens are unchanged. */
-.order-type-btn.active { background: var(--glacier); color: #020C10; font-weight: 480; }
-.side-btn.buy.active { background: var(--green); color: #020B07; font-weight: 480; }
-.side-btn.sell.active { background: var(--red); color: #0D0302; font-weight: 480; }
+.order-type-btn.active { background: var(--glacier); color: var(--glacier-text); font-weight: 480; }
+.side-btn.buy.active { background: var(--green); color: var(--green-text); font-weight: 480; }
+.side-btn.sell.active { background: var(--red); color: var(--red-text); font-weight: 480; }
 
 /* ── Spot | Margin mode toggle ─────────────────────────────────────
    Top-level switch on the Place Order box: Spot trades the Wallet, Margin
@@ -55,7 +55,7 @@
   border-radius: 6px;
   transition: all 0.2s;
 }
-.order-mode-btn.active { background: var(--accent); color: #010B0F; }
+.order-mode-btn.active { background: var(--accent); color: var(--accent-text); }
 
 /* Margin-only controls (pool + leverage), shown in Margin mode. The row needs
    its own class: the legacy .margin-row (Earn-card rows) adds margin-top:10px,
@@ -228,7 +228,7 @@
    Buy (mint) and Sell (clay) fills the JS swaps in. Weight applies in every
    state; the colour only when enabled (disabled keeps the muted grey). */
 #place-order-btn { font-weight: 370; }
-#place-order-btn:not(:disabled) { color: #060706; }
+#place-order-btn:not(:disabled) { color: var(--green-text); }   /* white in light, near-black in dark — same as --red-text */
 
 .trade-row {
   display: grid;
@@ -250,17 +250,17 @@
 .trade-row-buy  .price { color: var(--green); }
 .trade-row-sell .price { color: var(--red); }
 @keyframes tradeFlash {
-  0%   { background: rgba(94, 230, 180, 0.32); }
-  40%  { background: rgba(94, 230, 180, 0.16); }
-  100% { background: rgba(94, 230, 180, 0); }
+  0%   { background: var(--green-flash); }
+  40%  { background: var(--green-tint); }
+  100% { background: transparent; }
 }
 .trade-row-sell.trade-row-new {
   animation-name: tradeFlashRed;
 }
 @keyframes tradeFlashRed {
-  0%   { background: rgba(240, 122, 108, 0.32); }
-  40%  { background: rgba(240, 122, 108, 0.16); }
-  100% { background: rgba(240, 122, 108, 0); }
+  0%   { background: var(--red-flash); }
+  40%  { background: var(--red-tint); }
+  100% { background: transparent; }
 }
 .trade-row-new {
   animation: tradeFlash 2s ease-out;
@@ -337,7 +337,7 @@
 .uom-mgn-tag {
   display: inline-block; margin-left: 5px; padding: 0 4px;
   border-radius: 3px; font-size: 8.5px; font-weight: 600; letter-spacing: 0.04em;
-  background: rgba(56, 189, 240, 0.16); color: var(--accent); vertical-align: 1px;
+  background: var(--accent-tint-3); color: var(--accent); vertical-align: 1px;
 }
 .uom-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .uom-row span:nth-child(n+3) { text-align: right; }
@@ -398,28 +398,6 @@
   padding: 16px 0;
 }
 
-/* Pending match row — slice currently reserved against an AMM-protected
-   maker, settling on the 5s timer. Distinguished from open orders by a
-   subtle background tint and a countdown in the rightmost column. */
-.uom-row-pending {
-  background: rgba(180, 130, 40, 0.06);
-  position: relative;
-}
-.uom-row-pending::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 6px;
-  bottom: 6px;
-  width: 2px;
-  background: var(--accent);
-  border-radius: 1px;
-}
-.uom-settling {
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 500;
-}
 /* Archived-history rows (Spot/Positions History, Account trades): fills
    restored from the durable archive after the hot tape evicted them. Slightly
    dimmed, with a small tag so restored rows are distinguishable from live. */
@@ -449,6 +427,9 @@
   letter-spacing: 0.02em;
 }
 .af-more-row td { text-align: center; padding: 8px 0; }
+/* The live "Searching the archive… segments 7–12 of 42" line: tabular digits so
+   the count ticks without the text jittering. */
+.af-progress { font-variant-numeric: tabular-nums; }
 .uom-pagination {
   display: flex;
   align-items: center;

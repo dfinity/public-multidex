@@ -1089,6 +1089,168 @@ module {
     Iter.toArray(List.values(result));
   };
 
+  // ── H-31: per-principal trade side index ─────────────────────────
+  // The three user lookups above walk the GLOBAL tape (getUserTrades the
+  // whole list forward, the Since/SinceId pair backward with no scan
+  // ceiling): a 20-byte request paid O(tape) — up to TRADES_GLOBAL_TRIM_AT
+  // records with two Principal.equal each — whatever `limit` said, and
+  // getMyPositionFills paid it once per owned pool. This index is the
+  // poolIdsByOwner shape: TRANSIENT, owned by the actor (never a field on the
+  // stable OrderStore record — EOP refuses the type change), rebuilt from
+  // store.trades at init and maintained at the one fill-capture choke point
+  // (main.mo refreshRolling24h, which every trade-producing flow calls
+  // exactly once per batch). Each per-principal list holds references to the
+  // SAME immutable Trade records the tape holds, in tape (= id) order, so
+  // the indexed lookups return exactly what the walks returned — at
+  // O(matches) instead of O(tape). The legacy walks stay above as the
+  // rebuild reference and the probe's negative control.
+  public type UserTradeIndex = Map.Map<Principal, List.List<Types.Trade>>;
+
+  public func newUserTradeIndex() : UserTradeIndex {
+    Map.empty<Principal, List.List<Types.Trade>>()
+  };
+
+  // Get-or-create a principal's list — the writer's own step, public so the
+  // cost probe can bulk-seed 600k synthetic fills in query state at three
+  // List.adds each instead of two map lookups each (which blew the 5×10^9
+  // query budget); the reads it then measures go through the same map.
+  public func userTradeList(idx : UserTradeIndex, p : Principal) : List.List<Types.Trade> {
+    switch (Map.get(idx, Principal.compare, p)) {
+      case (?l) { l };
+      case null { let l = List.empty<Types.Trade>(); Map.add(idx, Principal.compare, p, l); l };
+    };
+  };
+  func userTradeListAdd(idx : UserTradeIndex, p : Principal, t : Types.Trade) {
+    List.add(userTradeList(idx, p), t);
+  };
+
+  // Index one trade under both parties (once when a party trades with itself
+  // — synthetic seed tape — so entries == parties, the audit invariant).
+  public func indexUserTrade(idx : UserTradeIndex, t : Types.Trade) {
+    userTradeListAdd(idx, t.buyer, t);
+    if (not Principal.equal(t.buyer, t.seller)) { userTradeListAdd(idx, t.seller, t) };
+  };
+
+  // Full rebuild from the tape: actor init, adminRebuildIndexes.
+  public func rebuildUserTradeIndex(idx : UserTradeIndex, store : OrderStore) {
+    Map.clear(idx);
+    for (t in List.values(store.trades)) { indexUserTrade(idx, t) };
+  };
+
+  // After the global tape trim: drop every indexed trade with id < minKeepId
+  // (ids are monotone in tape order, so each per-principal list loses a
+  // PREFIX; a principal whose whole history aged out loses its key — the
+  // index never retains what the tape has evicted). Returns entries dropped.
+  public func pruneUserTradeIndex(idx : UserTradeIndex, minKeepId : Nat) : Nat {
+    var dropped : Nat = 0;
+    let keys = Iter.toArray(Map.keys(idx));
+    for (p in keys.vals()) {
+      switch (Map.get(idx, Principal.compare, p)) {
+        case (?l) {
+          let n = List.size(l);
+          var cut : Nat = 0;
+          label c for (t in List.values(l)) { if (t.id < minKeepId) { cut += 1 } else { break c } };
+          if (cut == n) {
+            ignore Map.delete(idx, Principal.compare, p);
+            dropped += cut;
+          } else if (cut > 0) {
+            let keep = List.empty<Types.Trade>();
+            for (t in List.range(l, cut, n)) { List.add(keep, t) };
+            Map.add(idx, Principal.compare, p, keep);
+            dropped += cut;
+          };
+        };
+        case null {};
+      };
+    };
+    dropped
+  };
+
+  // Sum of per-principal list sizes — the audit compares it against the
+  // tape's party count (2 per trade, 1 when buyer == seller).
+  public func userTradeIndexEntries(idx : UserTradeIndex) : Nat {
+    var n : Nat = 0;
+    for ((_, l) in Map.entries(idx)) { n += List.size(l) };
+    n
+  };
+  public func tapePartyCount(store : OrderStore) : Nat {
+    var n : Nat = 0;
+    for (t in List.values(store.trades)) { n += (if (Principal.equal(t.buyer, t.seller)) { 1 } else { 2 }) };
+    n
+  };
+
+  // Flip a reverse-chrono collection to chrono order.
+  func flipChrono(rev : List.List<Types.Trade>) : [Types.Trade] {
+    let n = List.size(rev);
+    let result = List.empty<Types.Trade>();
+    var j : Int = n - 1;
+    while (j >= 0) {
+      switch (List.get(rev, Int.abs(j))) { case (?t) { List.add(result, t) }; case null {} };
+      j -= 1;
+    };
+    Iter.toArray(List.values(result));
+  };
+
+  // getUserTrades, indexed: the caller's last `limit` fills, chrono
+  // ascending — O(limit). The anonymous principal returns before any lookup
+  // (it can hold no fills; a 20-byte anonymous request must cost nothing).
+  public func getUserTradesIndexed(idx : UserTradeIndex, user : Principal, limit : Nat) : [Types.Trade] {
+    if (Principal.isAnonymous(user)) { return [] };
+    switch (Map.get(idx, Principal.compare, user)) {
+      case null { [] };
+      case (?l) {
+        let rev = List.empty<Types.Trade>();
+        var count : Nat = 0;
+        label take for (t in List.reverseValues(l)) {
+          if (count >= limit) { break take };
+          List.add(rev, t);
+          count += 1;
+        };
+        flipChrono(rev)
+      };
+    };
+  };
+
+  // getUserTradesSince, indexed: the same reverse walk and the same stop
+  // rules (limit reached, or a fill at/before sinceTimestamp) over the
+  // caller's OWN list — O(recent own fills) with no global skips at all.
+  public func getUserTradesSinceIndexed(idx : UserTradeIndex, user : Principal, sinceTimestamp : Int, limit : Nat) : [Types.Trade] {
+    if (Principal.isAnonymous(user)) { return [] };
+    switch (Map.get(idx, Principal.compare, user)) {
+      case null { [] };
+      case (?l) {
+        let rev = List.empty<Types.Trade>();
+        var count : Nat = 0;
+        label scan for (t in List.reverseValues(l)) {
+          if (count >= limit) { break scan };
+          if (t.timestamp <= sinceTimestamp) { break scan };
+          List.add(rev, t);
+          count += 1;
+        };
+        flipChrono(rev)
+      };
+    };
+  };
+
+  // getUserTradesSinceId, indexed: id cursor, same shape.
+  public func getUserTradesSinceIdIndexed(idx : UserTradeIndex, user : Principal, sinceTradeId : Nat, limit : Nat) : [Types.Trade] {
+    if (Principal.isAnonymous(user)) { return [] };
+    switch (Map.get(idx, Principal.compare, user)) {
+      case null { [] };
+      case (?l) {
+        let rev = List.empty<Types.Trade>();
+        var count : Nat = 0;
+        label scan for (t in List.reverseValues(l)) {
+          if (count >= limit) { break scan };
+          if (t.id <= sinceTradeId) { break scan };
+          List.add(rev, t);
+          count += 1;
+        };
+        flipChrono(rev)
+      };
+    };
+  };
+
   // Get the last `limit` trades for a market in chronological order.
   // O(limit): walks the list from the tail via a lazy reverse iterator
   // instead of materialising the whole list.

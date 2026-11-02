@@ -86,3 +86,15 @@ src/arb/arb.did
 src/xrc-mock/xrc-mock.did
 src/fuel-mock/fuel-mock.did
 ops/phase1/
+
+# identity backups: never in the repo (exported PEMs, encrypted or not)
+*.pem
+*.pem.enc
+
+# The software factory (re-sync 2026-10-31): the seat heartbeat factory.sh
+# touches on every command inside a pinned worktree, the desktop app's keep
+# sentinel seats carry so its worktree GC never wipes them, and the seat root
+# (<primary>/.factory/seats + the roster) - all runtime state, never tracked.
+.factory-heartbeat
+.worktree-keep
+.factory/

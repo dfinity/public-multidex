@@ -13,6 +13,7 @@
 # ⚠️ Calls resetExchange.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -22,14 +23,13 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
 
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-MKR=$(mkid rp_maker); DEP=$(mkid rp_dep); MM=$(mkid rp_mm); PLN=$(mkid rp_plain); WHL=$(mkid rp_whale)
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-mkr() { icp canister call --identity rp_maker backend "$@" 2>&1; }
-dep() { icp canister call --identity rp_dep   backend "$@" 2>&1; }
-mm()  { icp canister call --identity rp_mm    backend "$@" 2>&1; }
-pln() { icp canister call --identity rp_plain backend "$@" 2>&1; }
-whl() { icp canister call --identity rp_whale backend "$@" 2>&1; }
+mdx_identity_new rp_maker; MKR=$(principal_of rp_maker); mdx_identity_new rp_dep; DEP=$(principal_of rp_dep); mdx_identity_new rp_mm; MM=$(principal_of rp_mm); mdx_identity_new rp_plain; PLN=$(principal_of rp_plain); mdx_identity_new rp_whale; WHL=$(principal_of rp_whale)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mkr() { icp canister call --candid "$MDX_CANDID" --identity rp_maker backend "$@" 2>&1; }
+dep() { icp canister call --candid "$MDX_CANDID" --identity rp_dep   backend "$@" 2>&1; }
+mm()  { icp canister call --candid "$MDX_CANDID" --identity rp_mm    backend "$@" 2>&1; }
+pln() { icp canister call --candid "$MDX_CANDID" --identity rp_plain backend "$@" 2>&1; }
+whl() { icp canister call --candid "$MDX_CANDID" --identity rp_whale backend "$@" 2>&1; }
 release() { adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null; adm requoteAmm '("BTC-ICPUSD")' >/dev/null; }
 # The public tape (getRecentTrades) is de-identified PublicTrade (2026-07) —
 # no buyer/seller — so WHO traded is asserted via each identity's caller-scoped
@@ -38,12 +38,12 @@ release() { adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/nul
 # trades of its own section — the old newest_trade() returned the whole
 # 100-trade window, so a grep could match any earlier trade, not the newest.
 last_trade_id() { adm getRecentTrades '("BTC-ICPUSD")' | grep -oE "id = [0-9_]+ : nat" | tail -1 | grep -oE "[0-9_]+" | tr -d '_'; }
-fills_since()   { icp canister call --identity "$1" backend getMyTradesSinceId "(${2:-0} : nat, 50 : nat)" 2>&1 | tr -d '_'; }
+fills_since()   { icp canister call --candid "$MDX_CANDID" --identity "$1" backend getMyTradesSinceId "(${2:-0} : nat, 50 : nat)" 2>&1 | tr -d '_'; }
 
 adm setTestTimersPaused '(true)' >/dev/null 2>&1 || true
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1 || true
-adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, 0 : nat, 0:nat, 10:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, 0 : nat, 0:nat, 10:nat)" >/dev/null
 adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
 adm enableAmm '("BTC-ICPUSD", true)' >/dev/null 2>&1 || true
 for P in "$MKR" "$DEP" "$MM" "$PLN" "$WHL"; do

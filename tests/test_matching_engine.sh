@@ -10,13 +10,13 @@ echo "── test_matching_engine ──"
 setup_mode matching
 
 # Use a fresh identity for the taker so we don't clobber alice/bob's positions.
-icp identity new taker --storage plaintext 2>/dev/null || true
+mdx_identity_new taker
 TAKER=$(icp identity principal --identity taker)
 call setTestBalance "(principal \"$TAKER\", \"ICPUSD\", $(e8 1000000.0))" --identity alice > /dev/null
 
 # Taker BUYS 0.5 BTC at 67600 → should cross alice's ask and fully fill.
 RESP=$(call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 67600) : nat, $(e8 0.5) : nat)" --identity taker)
-assert_contains "taker order accepted" "$RESP" "ok"
+assert_ok "taker order accepted" "$RESP"
 
 # Sealed matching: a user↔user cross settles on the next GEPTOR release, not
 # inline — wait for the trade to post before asserting.

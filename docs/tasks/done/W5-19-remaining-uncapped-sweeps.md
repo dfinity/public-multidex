@@ -94,3 +94,15 @@ pool → fund → staged open → seeded AMM fill → getMyPositions returns the
 position through ownedPoolIds + prefix walk with sane VWAP/PnL);
 test_volume_credit PASS (badges now land inline — the sweep-era polls just
 exit early); deploy hygiene PASS; candid regenerated (gen-did) and deployed.
+
+**Correction (2026-09-04 — #19.6, round 18 #54/#55):** "all six walks bounded,
+indexed or cached" overstates F6. Of `tickTier`'s walks only the volume-badge
+backfill (and the join-badge backfill beside it) is sharded. The uptime sampler
+still walks `openOrdersByUser` in full every tick (skipping empty id-sets —
+F6's prune keeps dead keys out at source), and the level recompute unions five
+maps in full each tick (`makerVolCur/Prev`, `takerVolCur/Prev`, `feeLevels`).
+The maps they walk are bounded at source — `uptimeStats` prunes fully-decayed
+entries, the volume windows roll every `TIER_WINDOW_NS`, `feeLevels` drops a key
+at level 0 — and they run on the heartbeat, far from any ceiling and with no
+query-ceiling exposure, but they are full walks, not sharded ones, and were not
+among the `devSweepCostProbe` measurements above.

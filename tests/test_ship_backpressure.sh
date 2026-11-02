@@ -25,19 +25,19 @@
 # Needs #dev (setTestShipShedBands, setTestTimersPaused, addTestTokens).
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-u()   { icp canister call --identity shipbp_u backend "$@" 2>&1; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-U=$(mkid shipbp_u)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+u()   { icp canister call --candid "$MDX_CANDID" --identity shipbp_u backend "$@" 2>&1; }
+mdx_identity_new shipbp_u; U=$(principal_of shipbp_u)
 
 gate_refused() { echo "$1" | grep -qiE "refus|inspect|403"; }
-body_reached() { ! gate_refused "$1" && echo "$1" | grep -qE "ok|err|record|\(|[0-9]"; }
+body_reached() { ! gate_refused "$1" && echo "$1" | grep -qE "err|record|\(|[0-9]"; }
 # getAccessPolicy field reader: candid nat with _ separators, first match.
 policy_nat() { u getAccessPolicy '()' --query 2>/dev/null | tr -d '_\n' | tr -s ' ' | grep -oE "$1 = [0-9]+" | grep -oE '[0-9]+' | head -1; }
 
@@ -45,7 +45,7 @@ restore() {  # always leave the venue as found — bands off, timers running
   adm setTestShipShedBands '(null)' >/dev/null 2>&1
   adm setTestTimersPaused '(false)' >/dev/null 2>&1
 }
-trap restore EXIT
+on_exit restore   # registered, not installed directly: _scratch.sh (via _lib.sh) owns the one exit hook, and the identity + scratch cleanups ride it
 
 echo "── §1 pause the drain, read the baseline ──"
 R=$(u addTestTokens '("ICPUSD", 100_000_000 : nat)')   # faucet registers the caller (dev)
@@ -70,7 +70,8 @@ echo "── §4 entry refused at the gate ──"
 R=$(u placeLimitOrder '("ICP-ICPUSD", variant { buy }, 1_000_000_000 : nat, 100_000_000 : nat)')
 if gate_refused "$R"; then ok "placeLimitOrder refused pre-consensus under ship backpressure"; else nok "entry method was NOT shed" "$(echo "$R" | head -c 200)"; fi
 WHY=$(u whyAmIRefused '()' --query | tr -d '\n' | tr -s ' ')
-echo "$WHY" | grep -q "admittedNow = false" && ok "whyAmIRefused: admittedNow = false under the floor" || nok "diagnostic disagrees with the gate" "$WHY"
+echo "$WHY" | grep -q "admittedNow = false" && ok "whyAmIRefused: admittedNow = false under the floor (entry shed)" || nok "diagnostic says entry admitted while the gate refused it" "$WHY"
+echo "$WHY" | grep -q "exitsAdmitted = true" && ok "whyAmIRefused: exitsAdmitted = true under the floor (#55 — exits pass, §5 proves it)" || nok "diagnostic disagrees with the gate — exits pass but the diagnostic says refused (#55)" "$WHY"
 
 echo "── §5 the exit set still reaches its body ──"
 R=$(u withdraw '("ICPUSD", 1_000_000 : nat, "shipbp-exit-probe")')

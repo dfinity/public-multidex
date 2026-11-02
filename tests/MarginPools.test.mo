@@ -9,6 +9,8 @@ import Fixed "../src/backend/lib/Fixed";
 import Debug "mo:core/Debug";
 import Runtime "mo:core/Runtime";
 import Principal "mo:core/Principal";
+import Text "mo:core/Text";
+import Array "mo:core/Array";
 
 func eqN(name : Text, a : Nat, b : Nat) {
   if (a != b) { Runtime.trap("FAIL: " # name # " — expected " # debug_show b # " got " # debug_show a) };
@@ -118,8 +120,8 @@ func healthAt(otherColl : Nat, otherDebt : Nat, held : Nat, borrowed : Nat, ltv 
 // pre-#15.4 liqPriceLong (the debt-aware form reduces to it when debtBase=0).
 switch (MP.liqPrice(0, 12_000_000_000_000, 200_000_000, 0, 85_000_000, 115_000_000)) {
   case (?p) {
-    nearN("liqPrice long 81176.47", p, 8_117_647_058_824, 4);
-    eqN("long identity: health at P == 1.15", healthAt(0, 12_000_000_000_000, 200_000_000, 0, 85_000_000, p), 115_000_000);
+    nearN("liqPrice long 81176.47", p.price, 8_117_647_058_824, 4);
+    eqN("long identity: health at P == 1.15", healthAt(0, 12_000_000_000_000, 200_000_000, 0, 85_000_000, p.price), 115_000_000);
   };
   case null { Runtime.trap("FAIL: liqPrice long returned null") };
 };
@@ -129,8 +131,8 @@ truth("liqPrice long null when safe", MP.liqPrice(20_000_000_000_000, 12_000_000
 // P = 100000/1.15 = 86956.52 — unchanged from the pre-#15.4 liqPriceShort.
 switch (MP.liqPrice(10_000_000_000_000, 0, 0, 100_000_000, 85_000_000, 115_000_000)) {
   case (?p) {
-    nearN("liqPrice short 86956.52", p, 8_695_652_173_913, 4);
-    eqN("short identity: health at P == 1.15", healthAt(10_000_000_000_000, 0, 0, 100_000_000, 85_000_000, p), 115_000_000);
+    nearN("liqPrice short 86956.52", p.price, 8_695_652_173_913, 4);
+    eqN("short identity: health at P == 1.15", healthAt(10_000_000_000_000, 0, 0, 100_000_000, 85_000_000, p.price), 115_000_000);
   };
   case null { Runtime.trap("FAIL: liqPrice short returned null") };
 };
@@ -148,23 +150,23 @@ do {
   let oc = 100_000_000_000; // $1,000
   switch (MP.liqPrice(oc, 0, 0, 1_000_000_000, 85_000_000, 115_000_000)) {
     case (?p) {
-      eqN("table row 1 (control): 86.9565", p, 8_695_652_173);
-      eqN("row 1 identity: health at P == 1.15", healthAt(oc, 0, 0, 1_000_000_000, 85_000_000, p), 115_000_000);
+      eqN("table row 1 (control): 86.9565", p.price, 8_695_652_173);
+      eqN("row 1 identity: health at P == 1.15", healthAt(oc, 0, 0, 1_000_000_000, 85_000_000, p.price), 115_000_000);
     };
     case null { Runtime.trap("FAIL: table row 1 null") };
   };
   switch (MP.liqPrice(oc, 0, 300_000_000, 1_000_000_000, 85_000_000, 115_000_000)) {
     case (?p) {
-      eqN("table row 2: 111.7318 (old code said 124.2236)", p, 11_173_184_357);
-      eqN("row 2 identity: health at P == 1.15", healthAt(oc, 0, 300_000_000, 1_000_000_000, 85_000_000, p), 115_000_000);
+      eqN("table row 2: 111.7318 (old code said 124.2236)", p.price, 11_173_184_357);
+      eqN("row 2 identity: health at P == 1.15", healthAt(oc, 0, 300_000_000, 1_000_000_000, 85_000_000, p.price), 115_000_000);
     };
     case null { Runtime.trap("FAIL: table row 2 null") };
   };
   switch (MP.liqPrice(oc, 0, 700_000_000, 1_000_000_000, 85_000_000, 115_000_000)) {
     case (?p) {
-      eqN("table row 3: 180.180 (old code said 289.855)", p, 18_018_018_018);
-      truth("row 3: the pre-fix number is gone", p != 28_985_507_246);
-      eqN("row 3 identity: health at P == 1.15", healthAt(oc, 0, 700_000_000, 1_000_000_000, 85_000_000, p), 115_000_000);
+      eqN("table row 3: 180.180 (old code said 289.855)", p.price, 18_018_018_018);
+      truth("row 3: the pre-fix number is gone", p.price != 28_985_507_246);
+      eqN("row 3 identity: health at P == 1.15", healthAt(oc, 0, 700_000_000, 1_000_000_000, 85_000_000, p.price), 115_000_000);
     };
     case null { Runtime.trap("FAIL: table row 3 null") };
   };
@@ -173,8 +175,8 @@ do {
   // = 770/8.95 = $86.0335 (the debt-blind row-2 answer was $111.73).
   switch (MP.liqPrice(oc, 20_000_000_000, 300_000_000, 1_000_000_000, 85_000_000, 115_000_000)) {
     case (?p) {
-      eqN("term 1: other-market debt pulls the short crossing in (86.0335)", p, 8_603_351_955);
-      eqN("term 1 identity: health at P == 1.15", healthAt(oc, 20_000_000_000, 300_000_000, 1_000_000_000, 85_000_000, p), 115_000_000);
+      eqN("term 1: other-market debt pulls the short crossing in (86.0335)", p.price, 8_603_351_955);
+      eqN("term 1 identity: health at P == 1.15", healthAt(oc, 20_000_000_000, 300_000_000, 1_000_000_000, 85_000_000, p.price), 115_000_000);
     };
     case null { Runtime.trap("FAIL: term 1 case null") };
   };
@@ -183,16 +185,43 @@ do {
   // crossing is ABOVE the entry region (short-like), P = 100/1.85 = $54.05.
   switch (MP.liqPrice(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, 115_000_000)) {
     case (?p) {
-      eqN("direction by slope: net-long pool liquidating on a RISING mark", p, 5_405_405_405);
-      eqN("slope-case identity: health at P == 1.15", healthAt(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, p), 115_000_000);
+      eqN("direction by slope: net-long pool liquidating on a RISING mark", p.price, 5_405_405_405);
+      eqN("slope-case identity: health at P == 1.15", healthAt(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, p.price), 115_000_000);
     };
     case null { Runtime.trap("FAIL: slope case null") };
   };
+  // #54.8: the DIRECTION rides with the price — from the SAME A the price
+  // derives from, never from the net-size sign. Same slope fixture (10 SOL
+  // held, 9 owed, otherColl $100): A = 8.5 − 10.35 < 0 → #up, P = $54.05.
+  //   $50 (healthy): health 1.167 > 1.15 and the distance to P is POSITIVE
+  //     (+810 bps — the mark must RISE 8.1%); the size-sign convention (net
+  //     long ⇒ mark − P) read this as "−0.0%".
+  //   $60 (past): health 1.13 < 1.15 → liquidatable. distBps clamps to 0,
+  //     but the DECISION is the health ratio, never mark-vs-P.
+  switch (MP.liqPrice(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, 115_000_000)) {
+    case (?l) {
+      truth("slope fixture: direction is #up (heldLtv < maintDebtBase)", l.dir == #up);
+      truth("slope fixture @ $50: healthy (health > 1.15)", healthAt(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, 5_000_000_000) > 115_000_000);
+      eqN("slope fixture @ $50: positive distance, +810 bps toward a RISING mark", MP.distBps(5_000_000_000, l), 810);
+      truth("slope fixture @ $60: liquidatable (health < 1.15)", healthAt(10_000_000_000, 0, 1_000_000_000, 900_000_000, 85_000_000, 6_000_000_000) < 115_000_000);
+      eqN("slope fixture @ $60: distance clamps to 0 (the mark is past P)", MP.distBps(6_000_000_000, l), 0);
+    };
+    case null { Runtime.trap("FAIL: slope fixture null") };
+  };
+  // Long-like control (A > 0): #down, distance = mark − P.
+  switch (MP.liqPrice(0, 12_000_000_000_000, 200_000_000, 0, 85_000_000, 115_000_000)) {
+    case (?l) {
+      truth("pure long: direction is #down", l.dir == #down);
+      eqN("pure long @ 100000: 1882 bps toward a FALLING mark", MP.distBps(10_000_000_000_000, l), 1882);
+    };
+    case null { Runtime.trap("FAIL: pure long null") };
+  };
+  truth("distBps at mark 0 is 0 (no geometry)", MP.distBps(0, { price = 1; dir = #up }) == 0);
   // A = 0 (held·ltv == M·debtBase: 23·0.85 == 17·1.15): price-insensitive → null.
   truth("liqPrice null when price-insensitive", MP.liqPrice(oc, 0, 2_300_000_000, 1_700_000_000, 85_000_000, 115_000_000) == null);
   // Short-like with nothing price-independent left (otherColl ≤ M·otherDebt):
   // liquidatable at EVERY price → 0, the at-or-below-mark display signal.
-  truth("liqPrice 0 when liquidatable at every price", MP.liqPrice(0, 10_000_000_000, 0, 300_000_000, 85_000_000, 115_000_000) == ?0);
+  truth("liqPrice 0 when liquidatable at every price", MP.liqPrice(0, 10_000_000_000, 0, 300_000_000, 85_000_000, 115_000_000) == ?{ price = 0; dir = #up });
 };
 
 // pctToLiq: mark 100000, liq 80000 → 20%
@@ -224,14 +253,73 @@ do {
   // heldLtv = 3.0 × 1.0 = 300_000_000 → P = 10e9/3 = 3_333_333_333.33…
   let long = MP.liqPrice(1_500_000_000, 10_000_000_000, 3_00_000_000, 0, 100_000_000, 115_000_000);
   switch (long) {
-    case (?p) { eqN("liqPrice long-like rounds UP (3_333_333_334, conservative for a falling mark)", p, 3_333_333_334) };
+    case (?p) { eqN("liqPrice long-like rounds UP (3_333_333_334, conservative for a falling mark)", p.price, 3_333_333_334) };
     case null { truth("liqPrice long-like returned a price", false) };
   };
   // maintDebtBase = ceil(3.0 × 1.15) = 345_000_000 → P = 10e9/3.45 = 2_898_550_724.63…
   let shortP = MP.liqPrice(10_000_000_000, 0, 0, 3_00_000_000, 85_000_000, 115_000_000);
   switch (shortP) {
-    case (?p) { eqN("liqPrice short-like rounds DOWN (2_898_550_724, conservative for a rising mark)", p, 2_898_550_724) };
+    case (?p) { eqN("liqPrice short-like rounds DOWN (2_898_550_724, conservative for a rising mark)", p.price, 2_898_550_724) };
     case null { truth("liqPrice short-like returned a price", false) };
   };
 };
 Debug.print("W5-03 direction pinned");
+
+// ── H-19 (F44): pool-name charset — leading formula chars + control chars ──
+// The pool name is the one player-authored free-text field on the OQL surface;
+// a controller's CSV export of it lands in a spreadsheet. `nameRefusal` is the
+// creation-time gate createMarginPool applies after the length bound.
+Debug.print("── H-19 pool-name charset ──");
+do {
+  func refused(name : Text, t : Text) {
+    switch (MP.nameRefusal(t)) {
+      case (?_) { truth("nameRefusal refuses " # name, true) };
+      case null { truth("nameRefusal refuses " # name, false) };
+    };
+  };
+  func accepted(name : Text, t : Text) {
+    switch (MP.nameRefusal(t)) {
+      case null { truth("nameRefusal accepts " # name, true) };
+      case (?e) { Runtime.trap("FAIL: nameRefusal accepts " # name # " — refused: " # e) };
+    };
+  };
+  // the four spreadsheet formula triggers, leading
+  refused("a leading '=' (=HYPERLINK)", "=HYPERLINK(\"http://x\",\"y\")");
+  refused("a leading '+'", "+1");
+  refused("a leading '-'", "-1");
+  refused("a leading '@'", "@SUM(1)");
+  refused("a bare '='", "=");
+  // control characters anywhere: tab, CR, LF, NUL, ESC, DEL, a C1 control
+  refused("a leading tab", "\tx");
+  refused("an internal tab", "a\tb");
+  refused("an internal CR", "a\rb");
+  refused("an internal LF", "a\nb");
+  refused("a NUL", "a\u{0}b");
+  refused("an ESC", "a\u{1b}b");
+  refused("a DEL", "a\u{7f}b");
+  refused("a C1 control (U+0085 NEL)", "a\u{85}b");
+  refused("a trailing tab", "ab\t");
+  // the refusal text is the one createMarginPool returns
+  switch (MP.nameRefusal("=x")) {
+    case (?e) { truth("the leading-char refusal names the four characters", Text.contains(e, #text "'=', '+', '-' or '@'")) };
+    case null { truth("the leading-char refusal names the four characters", false) };
+  };
+  switch (MP.nameRefusal("a\tb")) {
+    case (?e) { truth("the control-char refusal says so", Text.contains(e, #text "control characters")) };
+    case null { truth("the control-char refusal says so", false) };
+  };
+  // benign shapes stay benign — adjacent cases: internal formula chars, an
+  // empty name (devSeedEmptyPools' shape), spaces, punctuation, non-ASCII
+  accepted("the empty name", "");
+  accepted("a plain name", "BTC swing");
+  accepted("an internal '='", "a=b");
+  accepted("an internal '-' (BTC-swing)", "BTC-swing");
+  accepted("an internal '+' and '@'", "a+b@c");
+  accepted("a trailing '='", "x=");
+  accepted("a leading space then '='", " =x");
+  accepted("a leading digit", "1st pool");
+  accepted("punctuation", "Pool (2) #1, \"quoted\"");
+  accepted("non-ASCII letters", "Écurie ünïcode 池");
+  accepted("a 64-char name of formula chars after the first", "x" # Text.fromArray(Array.tabulate<Char>(63, func(_ : Nat) : Char { '=' })));
+};
+Debug.print("H-19 pool-name charset pinned");

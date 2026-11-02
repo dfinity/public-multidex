@@ -25,7 +25,7 @@ The AMM does not trade by having its resting quotes hit. Its ladder is **non-tak
 // orders itself on its next requote (at its fresh price).
 ```
 
-Instead, every incoming order is **sealed off-book until the next fresh-price moment** ("GEPTOR" = get-fresh-oracle-price-then-requote). `placeMarketOrder` and `placeLimitOrder`/`placeProtectedLimitOrder` don't match anything synchronously — they `parkDeferred(...)` the whole order at its slippage cap (`main.mo:3135`, `:2767`). On the next requote the pool re-prices, *then* the staged order is released (`processDeferred`, `main.mo:1415`) against the **fresh** AMM plus any crossing user liquidity. Release is anti-snipe gated: an order only fires once a fresh price *postdates* it (`d.ts < pool.refPriceUpdatedNs`, `main.mo:1434`).
+Instead, every incoming order is **sealed off-book until the next fresh-price moment** ("GEPTOR" = get-fresh-oracle-price-then-requote). `placeMarketOrder` and `placeLimitOrder`* don't match anything synchronously — they `parkDeferred(...)` the whole order at its slippage cap (`main.mo:3135`, `:2767`). On the next requote the pool re-prices, *then* the staged order is released (`processDeferred`, `main.mo:1415`) against the **fresh** AMM plus any crossing user liquidity. Release is anti-snipe gated: an order only fires once a fresh price *postdates* it (`d.ts < pool.refPriceUpdatedNs`, `main.mo:1434`).
 
 Why build it this way? It makes the AMM impossible to pick off on a stale quote. You can never see the AMM's price, fire an order at it, and get filled at that now-stale number — by the time you execute, the pool has re-fetched the oracle and re-quoted. That is the core anti-arbitrage / anti-sandwich protection of the "sealed model."
 

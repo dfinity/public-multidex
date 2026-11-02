@@ -11,14 +11,14 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-U=$(mkid w43_u)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mdx_identity_new w43_u; U=$(principal_of w43_u)
 
 STOPPER="$SCRIPT_DIR/../scripts/stop_bots_local.sh"
 [ -f "$STOPPER" ] && { bash "$STOPPER" >/dev/null 2>&1 || true; sleep 2; }
@@ -26,7 +26,7 @@ adm setTestTimersPaused '(false)' >/dev/null 2>&1
 
 # History for the user + a live archive.
 adm setTestBalance "(principal \"$U\", \"ICPUSD\", 10_000_000_000 : nat)" >/dev/null
-i=0; while [ $i -lt 6 ]; do icp canister call --identity w43_u backend withdraw '("ICPUSD", 100_000_000 : nat, "w43")' >/dev/null 2>&1; i=$((i+1)); done
+i=0; while [ $i -lt 6 ]; do icp canister call --candid "$MDX_CANDID" --identity w43_u backend withdraw '("ICPUSD", 1_000_000_000 : nat, "w43")' >/dev/null 2>&1; i=$((i+1)); done
 # drain so the reset gates pass
 for i in $(seq 1 45); do
   INFO=$(adm getCanisterInfo '()' --query | tr -d '_')
@@ -38,15 +38,15 @@ done
 RAW=$(adm getArchives '()' --query)
 ACTIVE=$(echo "$RAW" | tr -d '_\n' | grep -oE 'canisterId = "[a-z0-9-]+"' | tail -1 | grep -oE '"[a-z0-9-]+"' | tr -d '"')
 [ -n "$ACTIVE" ] || { echo "no archive to test against"; exit 1; }
-PRE=$(icp canister call --identity w43_u backend getMyArchivedEvents "(principal \"$ACTIVE\", 0 : nat, 50 : nat)" --query 2>&1 | tr -d '_\n')
+PRE=$(icp canister call --candid "$MDX_CANDID" --identity w43_u backend getMyArchivedEvents "(principal \"$ACTIVE\", 0 : nat, 50 : nat)" --query 2>&1 | tr -d '_\n')
 PRE_TOTAL=$(echo "$PRE" | grep -oE "total = [0-9]+" | grep -oE "[0-9]+")
 [ "${PRE_TOTAL:-0}" -gt 0 ] && ok "pre-reset history present (total=$PRE_TOTAL on $ACTIVE)" || nok "no pre-reset history" "$PRE_TOTAL"
 
 R=$(adm resetSeason '()')
-echo "$R" | grep -q "ok" && ok "season reset completed" || nok "reset refused" "$(echo "$R" | head -c 150)"
+mdx_ok "$R" && ok "season reset completed" || nok "reset refused" "$(echo "$R" | head -c 150)"
 
 echo "── §1 W4-14: prior-season history still readable ──"
-POST=$(icp canister call --identity w43_u backend getMyArchivedEvents "(principal \"$ACTIVE\", 0 : nat, 50 : nat)" --query 2>&1 | tr -d '_\n')
+POST=$(icp canister call --candid "$MDX_CANDID" --identity w43_u backend getMyArchivedEvents "(principal \"$ACTIVE\", 0 : nat, 50 : nat)" --query 2>&1 | tr -d '_\n')
 POST_TOTAL=$(echo "$POST" | grep -oE "total = [0-9]+" | grep -oE "[0-9]+")
 if [ "${POST_TOTAL:-0}" = "${PRE_TOTAL:-x}" ]; then
   ok "same events readable after the reset (total=$POST_TOTAL) — the season registry resolves"

@@ -29,6 +29,16 @@
 # minimum itself — pool + refPrice, no LP, no positions. Beyond that the
 # test stays read-only: places no orders, opens no positions, never calls
 # resetExchange, so it is safe against a live venue.
+#
+# "Warm" is judged on the pool being priced NOW, not on the caches looking
+# populated: the transient `_heatmaps` cache and the `heatHistory` ring
+# SURVIVE resetExchange (main.mo: resetExchange clears `pools`, never the
+# heat caches), so after a destructive predecessor in run_all order
+# (test_margin_collateral_escape.sh resets at exit) the caches still hold
+# the pre-wipe world while the pool is gone. Judging warmth on them alone
+# skipped §0's re-pricing, the next tick computed a mark-0 snapshot that
+# never entered the ring, and §8's newest-column == snapshot equality
+# could never hold (task 1788476227).
 
 source "$(dirname "$0")/_lib.sh"
 
@@ -37,21 +47,43 @@ echo "── test_margin_heatmap ──"
 MKT="BTC-ICPUSD"
 
 # ── §0 precondition: a priced market + a heartbeat column ────────
-# Warm when the cache holds a computed map AND the history ring already has
-# a column for MKT (which needs markPrice > 0 at some tick). Cold → price
-# the market and wait out the 30s HB_HEAT_NS tick. markPrice is just the
-# pool's refPrice, so a pool + refPrice is the whole fixture: no LP (I1
-# stays trivially clean), no positions (every section holds on an
-# empty-but-priced book).
+# Warm when (a) the pool for MKT exists with refPrice > 0 RIGHT NOW, (b) the
+# cached snapshot was computed from a priced mark (markPrice > 0 — i.e. the
+# latest tick saw the priced pool, which is exactly the condition under
+# which it appended that snapshot to the ring), and (c) the ring holds a
+# column. (a) is what a stale cache cannot fake after resetExchange; (b) is
+# what makes §8's newest-column == snapshot equality reachable — a tick
+# computed against a wiped pool caches a mark-0 snapshot and appends
+# nothing. Cold → price the market and wait out the 30s HB_HEAT_NS tick.
+# markPrice is just the pool's refPrice, so a pool + refPrice is the whole
+# fixture: no LP (I1 stays trivially clean), no positions (every section
+# holds on an empty-but-priced book). On a seeded venue every leg is true
+# on the first probe, so the standalone fast path costs three queries.
 CTL="--identity anonymous"   # local controller
+# getAmmPools prints one `record { ... }` per pool with `vec { ... }` fields
+# nested inside, so split on the record opener (not on `}`) and read the
+# refPrice of the record that names MKT.
+pool_priced() {
+  call getAmmPools '()' --query | tr -d '_\n' | python3 -c '
+import re, sys
+mkt = sys.argv[1]
+for rec in sys.stdin.read().split("record {"):
+    if "marketId = \"" + mkt + "\"" in rec:
+        m = re.search(r"refPrice = (\d+)", rec)
+        sys.exit(0 if m and int(m.group(1)) > 0 else 1)
+sys.exit(1)' "$MKT"
+}
 warm() {
-  local c n
-  c=$(extract_nat "computedNs" "$(call getMarginHeatmap "(\"$MKT\")" --query)")
+  local hm c m n
+  pool_priced || return 1
+  hm=$(call getMarginHeatmap "(\"$MKT\")" --query)
+  c=$(extract_nat "computedNs" "$hm")
+  m=$(extract_nat "markPrice" "$hm")
   n=$(call getMarginHeatmapHistory "(\"$MKT\", 0)" --query | grep -c "computedNs")
-  [ -n "$c" ] && [ "$c" != "0" ] && [ "${n:-0}" -ge 1 ]
+  [ -n "$c" ] && [ "$c" != "0" ] && [ -n "$m" ] && [ "$m" != "0" ] && [ "${n:-0}" -ge 1 ]
 }
 if ! warm; then
-  echo "  (cold venue — pricing $MKT and waiting for the heartbeat tick)"
+  echo "  (cold venue — $MKT unpriced or its last snapshot unpriced: pricing it and waiting for the heartbeat tick)"
   call setTestTimersPaused '(false)' $CTL >/dev/null 2>&1   # an earlier failed test may have left them paused
   call createAmmPool "(\"$MKT\")" $CTL >/dev/null 2>&1      # idempotent-ish; refPrice is set NEXT (create zeroes it)
   call setAmmRefPrice "(\"$MKT\", $(e8 50000) : nat)" $CTL >/dev/null

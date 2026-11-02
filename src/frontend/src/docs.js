@@ -78,7 +78,7 @@ export const DOCS_PAGES = [
         <li>the first exchange <b>owned by the world</b>, token free, and
         <a href="#docs/platform">NNS controlled</a></li>
         <li>the first <b>AIware exchange</b> you can
-        <a href="#docs/mcp">query and instruct through AI chat</a></li>        
+        <a href="#ai">query and instruct through AI chat</a></li>        
         <li>the first <b>genuinely on-chain, open source
         <a href="#docs/markets">order book</a> exchange</b></li>
         <li>the first <b>capital-efficient <a href="#docs/swap">swap</a> platform backed by market order books</b></li>
@@ -107,7 +107,7 @@ export const DOCS_PAGES = [
       <b>Motoko</b>, a software language designed for AI that codes, and for developing AIware — a
       genuinely sophisticated financial application, produced by AI, running end-to-end as on-chain
       code with no servers hiding behind it, which enables you to analyse your position, and execute
-      trades, <a href="#docs/mcp">using your favourite AI chat</a>. The source is open; you can read every line (see
+      trades, <a href="#ai">using the built-in Agent Chat</a>. The source is open; you can read every line (see
       <a href="https://github.com/dfinity/public-multidex">the repository</a>) and judge the work yourself.</p>
 
       <h2 id="docs-sec-owned">Owned by nobody, run by the NNS</h2>
@@ -460,7 +460,9 @@ export const DOCS_PAGES = [
         the pair and its live price.</li>
         <li><b>Stat strip</b> — last price, 24h change and 24h volume for the selected market.</li>
         <li><b>The chart</b> — price history as candles. The buttons pick the time each candle
-        covers (1m … 1W); <i>Hide</i> collapses the chart if you'd rather have the room.</li>
+        covers (1m … 1W); the ⤢ button at the right of its bar opens the chart full-screen
+        (drag left for older history; <i>Esc</i> or × closes it); <i>Hide</i> collapses the
+        chart if you'd rather have the room.</li>
         <li><b>Order Book box</b> — the noticeboard itself: asks stacked in red above, bids in green
         below, the spread row between them. Each row is a price with the <i>Quantity</i> waiting at
         it and its <i>Value</i>; the coloured bars make size readable at a glance. The interval menu
@@ -996,7 +998,7 @@ export const DOCS_PAGES = [
     nav: "Margin trading",
     title: "Margin trading",
     part: 3,
-    blurb: "From first principles: pools, positions, leverage, financing costs, health and liquidation — plus a worked example and a quick-reference table.",
+    blurb: "From first principles: pools, positions, what each fill borrows, leverage, financing costs, health and liquidation — plus worked examples and a quick-reference table.",
     html: `
       <div class="docs-crumb">Part IV · Beyond spot</div>
       <h1>Margin trading</h1>
@@ -1008,6 +1010,7 @@ export const DOCS_PAGES = [
         <a data-docs-goto="what">What margin is</a>
         <a data-docs-goto="pools">Pools</a>
         <a data-docs-goto="positions">Positions</a>
+        <a data-docs-goto="borrows">What a fill borrows</a>
         <a data-docs-goto="leverage">Leverage</a>
         <a data-docs-goto="financing">Financing costs</a>
         <a data-docs-goto="health">Health &amp; distance to liquidation</a>
@@ -1072,13 +1075,87 @@ export const DOCS_PAGES = [
       outright. Manage everything from <b>Account → Positions</b>: each pool block shows equity, net
       funded, exposure, leverage, unrealized P&amp;L and distance to liquidation, with its positions
       nested beneath.</p>
+      <p><b>The borrow happens at the fill, not when you place the order.</b> Placing a Margin
+      order only <i>checks</i> that the vault could lend the shortfall at today's prices (it refuses
+      up front if not) and stages the whole size. While the order is staged or resting on the book
+      it holds <b>no debt</b> and accrues <b>no interest</b>; each fill borrows exactly its own
+      shortfall from the vault at that instant, and interest runs from then. Cancelling an unfilled
+      entry therefore repays nothing — there is nothing to repay. What exactly each fill borrows — and
+      the three things that can stop one — is the <a data-docs-goto="borrows">next section</a>.</p>
 
-      <h2 id="docs-sec-leverage"><span class="docs-num">4</span>Leverage: why the ceiling depends on the asset</h2>
+      <h2 id="docs-sec-borrows"><span class="docs-num">4</span>What a fill borrows</h2>
+      <p>Every fill of a Margin entry is settled on its own, and each one asks the same question:
+      does the pool hold enough of the token this fill <i>pays with</i>? Whatever it lacks, the vault
+      lends — exactly that amount, right there inside the fill, before the trade settles. Which token
+      that is depends on the direction:</p>
+      <ul>
+        <li><b>A long borrows cash.</b> A buy pays in ICPUSD, so the fill needs its cost plus the
+        pool's trading fee. The pool's free ICPUSD goes first and the rest is borrowed:
+        <i>borrow = cost + fee − free ICPUSD</i> (nothing, if the free cash covers it). The pool ends
+        up holding the asset and owing ICPUSD.</li>
+        <li><b>A short borrows the asset.</b> A sell pays in the asset, so the fill needs the quantity
+        it sells; the pool borrows that (less any of the asset it already holds free — usually none),
+        sells it, and ends up holding the ICPUSD proceeds and owing the <i>asset</i>. That debt, and
+        the interest on it, is counted in units of the asset — which is why a short loses when the
+        price rises: the same number of units costs more to buy back. Closing buys the asset back and
+        returns it to the vault in kind; the Repay row's token selector shows the same per-token debt
+        (<a data-docs-goto="financing">Financing</a>).</li>
+        <li><b>Only fills that add exposure borrow.</b> A fill that shrinks a position — selling
+        against a long, buying against a short — is paid from what the pool already holds (the asset
+        a long holds, the cash a short holds) and borrows nothing, so closing never waits on the
+        vault. A fill that carries the pool <i>through</i> flat and out the other side is treated as
+        an entry: the holdings cover what they can and the vault lends the excess. Plainly: closing
+        never borrows; flipping borrows for the part past flat.</li>
+        <li><b>Several fills, one position.</b> A limit entry that fills in slices — or several
+        entries in the same direction — builds one position whose entry price is the
+        quantity-weighted average of its fills (VWAP). The debt is simpler: each slice's shortfall is
+        added to the pool's debt in that token (ICPUSD for a long, the asset for a short), and each
+        slice's interest clock runs from its own fill — the first slice has been accruing since it
+        filled, the second starts when it does. What you see is one figure per token: the slices'
+        shortfalls plus the interest booked so far.</li>
+      </ul>
+      <p><b>Two slices, in numbers.</b> You fund a pool with <b>$1,000</b> and place a 3× long
+      limit entry for 30 units of an asset quoted near $100 (BTC's 0.90 LTV weight; fees left out so
+      the arithmetic stays visible). It fills in two slices:</p>
+      <ul>
+        <li><b>Slice 1 — 15 units at $100 ($1,500).</b> The pool's $1,000 goes first, so this fill
+        borrows the <b>$500</b> shortfall. The pool now holds 15 units, has no free cash, and owes
+        $500 of ICPUSD — whose 5% clock starts now, about 7 cents a day.</li>
+        <li><b>Slice 2 — two days later, 15 units at $102 ($1,530).</b> The remainder rested on the
+        book at $102 until a seller hit it. No free cash is left, so this fill borrows all
+        <b>$1,530</b>; its own clock starts now, about 21 cents a day. The first slice has meanwhile
+        accrued about 14 cents.</li>
+        <li><b>The position:</b> 30 units at an entry of <b>$101</b> — the VWAP,
+        (15 × 100 + 15 × 102) / 30 — worth $3,060 at the $102 mark. <b>The debt:</b> one ICPUSD
+        figure, 500 + 1,530 + 0.14 = <b>$2,030.14</b>. Equity ≈ $1,030 (the first slice is already
+        $30 in the money). Health at the second fill = 0.90 × 3,060 / 2,030 ≈ <b>1.36</b> — above
+        the 1.25 bar, which is why that slice was allowed to borrow.</li>
+      </ul>
+      <p><b>What can refuse a fill.</b> Because the vault lends at the fill, a check that passed at
+      placement can fail when the fill finally comes — the vault's capacity moves with everyone
+      else's borrows, repayments and deposits in between. Three things refuse a borrow:</p>
+      <ul>
+        <li><b>The vault cap.</b> At most <b>half</b> of what the vault holds in a token may be on
+        loan at once — live positions only; resting orders hold none of it. A shortfall that would
+        cross the line is refused.</li>
+        <li><b>Opening health.</b> After the borrow the pool must stand at health ≥ <b>1.25</b>
+        (<a data-docs-goto="health">below</a>) on fresh prices — the whole pool, every token it holds
+        or owes, not just the one being traded.</li>
+        <li><b>A stale oracle price</b> — for the asset being traded, or for anything in the pool's
+        collateral or debt.</li>
+      </ul>
+      <p>When one of them bites, that slice does not fill and settles nothing; slices already settled
+      stand; the rest of the order is <b>cancelled</b> rather than left resting; and the reason is
+      recorded — a notice appears in the app, and bots read it from
+      <code>getMyReleaseRejections</code>. Nothing dies silently. And since exits never borrow, a
+      close can never be refused this way.</p>
+
+      <h2 id="docs-sec-leverage"><span class="docs-num">5</span>Leverage: why the ceiling depends on the asset</h2>
       <p>The margin desk does not value all collateral equally. Each asset has a <b>loan-to-value
       (LTV)</b> weight — the fraction of its market value the desk will count when it sizes the
       cushion. Stable cash counts fully; the more volatile the asset, the bigger the haircut. LTV is
-      what caps how much leverage a position can <i>open</i> with — that's why the selector greys
-      out multiples an asset can't reach:</p>
+      what caps how much leverage a position can <i>open</i> with — the ceilings below are what the
+      opening-health rule works out to per asset:</p>
       <div class="docs-tablebox">
       <table>
         <tr><th>Asset</th><th class="docs-c">LTV weight</th><th class="docs-c">Max opening leverage*</th><th class="docs-c">Borrow APR</th></tr>
@@ -1091,25 +1168,48 @@ export const DOCS_PAGES = [
       </div>
       <p class="docs-dim">*For a long bought with borrowed ICPUSD: opening requires
       LTV-weighted collateral ÷ debt ≥ 1.25, which works out to max leverage = 1 / (1 − LTV/1.25).
-      The UI computes this per asset and greys unreachable options in the selector.</p>
+      The leverage menu on the ticket is a sizing calculator — it decides how much margin the
+      ticket commits for the notional you type; the ceiling itself is enforced by the check below.</p>
+      <p><b>What the ticket's "Pool capacity" means.</b> As you type, the ticket asks the engine
+      the question the fill will ask: the largest size this pool could open <i>right now</i> — the
+      opening-health rule above, plus whether the vault could lend the shortfall at today's prices.
+      It is a <b>check, not a reservation</b>. The vault's lending capacity (at most half of what it
+      holds) is consumed only by positions that have actually filled — never by orders resting on
+      the book, yours or anyone else's — so it can be used up, or freed, between placing a resting
+      entry and its fill. The fill re-runs the same check and, if the vault can no longer lend,
+      fails closed as described above.</p>
 
-      <h2 id="docs-sec-financing"><span class="docs-num">5</span>Financing: what holding a position costs</h2>
+      <h2 id="docs-sec-financing"><span class="docs-num">6</span>Financing: what holding a position costs</h2>
       <p>There is <b>no funding rate</b> here. Perpetual-futures venues charge longs or shorts a
       periodic fee to tether a synthetic price to the real one; MULTI/DEX positions hold real assets
       and real debt, so the only carrying cost is real too: <b>interest on what the pool actually
       borrowed</b>, at the APRs in the table above, accruing continuously (linear, per second) on the
-      borrowed amount only.</p>
+      borrowed amount only, from the moment of the fill that took each borrow.</p>
       <ul>
         <li><b>Cash-funded positions cost nothing to hold.</b> If the pool's own cash covered the
         purchase, there is no borrow, so there is no interest — ever.</li>
+        <li><b>Nothing accrues before the fill.</b> A staged or resting entry has borrowed nothing
+        yet, so leaving it on the book costs nothing — and cancelling it repays nothing.</li>
         <li><b>The lender is the protocol's own vault</b> — the shared inventory funded by
         <a href="#docs/earn">Earn depositors</a>, who receive the interest. At most half the vault's
-        holdings can be on loan at once.</li>
+        holdings can be on loan at once, and "on loan" counts live positions only: resting orders
+        hold none of it.</li>
         <li><b>See it per pool.</b> Each pool block's <i>Financing</i> disclosure shows exactly what
         is borrowed and what free cash remains — if it says "Borrowed nothing", holding is free.</li>
+        <li><b>Idle debt is yours to retire.</b> A pool can end up owing against free cash (a fill's
+        tail that never used its borrow, a top-up you would rather turn into repayment). The
+        liquidation pass never repays it for you, and <i>Fund</i> is margin, not repayment — so
+        the pool block shows a <i>Repay</i> row while it owes anything: enter an amount and a
+        token and it pays min(amount, debt, free) in kind via <code>repayPoolDebt</code>, where
+        free is the pool's cash minus what your resting <i>exits</i> earmark (a resting close must
+        stay funded; a resting entry borrows at its fill and holds nothing back). The row's
+        Debt and Free figures are per token — the selector lists
+        exactly what the pool owes (a short's debt is its base token) and the "Will pay" preview
+        is the backend's min() to the unit. Paying at least the debt retires it whole, interest
+        accrued to that moment included; the button stays disabled while nothing would be paid.</li>
       </ul>
 
-      <h2 id="docs-sec-health"><span class="docs-num">6</span>Health: your distance to liquidation</h2>
+      <h2 id="docs-sec-health"><span class="docs-num">7</span>Health: your distance to liquidation</h2>
       <p>Every pool's standing is one number, recomputed continuously against the
       <a href="#docs/oracle">oracle reference price</a>:</p>
       <div class="docs-formula">health &nbsp;=&nbsp; LTV-weighted collateral value &nbsp;/&nbsp; debt</div>
@@ -1128,7 +1228,7 @@ export const DOCS_PAGES = [
       0% means the line has been reached. Watch it like a fuel gauge — and top the pool up
       (<i>Fund</i>) or close some position to move it back up.</p>
 
-      <h2 id="docs-sec-liq"><span class="docs-num">7</span>Liquidation, without drama</h2>
+      <h2 id="docs-sec-liq"><span class="docs-num">8</span>Liquidation, without drama</h2>
       <p>If the market moves against a pool until its health drops below <b>1.15</b>, the protocol
       steps in and closes part of the position. Nobody phones a margin desk and nobody gets to look
       away — it is deterministic machinery:</p>
@@ -1149,10 +1249,14 @@ export const DOCS_PAGES = [
         (Account → Positions → Positions History).</li>
       </ul>
 
-      <h2 id="docs-sec-example"><span class="docs-num">8</span>A worked example</h2>
-      <p>You fund a pool with <b>$1,000</b> and open a <b>3× long on BTC</b>: the pool borrows
-      $2,000 of ICPUSD and buys $3,000 of BTC. Opening health = 0.90 × 3,000 / 2,000 = <b>1.35</b> —
-      comfortably above the 1.25 bar.</p>
+      <h2 id="docs-sec-example"><span class="docs-num">9</span>A worked example</h2>
+      <p>You fund a pool with <b>$1,000</b> and open a <b>3× long on BTC</b> — $3,000 of BTC. Say
+      the order fills in two slices. The first buys $1,200 of BTC: the pool's own $1,000 goes first,
+      so that fill borrows <b>$200</b>. The second buys the remaining $1,800 with no free cash left,
+      so it borrows all <b>$1,800</b>. Debt: $200 + $1,800 = <b>$2,000</b> of ICPUSD — exactly what
+      a single fill would have borrowed — with interest on the $200 running from the first fill and
+      on the $1,800 from the second; until each slice filled, the pool owed nothing. Opening
+      health = 0.90 × 3,000 / 2,000 = <b>1.35</b> — comfortably above the 1.25 bar.</p>
       <ul>
         <li><b>BTC +10%:</b> the BTC is worth $3,300; debt is still $2,000. Your equity is $1,300 —
         up 30%. Close now: sell, repay, walk away with the gain (minus the trade fees and any
@@ -1167,7 +1271,7 @@ export const DOCS_PAGES = [
       slide met the liquidation line. Leverage compresses the distance between "fine" and
       "liquidating" — that is the price of the amplification.</p>
 
-      <h2 id="docs-sec-reference"><span class="docs-num">9</span>Quick reference</h2>
+      <h2 id="docs-sec-reference"><span class="docs-num">10</span>Quick reference</h2>
       <div class="docs-tablebox">
       <table>
         <tr><th>Thing</th><th>Value / where</th></tr>
@@ -1176,6 +1280,9 @@ export const DOCS_PAGES = [
         <tr><td>Max opening leverage</td><td>1 / (1 − LTV/1.25) → BTC/ETH ≈3.6×, SOL ≈3.1×, ICP ≈2.8×</td></tr>
         <tr><td>Borrow APR (interest on borrows only)</td><td>ICPUSD 5% · BTC/ETH 8% · SOL/ICP 10%, continuous, paid to the <a href="#docs/earn">Earn vault</a></td></tr>
         <tr><td>Funding rate</td><td>None — real borrow interest instead</td></tr>
+        <tr><td>When leverage is borrowed</td><td>At the <b>fill</b>, never at placement — a staged or resting entry holds no debt and accrues no interest; cancelling it repays nothing; a fill the vault cannot fund fails closed with a recorded reason</td></tr>
+        <tr><td>What a fill borrows</td><td>Long → its ICPUSD shortfall (cost + fee − the pool's free ICPUSD); short → the asset it sells, owed and repaid in kind. Exits borrow nothing; a flip borrows for the part past flat. Several fills: entry = VWAP, debt = the sum per token, each slice's interest from its own fill</td></tr>
+        <tr><td>Pool capacity (ticket)</td><td>The largest size the pool could open right now — a check at today's prices, not a reservation; the vault's capacity is consumed by live positions only</td></tr>
         <tr><td>Liquidation</td><td>Partial to health 1.25 · 5% penalty → insurance fund · no trading fee · engine bypassed</td></tr>
         <tr><td>Trade fees on open/close</td><td>Normal maker/taker <a href="#docs/fees">fees</a>; they credit your <a href="#docs/levels">level scorecard</a></td></tr>
         <tr><td>Open a position</td><td>Markets → Place Order → <b>Margin</b> (market or limit + max slippage; size may clamp to collateral)</td></tr>
@@ -1217,21 +1324,37 @@ export const DOCS_PAGES = [
         pricing that makes depletion progressively expensive (<a href="#docs/liquidity">how the AMM
         defends its reserves</a>) — a deposit is a diversified market-making position, not a bet on
         one coin.</li>
-        <li><b>Deposits are gated for fairness:</b> they are blocked while the
-        <a href="#docs/oracle">oracle</a> is stale or a price jump is awaiting confirmation (nobody
-        buys in at a knowingly wrong mark) and sized against pool conditions so a whale cannot
-        distort the vault in one shot.</li>
+        <li><b>Deposits are gated for fairness:</b> a deposit never settles while the
+        <a href="#docs/oracle">oracle</a> is stale or a price jump is awaiting confirmation —
+        your request simply waits for the next confirmed price (nobody buys in at a knowingly
+        wrong mark; five minutes without one and it is refunded) — and it is sized against pool
+        conditions at that moment, so a whale cannot distort the vault in one shot.</li>
+        <li><b>Deposits and withdrawals are staged, then settled at the next fresh mark.</b> A
+        request reserves your funds (or shares) and settles at the first vault valuation whose
+        prices were fetched <i>after</i> you asked — so nobody can join or leave at a mark the
+        market has already left. You may <b>cancel a staged request</b> from the Earn card and get
+        the reservation back, under the same commit rule as a staged order: not in its first
+        3 seconds, and not while a price fetch started after your request is still in flight
+        (the card's Cancel button says exactly why it is disabled). A request no fresh prices
+        reach within 5 minutes is cancelled and refunded automatically.</li>
         <li><b>Withdrawals pay a 0.4% exit fee</b> that stays in the vault for remaining LPs. It
         exists to make "deposit, then immediately withdraw the basket" strictly worse than just
         trading — an honest exit pays it once; a scheme pays it every lap.</li>
-        <li><b>Your displayed value is an upper bound while the vault is lending.</b> The vault
-        is also the <a href="#docs/margin">margin</a> system's lender, and the Earn card values
-        your position against full NAV — the loan book included. A withdrawal is paid in kind
-        from what the vault <i>physically holds</i> (a loan cannot be handed out as inventory),
-        so while utilisation is non-zero it returns less than the headline figure — down to
-        about half of it with the loan book at its cap of 0.50&nbsp;× vault value. The Earn
-        card shows the utilisation-adjusted figure alongside; the difference is the loan book's
-        receivable, left behind for remaining LPs as it is collected — not a fee.</li>
+        <li><b>Withdrawals redeem at full vault value — instantly up to your share of what the
+        vault holds.</b> The vault is also the <a href="#docs/margin">margin</a> system's lender.
+        Every LP share redeems at NAV (the held basket plus the loan book, per share — the same
+        figure it was minted at), less the exit fee, and is paid in kind from what the vault
+        <i>physically holds</i>: a loan cannot be handed out as inventory. So your
+        <b>maximum instant withdrawal</b> is your pro-rata share of the vault's holdings — the
+        Earn card shows it as "withdrawable now / total" with how much of the vault is lent out,
+        before you deposit as well as after. "Lent out" counts positions that have actually
+        filled: a margin order resting on the book has borrowed nothing yet (leverage is borrowed
+        at the fill), so it never reduces what you can withdraw. The rest of your value is your share of the loan
+        book: those shares stay yours, keep earning, and become withdrawable as the loans repay.
+        A request above the limit is refused (nothing is queued), and nobody can drain the
+        vault's cash ahead of you — every LP can take only their own share of it. What NAV
+        marks is the loan book at face value net of known arrears; a default beyond its
+        collateral and the insurance fund lowers NAV for whoever holds shares at that moment.</li>
       </ul>
       <p class="docs-dim">Honest risk note: LP capital carries inventory risk. The AMM holds the
       assets it quotes; in a sharp move its inventory marks down like any market maker's would. The
@@ -1380,8 +1503,9 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
      --host https://icp-api.io --full --fold</pre>
       <p>Flags: <code>--host</code> is the gateway (mainnet <code>https://icp-api.io</code>; a local
       replica like <code>http://127.0.0.1:8000</code> works too), <code>--last N</code> checks the
-      newest N events, <code>--full</code> (the default) walks the entire history across every sealed
-      archive, and <code>--fold</code> additionally folds every delta row into per-account balances
+      newest N events \u2014 across every sealed archive the window reaches, each visited sealed head
+      certificate-checked; only the tape below the window is skipped \u2014, <code>--full</code> (the
+      default) walks the entire history across every sealed archive, and <code>--fold</code> additionally folds every delta row into per-account balances
       and prints <b>per-token liability totals</b> \u2014 the numbers to compare against on-chain
       custody.</p>
       <p>The script checks three things and exits non-zero if <i>any</i> fail:</p>
@@ -1394,6 +1518,13 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         this last step reports \u201cunavailable\u201d \u2014 test-replica certificates differ; on
         mainnet it must say <i>IC certificate VALID</i>.)</li>
       </ul>
+      <p>Exit codes: <b>0</b> everything verified; <b>1</b> a check failed; <b>2</b> usage;
+      <b>3</b> <i>inconclusive</i> \u2014 nothing failed, but the readable tape stopped short of the
+      certified head and no re-fetched head landed inside what was read, so nothing the network
+      signed covers the walk. The script re-fetches the head a bounded number of times
+      (<code>--anchor-retries</code>) before saying so; an honest gateway whose replicas are a
+      moment apart catches up on the retry. A 3 is never a pass \u2014 re-run, or try another
+      gateway.</p>
       <p class="docs-dim">A successful run means: the history you can download is the history that
       happened, the totals it implies are the exchange\u2019s true liabilities, and the network \u2014
       not the exchange \u2014 signed the head you checked it against.</p>
@@ -1448,9 +1579,16 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
       or write your own queries.</p>
 
       <h2 id="docs-sec-ai">And AI that can read it all</h2>
-      <p>The <b>AI Assistant</b> drives that same query surface in natural language — it can walk the live
+      <p><b>Agent Chat</b> drives that same query surface in natural language — it can walk the live
       order book, check your positions, or explain an event, and anything state-changing is
-      confirm-gated back to you. The same interface is open to external agents: connect Claude or
+      confirm-gated back to you: a proposed action is first <b>resolved against live data</b> (the
+      exact market, the pool by number and name, the amount in the venue's units) and checked the way
+      the canister would check it, then shown on a card with the decoded details and a caution line —
+      <i>nothing changes until you confirm</i>, a decline is final, and after a confirmed action the
+      chat re-reads the state it changed before reporting. It knows who is asking and which page and
+      market you are on, it answers <i>how do I…?</i> questions from these Docs (citing the pages it
+      drew on — and it still does that when no AI key is configured), and every answer keeps its
+      workings behind a link. The same interface is open to external agents: connect Claude or
       another assistant through the IC connector and it operates the exchange <i>as you</i>, under
       your keys, against the same scoped API. Nothing about the venue is a black box — not even to
       your tools.</p>
@@ -1535,7 +1673,7 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         <li><b><code>cancelAllMyOrders(opt marketId)</code></b> — cancel every order you own,
         one market or all (<code>null</code>), staged and resting alike; returns the count.
         Wallet-scoped: margin-pool position orders are deliberately excluded (cancel those with
-        <code>cancelPoolOrder</code>, which also repays the position's pre-borrow).</li>
+        <code>cancelPoolOrder</code>, which repays nothing — leverage is borrowed at the fill, so an unfilled entry holds no debt).</li>
         <li><b><code>replaceMyOrder(orderId, price, quantity)</code></b> — cancel + place in one
         message, so there is no consensus round where your old quote is dead and the new one
         hasn't arrived. The cancel always stands; if the replacement fails validation you're told
@@ -1557,7 +1695,20 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         constant bots otherwise learn from rejection strings — decimals, tick, minimums, bands,
         caps, seal delay. <code>getReleaseInfo(market)</code>: the armed seal deadline, so a bot
         phase-aligns its requotes. <code>whyAmIRefused()</code>: the admission gate explained
-        (queries bypass it, so a shed bot can always self-diagnose). <code>getAccessPolicy</code>
+        (queries bypass it, so a shed bot can always self-diagnose) — <code>admittedNow</code> is
+        the verdict for order entry and other sheddable updates, while <code>exitsAdmitted</code>
+        and <code>exitMethods</code> say that cancels, closes, unstakes and withdrawals are
+        admitted at <i>any</i> load floor: the exit set is never shed, so a shed bot can always
+        flatten even while it cannot quote. <code>preRegistrationAdmitted</code> and
+        <code>preRegistrationMethods</code> cover the signed-in, never-deposited principal: that
+        set (profile, preferences, username, the two Internet Identity sign-in legs) is the
+        <i>only</i> one it reaches, on every posture, and everything outside it is refused
+        pre-consensus until the first deposit registers the principal. Pre-deposit profile and
+        preference state lives in a hard-capped, self-expiring store until then
+        (<code>getPreRegStoreStats</code> reports size, cap and counters); the first deposit makes
+        it permanent. One wrinkle: <code>getUserPreferences</code> is still an <i>update</i> call,
+        not a query, until apiVersion 7.0.0 (Candid cannot flip the mode inside a major) — sign it
+        like a mutation. <code>getAccessPolicy</code>
         additionally reports open-order counts and caps, uptime qualification, your dead-man
         state, the self-trade policy, and a machine-readable <code>apiVersion</code>.</li>
       </ul>
@@ -1586,56 +1737,6 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
       <a href="#docs/liquidity">AMM</a>, which quotes every market around the oracle price — the
       spread it offers is the rate card you have to beat. When you do beat it, the fee ladder,
       the shield, and the queue are yours.</p>
-    `,
-  },
-
-  {
-    slug: "mcp",
-    nav: "MCP",
-    title: "MCP — trade from your AI chat",
-    part: 5,
-    blurb: "Connect ChatGPT, Claude, or another AI chat app to MULTI/DEX — check balances, explore the markets, and trade by typing plain language.",
-    html: `
-      <div class="docs-crumb">Part VI · Automate &amp; integrate</div>
-      <h1>MCP — trade from your AI chat</h1>
-      <p class="docs-lead">Ask an AI to trade for you. Connect ChatGPT, Claude, or another AI chat
-      app to MULTI/DEX and do everything in plain language — "what am I holding?", "swap half my
-      ICP into BTC". Four steps, no code — and the exchange runs in
-      <a href="#docs/launch">play mode</a>, so everything the AI can touch is paper tokens.</p>
-
-      <ol>
-        <li><b>Sign in on ID.ai.</b> Go to
-        <a href="https://id.ai" target="_blank" rel="noopener noreferrer">id.ai</a> and sign in to
-        the identity you use with MULTI/DEX. Signed in using Google and can't see your identity?
-        Click "+&nbsp;Add identity".</li>
-
-        <li><b>Trust the DFINITY MCP server.</b> Open
-        <a href="https://id.ai/manage/settings" target="_blank" rel="noopener noreferrer">id.ai/manage/settings</a>
-        and add the following as a "Trusted MCP server":
-        <code>https://mcp.beta.id.ai/mcp-prod</code></li>
-
-        <li><b>Add the same URL to your AI platform.</b>
-          <ul>
-            <li><b>Claude</b> (Claude Desktop or claude.ai): Settings → Connectors → Add custom connector.
-            Then set "Read-only tools" and "Write/delete tools" to "Always allow",
-            or you'll be answering an authorization question for every step the AI takes.</li>
-            <li><b>ChatGPT</b> (chatgpt.com): Settings → Apps (called Connectors or
-            Plugins on some plans). First enable "Developer mode" under Advanced
-            settings — despite the name, no coding is involved — then press "Create app" and
-            paste the URL.</li>
-            <li><b>Other apps:</b> look for "MCP", "connectors", or "plugins" in the settings.</li>
-          </ul>
-          Your app will now send you to ID.ai where you must grant it access. Untick "Read-only mode" if you
-          want the AI to act — place orders, swap — and not just read. Grants expire by design;
-          re-approving later is normal, not a fresh setup.</li>
-
-        <li><b>Talk to the exchange.</b> Ask your chat to connect to
-        <code>https://multidex.ai</code>, then try: <i>"What is the price of BTC?"</i> ·
-        <i>"How much is my account worth?"</i> · <i>"Buy $10,000 of ICP"</i> (needs Read-only
-        mode off).</li>
-      </ol>
-
-      <p>Enjoy</p>
     `,
   },
 
@@ -1723,6 +1824,211 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
       multiple chains can be trustlessly deposited, traded, and withdrawn directly, and AIware
       functionality lets users analyze the markets and their positions, and trade, via AI.</p>
 
+      <h3>1.75 — 1 November 2026</h3>
+      <ul>
+        <li><b>Agent Chat, rebuilt on the open-saas assistant's trust rules.</b> A proposed
+        action is now <b>resolved and validated before its card</b>: the exact market, pool and
+        token are looked up (an ambiguous name comes back as a question listing the candidates,
+        never a guess), amounts are converted in code, and what the canister would refuse — an
+        unknown market, slippage outside 1–25%, a balance you lack, an order under the 10 ICPUSD
+        minimum — is refused up front. The card shows the decoded details and a caution line for
+        slippage, leverage and anything that borrows or leaves the exchange; declining is final,
+        and after a confirmed action the chat <b>re-reads what changed</b> before reporting, then
+        refreshes the Markets and Account views. It knows who is asking (your username and
+        principal), the page, market and pool you are on, and today's date; suggested prompts
+        cover portfolio, markets, margin, earn, the leaderboard and help; the step line narrates
+        each read; a footer states what the chat can do right now. <b>Help questions</b>
+        ("how do I deposit?") are answered from these Docs with in-app citations — also when the
+        AI key is off or the model does not answer — and failures are classified plainly (a
+        refusal, a model outage, a step budget) with the technical reason in small print and
+        your question put back in the box to retry. The conversation survives a reload in this
+        tab (a card that was pending comes back as "nothing ran") and is purged at sign-out. The
+        tab itself is now called <b>Agent Chat</b> (it was the AI assistant); its address is
+        <code>#ai/agent-chat</code>, and the old <code>#ai/assistant</code> link still lands
+        there. Help answers lead with one actionable next step, and the chat's standing
+        instructions were cut by a quarter — the long venue description now loads only when a
+        question needs it.</li>
+        <li><b>A Home page.</b> The logo now opens <code>#home</code>: the strap
+        "Actually decentralized. Secure. Yours.", a short introduction, Swap / Markets / Earn
+        boxes that lead into the app, a live proof strip and an open-source section. Swap
+        keeps a strap of its own — "Directly swap digital assets. No middleman." — so the
+        two pages do not repeat each other.</li>
+        <li><b>MCP is gone from the product.</b> The Docs page on wiring an MCP client to the
+        exchange is deleted and its cross-links point at Agent Chat instead; the API contract
+        for bot authors stays where it was, in the public repository's
+        <code>candid/README.md</code>.</li>
+        <li><b>Docs → Margin explains borrow-at-fill end to end.</b> What a fill borrows, a
+        two-slice worked example and a quick-reference row — the page now describes the
+        model this release ships (below), not the old borrow-at-placement one.</li>
+        <li><b>Trade history backfills in seconds.</b> Reading your archived fills used to
+        walk the whole archive one segment at a time; it now pages fills only, probes six
+        segments at once and shows a live "segments 7–12 of 42" line while it works. After an
+        upgrade the archive rebuilds its own fill and deposit/withdrawal indexes, so neither
+        history goes slow after a release.</li>
+        <li><b>A major release.</b> The first product version since 1.60 (7 August): the
+        public API broke (apiVersion <b>6.0.0</b>), and margin, vault and matching behaviour
+        changed in ways you will notice. Its hardening half — the API, margin and vault changes
+        below — has been live since 31 October under the 1.60 badge; everything else in this
+        entry arrives with the 1.75 badge. The full list, in user terms, is
+        <code>docs/release-notes.md</code> in
+        <a href="https://github.com/dfinity/public-multidex" target="_blank" rel="noopener noreferrer">the repository</a>;
+        the highlights follow.</li>
+        <li><b>A leveraged order holds no debt until it fills.</b> A leveraged limit order
+        used to borrow its whole leverage from the vault the moment it was placed, and paid
+        interest while it rested. Now placement only checks that the vault could fund it: a
+        staged or resting entry holds <b>zero debt and pays no carry</b>, and the fill
+        borrows exactly what it fills, against fresh prices, with interest running from that
+        instant. The one new outcome: if the vault has run dry by the time your order would
+        fill, it does not fill — the remainder is cancelled and one record in your release
+        rejections says why.</li>
+        <li><b>Vault LP: redemption at NAV, sealed deposits and withdrawals.</b> Every LP
+        share now redeems at the same per-share value it was minted at, so a
+        deposit-then-withdraw round trip costs exactly the fee — an exit no longer forfeits
+        its slice of the loan book. What you can withdraw <i>instantly</i> is your share of
+        what the vault physically holds (a loan cannot be handed out in kind); a request past
+        that cap is refused with the figure, never clamped or queued, and after a maximum
+        exit your remaining shares stay locked until borrowers repay — so repeated maximum
+        exits can no longer drain the liquidity of the LPs who stay. Both doors are now
+        sealed: a deposit or withdrawal is staged and settles a second or two later at a
+        price fetched <i>after</i> you committed, so nobody can mint or redeem against a
+        stale mark, and the old "deposit paused: price is stale" flicker is gone.</li>
+        <li><b>Bot authors: apiVersion 6.0.0 is breaking.</b> <code>depositLp</code> /
+        <code>withdrawLp</code> return a staged request — read its id from <code>#ok</code>
+        and poll <code>getMyStagedLpRequests</code>; <code>seedAmmPool</code> is
+        controller-only; and the long-inert protection-window surfaces are gone
+        (<code>getMyPendingMatches</code>, <code>placeProtectedLimitOrder</code>, the
+        <code>pendingMatches</code> result fields, <code>setAmmConfig</code>'s sixth
+        argument). Since 1.60 the interface also took 3.0.0, 4.0.0 and 5.0.0 — the tape's
+        <code>#gap</code> and <code>#config</code> events, and the removal of the never-fed
+        adverse-flow queries. See the <a href="https://github.com/dfinity/public-multidex/blob/HEAD/candid/README.md" target="_blank" rel="noopener noreferrer">API docs</a>.</li>
+        <li><b>The September hardening wave</b> — 37 tasks from a 48-finding security scan,
+        all landed: bounded margin-pool fills so a pool's equity cannot go negative at the
+        worst-case price; fresh whole-basket prices required for any action that adds debt;
+        a scan budget on every book-walking simulation; every cross-swap leg capped around
+        its market's mid and settled through the sealed release like every other order; both
+        release passes paced; a maker shield that holds only while a genuine repricing is in
+        flight; ledger verifiers that never report success unanchored; an atomic season seal;
+        unregistered principals held to the sign-up methods; one slow or one off-price feed
+        unable to stall or freeze the mark; and a deploy pipeline that pins canister ids and
+        controller sets and reads the posture back after every install.</li>
+        <li><b>The funding authority.</b> The simulated traders are refilled by a single,
+        narrowly scoped funding key the controller designates — admitted to the balance
+        setters and nothing else, every designation on the public tape — so the key that
+        can upgrade the exchange is never one a bot process holds.</li>
+        <li><b>Light mode.</b> A sun/moon toggle at the top right of the header switches the
+        exchange to a light theme. The choice is remembered per browser; until you pick, the
+        site follows your system's dark/light preference. Charts, the order book and the
+        liquidation map re-colour with it, and the charts keep their visible range and
+        crosshair across a toggle.</li>
+        <li><b>The full-size chart.</b> The ⤢ button at the right of the chart bar opens the
+        chart full-screen at the interval you were looking at — drag left to page older
+        history, switch intervals, <i>Esc</i> or × closes it. (It was always in the app;
+        the button that opened it had been hidden since the first release.)</li>
+        <li><b>The chart, fixed in four places.</b> A refresh merges the newest candles into
+        the series you are looking at instead of replacing it, so older history you scrolled
+        in and your visible range survive the 10-second ticks; the older-history fetch fires
+        only when you actually pan to the left edge (every interval switch and overlay open
+        used to buy one wasted query); after a pan, switching interval or opening the
+        overlay lands exactly at real time again; and the time axis labels read as a year, a
+        month, a day, HH:MM or HH:MM:SS depending on how far you zoom.</li>
+        <li><b>Keyboard.</b> The chart cell's view menu (<b>Chart | Liquidations | Hide</b>)
+        works without a mouse — <i>Tab</i> to it, <i>Enter</i> or the arrow keys open it, the
+        arrows move, <i>Enter</i> picks, <i>Esc</i> closes — and the full-size chart keeps
+        <i>Tab</i> inside it until you close it.</li>
+        <li><b>Keyboard, everywhere a menu drops.</b> The order book's price-grouping menu
+        (Markets and Swap), the market selector, the price/stats popups, the signed-in user
+        menu and the drop-down selectors under Wallet, Swap and Earn work without a
+        mouse the same way — <i>Tab</i> to the control, <i>Enter</i> or the arrows open it,
+        the arrows move, <i>Enter</i> picks, <i>Esc</i> closes.</li>
+        <li><b>Oracle error popovers.</b> The error popover on a price source now survives the
+        5-second stats refresh — it follows its re-drawn trigger, or closes once the source
+        has recovered — and follows a scroll or a resize; keyboard focus on the trigger
+        survives the refresh too. The token-select buttons announce themselves to screen
+        readers ("Sell token: BTC").</li>
+        <li><b>Copy buttons copy.</b> The explorer's principal and URL Copy buttons and the
+        Copy on an Agent Chat error were silently dead — the page's own permissions policy
+        denied it the clipboard. It may write to the clipboard now (and still never read
+        it).</li>
+        <li><b>Two layout fixes.</b> Account → Deposit fills its pane like the other Account
+        panes instead of a narrow capped column, and the glow behind The launch, What is
+        MULTI/DEX? and Prizes in these Docs fades out at its edges instead of ending in a
+        hard vertical line — in both themes, and without widening the page on a phone.</li>
+        <li><b>Hosting and resilience.</b> The site is served by the certified-assets
+        static-site recipe: the same security headers as before, and cached files carry an
+        ETag so a return visit revalidates them instead of downloading them again. On a
+        local venue, a stale or foreign venue cookie no longer breaks the app — it picks its
+        own venue row, heals once and names the mismatch in the banner.</li>
+      </ul>
+
+      <h3>1.60 — 7 August 2026</h3>
+      <ul>
+        <li><b>The order book is bounded everywhere it walks.</b> A taker sweeping many resting
+        orders at one price used to pay a cost that grew with the <i>square</i> of the queue — a
+        few thousand orders at a single price could push one match past the platform's
+        instruction limit. Every price level now keeps its queue in time priority, so the next
+        order to fill is found in logarithmic time however deep the level, and every sweep
+        carries a hard budget: one match call takes at most <b>256</b> steps — a market order
+        that hits it stops there with its unfilled remainder cancelled, as before, while a limit
+        order rests the remainder — an all-or-nothing order that would need more than 128
+        distinct makers is refused up front rather than half-filled, and a price level holds at
+        most <b>512</b> resting orders, a new order at a crowded level being refused rather than
+        an old one evicted. The AMM's resting-order sweep and the expiry release pass have
+        budgets of their own. Every live book was migrated to the new index in place and
+        verified identical afterwards.</li>
+        <li><b>Your history no longer goes blank.</b> The exchange keeps a bounded hot tape of
+        recent trades, and under the simulated traders' churn a user's older fills leave it
+        within days — Spot History, Positions History, Account → Position fills and the Account
+        spot table were silently emptying (a trader's Phase II day-one fills were already gone).
+        Each view now shows its recent rows at once and merges your <b>archived</b> fills in
+        behind them from the public ledger chain: paging is open-ended (<i>N / M+</i>), Next at
+        the loaded edge pulls another archive page, the Account table gains a <b>Load older</b>
+        button, and archived rows ride dimmed with an <b>ARCHIVE</b> tag. One caveat: the public
+        tape carries no sub-account identity, so archived fills of a position that is still open
+        read as spot until it closes.</li>
+        <li>Open Orders, Spot History, Positions and Positions History now quote prices at the
+        <b>same precision as the books beside them</b> — at least five significant digits, with
+        the decimals set per row by that row's market (an ICP row to four places, a BTC row to
+        whole dollars) — instead of the coarse two-decimal money format that rounded to whole
+        dollars above $1,000.</li>
+        <li><b>The first community audits of the public repository, and their fixes.</b> Two
+        waves of outside reports — about forty findings, each re-verified against the code and
+        nearly all confirmed — landed within a week of open-sourcing; the reporters are credited
+        in the repository's <code>CONTRIBUTORS.md</code>. What changed: the in-browser
+        <b>ledger verifier actually verifies</b> — its certificate check had been failing on
+        every call with the failure swallowed, so a fabricated tape would have ticked green —
+        and it now fails closed and trusts the platform root key only on the hosts it belongs
+        to; a short with health between 1.15 and 1.25 can be <b>closed again</b> instead of
+        being held for the liquidation penalty a permitted close would have avoided; a
+        dust-sized collateral balance can no longer stall a liquidation and book a
+        fully-collateralised position as a loss to the insurance fund, and a liquidation pass
+        that runs out of budget mid-walk resumes on the next sweep rather than declaring
+        insolvency; no liquidation is decided on a stale mark; unstaking the Insurance Fund is
+        priced symmetrically with staking (an exit could redeem more than it had put in); the
+        liquidation batch is sliced and guarded by a breaker that backs off instead of retrying
+        a failing pass every beat; the price feed's outlier trim uses a robust band that a
+        single off-price source cannot inflate — the old band could not reject anything at three
+        or four sources, which is how one source a percent adrift froze the mark; the ledger
+        archive no longer discards events on a backlog alone; a free sign-in can no longer write
+        unbounded permanent state; the dev-only hooks trap on every public posture; the Bridge
+        has its own posture and asset allowlist and no longer records a ledger row for an asset
+        it rejects; the AI connect page validates where it sends the sign-in delegation it mints
+        and shows the lifetime it actually requests; six frontend display defects are fixed in
+        which a confidently wrong figure rendered without error (a staker's pending yield shown
+        100,000,000× too large, a duplicated trade, a chart drawn continuous across missing
+        pages, the units the AI assistant is told); the app ships with a content-security
+        policy; and these docs now say plainly that on this anti-mixer venue every deposit and
+        withdrawal is a public, attributed record, where they used to claim other users' rows
+        never leave the canister. Every fix is pinned by a test that fails on the pre-fix
+        tree.</li>
+        <li>The first pull requests from outside the core team were adopted. The one you can
+        see: System → Canisters reports the exchange's <b>real memory ceiling</b>, read back
+        from the platform rather than hand-copied from the source — the dashboard had once read
+        45% while the exchange sat at 79% of its true limit.</li>
+        <li>The footer's version badge is stamped into the page at build time, so it shows from
+        first paint and cannot drift from the running build — it had read 1.51 while 1.52 was
+        live, and sat blank whenever the app stumbled before stamping it.</li>
+      </ul>
+
       <h3>1.52 — 2 August 2026</h3>
       <ul>
         <li><b>The app keeps itself up to date.</b> Until now a new release only
@@ -1792,7 +2098,9 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         (every resting bid and ask), <b>Longs</b> and <b>Shorts</b> (open notional per side),
         <b>Long/Short Health</b> (each side merged into one book — collateral ÷ debt, red
         below the 1.25 opening floor, liquidation at 1.15), and <b>Long/Short Liq</b> (distance
-        from the mark to each side's nearest liquidation, at the map's 1% precision). Stats
+        from the mark to each side's nearest liquidation, at the map's 1% precision — signed by
+        the direction the mark must move, which follows the book's health slope rather than its
+        side, and reading <b>liquidatable</b> when a position is already past maintenance). Stats
         that don't fit fold into a dropdown on the last visible cell — any number of stats can
         join the bar; the single compact dropdown appears only when not even the 24h Change
         fits.</li>
@@ -1847,8 +2155,13 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         proof-of-reserves requires). The owner↔pool index is no longer published, and
         per-account balances and badges answer only to their owner. <b>Bot authors:</b> this is
         a breaking Candid change on <code>getRecentTrades</code> / <code>getAllTrades</code> /
-        <code>getTradesSince</code> — apiVersion is now <b>2.0.0</b>; see the
-        <a href="#docs/mcp">API docs</a>.</li>
+        <code>getTradesSince</code> — apiVersion moved to <b>2.0.0</b> at that release (the
+        current apiVersion is <b>6.0.0</b>; <code>getAccessPolicy</code> and
+        <code>getMarketSpecs</code> report it live); see the
+        <a href="https://github.com/dfinity/public-multidex/blob/HEAD/candid/README.md" target="_blank" rel="noopener noreferrer">API docs</a>.</li>
+        <li>Sealed vault LP deposits and withdrawals (<code>depositLp</code> /
+        <code>withdrawLp</code> as staged requests, apiVersion 6.0.0) and the removal of the
+        protection-window surfaces shipped with <b>1.75</b> — see that entry above.</li>
         <li>Two deep audits ahead of open-sourcing, and their fixes: a deposit-crediting race
         that could double-credit, a registration gap in the AI deposit path, an AMM sweep that
         could overfill against a stale quantity, sealed archive segments that could run out of
@@ -1924,8 +2237,7 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
       <ul>
         <li>Clearer names across the app: Stats → Status, Intelli → Intelligence, and the old
         Status pane is now Issues.</li>
-        <li>Docs open on <a href="#docs/launch">The launch</a>, and the
-        <a href="#docs/mcp">MCP guide</a> is condensed to four steps.</li>
+        <li>Docs open on <a href="#docs/launch">The launch</a>.</li>
         <li>Status notices and swap fixes, shipped to the subnet.</li>
       </ul>
 

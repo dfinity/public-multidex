@@ -1,3 +1,40 @@
+/* ── Demo/mock-mode marker (app-wide, #54.9) ─────────────────────────
+   Lit by renderDemoMarker() whenever appState.actor IS the built-in mock
+   (the init fallback, or sign-out with no II client). Never dismissible:
+   the numbers on the page are fabricated and the reader must not be able
+   to lose that fact. Hazard stripes in the heather warning tone over a
+   SOLID --bg base (same opacity reasoning as .launch-banner — #top-chrome
+   is sticky), and a heavy heather rule so it reads as a warning, not as
+   one more info strip. Theme via tokens only. */
+.demo-banner {
+  padding: 10px 16px;
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: center;
+  color: var(--text);
+  background:
+    repeating-linear-gradient(135deg, var(--heather-tint) 0 14px, transparent 14px 28px),
+    var(--bg);
+  border-top: 4px solid var(--heather);
+  border-bottom: 1px solid var(--heather);
+}
+.demo-banner strong { color: var(--heather); font-weight: 700; letter-spacing: 0.02em; }
+.demo-banner .demo-mark { color: var(--heather); margin-right: 6px; }
+.demo-banner .demo-reload {
+  background: none;
+  border: 1px solid var(--heather);
+  border-radius: var(--radius-sm);
+  color: var(--heather);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 10px;
+  margin-left: 6px;
+}
+.demo-banner .demo-reload:hover { background: var(--heather-tint); }
+/* Sign-in buttons the marker gated (renderDemoMarker adds the class). */
+.btn.signin-demo-off { opacity: 0.45; cursor: not-allowed; }
+
 /* ── Out-of-fuel banner (app-wide) ──────────────────────────────────
    Sits above the header. Hidden until getCanisterInfo reports the canister
    is low on, or out of, cycles. The DEX is a public good, so the message
@@ -33,6 +70,13 @@
   background: rgba(0, 0, 0, 0.18);
   white-space: nowrap;
 }
+/* Mobile mode (≤ 900px, isMobile()): the cycles-donation appeals are desktop
+   business — a phone visitor cannot act on a canister id, and the sticky
+   chrome is the scarcest space on the page. The critical (frozen) tier is
+   NOT in this rule: it explains why trading halted, on any width. */
+@media (max-width: 900px) {
+  .fuel-banner.asks-cycles { display: none; }
+}
 /* ✕ on the status banners — hides the notice for this session (or until the
    banner's state changes; see applyBannerDismiss). Inherits the tier color. */
 .banner-dismiss {
@@ -62,8 +106,8 @@
 }
 .oracle-banner strong { font-weight: 700; }
 .oracle-banner.warn {
-  background: #b8860b;
-  color: #fff8e7;
+  background: var(--alarm-amber);
+  color: var(--alarm-amber-text);
 }
 
 /* ── Launch notice (app-wide, #play only) ───────────────────────────
@@ -81,9 +125,9 @@
      translucent background would let scrolled text bleed through. The look at
      rest is unchanged (the tint already composited over the page's --bg). */
   background:
-    linear-gradient(180deg, rgba(56, 189, 240, 0.10), rgba(56, 189, 240, 0.05)),
+    linear-gradient(180deg, var(--accent-tint-2), var(--accent-tint-1)),
     var(--bg);
-  border-bottom: 1px solid rgba(56, 189, 240, 0.30);
+  border-bottom: 1px solid var(--accent-border);
 }
 .launch-banner strong { color: var(--text); font-weight: 640; }
 .launch-banner .launch-mark { color: var(--accent); margin-right: 6px; }
@@ -95,6 +139,39 @@
   margin-left: 4px;
 }
 .launch-banner a.launch-more:hover { text-decoration: underline; }
+/* Phones (≤480px): the whole notice wraps to six lines — 132px of sticky
+   chrome at 400px — so the strip collapses to the ✦ mark, the first sentence
+   and the link; "Read more" discloses sentences 2–5 (.launch-rest) in place
+   and reads "Show less" while open (renderLaunchBanner toggles .expanded +
+   aria-expanded and recomputes --chrome-h). A text control in the accent,
+   dotted-underlined so it does not read as the navigation link beside it;
+   the ✕ keeps its float, and a clearfix makes the strip CONTAIN it — when the
+   last line is full ("…coming soon… Read the story → Show less" at 400px) the
+   float takes a line of its own instead of hanging below the strip over the
+   header. A clearfix, not display: flow-root: renderLaunchBanner shows and
+   hides the strip through its INLINE display, which a stylesheet display
+   cannot beat. Desktop never sees the control. Task 1793575027. */
+.launch-banner .launch-expand { display: none; }
+@media (max-width: 480px) {
+  .launch-banner::after { content: ""; display: block; clear: both; }
+  .launch-banner .launch-rest { display: none; }
+  .launch-banner.expanded .launch-rest { display: inline; }
+  .launch-banner .launch-expand {
+    display: inline-block;
+    background: none;
+    border: none;
+    padding: 0;
+    margin-left: 6px;
+    font: inherit;
+    font-weight: 600;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+  }
+  .launch-banner .launch-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+}
 
 /* ── Stats → Canister tab ───────────────────────────────────────── */
 .canister-id-card {
@@ -124,6 +201,14 @@
   word-break: break-all;
 }
 .canister-id-copy { flex-shrink: 0; }
+/* The archive spawn slot row (W4-16 / #55) — principal + age beside the
+   archive id. health-* classes are defined only on .kpi-value and the margin
+   selectors, so the age element carries its own colour rule. */
+.spawn-slot-row { margin-top: 10px; }
+.spawn-slot-label { font-size: 12px; color: var(--text-dim); }
+.spawn-slot-age { font-size: 12px; color: var(--text-dim); }
+.spawn-slot-age.health-warn { color: var(--cta-ink); }   /* Uplands Amber as text — the task's "amber past 60 s" */
+.spawn-slot-age.health-bad  { color: var(--red); font-weight: 600; }
 .canister-id-hint {
   font-size: 12px;
   color: var(--text-dim);
@@ -337,7 +422,7 @@
   gap: 10px;
   margin-bottom: 16px;
   padding: 12px 18px;
-  background: rgba(56, 189, 240, 0.08);
+  background: var(--accent-tint-1);
   border: 1px solid var(--accent-border);
   border-radius: 8px;
   color: var(--accent);
@@ -346,7 +431,7 @@
   text-decoration: none;
   transition: background 0.15s, border-color 0.15s;
 }
-.stats-cta:hover { background: rgba(56, 189, 240, 0.14); border-color: var(--accent); }
+.stats-cta:hover { background: var(--accent-tint-2); border-color: var(--accent); }
 .stats-cta-arrow { flex-shrink: 0; }
 
 .status-alert {
@@ -468,6 +553,15 @@
 }
 .pool-fin-toggle:hover { color: var(--accent); }
 .pool-fin-detail { flex-basis: 100%; font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+/* The owner's Repay row (task 1788533844): rendered only while the pool holds
+   debt — the figures, amount + token, the min(amount, debt, free) preview,
+   and the submit (disabled while the preview is zero). */
+.pool-repay { flex-basis: 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; font-size: 12px; color: var(--text-dim); }
+.pool-repay .pool-repay-amt { width: 110px; padding: 6px 8px; }
+.pool-repay .pool-repay-token { padding: 6px 8px; }
+.pool-repay-figs b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+.pool-repay-preview { font-variant-numeric: tabular-nums; color: var(--text); }
+.pool-repay-note { flex-basis: 100%; font-size: 11px; color: var(--text-muted); line-height: 1.4; }
 .pool-block-empty { padding: 10px 12px; font-size: 12px; color: var(--text-muted); }
 .pool-block .positions-table { font-size: 12.5px; }
 .pool-block .positions-table td { border-bottom: 1px solid var(--border); }
@@ -487,7 +581,7 @@
 .pos-actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .pos-label { font-size: 12px; color: var(--text-dim); min-width: 44px; }
 .pos-input {
-  background: rgba(255,255,255,0.03); color: var(--text); border: 1px solid var(--border);
+  background: var(--text-tint-1); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 7px 10px; font-size: 13px; min-width: 90px;
 }
 .pos-input:focus { outline: none; border-color: var(--accent); }
@@ -501,15 +595,21 @@ select.pos-input { cursor: pointer; }
 .dd-native { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; margin: 0; }
 .dd-btn { display: inline-flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 110px; text-align: left; }
 .dd-chevron { color: var(--text-dim); font-size: 10px; transition: transform 0.12s; }
-.dd.dd-open .dd-chevron { transform: rotate(180deg); }
+.dd.open .dd-chevron { transform: rotate(180deg); }
+/* Shown off the wrapper's .open — the class makeDropdown's setter writes
+   (main.js enhanceSelectDropdown; it used to be an inline display toggle). */
 .dd-menu {
+  display: none;
   position: absolute; top: calc(100% + 4px); left: 0; min-width: 100%;
   background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.45); z-index: 60; padding: 4px;
+  box-shadow: var(--shadow-pop); z-index: 60; padding: 4px;
   max-height: 260px; overflow-y: auto;
 }
+.dd.open .dd-menu { display: block; }
 .dd-opt { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--text); padding: 8px 12px; font-size: 13px; cursor: pointer; border-radius: 6px; white-space: nowrap; }
-.dd-opt:hover { background: var(--bg-hover); }
+.dd-opt:hover, .dd-opt:focus-visible { background: var(--bg-hover); }
+/* An inset ring: the menu scrolls (max-height) and would clip an outer one. */
+.dd-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .dd-opt-active { color: var(--accent); }
 /* Per-option asset icon before the symbol (opt-in via .dd-has-icons — the Swap
    token selects). The auto-margin keeps the chevron pinned right; the menu rows
@@ -541,7 +641,7 @@ select.pos-input { cursor: pointer; }
 .lb-play-banner {
   margin: 0 0 18px;
   padding: 13px 18px;
-  background: rgba(56, 189, 240, 0.08);
+  background: var(--accent-tint-1);
   border: 1px solid var(--accent-border);
   border-radius: 8px;
   font-size: 13.5px;
@@ -586,7 +686,7 @@ select.pos-input { cursor: pointer; }
 .lb-explain a:hover { text-decoration: underline; }
 .lb-my-rank {
   margin: 0 0 12px; padding: 10px 14px; border-radius: 8px;
-  border: 1px solid var(--accent-border); background: rgba(56, 189, 240, 0.06);
+  border: 1px solid var(--accent-border); background: var(--accent-tint-1);
   font-size: 13px; color: var(--text-dim);
 }
 .lb-my-rank b { color: var(--text); }
@@ -613,7 +713,7 @@ select.pos-input { cursor: pointer; }
 .lb-pos { color: var(--green); }
 .lb-neg { color: var(--red); }
 /* Caller's own row: same accent language as the shed-safe banner. */
-.lb-row.lb-me td { background: rgba(56, 189, 240, 0.07); }
+.lb-row.lb-me td { background: var(--accent-tint-1); }
 .lb-row.lb-me .lb-trader { color: var(--accent); }
 .lb-updated { margin-top: 10px; font-size: 11.5px; color: var(--text-muted); }
 
@@ -633,8 +733,8 @@ select.pos-input { cursor: pointer; }
 .lg-verify-out.lg-warn { color: var(--heather); }
 .lg-verify-out.lg-warn .lg-gap-note { color: var(--text-dim); }
 .lg-badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
-.lg-sealed { background: rgba(122,134,153,0.18); color: var(--text-dim); }
-.lg-active { background: rgba(0,200,140,0.15); color: var(--green); }
+.lg-sealed { background: var(--text-tint-2); color: var(--text-dim); }
+.lg-active { background: var(--green-tint); color: var(--green); }
 /* Hash chips: colour derives from the hash bytes, so a row's own-hash chip
    visually reappears as the row above's prev chip — the chain, visible. */
 .lg-chip {

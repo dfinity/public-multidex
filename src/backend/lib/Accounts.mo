@@ -77,6 +77,19 @@ module {
     Iter.toArray(Map.entries(results));
   };
 
+  // Does this principal hold ANY positive balance? The same prefix seek as
+  // getUserBalances, stopping at the first hit — an emptiness test for the
+  // margin-pool scans (H-30: a pool with no holdings and no debt carries no
+  // position, so it must not count toward HEAT_MAX_POOLS).
+  public func hasAnyBalance(state : AccountState, user : Principal) : Bool {
+    let prefix = Principal.toText(user) # "#";
+    label walk for ((key, bal) in Map.entriesFrom(state.balances, Text.compare, prefix)) {
+      if (not Text.startsWith(key, #text prefix)) { break walk };
+      if (bal > 0) { return true };
+    };
+    false
+  };
+
   func textAfter(t : Text, skip : Nat) : Text {
     var i = 0;
     var result = "";

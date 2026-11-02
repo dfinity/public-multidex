@@ -1,0 +1,129 @@
+# Response headers for the static-site (certified-assets) canister that hosts
+# MULTI/DEX — copied into dist/ by Vite (publicDir), read there by the recipe's
+# sync plugin at `icp deploy`, never served. Netlify `_headers` syntax: a path
+# pattern on its own line, then indented `Name: value` lines. A blank line or a
+# `#` comment ENDS a block, so comments live out here at the top level, never
+# between a pattern and its headers.
+#
+# THIS FILE REPLACES public/.ic-assets.json5 (task 1793503326, 2026-11-01: the
+# frontend moved from @dfinity/asset-canister@v2.2.1 to @dfinity/static-site;
+# the certified-assets canister never reads .ic-assets.json5 — a dotfile is not
+# even uploaded — so rules placed there do nothing). Two things the legacy
+# canister did implicitly that must be explicit here:
+#
+#  1. SECURITY HEADERS. certified-assets adds NO default headers — there is no
+#     `security_policy: "standard"` preset — so the seven headers that preset
+#     emitted are reproduced below VERBATIM from the legacy canister's served
+#     response (curl -sI of a seat venue, 2026-11-01; dfx's
+#     ic-asset/src/security_policy.rs is the upstream source). Certified assets
+#     prove the bytes came from the canister; the CSP says what those bytes may
+#     then load. `script-src 'self'` is only affordable because the app bundles
+#     every script it runs (no CDN <script>) and emits no inline handlers.
+#     scripts/check_headers.sh reads the set back off the deployed origin after
+#     every remote deploy; tests/frontend_security.test.mjs §E parses this file.
+#     ONE token deviates from that preset, deliberately: `clipboard-write=(self)`.
+#     The preset's `clipboard-write=()` is the EMPTY allowlist, which denies the
+#     async Clipboard API to every origin INCLUDING the page itself — Chrome
+#     rejected every Copy button's navigator.clipboard.writeText with
+#     NotAllowedError "blocked because of a permissions policy applied to the
+#     current document" (confirmed on a seat venue, 2026-11-01; task
+#     1793506794). `clipboard-read=()` stays: the app never reads the
+#     clipboard. §E pins both tokens.
+#
+#  2. EVERY MATCHING BLOCK CONTRIBUTES, and same-named values COMBINE
+#     comma-separated. So a header whose value must DIFFER per file — the CSP
+#     (ai-connect.html carries its own) and Cache-Control (hashed assets are
+#     immutable, everything else revalidates) — may appear ONLY in blocks whose
+#     patterns can never both match one file: a second CSP would be enforced
+#     beside the first (the handshake script's hash is in one policy only), and
+#     a merged "max-age=0, must-revalidate, ..., max-age=31536000, immutable" is
+#     a contradiction. Only the headers identical for every file sit on the
+#     `/*` catch-all. The single `*` wildcard SPANS `/`, so a suffix pattern
+#     like `/*.js` would also match /assets/… and stack onto the immutable
+#     rule — those two headers use exact paths or prefix patterns only, and §E
+#     refuses any pair of blocks that could stack either onto a served file.
+#
+# Patterns match the ASSET KEY (the file path), never the visitor's URL: `/`,
+# `/index` and every SPA deep link (`_redirects`) resolve to /index.html, so
+# the /index.html block is what the shell gets, and a `/` block matches nothing.
+#
+# `allow_raw_access: false` has no equivalent: certified-assets certifies every
+# response but cannot refuse the raw.icp0.io host (static-site skill, Pitfall
+# 14). An accepted loss, recorded in the switch's completion note; only the
+# verifying hosts (multidex.ai, <id>.icp0.io, <id>.icp.net) are linked anywhere.
+
+/*
+  Permissions-Policy: accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=(), clipboard-write=(self), gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()
+  X-Frame-Options: DENY
+  Referrer-Policy: same-origin
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  X-Content-Type-Options: nosniff
+  X-XSS-Protection: 1; mode=block
+
+# The app shell. It names the content-hashed bundle, so it must never go stale:
+# revalidate on every load (sw.js has no fetch handler and caches nothing;
+# update-check.js polls /version.json with cache: "no-store" besides).
+/index.html
+  Content-Security-Policy: default-src 'self';script-src 'self';connect-src 'self' http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;
+  Cache-Control: public, max-age=0, must-revalidate
+
+# IC App Connect bridge page (ai-connect.html) — its OWN policy, which the
+# shell's standard one must NOT be stacked onto (see 2 above). Two reasons it
+# cannot just inherit: the page carries an inline handshake script (pinned by
+# hash rather than allowed wholesale with 'unsafe-inline'), and `standard`
+# includes `upgrade-insecure-requests`, which would rewrite the connector
+# callback `http://127.0.0.1:<port>/callback` to https and break every sign-in.
+# So: nothing loads by default; the one script that may run is that exact byte
+# sequence; the only place the page may talk to is loopback.
+#
+# THE HASH PINS THE SCRIPT BYTES. Editing the script without updating it here
+# takes the page down — `node tests/frontend_security.test.mjs` checks the two
+# are in step and prints the replacement value.
+#
+# frame-ancestors 'none' stays: a clickjacking overlay must not be able to
+# trick the user into approving the II sign-in.
+/ai-connect.html
+  Content-Security-Policy: default-src 'none'; script-src 'sha256-XOEHYxR2J7dp3RnLYahnQz+B7yMpO+68bGXcRcDPaTo='; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Cache-Control: public, max-age=0, must-revalidate
+
+# Content-hashed build output (assets/index-<hash>.js, fonts, sprites) — the
+# name changes whenever the bytes do, so it can be cached hard.
+/assets/*
+  Content-Security-Policy: default-src 'self';script-src 'self';connect-src 'self' http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;
+  Cache-Control: public, max-age=31536000, immutable
+
+# Agent-discovery and Internet Identity documents (ic-app.json — emitted by
+# vite.config.mjs's emitWellKnownManifest — ic-domains, ii-alternative-origins).
+# The sync plugin uploads .well-known/ on its own (the ONE dot-directory it
+# does not skip), so the legacy un-ignore rule is gone; same names across
+# deploys, so revalidate.
+/.well-known/*
+  Content-Security-Policy: default-src 'self';script-src 'self';connect-src 'self' http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;
+  Cache-Control: public, max-age=0, must-revalidate
+
+# Internet Identity requires the alternative-origins document to be JSON
+# (internet-identity skill, "Serving an app at more than one origin"); the file
+# has no extension, so the canister cannot infer it — the legacy canister
+# served it as application/octet-stream. The bare `Content-Type:` form sets
+# the asset's stored media type (it is not an extra response header, so it
+# stacks with nothing).
+/.well-known/ii-alternative-origins
+  Content-Type: application/json
+
+# Non-hashed root files: the same name across deploys, so revalidate (exact
+# paths — `/*.js` and `/*.svg` would span into /assets/, see 2 above).
+/favicon.svg
+  Content-Security-Policy: default-src 'self';script-src 'self';connect-src 'self' http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;
+  Cache-Control: public, max-age=0, must-revalidate
+
+/sw.js
+  Content-Security-Policy: default-src 'self';script-src 'self';connect-src 'self' http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;
+  Cache-Control: public, max-age=0, must-revalidate
+
+/theme-boot.js
+  Content-Security-Policy: default-src 'self';script-src 'self';connect-src 'self' http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;
+  Cache-Control: public, max-age=0, must-revalidate
+
+/version.json
+  Content-Security-Policy: default-src 'self';script-src 'self';connect-src 'self' http://localhost:* https://icp0.io https://*.icp0.io https://icp-api.io;img-src 'self' data:;style-src * 'unsafe-inline';style-src-elem * 'unsafe-inline';font-src *;object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;
+  Cache-Control: public, max-age=0, must-revalidate

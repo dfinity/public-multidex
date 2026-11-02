@@ -32,6 +32,7 @@ import Nat64 "mo:core/Nat64";
 import Nat8 "mo:core/Nat8";
 import Char "mo:core/Char";
 import Blob "mo:core/Blob";
+import List "mo:core/List";
 
 persistent actor Bridge {
 
@@ -52,15 +53,16 @@ persistent actor Bridge {
   // silently overwritten by the stored value on `--mode upgrade` and the flip
   // would never land. Transient re-evaluates on install AND upgrade.
   //
-  // The DEX also derives an IS_DEV from this literal; the Bridge deliberately
-  // does not, because nothing here is #dev-only (see requireNotProduction
-  // below for why the line sits at #production). A declared-but-unread
-  // constant is a dead binding — moc says so itself, M0194 — and this file
-  // already carries one such fossil (ASSETS, declared and never used as a
-  // membership test until now). Add IS_DEV when something reads it.
+  // The DEX also derives an IS_DEV from this literal; the Bridge did not
+  // until devTestStrandAdmission (below) needed a #dev-only gate — the
+  // on-ramp itself stays live on #play (see requireNotProduction below for
+  // why that line sits at #production). A declared-but-unread constant is a
+  // dead binding — moc says so itself, M0194 — so IS_DEV exists exactly
+  // because one hook reads it; nothing on the user path may.
   public type DeployMode = { #dev; #play; #production };
   transient let DEPLOY_MODE : DeployMode = #play;
   transient let IS_PRODUCTION : Bool = DEPLOY_MODE == #production;
+  transient let IS_DEV : Bool = DEPLOY_MODE == #dev;
 
   // THE RULE for every posture gate, copied from the DEX's requireDevHook:
   // refuse LOUDLY, in whichever way the signature allows — a typed #err where
@@ -116,6 +118,20 @@ persistent actor Bridge {
   let admittedUnits = Map.empty<Text, Nat>();
   let admitting     = Map.empty<Text, Bool>();      // in-flight guard — cleared by postupgrade
 
+  // H-26 (F41): the WIPE-PENDING FENCE. adminSeasonWipe refuses while any
+  // claim or admission is mid-flight, and the DEX's resetSeason aborts on
+  // that refusal — so a sustained stream of admissions (any keypair can
+  // start one; eligibility is judged DEX-side, one round trip later) could
+  // keep the venue-global interlock occupied for every retry the operator
+  // made. A refused wipe now ARMS this flag: NEW claims and admissions are
+  // refused with a typed #err until a wipe completes (or a controller
+  // cancels), so the in-flight ones drain within one DEX round trip and the
+  // next attempt finds the interlock free. Deliberately STABLE (a plain
+  // `var` in a persistent actor): a wipe the operator armed must survive the
+  // Bridge upgrade that may sit between two reset attempts — an upgrade
+  // clears the in-flight guards (postupgrade), never the operator's intent.
+  var wipePending : Bool = false;
+
   // The DEX we credit into, set by a controller after deploy (setDex).
   var dexPrincipal : ?Principal = null;
 
@@ -148,13 +164,23 @@ persistent actor Bridge {
   type DexActor = actor {
     // seq = this claim's post-credit cumulative `claimed` (monotonic per
     // user+asset); the DEX no-ops any seq it has already applied, so a
-    // lost-reply retry of this call can never double-credit.
-    creditAndRegister : (Principal, Text, Nat, Nat) -> async { #ok; #err : Text };
+    // lost-reply retry of this call can never double-credit. The trailing
+    // ?Nat is our PENDING units for (user, asset) at claim time: the DEX's
+    // reservation covers admitted-but-uncredited units, pending ones
+    // included, and a claim only ever covers confirmed units (claimable and
+    // pending are disjoint) — so the DEX fences the pending's units off from
+    // the reservation this claim consumes (3088472021). Candid-additive (opt).
+    creditAndRegister : (Principal, Text, Nat, Nat, ?Nat) -> async { #ok; #err : Text };
     // seq = this admission's post-admit cumulative admitted units (monotonic
     // per user+asset, same discipline as the claim seq); the DEX no-ops any
     // seq it has already applied, so a lost-reply retry can never double-
     // consume the play allowance.
     playDepositReserve : (Principal, Text, Nat, Nat) -> async { #ok; #err : Text };
+    // #55: the reservation view devConfirmDeposits reconciles a written-ahead
+    // pending against before it becomes claimable. `admitSeq` is the last
+    // admission seq the DEX APPLIED for (user, token); our admittedUnits
+    // running ahead of it names exactly the units the DEX never reserved.
+    playDepositReservation : shared query (Principal, Text) -> async { #ok : { capActive : Bool; reservedUnits : Nat; admitSeq : Nat }; #err : Text };
   };
 
   func key(user : Principal, asset : Text) : Text { Principal.toText(user) # "#" # asset };
@@ -173,6 +199,56 @@ persistent actor Bridge {
       case null { let l : Ledger = { var confirmed = 0; var pending = 0; var claimed = 0 }; Map.add(ledgers, Text.compare, k, l); l };
     };
   };
+
+  // H-26 (F40): a refused admission must leave the stable maps IDENTICAL to
+  // their pre-call state. The write-ahead (W3-04) get-or-creates the counter
+  // and the Ledger row before the DEX's verdict; the rollback restored their
+  // VALUES but never deleted the rows it had created, so every refused
+  // first-time deposit — every unbound keypair, on demand — left two
+  // permanent zero rows per asset, reclaimable only by the season wipe. An
+  // absent counter reads as 0 and an absent Ledger reads as all-zero
+  // (Option.get / getMyDeposits both say so), so deleting a zero-valued row
+  // is a pure no-op semantically and the only way to make refusal free.
+  // Never called on a key that is mid-flight: a held admission carries
+  // admitted + amount > 0 and pending > 0, so nothing here can match one.
+  func pruneZeroRows(k : Text) {
+    switch (Map.get(admittedUnits, Text.compare, k)) {
+      case (?0) { ignore Map.delete(admittedUnits, Text.compare, k) };
+      case _ {};
+    };
+    switch (Map.get(ledgers, Text.compare, k)) {
+      case (?l) { if (l.confirmed == 0 and l.pending == 0 and l.claimed == 0) { ignore Map.delete(ledgers, Text.compare, k) } };
+      case null {};
+    };
+  };
+
+  transient let WIPE_PENDING_MSG : Text = "A season wipe is pending on the Bridge — new deposits and claims are paused until the season reset completes (the operator retries it once in-flight admissions settle)";
+
+  // H-27 (F5-Bridge): the AMOUNT CEILING. `amount` is an unbounded Nat from
+  // the caller, and until this gate the only bound was `amount == 0`. A
+  // ~100 KB Nat sailed through the write-ahead and into the DEX's
+  // playDepositReserve, whose refusal formats the valued amount through
+  // Nat.toText — the per-decimal-digit bignum loop, Θ(bits²) — so the DEX
+  // burned its whole 40 B instruction budget (~20 DTS rounds during which
+  // nothing else ran) and trapped; the Bridge's catch arm (1788465034) rolls
+  // its own writes back, but the DEX stall was reachable on demand by any
+  // email-bound player. Now anything above 2^128 units is refused HERE,
+  // before any state write and before the DEX call is even sent. 2^128 is
+  // the ceiling H-15's brief names for the DEX side (kept in step so the two
+  // halves agree): a fixed, price-independent constant that no real deposit
+  // approaches (2^128 e8s of any asset is ~3.4e30 whole units), while the
+  // comparison itself is a single bignum compare — linear in the caller's
+  // bit length, not quadratic — and every value that passes it has at most
+  // 39 decimal digits, so no downstream toText can ever be expensive again.
+  // The refusal text deliberately does NOT echo the amount (formatting it is
+  // the very cost this gate exists to avoid).
+  transient let AMOUNT_CEILING : Nat = 2 ** 128;
+  transient let AMOUNT_CEILING_MSG : Text = "Amount exceeds the Bridge deposit ceiling (2^128 units) — refused before admission; nothing was written and the DEX was not called";
+  // Observability for the "no DEX call" property (H-27 verify): counts every
+  // playDepositReserve the Bridge actually SENDS. Transient by design (a
+  // diagnostic delta, not accounting): tests read it before/after a refused
+  // call through getBridgeStats.
+  transient var dexAdmitCalls : Nat = 0;
 
   // STUB address derivation. The real Bridge derives these under threshold ECDSA
   // (BTC/EVM) / Schnorr–Ed25519 (SOL) with the principal as the derivation path
@@ -305,6 +381,9 @@ persistent actor Bridge {
     // key. Without this, claim("<any junk>") was a permanent write.
     if (not isSupportedAsset(asset)) { return #err("Unsupported asset: " # asset) };
     switch (requireNotProduction("claim")) { case (#err(e)) { return #err(e) }; case (#ok) {} };
+    // H-26 fence: a pending season wipe refuses NEW claims before the guard
+    // is taken, so the in-flight ones drain and the wipe can land.
+    if (wipePending) { return #err(WIPE_PENDING_MSG) };
     let dexP = switch (effectiveDex<system>()) { case (?p) { p }; case null { return #err("Bridge is not wired to a DEX yet") } };
     let k = key(msg.caller, asset);
     if (Map.get(claiming, Text.compare, k) != null) { return #err("A claim for " # asset # " is already in progress") };
@@ -330,7 +409,13 @@ persistent actor Bridge {
       // Pass the post-claim high-water (l.claimed + claimable) as the DEX-side
       // idempotency key: on success we advance l.claimed to exactly this value,
       // so a retry after a lost #ok recomputes the SAME key and the DEX no-ops.
-      let r = await dex.creditAndRegister(msg.caller, asset, claimable, l.claimed + claimable);
+      // `?l.pending`: the units admitted but not yet confirmed — NOT part of
+      // this claim, so the DEX must keep their reservation (see DexActor).
+      // Read at send time: an admission that lands during the await adds to
+      // both sides consistently (its reserve and its pending), and only an
+      // EXCESS claim — a claimable larger than the reservation — can even
+      // observe the difference.
+      let r = await dex.creditAndRegister(msg.caller, asset, claimable, l.claimed + claimable, ?l.pending);
       ignore Map.delete(claiming, Text.compare, k);
       switch (r) {
         case (#ok) { l.claimed += claimable; #ok(claimable) };
@@ -350,8 +435,11 @@ persistent actor Bridge {
   // the DEX values it at press-time marks, consumes that much of the user's
   // lifetime allowance up front, and reserves the units so the eventual claim
   // settles against the reservation with no re-valuation and can NEVER be
-  // refused by the cap. A refused deposit is never created, so nothing
-  // unclaimable ever accumulates here. The admission seq (post-admit
+  // refused by the cap. A refused deposit is ROLLED BACK — on the DEX's
+  // explicit #err and on a system-level rejection alike (the DEX stopped for
+  // an upgrade is the routine one, #55) — and a pending the DEX never
+  // reserved is dropped by devConfirmDeposits instead of becoming claimable,
+  // so nothing unclaimable accumulates here. The admission seq (post-admit
   // cumulative admitted units) makes the call idempotent: if the DEX reserved
   // but our reply was lost, the user's retry recomputes the SAME seq and the
   // DEX no-ops instead of double-debiting the allowance.
@@ -362,6 +450,18 @@ persistent actor Bridge {
     if (not isSupportedAsset(asset)) { return #err("Unsupported asset: " # asset) };
     switch (requireNotProduction("devSimulateDeposit")) { case (#err(e)) { return #err(e) }; case (#ok) {} };
     if (amount == 0) { return #err("Amount must be positive") };
+    // H-27: the ceiling sits with the other LOCAL checks — above the fence,
+    // the wiring, the interlock, every write and the DEX call (see
+    // AMOUNT_CEILING). Never format `amount` in a refusal below this line.
+    if (amount > AMOUNT_CEILING) { return #err(AMOUNT_CEILING_MSG) };
+    // H-26: EVERY eligibility check the Bridge can make locally — asset,
+    // posture, amount, the wipe fence, DEX wiring — runs ABOVE the in-flight
+    // guard and above any state write, so an ineligible call neither
+    // occupies the interlock nor leaves a row. The one check that is not
+    // local (the DEX's verified-binding gate, judged in playDepositReserve)
+    // is what the fence exists for: a refused wipe pauses new admissions so
+    // that stream cannot hold the interlock across the operator's retry.
+    if (wipePending) { return #err(WIPE_PENDING_MSG) };
     switch (effectiveDex<system>()) {
       case (?dexP) {
         let k = key(msg.caller, asset);
@@ -370,12 +470,17 @@ persistent actor Bridge {
         Map.add(admitting, Text.compare, k, true);
         // WRITE-AHEAD (W3-04, #27.2): commit the counter AND the pending
         // credit BEFORE the yield, and roll both back only on the DEX's
-        // explicit #err. Behind-the-yield writes were lost when an upgrade
-        // landed in the await window (the routine act of deploying):
-        // postupgrade cleared `admitting`, the user retried, the retry
-        // computed a DIFFERENT seq, and the DEX's replay gate — keyed on
-        // seq — debited the lifetime allowance a second time for units
-        // already admitted once. Write-ahead is safe on the ADMIT side
+        // explicit #err. Behind-the-yield writes are lost whenever the
+        // continuation does not run to its assignment — W3-04 told that as an
+        // upgrade landing in the await window, a routine deploy; #55 (d)
+        // measured that an upgrade cannot land inside an await on this
+        // toolchain (the Motoko runtime refuses it while the DEX call is
+        // outstanding — the upgrade lands only once the message is done), so
+        // the shape that is real is a continuation that traps after the DEX
+        // reserved. Then: postupgrade cleared `admitting`, the user retried,
+        // the retry computed a DIFFERENT seq, and the DEX's replay gate —
+        // keyed on seq — debited the lifetime allowance a second time for
+        // units already admitted once. Write-ahead is safe on the ADMIT side
         // specifically because the reserve is amount-based: a SKIPPED seq
         // range costs nothing, while a repeated one double-reserves. On an
         // ambiguous transport failure both writes are KEPT (the DEX may
@@ -388,6 +493,7 @@ persistent actor Bridge {
         let l = ledgerOf(msg.caller, asset);
         l.pending += amount;
         let dex : DexActor = actor (Principal.toText(dexP));
+        dexAdmitCalls += 1;   // H-27 observability: a SENT admission, counted at the send
         try {
           switch (await dex.playDepositReserve(msg.caller, asset, amount, admitted + amount)) {
             case (#err(e)) {
@@ -397,13 +503,34 @@ persistent actor Bridge {
               Map.add(admittedUnits, Text.compare, k, admitted);
               l.pending := if (l.pending >= amount) { l.pending - amount } else { 0 };
               ignore Map.delete(admitting, Text.compare, k);
+              // H-26 (F40): rows the write-ahead CREATED for this call go
+              // too — a refusal leaves the maps exactly as it found them.
+              pruneZeroRows(k);
               return #err(e);
             };
             case (#ok) {};
           };
         } catch (e) {
+          // SYSTEM-LEVEL rejection (#55 "phantom pending"): the DEX did not
+          // run — a stopped canister (every DEX upgrade goes through a stop),
+          // an absent target, a full queue — so nothing was reserved and
+          // nothing debited, and the write-aheads roll back exactly as on an
+          // explicit #err. KEEPING them here was the hole: devConfirmDeposits
+          // moved the orphan pending to confirmed, the claim then died in
+          // creditAndRegister's excess branch with reserved == 0 — identically
+          // on retry — and, claim being all-or-nothing, took every later
+          // deposit on the asset with it. A rejected call never committed on
+          // the callee (a trap rolls the DEX back; a system reject never
+          // reached it), so the rollback cannot strand a live reservation.
+          // The one strand this arm cannot see — the DEX answered, but OUR
+          // continuation trapped before its arm could run (W3-04 told it as
+          // an upgrade in the await window; #55 (d): an upgrade cannot land
+          // there) — is what the reservation check in devConfirmDeposits is for.
+          Map.add(admittedUnits, Text.compare, k, admitted);
+          l.pending := if (l.pending >= amount) { l.pending - amount } else { 0 };
           ignore Map.delete(admitting, Text.compare, k);
-          return #err("Deposit admission transport failed (state kept — the deposit shows as pending; if the DEX never saw it, the skipped range costs nothing): " # Error.message(e));
+          pruneZeroRows(k);   // H-26 (F40): same row discipline as the #err arm
+          return #err("Deposit admission failed — the DEX did not accept the call (nothing was created; retry once it is reachable): " # Error.message(e));
         };
         ignore Map.delete(admitting, Text.compare, k);
         return #ok;
@@ -422,15 +549,130 @@ persistent actor Bridge {
     if (IS_PRODUCTION) {
       Runtime.trap("devConfirmDeposits is disabled on #production: this Bridge is a STUB with no custody behind it. Deploy the real chain-key Bridge before flipping the posture.");
     };
+    // H-26 fence: nothing moves pending to confirmed while a season wipe is
+    // pending (the same posture rule: no Result channel, so a trap).
+    if (wipePending) { Runtime.trap(WIPE_PENDING_MSG) };
+    let dex : ?DexActor = switch (effectiveDex<system>()) {
+      case (?p) { ?(actor (Principal.toText(p)) : DexActor) };
+      case null { null };   // unwired stub → pure dev sandbox, nothing to reconcile against
+    };
     for (asset in ASSETS.vals()) {
+      let k = key(msg.caller, asset);
       // Skip an asset whose admission is mid-flight (W3-04): its pending was
       // written AHEAD of the DEX's verdict, and confirming it here would
       // strand the explicit-#err rollback (the refused amount would already
       // have moved to `confirmed`). The next confirm call picks it up.
-      if (Map.get(admitting, Text.compare, key(msg.caller, asset)) != null) { continue };
-      let l = ledgerOf(msg.caller, asset);
+      if (Map.get(admitting, Text.compare, k) != null) { continue };
+      // Read-only: an absent row has nothing pending and must not be created
+      // by a confirm sweep (the same get-or-create discipline as claim).
+      let l = switch (Map.get(ledgers, Text.compare, k)) { case (?x) { x }; case null { continue } };
+      if (l.pending == 0) { continue };
+      switch (dex) {
+        case null {};
+        case (?d) {
+          // #55 "phantom pending": a pending is written AHEAD of the DEX's
+          // verdict, and the one strand the catch arm cannot undo — our
+          // continuation never running its rollback while the DEX reserved
+          // nothing (W3-04 told it as an upgrade in the await window; #55 (d)
+          // measured that an upgrade cannot land inside an await, so a
+          // trapped continuation is the real shape) — leaves a pending with
+          // NO reservation behind it.
+          // Confirming it blind minted a claimable the claim then refused
+          // forever. So before a pending becomes claimable, ask the DEX
+          // whether the admission landed. The test is the SEQ, not the
+          // reservation size: the DEX's applied admission seq lagging our
+          // counter names exactly the units it never reserved (an allowance
+          // re-arm can zero the reservation under a perfectly legitimate
+          // pending, and must not drop it; a claim's excess branch fences
+          // our pending since 3088472021, but the seq test never relied on it).
+          // The drop fires ONLY when the DEX is reachable and answers: a
+          // stopped DEX or a wiring refusal leaves the pending where it is
+          // — visible, retryable, never confirmed unverified.
+          let admitted = Option.get(Map.get(admittedUnits, Text.compare, k), 0);
+          let verdict : ?{ capActive : Bool; reservedUnits : Nat; admitSeq : Nat } = try {
+            switch (await d.playDepositReservation(msg.caller, asset)) {
+              case (#ok(v)) { ?v };
+              case (#err(_)) { null };
+            };
+          } catch (_) { null };
+          // Re-read AFTER the yield. An admission that STARTED meanwhile must
+          // find its pending intact for its own rollback; one that LANDED
+          // moved the counter past the verdict we hold — either way, leave
+          // this asset for the next confirm rather than act on stale state.
+          if (Map.get(admitting, Text.compare, k) != null) { continue };
+          if (Option.get(Map.get(admittedUnits, Text.compare, k), 0) != admitted) { continue };
+          switch (verdict) {
+            case null { continue };   // unverifiable — never confirm blind
+            case (?v) {
+              if (v.capActive and v.admitSeq < admitted) {
+                let phantom : Nat = admitted - v.admitSeq;
+                let drop = if (phantom < l.pending) { phantom } else { l.pending };
+                l.pending -= drop;
+                // Re-sync the counter to what the DEX applied, so the next
+                // admission's seq is strictly greater and gets reserved
+                // instead of being no-op'd as a replay of units it never saw.
+                Map.add(admittedUnits, Text.compare, k, v.admitSeq);
+              };
+            };
+          };
+        };
+      };
       if (l.pending > 0) { l.confirmed += l.pending; l.pending := 0 };
+      // H-26 (F40): a phantom drop can leave the row all-zero and the counter
+      // re-synced to 0 — the third way a zero row is born; prune it here too.
+      pruneZeroRows(k);
     };
+  };
+
+  // ── Dev-only test hook (#55) ─────────────────────────────────
+  // Reproduce the W3-04 "phantom pending" strand ON DEMAND: a pending row and
+  // an advanced admission counter with NO DEX reservation behind them — the
+  // state devSimulateDeposit's write-ahead leaves when its continuation never
+  // runs its rollback over a DEX that reserved nothing, which the write-ahead
+  // deliberately makes durable. W3-04 told that as an upgrade landing in the
+  // await window; #55 (d) measured that an upgrade cannot land inside an
+  // await on this toolchain (the upgrade lands only once the message is
+  // done), so the shape that is real is a continuation that traps. Nothing
+  // else can manufacture it: the catch arm rolls back on a throw, and a trap
+  // inside the continuation is not stageable from a test. Controller + #dev
+  // only; a typed #err elsewhere (the posture rule above).
+  public shared (msg) func devTestStrandAdmission(user : Principal, asset : Text, amount : Nat) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    if (not IS_DEV) { return #err("devTestStrandAdmission is a dev-only hook (posture: play/production)") };
+    if (not isSupportedAsset(asset)) { return #err("Unsupported asset: " # asset) };
+    if (amount == 0) { return #err("Amount must be positive") };
+    // H-27: the strand hook writes the same pending/admittedUnits the real
+    // path does, and a later claim relays them into creditAndRegister's
+    // toText — so it wears the same ceiling, ahead of its writes.
+    if (amount > AMOUNT_CEILING) { return #err(AMOUNT_CEILING_MSG) };
+    if (wipePending) { return #err(WIPE_PENDING_MSG) };
+    let k = key(user, asset);
+    if (Map.get(admitting, Text.compare, k) != null) { return #err("A deposit for " # asset # " is already in progress") };
+    Map.add(admittedUnits, Text.compare, k, Option.get(Map.get(admittedUnits, Text.compare, k), 0) + amount);
+    let l = ledgerOf(user, asset);
+    l.pending += amount;
+    #ok;
+  };
+
+  // ── Dev-only test hook (H-26 / F41) ──────────────────────────
+  // Park an admission in its DEX round trip ON DEMAND: `hold = true` takes the
+  // in-flight guard for (user, asset) exactly as devSimulateDeposit does —
+  // through the SAME pre-guard eligibility path (asset, fence, not already in
+  // progress) and with NO other write — and `hold = false` releases it, as the
+  // continuation would. A real hold lasts one round trip and cannot be timed
+  // from a test; this is the deterministic stand-in for "a stream of
+  // ineligible callers keeps re-taking the interlock between the operator's
+  // reset attempts". Controller + #dev only; a typed #err elsewhere.
+  public shared (msg) func devTestHoldAdmission(user : Principal, asset : Text, hold : Bool) : async { #ok; #err : Text } {
+    requireController(msg.caller);
+    if (not IS_DEV) { return #err("devTestHoldAdmission is a dev-only hook (posture: play/production)") };
+    if (not isSupportedAsset(asset)) { return #err("Unsupported asset: " # asset) };
+    let k = key(user, asset);
+    if (not hold) { ignore Map.delete(admitting, Text.compare, k); return #ok };
+    if (wipePending) { return #err(WIPE_PENDING_MSG) };
+    if (Map.get(admitting, Text.compare, k) != null) { return #err("A deposit for " # asset # " is already in progress") };
+    Map.add(admitting, Text.compare, k, true);
+    #ok;
   };
 
   // W4-12: the DEX-driven half of the season boundary. A reset wipes the
@@ -449,11 +691,69 @@ persistent actor Bridge {
       return #err("adminSeasonWipe: caller is neither the wired DEX nor a controller");
     };
     if (Map.size(claiming) > 0 or Map.size(admitting) > 0) {
-      return #err("adminSeasonWipe: a claim or admission is in flight — retry when it settles");
+      // H-26 (F41): ARM the fence before refusing. Nothing new can take the
+      // interlock from here on, so the in-flight ones settle within one DEX
+      // round trip and the caller's retry completes — a sustained stream of
+      // admissions can delay the wipe by exactly one attempt, never hold it.
+      wipePending := true;
+      return #err("adminSeasonWipe: a claim or admission is in flight — the wipe is now ARMED (new claims and admissions are refused until it completes); retry when the in-flight ones settle");
     };
     Map.clear(ledgers);
     Map.clear(admittedUnits);
+    wipePending := false;
     #ok;
+  };
+
+  // H-26: disarm a wipe the operator abandoned (a reset attempt that armed
+  // the fence and was never retried would otherwise pause the on-ramp
+  // forever — the fence is stable by design, so an upgrade does not clear
+  // it either). Same callers as the wipe itself.
+  public shared (msg) func adminCancelSeasonWipe() : async { #ok; #err : Text } {
+    let dexOk = switch (effectiveDex<system>()) {
+      case (?p) { Principal.equal(msg.caller, p) };
+      case null { false };
+    };
+    if (not dexOk and not Principal.isController(msg.caller)) {
+      return #err("adminCancelSeasonWipe: caller is neither the wired DEX nor a controller");
+    };
+    wipePending := false;
+    #ok;
+  };
+
+  // H-26 (F40): controller purge for rows the pre-fix rollback leaked — a
+  // zero-valued admission counter, an all-zero Ledger. Both read identically
+  // to an absent row (see pruneZeroRows), so this changes no balance and no
+  // seq; it reclaims memory that only the season wipe could before. Keys
+  // mid-flight are skipped (they cannot be zero, but the guard is cheap).
+  public shared (msg) func adminPurgeZeroRows() : async { #ok : { admittedUnits : Nat; ledgers : Nat }; #err : Text } {
+    if (not Principal.isController(msg.caller)) { return #err("adminPurgeZeroRows: caller is not a controller") };
+    let deadCounters = List.empty<Text>();
+    for ((k, v) in Map.entries(admittedUnits)) {
+      if (v == 0 and Map.get(admitting, Text.compare, k) == null) { List.add(deadCounters, k) };
+    };
+    let deadLedgers = List.empty<Text>();
+    for ((k, l) in Map.entries(ledgers)) {
+      if (l.confirmed == 0 and l.pending == 0 and l.claimed == 0
+          and Map.get(admitting, Text.compare, k) == null
+          and Map.get(claiming, Text.compare, k) == null) { List.add(deadLedgers, k) };
+    };
+    for (k in List.values(deadCounters)) { ignore Map.delete(admittedUnits, Text.compare, k) };
+    for (k in List.values(deadLedgers))  { ignore Map.delete(ledgers, Text.compare, k) };
+    #ok({ admittedUnits = List.size(deadCounters); ledgers = List.size(deadLedgers) });
+  };
+
+  // H-26: the Bridge's state-growth telemetry — map sizes and the fence.
+  // Counts only, no principals: what a test asserts "unchanged" across a
+  // refused admission and what an operator reads before a season reset.
+  public query func getBridgeStats() : async {
+    ledgers : Nat; admittedUnits : Nat; admitting : Nat; claiming : Nat; onboarded : Nat; wipePending : Bool;
+    dexAdmitCalls : Nat;   // H-27: playDepositReserve calls SENT since the last upgrade (transient)
+  } {
+    {
+      ledgers = Map.size(ledgers); admittedUnits = Map.size(admittedUnits);
+      admitting = Map.size(admitting); claiming = Map.size(claiming);
+      onboarded = Map.size(onboarded); wipePending; dexAdmitCalls;
+    };
   };
 
   // ── Admission control ───────────────────────────────────────
@@ -464,24 +764,28 @@ persistent actor Bridge {
   //
   // `claiming` and `admitting` are each set BEFORE an `await` and cleared only
   // in the continuation. In a `persistent actor` a plain `let` is implicitly
-  // STABLE, so the flag survived an upgrade while the continuation that clears
-  // it did not: an upgrade landing between a call and its reply left the flag
-  // `true` FOREVER, and that (user, asset) could never claim or deposit again.
-  // The cause was the routine act of deploying, and there was no cure short of
-  // a code change.
+  // STABLE, so a flag whose continuation never ran its clear stays `true`
+  // FOREVER, and that (user, asset) could never claim or deposit again, with
+  // no cure short of a code change. The strand was told as an upgrade landing
+  // between a call and its reply — a routine deploy; #55 (d) measured that an
+  // upgrade cannot land inside an await on this toolchain (the Motoko runtime
+  // refuses it while a message is outstanding — the upgrade lands only once
+  // the message is done), so the shape that strands a flag is a continuation
+  // that traps after the set (the catch arms clear on a throw, not on a trap).
   //
   // Clearing them here is exactly right rather than merely convenient: no
-  // continuation survives an upgrade, so after one there is by definition
-  // nothing left to guard against — a surviving flag can only be a lie.
+  // continuation is outstanding across an upgrade, so after one there is by
+  // construction nothing left to guard against — a surviving flag can only
+  // be a stale latch, a lie.
   //
   // Why not mark them `transient`, which expresses the same idea? Because
   // dropping a stable variable is a one-way door: `moc --stable-compatible`
   // rejects it with M0169 ("cannot be implicitly discarded"), so the change
   // would need an explicit migration function and would block the upgrade on
   // any already-deployed Bridge. This achieves the same semantics with no
-  // change to the stable signature at all — and it also makes an upgrade the
-  // RECOVERY for a flag stranded any other way, instead of the thing that
-  // strands it. (`admittedUnits` is untouched: that is the admission seq the
+  // change to the stable signature at all — and it makes an upgrade the
+  // RECOVERY for a stranded flag: the redeploy clears what a trap left behind
+  // (#55 (d)). (`admittedUnits` is untouched: that is the admission seq the
   // DEX de-dups against, real bookkeeping rather than a latch.)
   system func postupgrade() {
     Map.clear(claiming);

@@ -1,15 +1,22 @@
 /* Deposit tab — talks to the STUB Bridge canister (src/bridge/main.mo). */
-.deposit-container { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
-/* Mobile: match the Account page's page gutter (view's 12px only), not 12+16. */
-@media (max-width: 900px) {
-  .deposit-container { padding-left: 0; padding-right: 0; }
-}
+/* The pane's card fills its .acct-pane exactly like the other Account panes'
+   cards: .account-container caps the page at 900px and the panes add no inner
+   cap, margin or padding of their own. This wrapper used to carry a 760px cap,
+   an auto margin and 24px/16px padding from the Deposit page's days as a
+   top-level nav item (the Swap page matched its 48px-below-the-header offset,
+   swap.css .swap-container); nested under the Account tabs that left the
+   Deposit card narrower than its siblings at desktop (760 - 2x16 = 728px
+   against their 900px) and 24px below their rhythm (.acct-pane gap 20px).
+   Zero padding at every width also keeps the mobile gutter parity the old
+   max-width:900px rule provided (the view's 12px only, never 12+16) - by
+   construction, so that rule is gone too. */
+.deposit-container { max-width: none; margin: 0; padding: 0; }
 /* Same treatment as the Swap box (swap.css .swap-card): transparent over the
    page field, with the slightly-stronger, slightly-thicker cyan outline
    carrying the box edge. */
 .deposit-card {
   background: transparent;
-  border: 1.5px solid rgba(56, 189, 240, 0.45);
+  border: 1.5px solid var(--accent-outline);
   border-radius: 12px;
   padding: 24px;
 }
@@ -28,7 +35,7 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  border: 1px solid rgba(56, 189, 240, 0.35);
+  border: 1px solid var(--accent-outline);
   border-radius: 8px;
   padding: 12px 14px;
   margin-bottom: 16px;
@@ -46,8 +53,8 @@
   align-items: center;
   gap: 12px;
   /* Same soft cyan-gradient panel as the Swap page's Sell/Buy boxes. */
-  background: linear-gradient(160deg, rgba(56, 189, 240, 0.12), rgba(56, 189, 240, 0.04));
-  border: 1px solid rgba(56, 189, 240, 0.20);
+  background: var(--accent-panel);
+  border: 1px solid var(--accent-border);
   border-radius: 8px;
   padding: 12px 14px;
 }
@@ -130,11 +137,11 @@
    Replaces the on-ramp for signed-in-but-unverified accounts. Same cyan
    card language as the Swap box — an invitation, not an error state. */
 .deposit-verify {
-  border: 1.5px solid rgba(56, 189, 240, 0.45);
+  border: 1.5px solid var(--accent-outline);
   border-radius: 16px;
   padding: 20px;
   margin: 14px 0;
-  background: linear-gradient(160deg, rgba(56, 189, 240, 0.10), rgba(56, 189, 240, 0.03));
+  background: var(--accent-panel);
 }
 .deposit-verify-head { font-size: 17px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
 .deposit-verify-why  { font-size: 13px; color: var(--text-dim); line-height: 1.5; margin-bottom: 14px; }

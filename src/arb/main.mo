@@ -57,8 +57,17 @@ persistent actor Arb {
   // that cap, while the cheap-side buy goes through the ordinary limit path
   // with no such cap. At the old $10.25k one fully-filled buy left the arb
   // holding inventory its only exit refused, retrying every 5s until the
-  // mark happened to decline. test_deploy_hygiene §6h pins arb ≤ DEX.
-  transient let TRADE_CAP_USD : Nat = 500_000_000_000; // $5k per market per tick (= DEX per-call cap)
+  // mark happened to decline.
+  // #55: and STRICTLY below it, by more than the largest oracle step the DEX
+  // applies without its jump gate (PRICE_JUMP_BPS = 250, main.mo). capBase
+  // is floored at the mark THIS tick read, but the DEX re-prices the leg at
+  // ITS current mark with a ceiling — at an equal cap a +$0.01 uptick between
+  // the two reads refused a cap-sized export/flatten/unwind ("Exceeds
+  // per-call cap"), one lost tick per event. (Imports are bounded at +50 bps
+  // first; EXPORTS carry only a floor, so a whole applied step reaches the
+  // cap check.) $4,850 = 300 bps under: ceil(q·mark·1.025) still clears $5k.
+  // test_deploy_hygiene §6h pins arb < DEX with headroom > PRICE_JUMP_BPS.
+  transient let TRADE_CAP_USD : Nat = 485_000_000_000; // $4,850 per market per tick (DEX per-call cap $5k − 300 bps)
   transient let DUST_USD      : Nat = 500_000_000;     // ignore base positions under $5
   // W4-25: STRICTLY under TICK_NS (5s). At the old 8s a still-live hedge
   // straddled the next tick's flatten: resting spot orders hold no
@@ -129,7 +138,13 @@ persistent actor Arb {
   transient let IMPORT_MEMO_NS  : Int = 25_000_000_000;   // covers the flatten a few ticks late
   transient var _richStreak    : Map.Map<Text, Nat> = Map.empty();
   transient var _richHoldUntil : Map.Map<Text, Int> = Map.empty();
-  transient var _lastImport    : Map.Map<Text, (Nat, Int)> = Map.empty();  // token → (qty, ns)
+  // token → the last rich import: the hedge's quantity, when it went out, and
+  // the base the arb ALREADY held when it did (#55: carried inventory — a
+  // flatten the DEX refused, or the residue of one clipped at the per-call
+  // cap). Before, the memo was just (qty, ns) and the verdict compared the
+  // WHOLE balance against qty, so carried inventory read a fully filled
+  // hedge as a spoof and parked the market's rich side 10 s per event.
+  transient var _lastImport    : Map.Map<Text, { qty : Nat; ns : Int; carried : Nat }> = Map.empty();
 
   func richHeld(marketId : Text, now : Int) : Bool {
     switch (Map.get(_richHoldUntil, Text.compare, marketId)) {
@@ -151,21 +166,30 @@ persistent actor Arb {
     ignore Map.delete(_richHoldUntil, Text.compare, marketId);
   };
   // Flatten-side verdict on the last import: did its hedge trade?
-  //   #roundTrip — >50% of the imported base is being exported back: the
+  //   #roundTrip — >50% of the HEDGE's quantity is back in the account: the
   //                cycle was spoof-dominated (bump the backoff).
   //   #filled    — ≤50% remains: the hedge mostly filled; whoever pushed the
   //                price paid the tax (clear the streak).
   //   #none      — no recent import to judge.
+  // #55: judged on the hedge's OWN remainder — the balance beyond what the
+  // arb carried into the import — never on the whole balance. Pure: the memo
+  // is NOT consumed here; the flatten settles it (settleImport) once the
+  // export outcome is known, so a refused export keeps the verdict for the
+  // retry instead of discarding it. Only expiry deletes here.
   func importVerdict(token : Text, availBase : Nat, now : Int) : { #roundTrip; #filled; #none } {
     switch (Map.get(_lastImport, Text.compare, token)) {
-      case (?(qty, ns)) {
-        if (now - ns > IMPORT_MEMO_NS) { ignore Map.delete(_lastImport, Text.compare, token); return #none };
-        ignore Map.delete(_lastImport, Text.compare, token);   // single verdict per import
-        if (availBase * 2 > qty) { #roundTrip } else { #filled };
+      case (?m) {
+        if (now - m.ns > IMPORT_MEMO_NS) { settleImport(token); return #none };
+        // Saturating: an intervening export of the carried part only shrinks
+        // the balance; the remainder can never exceed the hedge itself.
+        let beyond = if (availBase > m.carried) { availBase - m.carried : Nat } else { 0 };
+        let unfilled = Nat.min(beyond, m.qty);
+        if (unfilled * 2 > m.qty) { #roundTrip } else { #filled };
       };
       case null { #none };
     };
   };
+  func settleImport(token : Text) { ignore Map.delete(_lastImport, Text.compare, token) };
 
   // Break-glass: un-stick a market a false-positive backoff parked (ops),
   // and the deterministic reset the integration suite runs between cases.
@@ -288,11 +312,19 @@ persistent actor Arb {
           // lands; leftovers cost the haircut, bounded by the per-tick cap.
           let availBase = await dex.getMyAvailableBalance(token);
           // W4-25: judge the previous rich cycle by what the flatten sees —
-          // base mostly gone means the hedge filled (clear the backoff
-          // streak); base mostly back means a zero-fill round-trip (the
-          // cancel-after-rest spoof — bump it, after the export below).
+          // the hedge's remainder mostly gone means it filled (clear the
+          // backoff streak, settled at once: nothing about it depends on
+          // the export); mostly back means a zero-fill round-trip (the
+          // cancel-after-rest spoof — bump it AFTER the export outcome; #55:
+          // a refused export keeps the memo, and the verdict, for the retry).
           let verdict = importVerdict(token, availBase, now);
-          if (verdict == #filled) { richClear(pool.marketId) };
+          if (verdict == #filled) { richClear(pool.marketId); settleImport(token) };
+          var roundTripPending = verdict == #roundTrip;
+          // #55: the base this tick carries INTO its rich leg — whatever the
+          // flatten leaves behind (clipped at the per-call cap, or refused)
+          // is inventory the hedge did not create, and the next verdict must
+          // not count it against the hedge.
+          var carried = availBase;
           if (Fixed.mul(availBase, mark, false) > DUST_USD) {
             let capBase = Fixed.mulDiv(TRADE_CAP_USD, Fixed.SCALE, mark, false);
             let q = Nat.min(availBase, capBase);
@@ -301,10 +333,18 @@ persistent actor Arb {
             switch (await dex.extMarketSwap(token, #exportBase, q, ?bpsDn(mark, 50))) {
               case (#ok(proceeds)) {
                 note("export " # Nat.toText(q) # " " # token # " → " # Nat.toText(proceeds) # " USD"); summary #= token # ":export ";
-                if (verdict == #roundTrip) { richBackoff(pool.marketId, now) };
+                carried := availBase - q;
+                if (roundTripPending) { richBackoff(pool.marketId, now); settleImport(token); roundTripPending := false };
               };
-              case (#err(e)) { note("export " # token # " refused: " # e) };
+              case (#err(e)) {
+                note("export " # token # " refused: " # e
+                  # (if roundTripPending " — round-trip verdict kept for the retry" else ""));
+              };
             };
+          } else if (roundTripPending) {
+            // Nothing worth exporting, yet the hedge mostly came back: a dust-
+            // sized import. The verdict needs no export to settle.
+            richBackoff(pool.marketId, now); settleImport(token); roundTripPending := false;
           };
 
           // 2. Read the top of book and act on a deviation beyond the band.
@@ -321,7 +361,14 @@ persistent actor Arb {
             // W4-25: sit the backoff window out instead of feeding a spoofer
             // another funded cycle (see the backoff block above). The flatten
             // and cheap legs stay live; only this market's rich entry waits.
-            if (not richHeld(pool.marketId, now)) {
+            // #55: a round-trip verdict the flatten could not settle (its
+            // export was refused) is unhedged base that came BACK — feeding
+            // the rich side another funded cycle on top of it is exactly what
+            // the backoff exists to stop. Sit this tick out; the retried
+            // export settles it.
+            if (roundTripPending) {
+              note("rich: round-trip verdict unsettled (" # token # ") — export retry first, no new import");
+            } else if (not richHeld(pool.marketId, now)) {
               let sellPx = bpsUp(mark, EDGE_BPS);
               let takeable = await dex.getTakeableDepth(pool.marketId, #sell, sellPx);
               let q = Nat.min(takeable, capBase);
@@ -331,7 +378,7 @@ persistent actor Arb {
                 // CURRENT mark (W4-17 items 3/4).
                 switch (await dex.extMarketSwap(token, #importBase, q, ?bpsUp(mark, 50))) {
                   case (#ok(_)) {
-                    Map.add(_lastImport, Text.compare, token, (q, now));
+                    Map.add(_lastImport, Text.compare, token, { qty = q; ns = now; carried });
                     // W4-25 item 4: the import was justified by depth read
                     // BEFORE it committed; a spoofer cancels in that gap.
                     // Re-read — if the justifying depth is gone, export
@@ -345,7 +392,7 @@ persistent actor Arb {
                         case (#ok(p2)) { note("unwound " # Nat.toText(q) # " " # token # " → " # Nat.toText(p2) # " USD") };
                         case (#err(e2)) { note("UNWIND REFUSED (" # token # "): " # e2 # " — flatten leg picks it up next tick") };
                       };
-                      ignore Map.delete(_lastImport, Text.compare, token);   // verdict rendered here
+                      settleImport(token);   // verdict rendered here
                       richBackoff(pool.marketId, now);
                       summary #= token # ":spoofed ";
                     } else {
@@ -363,7 +410,7 @@ persistent actor Arb {
                             case (#ok(p2)) { note("unwound " # Nat.toText(q) # " " # token # " → " # Nat.toText(p2) # " USD") };
                             case (#err(e2)) { note("UNWIND REFUSED (" # token # "): " # e2 # " — flatten leg picks it up next tick") };
                           };
-                          ignore Map.delete(_lastImport, Text.compare, token);   // verdict rendered here
+                          settleImport(token);   // verdict rendered here
                           richBackoff(pool.marketId, now);
                         };
                       };

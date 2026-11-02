@@ -16,6 +16,7 @@
 # config (isolates the staleness term). Floor rate 12bps/s, grace 60s.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -31,7 +32,7 @@ e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
 
 MKT="ICP-ICPUSD"
-adm()  { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm()  { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 # canister's own clock, read back from the pool after a fresh setAmmRefPrice
 ref_now() { adm getAmmPool "(\"$MKT\")" | tr '\n' ' ' | grep -oE "refPriceUpdatedNs = [0-9_]+" | head -1 | grep -oE "[0-9_]+" | tr -d '_'; }
 asks_section() { adm getOrderBook "(\"$MKT\")" | tr '\n' ' ' | sed -E 's/.*asks = vec \{//; s/bids = vec.*//'; }
@@ -52,13 +53,12 @@ adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1
 adm createAmmPool "(\"$MKT\")" >/dev/null 2>&1
 # (quoteDepthBase is a base-unit Nat quantity; spread/levels/spacing/window stay plain nats.)
-adm setAmmConfig "(\"$MKT\", 20:nat, $(e8 5.0) : nat, 5:nat, 15:nat, 5:nat)" >/dev/null
+adm setAmmConfig "(\"$MKT\", 20:nat, $(e8 5.0) : nat, 5:nat, 15:nat)" >/dev/null
 adm setAmmRefPrice "(\"$MKT\", $(e8 10.0) : nat)" >/dev/null
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-SEED=$(mkid amm_stale_seed)
+mdx_identity_new amm_stale_seed; SEED=$(principal_of amm_stale_seed)
 adm setTestBalance "(principal \"$SEED\", \"ICP\", $(e8 1000.0) : nat)"      >/dev/null
 adm setTestBalance "(principal \"$SEED\", \"ICPUSD\", $(e8 100000.0) : nat)" >/dev/null
-icp canister call --identity amm_stale_seed backend seedAmmPool "(\"$MKT\", $(e8 1000.0) : nat, $(e8 100000.0) : nat)" >/dev/null 2>&1
+mdx_lp_deposit amm_stale_seed "$MKT" "$(e8 1000.0)" "$(e8 100000.0)" >/dev/null 2>&1
 adm enableAmm "(\"$MKT\", true)" >/dev/null
 
 # ── 0. Fresh quote baseline ──

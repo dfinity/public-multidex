@@ -15,6 +15,7 @@
 #   B. normal slippage (5%) → fills → outcome filled=true, toAmount>0.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -27,9 +28,8 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 # call args; from_e8 base→human so the human-scale assertions stay unchanged.
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-u()   { icp canister call --identity swo_user backend "$@" 2>&1; }
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+u()   { icp canister call --candid "$MDX_CANDID" --identity swo_user backend "$@" 2>&1; }
 # bal / avail → HUMAN units: pull the base-unit Nat and /1e8.
 bal()   { local n; n=$(adm getTestBalance "(principal \"$1\", \"$2\")" | tr -d '_' | grep -oE "[0-9]+ : nat" | head -1 | grep -oE "[0-9]+"); [ -z "$n" ] && n=0; from_e8 "$n"; }
 avail() { local n; n=$(u getMyAvailableBalance "(\"$1\")" | tr -d '_' | grep -oE "[0-9]+ : nat" | head -1 | grep -oE "[0-9]+"); [ -z "$n" ] && n=0; from_e8 "$n"; }
@@ -39,20 +39,20 @@ swap_filled() { u getMyRecentSwap '()' | grep -oE "filled = (true|false)" | grep
 # toAmount is a base-unit Nat now — strip underscores, then /1e8 for the report.
 swap_to()     { local n; n=$(u getMyRecentSwap '()' | tr -d '_' | grep -oE "toAmount = [0-9]+" | grep -oE "[0-9]+" | head -1); [ -z "$n" ] && n=0; from_e8 "$n"; }
 
-S=$(mkid swo_seed); U=$(mkid swo_user)
-seed() { icp canister call --identity swo_seed backend "$@" 2>&1; }
+mdx_identity_new swo_seed; S=$(principal_of swo_seed); mdx_identity_new swo_user; U=$(principal_of swo_user)
+seed() { icp canister call --candid "$MDX_CANDID" --identity swo_seed backend "$@" 2>&1; }
 
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm setTestTimersPaused '(true)' >/dev/null 2>&1
 # (quoteDepthBase is a base-unit Nat quantity now; spread/levels/spacing/window stay plain nats.)
-for m in "ICP-ICPUSD" "BTC-ICPUSD"; do adm createAmmPool "(\"$m\")" >/dev/null 2>&1; adm setAmmConfig "(\"$m\", 20:nat, $(e8 5.0) : nat, 5:nat, 15:nat, 5:nat)" >/dev/null; done
+for m in "ICP-ICPUSD" "BTC-ICPUSD"; do adm createAmmPool "(\"$m\")" >/dev/null 2>&1; adm setAmmConfig "(\"$m\", 20:nat, $(e8 5.0) : nat, 5:nat, 15:nat)" >/dev/null; done
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)"  >/dev/null
 adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 100.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICP\", $(e8 100000.0) : nat)"      >/dev/null
 adm setTestBalance "(principal \"$S\", \"BTC\", $(e8 1000.0) : nat)"        >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICPUSD\", $(e8 10000000.0) : nat)" >/dev/null
-seed seedAmmPool "(\"ICP-ICPUSD\", $(e8 10000.0) : nat, $(e8 200000.0) : nat)" >/dev/null
-seed seedAmmPool "(\"BTC-ICPUSD\", $(e8 500.0) : nat, $(e8 200000.0) : nat)"   >/dev/null
+mdx_lp_deposit swo_seed "ICP-ICPUSD" "$(e8 10000.0)" "$(e8 200000.0)" >/dev/null
+mdx_lp_deposit swo_seed "BTC-ICPUSD" "$(e8 500.0)" "$(e8 200000.0)"   >/dev/null
 adm enableAmm '("ICP-ICPUSD", true)' >/dev/null
 adm enableAmm '("BTC-ICPUSD", true)' >/dev/null
 freshrequote "ICP-ICPUSD" 10.0; freshrequote "BTC-ICPUSD" 100.0
@@ -69,7 +69,7 @@ echo "── A. Swap 50 ICP → BTC @ 1% slippage vs a 3% BUY-leg spread (→ un
 # the SELL leg does nothing. Widen BTC-ICPUSD to 3% (restored below): asks
 # rest ≈1.5% over ref, the 1% cap can't reach them, absorb=0 → the swap
 # records filled=false and refunds.
-adm setAmmConfig "(\"BTC-ICPUSD\", 300:nat, $(e8 1.0):nat, 15:nat, 35:nat, 8:nat)" >/dev/null
+adm setAmmConfig "(\"BTC-ICPUSD\", 300:nat, $(e8 1.0):nat, 15:nat, 35:nat)" >/dev/null
 adm requoteAmm '("BTC-ICPUSD")' >/dev/null
 RA=$(u swap "(record { fromToken=\"ICP\"; toToken=\"BTC\"; amount=$(e8 50.0) : nat; mode=variant { marketOrder=record { maxSlippage=$(e8 0.01) : nat } }; noPartialFill=false })")
 if echo "$RA" | grep -q "swapOrderId = opt"; then ok "swap staged (swapOrderId returned)"; else nok "swap should stage" "$(echo "$RA" | head -c 120)"; fi
@@ -84,7 +84,7 @@ else nok "funds should be returned on an unfilled swap" "btc=$BTCA icpAvail=$ICP
 
 # ── B. Fillable swap reports filled=true with a real toAmount ──
 # restore the seeded spread first (values = scripts/play_start.sh:223)
-adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, $(e8 1.0):nat, 15:nat, 35:nat, 8:nat)" >/dev/null
+adm setAmmConfig "(\"BTC-ICPUSD\", 20:nat, $(e8 1.0):nat, 15:nat, 35:nat)" >/dev/null
 adm requoteAmm '("BTC-ICPUSD")' >/dev/null
 echo ""
 echo "── B. Swap 50 ICP → BTC @ 5% slippage → fills ──"
