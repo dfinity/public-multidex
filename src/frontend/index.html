@@ -656,79 +656,146 @@
             </div>
 
             <!-- Place order -->
-            <div class="order-panel">
-              <h3>Place Order</h3>
-              <div class="order-mode-toggle">
-                <button class="order-mode-btn active" data-mode="spot">Spot</button>
-                <button class="order-mode-btn" data-mode="margin">Margin</button>
+            <!-- Reads top-down as the trader decides (design pass: the
+                 multidex-mocks/place-order composition C1): the ACCOUNT as
+                 header tabs, the DIRECTION as the one coloured surface, the
+                 MONEY rows, then the execution type on the field it swaps,
+                 the inputs, the options as one-line rows, the total /
+                 preview and a CTA that states the order. -->
+            <div class="order-panel" data-side="buy" data-mode="spot">
+              <!-- Header: the account the order trades from — Spot (the
+                   Wallet) or Margin (a leveraged position in a pool). The
+                   whole box re-skins under the tab (labels, rows, preview,
+                   what 100% means), so it is the outermost choice. It takes
+                   the slot of the old "Place Order" title: the CTA names the
+                   action, and mobile already hid the title. -->
+              <div class="order-mode-tabs" role="tablist" aria-label="Account">
+                <button class="order-mode-btn active" role="tab" aria-selected="true" data-mode="spot">Spot</button>
+                <button class="order-mode-btn" role="tab" aria-selected="false" data-mode="margin">Margin</button>
+                <span class="order-pair" id="order-pair"></span>
               </div>
-              <div class="order-type-toggle">
-                <button class="order-type-btn active" data-type="limit">Limit</button>
-                <button class="order-type-btn" data-type="market">Market</button>
+              <!-- Direction: the top row, in the trading colours (mint buy /
+                   clay sell). applyOrderMode relabels Buy/Sell ⇄ Long/Short. -->
+              <div class="order-side-toggle" role="radiogroup" aria-label="Side">
+                <button class="side-btn buy active" role="radio" aria-checked="true" data-side="buy">Buy</button>
+                <button class="side-btn sell" role="radio" aria-checked="false" data-side="sell">Sell</button>
               </div>
-              <div class="order-side-toggle">
-                <button class="side-btn buy active" data-side="buy">Buy</button>
-                <button class="side-btn sell" data-side="sell">Sell</button>
-              </div>
-              <!-- Margin-only: which pool backs the position + how much leverage.
-                   Hidden in Spot mode; the rest of the form (price/size/slippage)
-                   is shared. -->
-              <div id="margin-controls" class="margin-controls" style="display:none">
-                <div class="margin-ctl-row">
-                  <div class="margin-col-pool">
-                    <label>Margin pool</label>
-                    <select id="order-pool"></select>
-                  </div>
-                  <div class="margin-col-lev">
-                    <label>Leverage</label>
-                    <select id="order-leverage">
-                      <option value="1">1×</option>
-                      <option value="2" selected>2×</option>
-                      <option value="3">3×</option>
-                      <option value="5">5×</option>
-                      <option value="10">10×</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
+              <!-- Money before inputs: what this side can spend, plus buying
+                   power / pool margin on Margin and the resting orders on
+                   Spot. Rendered by updateOrderSideUI. -->
+              <div class="order-info" id="order-available"></div>
               <div class="order-form">
-                <div id="limit-price-group">
-                  <label>Price (ICPUSD)</label>
-                  <input type="number" id="order-price" placeholder="0.0" step="any" min="0" />
+                <!-- Execution: Limit | Market, a quiet segment right above the
+                     field it swaps (price + expiry ⇄ max slippage). -->
+                <div class="order-type-toggle" role="radiogroup" aria-label="Order type">
+                  <button class="order-type-btn active" role="radio" aria-checked="true" data-type="limit">Limit</button>
+                  <button class="order-type-btn" role="radio" aria-checked="false" data-type="market">Market</button>
                 </div>
-                <div>
-                  <label id="order-qty-label">Quantity</label>
-                  <input type="number" id="order-quantity" placeholder="0.0" step="any" min="0" />
-                  <div class="order-pct-slider-row">
-                    <input type="range" id="order-pct-slider" min="0" max="100" step="1" value="0" list="order-pct-ticks" aria-label="Order size as percent of available balance" disabled />
-                    <span id="order-pct-readout" class="order-pct-readout">0%</span>
-                    <datalist id="order-pct-ticks">
-                      <option value="0"></option>
-                      <option value="25"></option>
-                      <option value="50"></option>
-                      <option value="75"></option>
-                      <option value="100"></option>
-                    </datalist>
+                <div id="limit-price-group">
+                  <label for="order-price">Price (ICPUSD)</label>
+                  <div class="order-field">
+                    <input type="number" id="order-price" placeholder="0.0" step="any" min="0" />
+                    <!-- Where the price comes from: the mid, join the bid or
+                         hit the ask — one click each from the live book. -->
+                    <div class="order-field-addon order-price-src" id="order-price-src">
+                      <button type="button" data-price-src="mid">Mid</button>
+                      <button type="button" data-price-src="bid">Bid</button>
+                      <button type="button" data-price-src="ask">Ask</button>
+                    </div>
                   </div>
                 </div>
-                <div class="order-total">
-                  <span id="order-total-label">Bid: </span><span id="order-total-value">0.00 ICPUSD</span>
-                </div>
-                <!-- Margin-only position preview: notional, leverage, margin pulled,
-                     est. entry/liq price and (market) est. slippage from live depth. -->
-                <div id="margin-preview" class="margin-preview" style="display:none"></div>
-                <div id="market-slippage-group" style="display:none">
-                  <label>Max Slippage</label>
-                  <select id="order-slippage">
+                <div id="market-slippage-group" class="order-opt-row" style="display:none">
+                  <label for="order-slippage">Max slippage</label>
+                  <select id="order-slippage" class="order-opt-select">
                     <option value="0.01">1%</option>
                     <option value="0.05" selected>5%</option>
                     <option value="0.10">10%</option>
                     <option value="0.25">25%</option>
                   </select>
                 </div>
-                <div id="limit-expiry-group">
-                  <label>Expiry</label>
-                  <select id="order-expiry">
+                <!-- Margin-only (multidex-mocks page 7, treatment V1): the
+                     collateral comes first. MARGIN is how much of your money
+                     backs this order - a field plus a slider over everything
+                     you can commit (the pool's own free margin first, shaded on
+                     the rail, then the wallet); LEVERAGE is a slider from 1x to
+                     the ceiling the engine reports for that margin; the Size
+                     field above is derived (margin x leverage / price) and still
+                     typable - it back-solves the margin at the chosen leverage.
+                     The hidden #order-leverage stays the value every preview and
+                     submit path reads, so nothing downstream knows the controls
+                     changed. Hidden in Spot mode. -->
+                <div id="margin-controls" class="margin-controls" style="display:none">
+                  <div class="order-opt-row">
+                    <label for="order-pool">Margin pool</label>
+                    <select id="order-pool" class="order-opt-select"></select>
+                  </div>
+                  <div>
+                    <div class="order-lrow"><label for="order-margin">Margin</label><span class="order-note" id="order-margin-hint"></span></div>
+                    <div class="order-field">
+                      <input type="number" id="order-margin" placeholder="0.0" step="any" min="0" disabled />
+                      <span class="order-field-addon order-unit">ICPUSD</span>
+                    </div>
+                    <div class="order-pct-slider-row order-margin-row" id="order-margin-row">
+                      <div class="order-pct-track">
+                        <span class="order-pct-rail"></span>
+                        <span class="order-pct-fill"></span>
+                        <span class="order-pct-dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+                        <input type="range" id="order-margin-slider" min="0" max="100" step="1" value="0" aria-label="Margin as percent of what you can commit" disabled />
+                      </div>
+                      <label class="order-pct-box">
+                        <input type="text" id="order-margin-pct" inputmode="numeric" value="0" aria-label="Margin as percent of what you can commit" disabled />
+                        <span class="order-pct-readout">%</span>
+                      </label>
+                    </div>
+                    <div class="order-pct-max" id="order-margin-split"></div>
+                  </div>
+                  <div>
+                    <div class="order-lrow"><label for="order-lev-slider">Leverage</label><b class="order-lev-value" id="order-lev-value">2.0×</b></div>
+                    <input type="hidden" id="order-leverage" value="2" />
+                    <div class="order-lev-row" id="order-lev-row">
+                      <div class="order-pct-track">
+                        <span class="order-pct-rail"></span>
+                        <span class="order-pct-fill"></span>
+                        <span class="order-lev-ticks" id="order-lev-ticks" aria-hidden="true"></span>
+                        <input type="range" id="order-lev-slider" min="100" max="500" step="10" value="200" aria-label="Leverage" disabled />
+                      </div>
+                    </div>
+                    <div class="order-lev-labels" id="order-lev-labels" aria-hidden="true"></div>
+                    <div class="order-pct-max" id="order-lev-note"></div>
+                  </div>
+                </div>
+                <div class="order-size-block">
+                  <div class="order-lrow"><label id="order-qty-label" for="order-quantity">Quantity</label><span class="order-note" id="order-size-note"></span></div>
+                  <div class="order-field">
+                    <input type="number" id="order-quantity" placeholder="0.0" step="any" min="0" />
+                    <span class="order-field-addon order-unit" id="order-unit"></span>
+                  </div>
+                  <!-- Margin mode: the size is DERIVED (margin x leverage / price) and
+                       this line says what it costs; the % slider below is the
+                       spot sizing control and is hidden on Margin (orderform.css). -->
+                  <div class="order-pct-max" id="order-size-sub"></div>
+                  <!-- Size as a share of what the money rows show: a ring
+                       thumb, quarter stops that light as the fill passes
+                       them, the % as a box you can type into. The drawn
+                       track reads --p (0–1) and the lit dots from
+                       setOrderPctUI; the fill takes the side's colour. -->
+                  <div class="order-pct-slider-row" id="order-pct-row">
+                    <div class="order-pct-track">
+                      <span class="order-pct-rail"></span>
+                      <span class="order-pct-fill"></span>
+                      <span class="order-pct-dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+                      <input type="range" id="order-pct-slider" min="0" max="100" step="1" value="0" aria-label="Order size as percent of available balance" disabled />
+                    </div>
+                    <label class="order-pct-box">
+                      <input type="text" id="order-pct-input" inputmode="numeric" value="0" aria-label="Order size as percent of available balance" disabled />
+                      <span class="order-pct-readout">%</span>
+                    </label>
+                  </div>
+                  <div class="order-pct-max" id="order-pct-max"></div>
+                </div>
+                <div id="limit-expiry-group" class="order-opt-row">
+                  <label for="order-expiry">Expiry</label>
+                  <select id="order-expiry" class="order-opt-select">
                     <option value="0" selected>Good 'til cancelled</option>
                     <option value="60">1 minute</option>
                     <option value="300">5 minutes</option>
@@ -736,8 +803,14 @@
                     <option value="86400">1 day</option>
                   </select>
                 </div>
+                <div class="order-divider"></div>
+                <div class="order-total">
+                  <span id="order-total-label">Bid: </span><span id="order-total-value">0.00 ICPUSD</span>
+                </div>
+                <!-- Margin-only position preview: notional, leverage, margin pulled,
+                     est. entry/liq price and (market) est. slippage from live depth. -->
+                <div id="margin-preview" class="margin-preview" style="display:none"></div>
                 <div class="order-bottom">
-                  <div class="order-available" id="order-available"></div>
                   <button id="place-order-btn" class="btn btn-primary btn-lg" disabled>Sign in to trade</button>
                 </div>
               </div>

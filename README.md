@@ -15,7 +15,7 @@ capped play allowance. Balances there are valueless by construction.
 > with real funds. See [SECURITY.md](SECURITY.md).
 
 **Release notes:** [`docs/release-notes.md`](docs/release-notes.md) — what changed in
-1.75.0 (2026-11-01), in user terms.
+1.80.0 (2026-11-04), in user terms.
 
 ## What's inside
 

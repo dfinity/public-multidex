@@ -10,6 +10,7 @@ import Types "../src/backend/lib/Types";
 import Debug "mo:core/Debug";
 import Runtime "mo:core/Runtime";
 import Principal "mo:core/Principal";
+import Int "mo:core/Int";
 
 func eqN(name : Text, a : Nat, b : Nat) {
   if (a != b) { Runtime.trap("FAIL: " # name # " — expected " # debug_show b # " got " # debug_show a) };
@@ -246,3 +247,124 @@ switch (BE.settleFromQuote(st7, acc7, vault, bob, "BTC", 0, px, CAP5)) {
 };
 truth("boundary: entry deleted", not BE.hasLoanEntry(st7, bob));
 Debug.print("1788516128 fixtures green");
+
+// ── Task 1793732895: the fill-time initial-margin projection ──────────────
+// The release clamp's inequality (clampToInitialMargin in main.mo) in closed
+// form — fillDeltaPerUnit / fillHeadroom / fillRoom, the ONE source
+// previewOpenPosition shares with the release — pinned here so the rule, its
+// roundings and the per-asset ceilings it yields cannot move silently. (The
+// venue half, preview == release to the base unit, is test_initial_margin §H.)
+func eqI(name : Text, a : Int, b : Int) {
+  if (a != b) { Runtime.trap("FAIL: " # name # " — expected " # debug_show b # " got " # debug_show a) };
+  Debug.print("  ✓ " # name);
+};
+func between(name : Text, x : Nat, lo : Nat, hi : Nat) {
+  if (x < lo or x > hi) { Runtime.trap("FAIL: " # name # " — expected " # debug_show lo # ".." # debug_show hi # " got " # debug_show x) };
+  Debug.print("  ✓ " # name # " (" # debug_show x # ")");
+};
+func ltvOf(t : Types.TokenId) : Nat { switch (Types.marginLTV(t)) { case (?x) { x }; case null { 0 } } };
+Debug.print("── fill-time initial-margin projection (task 1793732895) ──");
+
+// The engine report (2026-11-03): ICP at $2.49, LTV 0.80, a fresh pool with
+// $4,980 of margin asked for a 10,000-ICP long (5×). Per unit filled a pool
+// long gains 0.8 × 2.49 of collateral and owes 1.25 × 2.49 → −1.1205 per ICP.
+let icpPx : Nat = 249_000_000;
+eqI("pool long, ICP @ 2.49: delta = 0.8·2.49 − 1.25·2.49 = −1.1205", BE.fillDeltaPerUnit(true, #buy, icpPx, ltvOf("ICP"), icpPx), -112_050_000);
+eqI("headroom of a debt-free pool = its collateral", BE.fillHeadroom(498_000_000_000, 0), 498_000_000_000);
+eqN("…so the release holds the 10,000-ICP ask to 4,444.44 ICP (2.2×)",
+  switch (BE.fillRoom(498_000_000_000, -112_050_000)) { case (?q) { q }; case null { 0 } }, 444_444_444_444);
+// The BORROW gate alone — the borrowed quote at LTV 1.0 — reads 4 × margin of
+// room, the 5× the preview used to promise for every asset.
+eqN("borrow gate alone: quote room = 4 × margin (the old 5× answer)", BE.healthRoom(498_000_000_000, 0, Fixed.SCALE, Fixed.SCALE), 4 * 498_000_000_000);
+
+// Per-asset ceilings on a fresh $10k pool at the mark: notional / margin ≈
+// 1 / (1.25 − ltv), in basis points of leverage — and the room is EXACT: the
+// largest quantity whose fill keeps the line (one more base unit breaches).
+let m : Nat = 1_000_000_000_000;   // $10,000
+func ceilingBps(token : Types.TokenId, px : Nat) : Nat {
+  let d = BE.fillDeltaPerUnit(true, #buy, px, ltvOf(token), px);
+  let q = switch (BE.fillRoom(m, d)) { case (?q) { q }; case null { Runtime.trap("FAIL: a pool long is unbounded?") } };
+  truth(token # ": the room is the largest safe quantity (q·|δ| ≤ headroom)", Fixed.mul(q, Int.abs(d), true) <= m);
+  truth(token # ": …and one more base unit breaches the line", Fixed.mul(q + 1, Int.abs(d), false) > m);
+  Fixed.mul(q, px, false) * 10_000 / m
+};
+between("ICP long ceiling ≈ 2.22× (1 / 0.45)", ceilingBps("ICP", icpPx), 22_221, 22_223);
+between("SOL long ceiling ≈ 2.50× (1 / 0.40)", ceilingBps("SOL", 15_000_000_000), 24_999, 25_000);
+between("BTC long ceiling ≈ 2.86× (1 / 0.35)", ceilingBps("BTC", 8_051_000_000_000), 28_570, 28_572);
+between("ETH long ceiling ≈ 2.86× (1 / 0.35)", ceilingBps("ETH", 300_000_000_000), 28_570, 28_572);
+// Shorts land on the SAME ceiling through the borrow gate (the borrowed base
+// valued at its LTV): healthRoom(m, 0, ltv, px) × px / m ≈ 1 / (1.25 − ltv).
+between("ICP short ceiling via borrowCheck's closed form ≈ 2.22×", Fixed.mul(BE.healthRoom(m, 0, ltvOf("ICP"), icpPx), icpPx, false) * 10_000 / m, 22_221, 22_223);
+between("BTC short ceiling via borrowCheck's closed form ≈ 2.86×", Fixed.mul(BE.healthRoom(m, 0, ltvOf("BTC"), 8_051_000_000_000), 8_051_000_000_000, false) * 10_000 / m, 28_570, 28_572);
+// At the mark the long's room and the short's room are the same closed form,
+// m / ((1.25 − ltv) × price) — healthRoom divides twice (by 1.25 − ltv, then by
+// the price), fillRoom once (by |δ| with 1.25 × qp rounded UP), so the two
+// floors may differ by ONE base unit (10⁻⁸ of a token); never more.
+let longRoomIcp : Nat = switch (BE.fillRoom(m, BE.fillDeltaPerUnit(true, #buy, icpPx, ltvOf("ICP"), icpPx))) { case (?q) { q }; case null { 0 } };
+let shortRoomIcp : Nat = BE.healthRoom(m, 0, ltvOf("ICP"), icpPx);
+truth("…and at the mark the long's room is the short's room within one base unit (ICP: " # debug_show longRoomIcp # " vs " # debug_show shortRoomIcp # ")",
+  (if (longRoomIcp >= shortRoomIcp) { longRoomIcp - shortRoomIcp } else { shortRoomIcp - longRoomIcp }) <= 1);
+
+// The other arms and the edge shapes.
+eqI("pool short: delta = qp − 1.25·oracle (the post-sale world at the floor price)", BE.fillDeltaPerUnit(true, #sell, icpPx, ltvOf("ICP"), 236_550_000), 236_550_000 - 311_250_000);
+eqI("wallet-era buy: the collateral swap only (0.8·oracle − qp)", BE.fillDeltaPerUnit(false, #buy, icpPx, ltvOf("ICP"), icpPx), 199_200_000 - 249_000_000);
+eqI("wallet-era sell: qp − 0.8·oracle", BE.fillDeltaPerUnit(false, #sell, icpPx, ltvOf("ICP"), icpPx), 249_000_000 - 199_200_000);
+truth("delta ≥ 0 → no bound (null)", BE.fillRoom(m, 0) == null and BE.fillRoom(m, 5) == null);
+eqN("headroom 0 → room 0 (at the floor)", switch (BE.fillRoom(0, -1)) { case (?q) { q }; case null { 99 } }, 0);
+eqN("…negative headroom too (below the floor)", switch (BE.fillRoom(-5, -1)) { case (?q) { q }; case null { 99 } }, 0);
+eqI("headroom rounds the required collateral UP (debt side, against the pool)", BE.fillHeadroom(1_000_000_000_000, 400_000_000_001), 1_000_000_000_000 - 500_000_000_002);
+Debug.print("1793732895 fixtures green");
+
+// ── Task 1793733917: the SHORT closed form at a floor price ───────────────
+// borrowCheck values the borrowed base at its LTV BEFORE the sale: notional ≤
+// m / (1.25 − ltv). The release clamp scores the POST-sale world at the floor
+// qp = oracle·(1 − slip): the proceeds q·qp against 1.25·q·oracle of base
+// debt, so notional ≤ m / (0.25 + slip) — independent of the asset's LTV. The
+// clamp binds below the borrow gate exactly when 1 − slip < ltv, the corner
+// previewOpenPosition's #buy-only gate missed. Pinned on the brief's venue
+// numbers (BTC @ 50,000, a fresh $10k pool; test_initial_margin §H6-H8 is the
+// venue half) and on the per-slippage ceilings and per-asset crossovers.
+Debug.print("── short fill projection at a floor price (task 1793733917) ──");
+let btcPx : Nat = 5_000_000_000_000;   // $50,000
+let floor20 : Nat = Fixed.mul(btcPx, Fixed.SCALE - 20_000_000, false);   // 40,000 — the 20 % floor
+let floor05 : Nat = Fixed.mul(btcPx, Fixed.SCALE - 5_000_000, false);    // 47,500 — the 5 % floor
+eqN("the 20 % floor on BTC @ 50,000 is 40,000", floor20, 4_000_000_000_000);
+eqI("pool short at the 20 % floor: delta = 40,000 − 1.25·50,000 = −22,500 per BTC", BE.fillDeltaPerUnit(true, #sell, btcPx, ltvOf("BTC"), floor20), -2_250_000_000_000);
+let shortRoom20 : Nat = switch (BE.fillRoom(m, BE.fillDeltaPerUnit(true, #sell, btcPx, ltvOf("BTC"), floor20))) { case (?q) { q }; case null { 0 } };
+eqN("…so the clamp holds a fresh $10k pool to 10,000 / 22,500 = 0.44444444 BTC (2.22×)", shortRoom20, 44_444_444);
+let borrowRoomBtc : Nat = BE.healthRoom(m, 0, ltvOf("BTC"), btcPx);
+eqN("borrowCheck's closed form for the same short: 10,000 / (1.25 − 0.9) / 50,000 = 0.57142857 BTC (2.86×)", borrowRoomBtc, 57_142_857);
+truth("at 20 % slippage the clamp binds BELOW the borrow gate (1 − 0.20 < 0.90): min(borrow room, clamp room) is the clamp's 0.4444", shortRoom20 < borrowRoomBtc);
+let shortRoom05 : Nat = switch (BE.fillRoom(m, BE.fillDeltaPerUnit(true, #sell, btcPx, ltvOf("BTC"), floor05))) { case (?q) { q }; case null { 0 } };
+eqN("at the 5 % floor the clamp's room is 10,000 / 15,000 = 0.66666666 BTC (3.33×)", shortRoom05, 66_666_666);
+truth("…above the borrow gate's 0.5714 (1 − 0.05 > 0.90): the borrow gate binds, min(…) = 0.57142857", shortRoom05 > borrowRoomBtc);
+// The crossover: at slip = 1 − ltv the two closed forms coincide (one base
+// unit of rounding apart at most — healthRoom divides twice, fillRoom once).
+let floor10 : Nat = Fixed.mul(btcPx, Fixed.SCALE - 10_000_000, false);   // 45,000 — BTC's 1 − ltv
+let shortRoom10 : Nat = switch (BE.fillRoom(m, BE.fillDeltaPerUnit(true, #sell, btcPx, ltvOf("BTC"), floor10))) { case (?q) { q }; case null { 0 } };
+truth("at slip = 1 − ltv (BTC: 10 %) the clamp's room equals the borrow gate's within one base unit (" # debug_show shortRoom10 # " vs " # debug_show borrowRoomBtc # ")",
+  (if (shortRoom10 >= borrowRoomBtc) { shortRoom10 - borrowRoomBtc } else { borrowRoomBtc - shortRoom10 }) <= 1);
+// Per-slippage ceilings of the post-sale rule, notional / margin in bps of
+// leverage = 1 / (0.25 + slip): the asset's LTV does not enter.
+func shortCeilingBps(slipE8 : Nat) : Nat {
+  let qp = Fixed.mul(btcPx, Fixed.SCALE - slipE8, false);
+  let q = switch (BE.fillRoom(m, BE.fillDeltaPerUnit(true, #sell, btcPx, ltvOf("BTC"), qp))) { case (?q) { q }; case null { Runtime.trap("FAIL: a pool short is unbounded?") } };
+  Fixed.mul(q, btcPx, false) * 10_000 / m
+};
+between("short ceiling at 5 % slippage ≈ 3.33× (1 / 0.30)", shortCeilingBps(5_000_000), 33_332, 33_334);
+between("short ceiling at 15 % slippage = 2.50× (1 / 0.40)", shortCeilingBps(15_000_000), 24_999, 25_000);
+between("short ceiling at 20 % slippage ≈ 2.22× (1 / 0.45)", shortCeilingBps(20_000_000), 22_221, 22_223);
+between("short ceiling at 25 % slippage = 2.00× (1 / 0.50)", shortCeilingBps(25_000_000), 19_999, 20_000);
+// The crossover slippage per asset is 1 − ltv — ICP 20 %, SOL 15 %, BTC/ETH
+// 10 % — past it the clamp's ceiling sits under the borrow gate's 1 / (1.25 − ltv).
+func clampBindsBelowBorrow(token : Types.TokenId, px : Nat, slipE8 : Nat) : Bool {
+  let qp = Fixed.mul(px, Fixed.SCALE - slipE8, false);
+  let clampRoom = switch (BE.fillRoom(m, BE.fillDeltaPerUnit(true, #sell, px, ltvOf(token), qp))) { case (?q) { q }; case null { 0 } };
+  clampRoom < BE.healthRoom(m, 0, ltvOf(token), px)
+};
+truth("ICP (LTV 0.80): the clamp binds past 20 % slippage, not before", clampBindsBelowBorrow("ICP", icpPx, 21_000_000) and not clampBindsBelowBorrow("ICP", icpPx, 19_000_000));
+truth("SOL (LTV 0.85): past 15 %", clampBindsBelowBorrow("SOL", 15_000_000_000, 16_000_000) and not clampBindsBelowBorrow("SOL", 15_000_000_000, 14_000_000));
+truth("BTC / ETH (LTV 0.90): past 10 %",
+  clampBindsBelowBorrow("BTC", btcPx, 11_000_000) and not clampBindsBelowBorrow("BTC", btcPx, 9_000_000)
+  and clampBindsBelowBorrow("ETH", 300_000_000_000, 11_000_000) and not clampBindsBelowBorrow("ETH", 300_000_000_000, 9_000_000));
+Debug.print("1793733917 fixtures green");

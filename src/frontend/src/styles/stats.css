@@ -144,16 +144,24 @@
    and the link; "Read more" discloses sentences 2–5 (.launch-rest) in place
    and reads "Show less" while open (renderLaunchBanner toggles .expanded +
    aria-expanded and recomputes --chrome-h). A text control in the accent,
-   dotted-underlined so it does not read as the navigation link beside it;
-   the ✕ keeps its float, and a clearfix makes the strip CONTAIN it — when the
-   last line is full ("…coming soon… Read the story → Show less" at 400px) the
-   float takes a line of its own instead of hanging below the strip over the
-   header. A clearfix, not display: flow-root: renderLaunchBanner shows and
-   hides the strip through its INLINE display, which a stylesheet display
-   cannot beat. Desktop never sees the control. Task 1793575027. */
+   dotted-underlined so it does not read as the navigation link beside it.
+   Desktop never sees the control. Task 1793575027.
+   The ✕ sits in the strip's top-right corner on phones (operator option 1,
+   task 1793577015): the strip is the positioning context with SYMMETRIC 32px
+   side padding — the centred text stays centred; its column narrows to 336px
+   at 400px — and the control is absolutely placed, float and margin cleared.
+   Floated at the end of the text (as the fuel/oracle banners' ✕ still is) it
+   took a 7th line of its own when the expanded strip's last line was full
+   ("…coming soon… Read the story → Show less" at 400px) and needed a clearfix
+   to stay inside the strip; the corner needs neither. Measured at 400px
+   (2026-11-02): the ✕ no longer takes a line, but the 336px column re-wraps
+   sentence 1 to three lines and the disclosed text to seven (150.9px expanded,
+   75.5px collapsed — the heights (B) had); six lines need a ≥367px column
+   with this copy. Whether to buy the line back is task 1793615445. */
 .launch-banner .launch-expand { display: none; }
 @media (max-width: 480px) {
-  .launch-banner::after { content: ""; display: block; clear: both; }
+  .launch-banner { position: relative; padding-right: 32px; padding-left: 32px; }
+  .launch-banner .banner-dismiss { position: absolute; top: 7px; right: 10px; float: none; margin: 0; }
   .launch-banner .launch-rest { display: none; }
   .launch-banner.expanded .launch-rest { display: inline; }
   .launch-banner .launch-expand {

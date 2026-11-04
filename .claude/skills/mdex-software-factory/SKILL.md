@@ -53,7 +53,10 @@ tasks/factory/   coordination surface: index.md (the board), merge.lock/,
                  .ids/ (the append-only id allocator - never touch, never clean),
                  fleet-roster (the seats the fleet doctor REMEMBERS - written
                  by worker-pin, adopted by the doctor, dropped only by
-                 seat-retire) + fleet-orphaned (the first pass that saw a
+                 seat-retire - except a row for the OPERATOR principal, stale
+                 by construction, which the doctor's own pass drops instead of
+                 reading it ORPHANED: roster_drop_operator_row, task
+                 1793621537) + fleet-orphaned (the first pass that saw a
                  roster seat's worktree missing - the forensic anchor),
                  spawn-pending/<seat> (a boot Terminal has queued but not yet
                  run), signal-shown/<worker>.all|.own (the order text a
@@ -565,9 +568,11 @@ anyway.
      checkout on merged main, foregrounded so the `icp` reauth URL is
      visible, and DECLARED as the operator's direct round (`FACTORY_DIRECT=1
      scripts/deploy.sh engine|subnet ...`, or `export FACTORY_WORKER=operator`
-     for the session - the no-identity belt, Operator guide, reads an
-     undeclared primary commit as a drifted executor while seats are
-     pinned) - then `factory.sh done <id> done "<what ran, where>"`.
+     - or `claude-operator`, the operator seat's own spelling; the two are
+     one principal to every guard, "The operator seat" - for the session:
+     the no-identity belt, Operator guide, reads an undeclared primary
+     commit as a drifted executor while seats are pinned) - then
+     `factory.sh done <id> done "<what ran, where>"`.
    - Obsolete / answered elsewhere: `claim --operator --id <id>` then
      `done <id> superseded "why"`.
 4. Law 9 always: never edit a queued file in place - claim-edit-requeue is
@@ -660,7 +665,9 @@ a belt), `foreign-parent` (the parent dir is not the pool root),
   minutes before the probe was retired). Exercise factory.sh against a
   throwaway tree under `FACTORY_TASKS_ROOT` (the selftest's way), or retire
   a real-roster probe within minutes of pinning it - never leave one
-  standing.
+  standing. (The one pinned tree the doctor passes over is the operator
+  seat's - pin `operator` or `claude-operator`, or basename `operator` -
+  by its overlay skip; "The operator seat", below.)
 
 **PIN IT ONCE, as your first act on the seat:**
 
@@ -1206,16 +1213,29 @@ TaskConsumer in executor mode..."* - everything else per this skill.
   1dc9df2fa onto main - every identity-keyed guard stayed silent): the hook
   (its guard C, re-synced here 2026-10-31) ALSO refuses a commit on the
   primary's main when the process carries NO seat identity WHILE A FACTORY
-  IS RUNNING - any `.factory-worker` pin under `.factory/seats/*/`, the
-  legacy `.claude/worktrees/*/`, or a linked worktree. The operator's own
+  IS RUNNING - any CONSUMER seat's `.factory-worker` pin under
+  `.factory/seats/*/`, the legacy `.claude/worktrees/*/`, or a linked
+  worktree (the operator seat's `operator` / `claude-operator` pin is no
+  running factory to either belt - task 1793617711). The operator's own
   primary work declares itself: `FACTORY_DIRECT=1` (the direct-round marker
   - `FACTORY_DIRECT=1 git commit ...` for a direct round on main, a release
-  tag or a hotfix; the same prefix on a primary `scripts/deploy.sh` run is
-  the declaration `scripts/factory_guard.sh` will read once it carries the
-  belt - today the hook alone does, the guard still fails open without an
-  identity) or `FACTORY_WORKER=operator`; `FACTORY_FORCE=1` stays the
-  blanket override. Fail-open remains ONLY when no seat is pinned anywhere
-  (a checkout with no factory). The merge protocol is untouched: `git -C
+  tag or a hotfix; the same prefix on a primary `scripts/deploy.sh` run -
+  `FACTORY_DIRECT=1 bash scripts/deploy.sh <target>` - is the declaration
+  `scripts/factory_guard.sh` reads TODAY: its `factory_primary_guard`
+  carries the belt too (re-synced 2026-10-31) and, with NO identity,
+  REFUSES a REMOTE deploy (`deploy.sh cloud|engine|subnet`) from the
+  primary while any consumer seat is pinned under `.factory/seats/*/`,
+  `.claude/worktrees/*/` or any linked worktree (`git worktree list`, the
+  hook's own list - task 1793617711) - "REFUSED - a REMOTE deploy from the
+  primary with NO seat identity while a factory is running" - and leaves a
+  LOCAL deploy or `cold_start.sh` run untouched, the primary's :8000 venue
+  being the operator's by design) or `FACTORY_WORKER=operator` (or
+  `claude-operator` - the operator seat's pin; one principal to the hook,
+  the guard and factory.sh, "The operator seat"); `FACTORY_FORCE=1` stays
+  the blanket override.
+  Fail-open remains ONLY when no CONSUMER seat is pinned anywhere (a
+  checkout with no factory; the operator seat's pin alone does not count -
+  task 1793617711). The merge protocol is untouched: `git -C
   <primary> merge --no-ff` runs the pre-merge-commit hook, never
   pre-commit, and none is shipped. Environments the guards cannot see (a
   shell with no FACTORY_WORKER and a cwd outside any pinned tree, in a
@@ -1348,7 +1368,11 @@ TaskConsumer in executor mode..."* - everything else per this skill.
   prioritizer-boot`) - and ORPHANED for a seat on the FLEET ROSTER
   (`tasks/factory/fleet-roster`: written by `worker-pin`, adopted by the
   doctor for any pinned worktree it enumerates, dropped ONLY by
-  `seat-retire`) whose worktree is gone (task 1788956135). The doctor used
+  `seat-retire` - except a row for the OPERATOR principal, stale by
+  construction (no writer mints one and `seat-retire` refuses that seat),
+  which the pass itself drops instead of reading it ORPHANED:
+  `roster_drop_operator_row`, task 1793621537) whose worktree is gone
+  (task 1788956135). The doctor used
   to ENUMERATE pinned worktrees, so a deleted tree simply dropped out of
   the count: upstream's seat-7 and seat-14 vanished under LIVE processes,
   the fleet went 10 -> 6, and every pass read `FLEET-OK seats 6`. Now the
@@ -1875,15 +1899,80 @@ something outside the queue's flow:
   protocol. It stays at that path (a live seat is never moved under a
   running venue) although `.claude/worktrees/` is the desktop app's GC'd
   pool: it is an app-made desktop worktree, which the untracked-dir GC
-  passes over, and a standing desktop session keeps it recently-active.
-  NEVER `worker-pin` it - a pinned tree joins the fleet roster and the
-  fleet doctor would adopt it as a consumer seat (and respawn an executor
-  into it); its identity is `FACTORY_WORKER=operator`, exported for the
-  session, which the hook and `claim --operator` already know. Should the
-  GC ever take it, rebuild it by hand from `claude/operator` (never
-  `seat-recreate`, which mints consumer seats under the seat root).
-  Consumer seats mint under the seat root (`factory.sh seat-root`), never
-  here.
+  passes over, a standing desktop session keeps it recently-active, and
+  `.worktree-keep` at its root is the keep-sentinel belt - dropped BY HAND
+  (the operator's interim shield of 2026-10-31, task 1793461559) or by
+  `worker-pin` run here (task 1793616271): the fleet doctor's walk skips
+  this tree before its sentinel drop, so nothing else re-drops it. Should
+  the GC ever take it, rebuild it by hand from `claude/operator` (never
+  `seat-recreate`, which mints consumer seats under the seat root) and
+  re-pin it (`worker-pin`, or the hand-written line below). Consumer seats
+  mint under the seat root (`factory.sh seat-root`), never here.
+- **Identity - ONE operator principal, two spellings.** The seat IS
+  pinned: `.claude/worktrees/operator/.factory-worker` reads
+  `claude-operator` (the flattened branch), written BY HAND - `printf
+  'claude-operator\n' > .factory-worker` at the worktree root, one line,
+  nothing else - so that `claim`/`requeue`/`done` run anywhere inside the
+  tree, `factory.sh worker`, and `factory.sh executor-env` (which refuses
+  to mint an identity line from an unpinned tree) all resolve
+  `claude-operator` for the session and for the subagents it spawns -
+  "pinned so its claims resolve", the engine's own words at the fleet
+  doctor's overlay skip. `export FACTORY_WORKER=operator` (or
+  `=claude-operator`) for a session is the same declaration. Everywhere
+  the engine compares identities the two spellings are one principal:
+  `.githooks/pre-commit` (guards B and C), `scripts/factory_guard.sh`
+  (`factory_seat_identity` / `factory_primary_guard`), the fleet doctor's
+  overlay skip, and - through `same_principal()` (scripts/factory.sh,
+  "MULTI/DEX overlay: operator == claude-operator", task 1793613786) - the
+  two law-3 belts, `warn_owner_mismatch` (`done` / `requeue`) and
+  `merge_lock_claim_check` (`merge-lock acquire --task`, `merge-land
+  --task`). `claim --operator` stamps the literal `operator` and files
+  under `tasks/claimed/operator/` regardless of how the seat resolves
+  (1793613786 kept the stamp and taught the belts instead), so an
+  operator-claimed task is closed and merged from this seat under either
+  spelling with no law-3 noise; a foreign claim still warns and is still
+  refused.
+  **Never adopted as a consumer seat, never respawned** - and what
+  guarantees it is the fleet doctor's OVERLAY SKIP on the pin, not the
+  absence of a pin: the pinned-worktree walk passes over any tree whose
+  pin reads `operator` or `claude-operator` (or whose basename is
+  `operator`) before any verdict, roster adoption, sentinel drop or
+  respawn (scripts/factory.sh, "the OPERATOR seat is pinned
+  (claude-operator)"), so the seat has no doctor row and stays off
+  `tasks/factory/fleet-roster`. **`worker-pin` is ALLOWED here** (task
+  1793616271): `roster_register` - which `cmd_worker_pin` and
+  `handoff-clear`'s pin refresh both call - skips the roster row and the
+  `factory-seat` tripwire for the operator principal by the SAME predicate
+  as the doctor's walk (`operator_seat`: pin `operator` or
+  `claude-operator`, or basename `operator`) and says `operator seat: not
+  a roster seat (MULTI/DEX overlay)` on stderr, so the command writes the
+  pin and `.worktree-keep` only. Why that skip had to exist: the doctor's
+  ORPHANED pass reads the roster for every seat its walk did not mark seen
+  - the skip fires before the marking - so a roster row for this tree read
+  `ORPHANED operator ...` with the summary `FLEET-DEGRADED 1 missing of N`
+  on EVERY pass, and - until task 1793621537, below - nothing but
+  `seat-retire` dropped a row - a command the
+  ENGINE REFUSES on this seat (task 1793617638): `cmd_seat_retire`, finding
+  no roster row, resolves the tree from `git worktree list` by basename -
+  exactly this seat's off-roster shape - and once worker and branch have
+  resolved refuses the operator principal by the same `operator_seat`
+  predicate, `seat-retire refused: '<seat>' is the OPERATOR seat (pin
+  <pin>) - it is wound up by hand, never by this command (MULTI/DEX
+  overlay)`, with no `FACTORY_FORCE` override and `--dry-run` refusing the
+  same way (before 1793617638 only this sentence and the live-cwd check -
+  absent after a handoff, an app restart or a reboot - stood between
+  `seat-retire operator` and the removal). `handoff-clear operator` run here
+  goes through the same door. A roster row this principal nonetheless holds
+  (a pre-1793616271 `factory.sh`, a hand edit, a restored roster backup) is
+  STALE BY CONSTRUCTION and the fleet doctor's own pass drops it (task
+  1793621537, `roster_drop_operator_row` - `roster_remove`'s second caller,
+  by the same `operator_seat` predicate): `roster: dropped stale
+  operator-principal row <seat> (MULTI/DEX overlay)` on stderr plus a
+  fleet-log record, never an `ORPHANED` verdict, never counted missing,
+  never a `fleet-orphaned` anchor; `--dry-run` says `would drop` and leaves
+  it - no hand edit of `tasks/factory/fleet-roster` is ever needed. The
+  hand-written pin stays a valid shape; after a move or a rebuild
+  `worker-pin` is the simpler one (it drops the sentinel too).
 - **What runs there**: operator-directed development; the OperatorTasks
   console; pre-rollout verification (exercise merged main against a fresh
   venue before the operator ships it anywhere).
@@ -1896,8 +1985,12 @@ something outside the queue's flow:
   primary checkout clean for its four jobs (law 5). Interactive sessions
   claim nothing unless asked; when operator-directed work turns out to be
   queue-shaped, file it (producer procedure) instead of doing it inline.
-- **Lifecycle**: standing - hand it off to refresh context, wind it up only
-  deliberately. Its work merges through the same lock, gates included.
+- **Lifecycle**: standing - hand it off to refresh context (its successor
+  clears the handoff file with `handoff-clear operator` like any seat: the
+  pin refresh takes the operator skip, the Identity bullet - task
+  1793616271), wind it up only deliberately, BY HAND - `seat-retire`
+  refuses this seat (the Identity bullet). Its work merges
+  through the same lock, gates included.
   Unlike worker seats it MAY be a desktop session - it exists for
   interactive work with the operator, and the desktop is the operator's
   surface.
@@ -2132,20 +2225,29 @@ window is closed, clears the inherited set at its source; the scrub makes
 boots correct either way.
 
 **Your own work on the primary's main declares itself: `FACTORY_DIRECT=1`**
-(task 1791133471). While any seat is pinned (a factory is running), the
-primary's pre-commit hook (`.githooks/pre-commit`, guard C) refuses an
-identity-free commit on main - that is exactly what a drifted executor
-subagent looks like (upstream's 1dc9df2fa, 2026-10-04). So a direct round
+(task 1791133471). While any CONSUMER seat is pinned (a factory is running;
+the operator seat's pin does not count - task 1793617711), the primary's
+pre-commit hook (`.githooks/pre-commit`, guard C) refuses an identity-free
+commit on main - that is exactly what a drifted executor subagent looks
+like (upstream's 1dc9df2fa, 2026-10-04). So a direct round
 (a docs or corpus commit on main, a release tag, a hotfix) commits as
 `FACTORY_DIRECT=1 git commit ...`, and your own primary deploys and
 rollouts run as `FACTORY_DIRECT=1 scripts/deploy.sh ...` (or export
-`FACTORY_WORKER=operator` for the session - the declared operator identity
-passes the hook, and `scripts/factory_guard.sh` reads the same declaration
-once it carries the belt; today it still fails open without an identity).
+`FACTORY_WORKER=operator` - or `claude-operator`, the operator seat's own
+spelling, one principal to every guard ("The operator seat") - for the
+session: the declared operator identity passes the hook and the guard
+alike). `scripts/factory_guard.sh` reads `FACTORY_DIRECT=1` TODAY - its
+`factory_primary_guard` carries the same belt (re-synced 2026-10-31):
+with no identity it REFUSES a REMOTE deploy (`deploy.sh
+cloud|engine|subnet`) from the primary while any consumer seat is pinned
+- "REFUSED - a REMOTE deploy from the primary with NO seat identity while
+a factory is running" - and leaves a LOCAL deploy or `cold_start.sh` run
+untouched (the :8000 venue is yours).
 Seat merges (`git -C <primary> merge --no-ff`, the `merge-land` door) need
-nothing: git-merge never runs pre-commit. With no seat pinned anywhere the
-guards fail open as before. The refusal text names the marker and the
-remedy; `FACTORY_FORCE=1` remains the blanket override.
+nothing: git-merge never runs pre-commit. With no CONSUMER seat pinned
+anywhere the guards fail open as before (the operator seat's pin alone does
+not count). The refusal text names the marker and the remedy;
+`FACTORY_FORCE=1` remains the blanket override.
 
 Only consumers are workers under the doctrine: the prioritizer, producers,
 the OperatorTasks console and the operator seat are operator-surface

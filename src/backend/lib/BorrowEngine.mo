@@ -289,6 +289,57 @@ module {
     } else { 0 };
   };
 
+  // ── Fill-time initial-margin projection (the release clamp's inequality) ──
+  // The SECOND gate on a leveraged entry, beside borrowCheck / healthRoom
+  // above (task 1793732895). borrowCheck judges the BORROW: it values the
+  // borrowed token at its own LTV — for a LONG that is the quote at 1.0,
+  // which the fill then SPENDS on base at the base's LTV — so for longs it is
+  // not the health the position opens with (notional ≤ 5 × margin for every
+  // asset). clampToInitialMargin (main.mo) judges the FILL at release: per
+  // unit of base filled at the worst-case price qp, the pool's (LTV-weighted
+  // collateral − INITIAL_HEALTH_RATIO × debt) moves by fillDeltaPerUnit, and
+  // the fill may grow until that line reaches zero (fillRoom). These three
+  // are the ONE source of that inequality: the clamp and previewOpenPosition
+  // both go through them, so the preview's capacity and verdict are the
+  // release's by construction and cannot drift again.
+  //
+  // borrowsAtFill = true is a POOL (H-34 / D5 (d): the re-levering excess is
+  // BORROWED at the fill, so per unit the debt side grows by the borrowed
+  // value — quote at the fill price for a long; base at the mark, valued UP,
+  // for a short — and the health line demands INITIAL_HEALTH_RATIO × that,
+  // while the collateral side gains the leg bought: base at ltv × mark; quote
+  // at 1.0). Conservative: the WHOLE fill is scored as borrowed — the pool's
+  // own free funds are not credited (they only make the fill's borrow
+  // smaller, never larger) — so a fresh pool with margin m opens a long OR a
+  // short up to notional m / (INITIAL − ltv): ICP 2.2×, SOL 2.5×, BTC/ETH
+  // 2.9×. (Whether a long's own margin SHOULD be credited — 1 / (1 − ltv/1.25),
+  // ICP 2.8× — is the operator's open doctrine call, task 1793733873.)
+  // borrowsAtFill = false is the wallet-era shape (no borrow at the fill):
+  // the collateral swap only.
+  public func fillDeltaPerUnit(borrowsAtFill : Bool, side : Types.Side, oracle : Nat, baseLtv : Nat, qp : Nat) : Int {
+    let haircut : Int = Fixed.mul(oracle, baseLtv, false);   // the base leg marked at oracle × LTV, valued DOWN
+    switch (borrowsAtFill, side) {
+      case (true, #buy)   { haircut - (Fixed.mul(qp, Types.INITIAL_HEALTH_RATIO, true) : Int) };
+      case (true, #sell)  { (qp : Int) - (Fixed.mul(oracle, Types.INITIAL_HEALTH_RATIO, true) : Int) };
+      case (false, #buy)  { haircut - (qp : Int) };
+      case (false, #sell) { (qp : Int) - haircut };
+    };
+  };
+  // (LTV-weighted collateral) − INITIAL_HEALTH_RATIO × debt, the required
+  // collateral rounded UP (conservative → smaller headroom). ≤ 0 means the
+  // account is already at/below the initial floor.
+  public func fillHeadroom(collUsd : Nat, debtUsd : Nat) : Int {
+    (collUsd : Int) - (Fixed.mul(Types.INITIAL_HEALTH_RATIO, debtUsd, true) : Int)
+  };
+  // The largest quantity q with q × |delta| ≤ headroom: null when delta ≥ 0
+  // (every unit improves or keeps the margin — no bound binds), ?0 at or
+  // below the floor, else headroom / |delta| rounded DOWN (against the pool).
+  public func fillRoom(headroom : Int, deltaPerUnit : Int) : ?Nat {
+    if (deltaPerUnit >= 0) { return null };
+    if (headroom <= 0) { return ?0 };
+    ?Fixed.div(Int.abs(headroom), Int.abs(deltaPerUnit), false)
+  };
+
   public func borrow(
     state          : LoanState,
     margin         : MarginEngine.MarginState,

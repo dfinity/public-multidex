@@ -1288,6 +1288,57 @@ case "$out" in
   *) bad "post-broadcast claim" "got '$out'" ;;
 esac
 
+echo "== watch hashes the queue, never its own cwd: an empty signal glob under nullglob is no bare ls -l (task 1793664290) =="
+# main() runs `shopt -s nullglob`, so with no tasks/signal/*.md standing - the
+# normal state - watch_sig's former `ls -l "$SIGNAL"/*.md` lost its operand and
+# ran as a bare `ls -l` of the watch PROCESS'S cwd: the seat's worktree root
+# (the primary's, for the prioritizer). Every top-level change there - an npm
+# build rewriting dist/, git merge main touching a root file - fired CHANGED
+# with nothing in queue/claimed/archive/signal moved: a full-context model
+# turn per false wake (four empty prioritizer wakes in an hour, 2026-11-02).
+# The watch runs here from a throwaway cwd OUTSIDE the tasks root: a new entry
+# there must not wake it, a signal must (within one 10 s poll), and with a
+# signal standing the cwd still must not. The pid is $! of a `( cd && exec )`
+# subshell - exec makes it the watch's own pid - and only that pid is ever
+# killed (law 10); no watch outlives the case.
+wcwd="$(mktemp -d)"
+( cd "$wcwd" && exec "$F" watch 30 > "$R/watch4.out" 2>/dev/null ) &
+cw_pid=$!
+sleep 2
+touch "$wcwd/new-top-level-entry"
+sleep 15
+if kill -0 "$cw_pid" 2>/dev/null && [ ! -s "$R/watch4.out" ]; then
+  ok "a new file in the watch's own cwd does not wake it (still parked 15 s later, nothing printed)"
+else
+  bad "cwd wake" "watch gone or wrote '$(cat "$R/watch4.out" 2>/dev/null)' after a cwd touch"
+fi
+"$F" signal seat-cwd "selftest: an order for the cwd case" >/dev/null
+cw_waited=0
+while kill -0 "$cw_pid" 2>/dev/null && [ "$cw_waited" -lt 14 ]; do sleep 1; cw_waited=$((cw_waited+1)); done
+# One 10 s poll interval plus a second of scheduling slack.
+if ! kill -0 "$cw_pid" 2>/dev/null && [ "$(cat "$R/watch4.out")" = "CHANGED" ] && [ "$cw_waited" -le 11 ]; then
+  ok "...and a signal still wakes it within one poll (CHANGED after ${cw_waited}s)"
+else
+  bad "signal wake" "after ${cw_waited}s: out='$(cat "$R/watch4.out" 2>/dev/null)'"
+fi
+kill "$cw_pid" 2>/dev/null || true; wait "$cw_pid" 2>/dev/null || true
+# With the signal standing the glob matches, so the old code was quiet here
+# too; the case pins that the fix changed nothing on that side.
+( cd "$wcwd" && exec "$F" watch 30 > "$R/watch5.out" 2>/dev/null ) &
+cw_pid=$!
+sleep 2
+touch "$wcwd/another-top-level-entry"
+sleep 15
+if kill -0 "$cw_pid" 2>/dev/null && [ ! -s "$R/watch5.out" ]; then
+  ok "with a signal standing, a cwd touch does not wake a watch either"
+else
+  bad "cwd wake under signal" "watch gone or wrote '$(cat "$R/watch5.out" 2>/dev/null)'"
+fi
+kill "$cw_pid" 2>/dev/null || true; wait "$cw_pid" 2>/dev/null || true
+if ! kill -0 "$cw_pid" 2>/dev/null && [ ! -s "$R/watch5.out" ]; then ok "the parked watch was ended by its own captured pid, having printed nothing"; else bad "watch5 residue" "alive=$(kill -0 "$cw_pid" 2>/dev/null && echo yes || echo no) out='$(cat "$R/watch5.out" 2>/dev/null)'"; fi
+"$F" signal-clear seat-cwd >/dev/null
+rm -rf "$wcwd"
+
 echo "== the seat pin (.factory-worker) survives cwd drift =="
 # The realistic drift: an executor subagent or a backgrounded shell runs inside
 # a worktree whose BRANCH names another seat. A throwaway git repo reproduces
@@ -1337,6 +1388,49 @@ if grep -q "pinned as 'seat-pinned'" "$R/pin3.txt"; then ok "the disagreement is
 id_other="$(basename "$out" .md)"; id_other="${id_other#*-}"
 out="$(cd "$SEAT" && "$F" requeue "$id_other" "selftest" 2>"$R/pin4.txt")"
 if grep -q "law 3" "$R/pin4.txt"; then ok "requeue warns when the pin does not own the claim"; else bad "owner mismatch" "$(cat "$R/pin4.txt")"; fi
+
+echo "== operator == claude-operator: the operator's two spellings are one principal to the law-3 belts (task 1793613786) =="
+# `claim --operator` stamps the literal `operator` and files under claimed/operator/
+# (unchanged), while the standing operator seat resolves as `claude-operator` -
+# its FACTORY_WORKER export or its .factory-worker pin, the flattened branch.
+# Both name the one operator principal (factory_guard.sh and the pre-commit hook
+# already read them as one): done/requeue from that seat must be QUIET, while a
+# consumer seat acting on an operator claim, and a genuinely foreign claim
+# (claimed by claude-seat-9, closed from claude-seat-2), must still warn.
+OPWT="$R/opwt"; S2WT="$R/s2wt"
+mkdir -p "$OPWT" "$S2WT"
+printf 'claude-operator\n' > "$OPWT/.factory-worker"
+printf 'claude-seat-2\n' > "$S2WT/.factory-worker"
+{ echo "---"; echo "lane: operator"; echo "touches: nothing-$$-$RANDOM"; echo "---"; echo "# principal lane task"; } > "$R/draft.md"
+p_pr="$("$F" new "$R/draft.md")"; id_pr="$(basename "$p_pr" .md)"; id_pr="${id_pr#*-}"
+out="$(cd "$OPWT" && FACTORY_WORKER=claude-operator "$F" claim --operator --id "$id_pr" 2>"$R/pr1.txt")"
+case "$out" in
+  */claimed/operator/*) ok "claim --operator from the seat resolving as claude-operator still files under claimed/operator/ (the on-disk spelling is unchanged)" ;;
+  *) bad "principal claim dest" "got '$out'" ;;
+esac
+if grep -q "^- claimed by operator at " "$out" 2>/dev/null; then ok "its Factory log stamp still reads 'claimed by operator'"; else bad "principal stamp" "$(grep 'claimed by' "$out" 2>/dev/null)"; fi
+out="$(cd "$OPWT" && FACTORY_WORKER=claude-operator "$F" requeue "$id_pr" "selftest" 2>"$R/pr2.txt")"
+if grep -q "law 3" "$R/pr2.txt"; then bad "principal requeue warned" "$(cat "$R/pr2.txt")"; else ok "requeue from the seat pinned claude-operator is QUIET on an operator claim (no law-3 warning)"; fi
+if [ "$(count "$R/queue" "*-$id_pr.md")" = "1" ]; then ok "the lane task is back in the queue"; else bad "principal requeue" "id $id_pr"; fi
+# the equivalence is operator-only: a CONSUMER seat pinned claude-seat-2 acting on an operator claim still warns
+out="$(cd "$OPWT" && "$F" claim --operator --id "$id_pr" 2>/dev/null)"
+out="$(cd "$S2WT" && "$F" requeue "$id_pr" "selftest" 2>"$R/pr3.txt")"
+if grep -q "law 3" "$R/pr3.txt" && grep -q "claimed by 'operator'" "$R/pr3.txt" && grep -q "pinned as 'claude-seat-2'" "$R/pr3.txt"; then ok "a consumer seat (pinned claude-seat-2) requeuing an operator claim still warns, naming both (negative control: the equivalence is operator-only)"; else bad "operator-vs-consumer warning" "$(cat "$R/pr3.txt")"; fi
+# a genuinely foreign claim: claimed by claude-seat-9, requeued from the seat pinned claude-seat-2
+out="$("$F" claim claude-seat-9 2>/dev/null)"
+case "$out" in
+  */claimed/claude-seat-9/*) ok "a queued task is claimed by claude-seat-9 (the foreign holder)" ;;
+  *) bad "foreign claim" "got '$out'" ;;
+esac
+id_f9="$(basename "$out" .md)"; id_f9="${id_f9#*-}"
+out="$(cd "$S2WT" && "$F" requeue "$id_f9" "selftest" 2>"$R/pr4.txt")"
+if grep -q "law 3" "$R/pr4.txt" && grep -q "claimed by 'claude-seat-9'" "$R/pr4.txt" && grep -q "pinned as 'claude-seat-2'" "$R/pr4.txt"; then ok "requeue from claude-seat-2 of a claude-seat-9 claim still warns and names both (negative control)"; else bad "foreign warning" "$(cat "$R/pr4.txt")"; fi
+# done from the operator seat is quiet too, and archives
+out="$(cd "$OPWT" && "$F" claim --operator --id "$id_pr" 2>/dev/null)"
+out="$(cd "$OPWT" && FACTORY_WORKER=claude-operator "$F" done "$id_pr" done "selftest" 2>"$R/pr5.txt")"
+if grep -q "law 3" "$R/pr5.txt"; then bad "principal done warned" "$(cat "$R/pr5.txt")"; else ok "done from the seat pinned claude-operator is QUIET on an operator claim (no law-3 warning)"; fi
+if [ "$(count "$R/archive" "*$id_pr*.md")" = "1" ]; then ok "the operator claim is archived"; else bad "principal done" "id $id_pr"; fi
+rm -rf "$OPWT" "$S2WT"
 out="$(cd "$SEAT" && FACTORY_WORKER=seat-env2 "$F" worker 2>/dev/null | cut -f1)"
 if [ "$out" = "seat-env2" ]; then ok "worker reports FACTORY_WORKER ahead of the pin"; else bad "worker env" "got '$out'"; fi
 out="$(cd "$SEAT/deep" && "$F" worker 2>/dev/null | cut -f1)"
@@ -1483,6 +1577,27 @@ else
   ok "a pin at the legacy .claude/worktrees/<seat> location counts"
 fi
 rm -rf "$GP/.claude"
+# The OPERATOR seat's pin is no running factory to the belt (task 1793617711):
+# factory_guard.sh's belt skips `operator` / `claude-operator` pins and the
+# fleet doctor's overlay skip passes the seat over - guard C reads the same
+# way, at both seat dirs and on the linked-worktree list. The real shape is
+# .claude/worktrees/operator pinned claude-operator (hand-written).
+mkdir -p "$GP/.claude/worktrees/operator" && printf 'claude-operator\n' > "$GP/.claude/worktrees/operator/.factory-worker"
+mkdir -p "$GP/.factory/seats/op-direct" && printf 'operator\n' > "$GP/.factory/seats/op-direct/.factory-worker"
+printf 'claude-operator\n' > "$R/guard-wt/.factory-worker"
+if (cd "$GP" && env -u FACTORY_WORKER -u FACTORY_DIRECT "$HOOK" >/dev/null 2>"$R/g8a.txt"); then
+  ok "operator pins only (claude-operator at .claude/worktrees/operator, operator under the seat root, claude-operator on a linked worktree): an identity-free primary commit passes - the operator seat is no running factory to guard C"
+else
+  bad "belt operator pins" "$(cat "$R/g8a.txt")"
+fi
+mkdir -p "$GP/.factory/seats/seat-beside" && printf 'claude-seat-beside\n' > "$GP/.factory/seats/seat-beside/.factory-worker"
+if (cd "$GP" && env -u FACTORY_WORKER -u FACTORY_DIRECT "$HOOK" >/dev/null 2>"$R/g8b.txt"); then
+  bad "belt seat beside operator" "a consumer pin beside the operator pins did not count as a running factory"
+else
+  pl="$(sed -n 's/.*(seat pins:\(.*\))\..*/\1/p' "$R/g8b.txt")"
+  if [ "$pl" = " seat-beside" ]; then ok "a consumer pin beside the operator pins is refused, the refusal listing the consumer seat alone (seat pins:$pl)"; else bad "belt pins list" "seat pins list '$pl' (expected ' seat-beside'): $(cat "$R/g8b.txt")"; fi
+fi
+rm -rf "$GP/.claude" "$GP/.factory"; rm -f "$R/guard-wt/.factory-worker"
 printf 'claude-guard-seat\n' > "$R/guard-wt/.factory-worker"
 if (cd "$GP" && env -u FACTORY_WORKER -u FACTORY_DIRECT "$HOOK" >/dev/null 2>"$R/g8.txt"); then
   bad "belt wt pin" "a linked worktree's pin outside both seat roots did not count"
@@ -1625,6 +1740,37 @@ if out="$(FACTORY_WORKER=seat-belt FB merge-lock acquire some-worker-name --task
 out="$(FB merge-lock acquire some-worker-name 2>/dev/null)"
 if [ "$out" = "acquired" ]; then ok "without --task the acquire is as before (the operator's shape)"; else bad "belt plain" "got '$out'"; fi
 FB merge-lock release some-worker-name >/dev/null
+# operator == claude-operator (task 1793613786): the standing operator seat
+# resolves as claude-operator (FACTORY_WORKER, or its .factory-worker pin) while
+# its claims are stamped `operator` under claimed/operator/ - ONE principal to
+# the belt under either spelling and through the pin. A consumer seat is still
+# refused on an operator claim, and a genuinely foreign claim (claimed by
+# claude-seat-9, resolving as claude-seat-2) is still refused: negative controls.
+{ echo "---"; echo "lane: operator"; echo "touches: nothing-belt-op"; echo "---"; echo "# belt operator lane task"; } > "$RB/draft.md"
+p_o="$(FB new "$RB/draft.md")"; id_o="$(basename "$p_o" .md)"; id_o="${id_o#*-}"
+out="$(FB claim --operator --id "$id_o" 2>/dev/null)"
+case "$out" in */claimed/operator/*) ok "the belt's operator task is claimed under claimed/operator/ (stamped operator)" ;; *) bad "belt op claim" "got '$out'" ;; esac
+out="$(FACTORY_WORKER=claude-operator FB merge-lock acquire some-worker-name --task "$id_o" 2>"$RB/g14.txt")"
+if [ "$out" = "acquired" ]; then ok "--task on an operator claim ACQUIRES when the seat resolves as claude-operator (one principal)"; else bad "belt claude-operator" "out='$out' err='$(cat "$RB/g14.txt")'"; fi
+FB merge-lock release some-worker-name >/dev/null
+out="$(FACTORY_WORKER=operator FB merge-lock acquire some-worker-name --task "$id_o" 2>"$RB/g15.txt")"
+if [ "$out" = "acquired" ]; then ok "... and when it resolves as the literal operator"; else bad "belt operator" "out='$out' err='$(cat "$RB/g15.txt")'"; fi
+FB merge-lock release some-worker-name >/dev/null
+mkdir -p "$RB/opwt" && printf 'claude-operator\n' > "$RB/opwt/.factory-worker"
+out="$(cd "$RB/opwt" && FB merge-lock acquire some-worker-name --task "$id_o" 2>"$RB/g16.txt")"
+if [ "$out" = "acquired" ]; then ok "... and through a .factory-worker pin reading claude-operator with no FACTORY_WORKER (the operator seat's resting state)"; else bad "belt op pin" "out='$out' err='$(cat "$RB/g16.txt")'"; fi
+FB merge-lock release some-worker-name >/dev/null
+if out="$(FACTORY_WORKER=claude-seat-2 FB merge-lock acquire some-worker-name --task "$id_o" 2>"$RB/g17.txt")"; then bad "belt op vs consumer" "a consumer seat acquired on an operator claim: '$out'"; else ok "a consumer seat (claude-seat-2) is still REFUSED on an operator claim (negative control: the equivalence is operator-only)"; fi
+if grep -q "claimed by 'operator'" "$RB/g17.txt" && grep -q "resolves as 'claude-seat-2'" "$RB/g17.txt"; then ok "that refusal names the holder and this seat"; else bad "belt op vs consumer text" "$(cat "$RB/g17.txt")"; fi
+{ echo "---"; echo "touches: nothing-belt-9"; echo "---"; echo "# belt foreign task"; } > "$RB/draft.md"
+p_9="$(FB new "$RB/draft.md")"; id_9="$(basename "$p_9" .md)"; id_9="${id_9#*-}"
+out="$(FB claim claude-seat-9 2>/dev/null)"
+if grep -q "belt foreign task" "$out" 2>/dev/null; then ok "the foreign task is claimed by claude-seat-9"; else bad "belt foreign claim" "got '$out'"; fi
+if out="$(FACTORY_WORKER=claude-seat-2 FB merge-lock acquire some-worker-name --task "$id_9" 2>"$RB/g18.txt")"; then bad "belt foreign" "claude-seat-2 acquired on claude-seat-9's claim: '$out'"; else ok "a genuinely foreign claim (claimed by claude-seat-9, resolving as claude-seat-2) is still REFUSED (negative control)"; fi
+if grep -q "claimed by 'claude-seat-9'" "$RB/g18.txt" && grep -q "resolves as 'claude-seat-2'" "$RB/g18.txt"; then ok "that refusal names both"; else bad "belt foreign text" "$(cat "$RB/g18.txt")"; fi
+if [ "$(FB merge-lock status)" = "free" ]; then ok "the principal refusals held no lock"; else bad "belt principal lock leak" "$(FB merge-lock status)"; fi
+FB done "$id_o" done >/dev/null 2>&1
+FB done "$id_9" done >/dev/null 2>&1
 FB done "$id_b" done >/dev/null
 rm -rf "$RB"
 
@@ -2296,6 +2442,104 @@ if printf '%s\n' "$out" | grep -q "^UNMANNED	lg-wt	seat-lg	" && ! printf '%s\n' 
 rm -f "$R/handoff/lg-wt.md"
 out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" seat-retire lg-wt 2>&1)"
 if printf '%s\n' "$out" | grep -q "^RETIRED lg-wt" && [ ! -e "$RPP/.factory/seats/lg-wt" ]; then ok "seat-retire drops a seat-root seat the same way"; else bad "legacy retire" "$out"; fi
+echo "== the operator seat is not a roster seat: worker-pin / handoff-clear in an operator-pinned tree write the pin + sentinel only (task 1793616271) =="
+# The doctor's walk skips a worktree pinned operator|claude-operator (or whose
+# basename is operator) BEFORE marking it seen, and its ORPHANED pass reads
+# every roster seat the walk did not see - so a roster row for the operator
+# seat, which worker-pin and handoff-clear's pin refresh used to write, read
+# ORPHANED + FLEET-DEGRADED on every pass. roster_register now shares the
+# doctor's predicate (operator_seat): no row, no factory-seat tripwire, one
+# info line on stderr; a consumer pin still registers (the negative control).
+# Linked worktrees of the throwaway primary RP, one per arm: the pin
+# claude-operator (the flattened branch claude/operator - what worker-pin
+# derives, the live seat's pin), the basename operator (the live seat's
+# path shape) under a consumer-looking pin, and the pin operator.
+OPW="$R/op-wt"
+git -C "$RP" worktree add -q "$OPW" -b claude/operator 2>/dev/null
+out="$(cd "$OPW" && "$F" worker-pin 2>"$R/op1.txt")"
+if [ "$(cat "$OPW/.factory-worker" 2>/dev/null)" = "claude-operator" ] && [ "$(basename "$out")" = ".factory-worker" ]; then ok "worker-pin in a tree on claude/operator derives and writes the pin claude-operator"; else bad "op pin" "out='$out' pin='$(cat "$OPW/.factory-worker" 2>&1)'"; fi
+if [ -f "$OPW/.worktree-keep" ]; then ok "and drops the keep sentinel"; else bad "op sentinel" "$(ls -la "$OPW" 2>&1)"; fi
+if grep -q "^factory: operator seat: not a roster seat (MULTI/DEX overlay)$" "$R/op1.txt"; then ok "and says on stderr: operator seat: not a roster seat (MULTI/DEX overlay)"; else bad "op info line" "$(cat "$R/op1.txt")"; fi
+if ! grep -q "^op-wt	" "$R/factory/fleet-roster" 2>/dev/null; then ok "but writes NO roster row for the operator-pinned tree"; else bad "op roster row" "$(cat "$R/factory/fleet-roster")"; fi
+if [ ! -e "$RP/.git/worktrees/op-wt/factory-seat" ]; then ok "and NO factory-seat tripwire in its git admin dir"; else bad "op tripwire" "$(cat "$RP/.git/worktrees/op-wt/factory-seat")"; fi
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor 2>"$R/op2.txt")"
+if ! printf '%s\n' "$out" | grep -q "	op-wt	" && ! printf '%s\n' "$out" | grep -q "^ORPHANED" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-OK seats 0"; then ok "the doctor's pass prints nothing for it: no verdict row, no ORPHANED line, FLEET-OK seats 0"; else bad "op doctor" "$out"; fi
+if ! grep -q "op-wt" "$R/factory/fleet-roster" 2>/dev/null && ! grep -q "roster: adopted op-wt" "$R/op2.txt"; then ok "and adopts nothing (the walk skips it before roster adoption)"; else bad "op adopt" "$(cat "$R/factory/fleet-roster" 2>&1) / $(cat "$R/op2.txt")"; fi
+if [ "$(cd "$RP" && "$F" seat-roster 2>/dev/null)" = "NONE" ]; then ok "seat-roster reads NONE"; else bad "op seat-roster" "$(cd "$RP" && "$F" seat-roster 2>&1)"; fi
+# handoff-clear's pin refresh (the successor's ack) goes through the same door
+printf 'boot prompt\n' > "$R/handoff/op-wt.md"
+out="$(cd "$OPW" && "$F" handoff-clear op-wt 2>"$R/op3.txt")"
+if [ "$out" = "cleared op-wt" ] && [ "$(cat "$OPW/.factory-worker" 2>/dev/null)" = "claude-operator" ]; then ok "handoff-clear in the tree clears the handoff and refreshes the pin claude-operator"; else bad "op handoff" "out='$out' pin='$(cat "$OPW/.factory-worker" 2>&1)'"; fi
+if grep -q "^factory: operator seat: not a roster seat (MULTI/DEX overlay)$" "$R/op3.txt" && grep -q "seat pinned as 'claude-operator'" "$R/op3.txt"; then ok "its pin refresh says the same line (and still reports the pin)"; else bad "op handoff info" "$(cat "$R/op3.txt")"; fi
+if ! grep -q "^op-wt	" "$R/factory/fleet-roster" 2>/dev/null && [ ! -e "$RP/.git/worktrees/op-wt/factory-seat" ]; then ok "handoff-clear wrote no roster row and no tripwire either"; else bad "op handoff roster" "$(cat "$R/factory/fleet-roster" 2>&1)"; fi
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor 2>/dev/null)"
+if ! printf '%s\n' "$out" | grep -q "	op-wt	\|^ORPHANED" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-OK seats 0"; then ok "the doctor's next pass is still silent about it"; else bad "op doctor 2" "$out"; fi
+# the other two arms of the doctor's case: the basename operator (the live seat's shape) and the explicit pin operator
+OPB="$RPP/.claude/worktrees/operator"
+mkdir -p "$RPP/.claude/worktrees"
+git -C "$RP" worktree add -q "$OPB" -b claude/op-basename 2>/dev/null
+out="$(cd "$OPB" && "$F" worker-pin seat-op-basename 2>"$R/op4.txt")"
+if [ "$(cat "$OPB/.factory-worker" 2>/dev/null)" = "seat-op-basename" ] && ! grep -q "^operator	" "$R/factory/fleet-roster" 2>/dev/null && grep -q "operator seat: not a roster seat" "$R/op4.txt"; then ok "a tree whose BASENAME is operator is the operator seat whatever its pin says (the live seat's path shape): pinned, no row"; else bad "op basename" "pin='$(cat "$OPB/.factory-worker" 2>&1)' roster='$(cat "$R/factory/fleet-roster" 2>&1)' err='$(cat "$R/op4.txt")'"; fi
+out="$(cd "$OPW" && "$F" worker-pin operator 2>"$R/op5.txt")"
+if [ "$(cat "$OPW/.factory-worker" 2>/dev/null)" = "operator" ] && ! grep -q "^op-wt	" "$R/factory/fleet-roster" 2>/dev/null && grep -q "operator seat: not a roster seat" "$R/op5.txt"; then ok "the pin operator (claim --operator's spelling) is the operator seat too: pinned, no row"; else bad "op pin operator" "pin='$(cat "$OPW/.factory-worker" 2>&1)' roster='$(cat "$R/factory/fleet-roster" 2>&1)' err='$(cat "$R/op5.txt")'"; fi
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor 2>/dev/null)"
+if ! printf '%s\n' "$out" | grep -q "	op-wt	\|	operator	\|^ORPHANED" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-OK seats 0"; then ok "the doctor passes over all three shapes: no rows, no ORPHANED, FLEET-OK seats 0"; else bad "op doctor 3" "$out"; fi
+# NEGATIVE CONTROL: a consumer pin registers exactly as before - row, tripwire, a verdict row, no info line
+S7W="$R/s7-wt"
+git -C "$RP" worktree add -q "$S7W" -b claude/seat-7 2>/dev/null
+out="$(cd "$S7W" && "$F" worker-pin 2>"$R/op6.txt")"
+if [ "$(cat "$S7W/.factory-worker" 2>/dev/null)" = "claude-seat-7" ] && grep -q "^s7-wt	.*	claude-seat-7	claude/seat-7	20" "$R/factory/fleet-roster" 2>/dev/null; then ok "negative control: worker-pin in a consumer tree (claude/seat-7) still writes the roster row"; else bad "s7 roster" "pin='$(cat "$S7W/.factory-worker" 2>&1)' roster='$(cat "$R/factory/fleet-roster" 2>&1)'"; fi
+if [ "$(cat "$RP/.git/worktrees/s7-wt/factory-seat" 2>/dev/null)" = "s7-wt" ]; then ok "and the tripwire"; else bad "s7 tripwire" "$(ls "$RP/.git/worktrees/" 2>&1)"; fi
+if ! grep -q "not a roster seat" "$R/op6.txt"; then ok "and says nothing about the operator seat"; else bad "s7 info" "$(cat "$R/op6.txt")"; fi
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor 2>/dev/null)"
+if printf '%s\n' "$out" | grep -q "^UNMANNED	s7-wt	claude-seat-7	" && ! printf '%s\n' "$out" | grep -q "^ORPHANED\|	op-wt	\|	operator	" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-STALLED 0 stalled, 1 unmanned of 1 seats"; then ok "the doctor reads the consumer seat (UNMANNED: no process) and still nothing for the operator trees: 1 unmanned of 1 seats"; else bad "s7 doctor" "$out"; fi
+# Why it matters (task 1793621537 flipped this probe): plant the row worker-pin used to write for the operator tree.
+# Until 1793621537 the next pass read it ORPHANED + FLEET-DEGRADED on every pass, minted a fleet-orphaned anchor, and
+# the remedy pair it printed was a dead end for it (seat-recreate refuses while the tree exists and mints CONSUMER
+# seats; seat-retire refuses the operator principal) - this probe then dropped the row BY HAND (grep -v > a tmp file
+# && mv), the only cure an operator had. Now the ORPHANED pass drops an operator-principal row as stale by
+# construction (roster_drop_operator_row, roster_remove's second caller): one stderr line, one fleet-log record, no
+# ORPHANED verdict, never counted missing, no anchor. The row's OWN fields decide (op-wt's pin reads `operator` at
+# this point; the planted row says claude-operator). First a --dry-run pass: it says "would drop" and leaves the
+# row, the verdict and the count withheld the same way.
+printf 'op-wt\t%s\tclaude-operator\tclaude/operator\t2026-01-01T00:00:00Z\n' "$(cd "$OPW" && pwd -P)" >> "$R/factory/fleet-roster"
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor --dry-run 2>"$R/op7.txt")"
+if ! printf '%s\n' "$out" | grep -q "^ORPHANED\|	op-wt	" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-STALLED 0 stalled, 1 unmanned of 1 seats" && grep -q "^factory: roster: would drop stale operator-principal row op-wt - dry-run (MULTI/DEX overlay)$" "$R/op7.txt" && ! grep -q "dropped stale" "$R/op7.txt" && grep -q "^op-wt	" "$R/factory/fleet-roster" && ! grep -q "^op-wt	" "$R/factory/fleet-orphaned" 2>/dev/null && ! grep -q "stale operator-principal" "$R/fleet.log" 2>/dev/null; then ok "(why it matters) a planted roster row for the operator tree under --dry-run: 'would drop' on stderr, the row left in place, no ORPHANED verdict, not counted missing (1 unmanned of 1 seats, never FLEET-DEGRADED), no anchor, no log record"; else bad "op planted row dry-run" "$out / $(cat "$R/op7.txt") / roster: $(cat "$R/factory/fleet-roster" 2>&1)"; fi
+# The live pass drops it - and ONLY it: the consumer row s7-wt and its verdict survive (the dropper is narrow).
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor 2>"$R/op7.txt")"
+if ! printf '%s\n' "$out" | grep -q "^ORPHANED\|	op-wt	" && printf '%s\n' "$out" | grep -q "^UNMANNED	s7-wt	claude-seat-7	" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-STALLED 0 stalled, 1 unmanned of 1 seats" && grep -q "^factory: roster: dropped stale operator-principal row op-wt (MULTI/DEX overlay)$" "$R/op7.txt" && ! grep -q "^op-wt	" "$R/factory/fleet-roster" && grep -q "^s7-wt	" "$R/factory/fleet-roster" && ! grep -q "^op-wt	" "$R/factory/fleet-orphaned" 2>/dev/null; then ok "the live pass DROPS the planted row as stale by construction: the info line on stderr, no ORPHANED verdict, no fleet-orphaned anchor, the consumer row s7-wt and its UNMANNED verdict untouched - no hand edit of fleet-roster needed"; else bad "op planted row dropped" "$out / $(cat "$R/op7.txt") / roster: $(cat "$R/factory/fleet-roster" 2>&1)"; fi
+if [ "$(grep -c "^fleet-doctor 20.* op-wt: dropped stale operator-principal roster row (worker claude-operator, worktree .*/op-wt, branch claude/operator) - the operator seat is not a roster seat (MULTI/DEX overlay)$" "$R/fleet.log" 2>/dev/null)" = "1" ]; then ok "and appended the drop to the fleet-doctor log once, with the row's worker, worktree and branch"; else bad "op planted row log" "$(cat "$R/fleet.log" 2>&1)"; fi
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" seat-retire s7-wt 2>&1)"
+if printf '%s\n' "$out" | grep -q "^RETIRED s7-wt" && [ ! -e "$S7W" ]; then ok "seat-retire drops the consumer control seat"; else bad "s7 retire" "$out"; fi
+# Both arms of the predicate on an otherwise empty roster: the live pin claude-operator (op-wt, tree present) and a
+# row whose SEAT BASENAME is operator under a consumer-looking pin (the live seat's path shape). One pass drops both.
+printf 'op-wt\t%s\tclaude-operator\tclaude/operator\t2026-01-01T00:00:00Z\noperator\t%s\tseat-op-basename\tclaude/op-basename\t2026-01-01T00:00:00Z\n' "$(cd "$OPW" && pwd -P)" "$OPB" >> "$R/factory/fleet-roster"
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor 2>"$R/op7.txt")"
+if ! printf '%s\n' "$out" | grep -q "^ORPHANED\|	op-wt	\|	operator	" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-OK seats 0" && grep -q "^factory: roster: dropped stale operator-principal row op-wt (MULTI/DEX overlay)$" "$R/op7.txt" && grep -q "^factory: roster: dropped stale operator-principal row operator (MULTI/DEX overlay)$" "$R/op7.txt" && [ "$(cd "$RP" && "$F" seat-roster 2>/dev/null)" = "NONE" ] && ! grep -q "^op-wt	\|^operator	" "$R/factory/fleet-orphaned" 2>/dev/null && [ "$(grep -c 'dropped stale operator-principal roster row' "$R/fleet.log" 2>/dev/null)" = "3" ]; then ok "both arms at once (pin claude-operator; basename operator under a consumer-looking pin): dropped on one pass, FLEET-OK seats 0, seat-roster NONE, no anchors, one log record each"; else bad "op planted rows both arms" "$out / $(cat "$R/op7.txt") / roster: $(cat "$R/factory/fleet-roster" 2>&1) / log: $(cat "$R/fleet.log" 2>&1)"; fi
+# The refusal belt (task 1793617638): seat-retire falls back from the roster to `git worktree list` by
+# basename, so an off-roster pinned tree - the operator seat's shape by construction since 1793616271 - is
+# resolved from git; until 1793617638 it was then REMOVED (only doctrine and the live-cwd check stood in the
+# way, and this probe pinned that fallback "not endorsed"). cmd_seat_retire now refuses by operator_seat once
+# worker and branch have resolved (the resolution info line still prints first) and BEFORE the plan, so
+# --dry-run refuses the same way; FACTORY_FORCE is no override. op-wt is pinned `operator` at this point (the
+# arm above); a refusal must leave the tree, its pin, its git admin entry and the fleet log untouched.
+fleet_lines_before="$(grep -c 'seat-retire' "$R/fleet.log" 2>/dev/null || true)"
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" seat-retire op-wt --dry-run 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q "seat-retire: 'op-wt' is not on the roster - resolved worktree .*/op-wt, worker operator, branch claude/operator from git" && printf '%s\n' "$out" | grep -q "^factory: ERROR: seat-retire refused: 'op-wt' is the OPERATOR seat (pin operator) - it is wound up by hand, never by this command (MULTI/DEX overlay)$" && ! printf '%s\n' "$out" | grep -q "^DRY-RUN would:\|^seat-retire op-wt:" && [ -d "$OPW" ] && [ "$(cat "$OPW/.factory-worker" 2>/dev/null)" = "operator" ]; then ok "seat-retire --dry-run on the off-roster tree pinned operator: resolved from git, then REFUSED - non-zero exit, the refusal text, no plan printed, tree + pin intact (task 1793617638)"; else bad "op retire dry-run refusal" "rc=$rc $out"; fi
+# The REAL run (no --dry-run) under FACTORY_FORCE=1, with the LIVE seat's pin claude-operator written by hand
+# (the skill's hand-written shape): refused the same way - nothing killed, recycled or removed, no fleet-log line.
+printf 'claude-operator\n' > "$OPW/.factory-worker"
+out="$(cd "$RP" && FACTORY_PROJECT=$FP FACTORY_FORCE=1 "$F" seat-retire op-wt 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q "^factory: ERROR: seat-retire refused: 'op-wt' is the OPERATOR seat (pin claude-operator) - it is wound up by hand, never by this command (MULTI/DEX overlay)$" && ! printf '%s\n' "$out" | grep -q "^RETIRED\|killed pid\|replica:\|worktree:\|^seat-retire op-wt:" && [ -d "$OPW" ] && [ -d "$RP/.git/worktrees/op-wt" ] && [ "$(cat "$OPW/.factory-worker" 2>/dev/null)" = "claude-operator" ] && [ "$(grep -c 'seat-retire' "$R/fleet.log" 2>/dev/null || true)" = "$fleet_lines_before" ]; then ok "the real seat-retire op-wt under FACTORY_FORCE=1 with the live pin claude-operator is refused too: no override, nothing killed/recycled/removed, admin entry + pin intact, no fleet-log line"; else bad "op retire real refusal" "rc=$rc $out"; fi
+# The BASENAME arm - the live seat's path shape: $RPP/.claude/worktrees/operator under the consumer-looking pin
+# seat-op-basename, off the roster. `seat-retire operator` from the primary resolves it from git and refuses.
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" seat-retire operator 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q "seat-retire: 'operator' is not on the roster - resolved worktree .*/.claude/worktrees/operator, worker seat-op-basename, branch claude/op-basename from git" && printf '%s\n' "$out" | grep -q "^factory: ERROR: seat-retire refused: 'operator' is the OPERATOR seat (pin seat-op-basename) - it is wound up by hand, never by this command (MULTI/DEX overlay)$" && ! printf '%s\n' "$out" | grep -q "^RETIRED\|^seat-retire operator:" && [ -d "$OPB" ] && [ "$(cat "$OPB/.factory-worker" 2>/dev/null)" = "seat-op-basename" ]; then ok "seat-retire operator (the live seat's path shape: basename operator under a consumer-looking pin) is refused by the basename arm, tree + pin intact"; else bad "op retire basename refusal" "rc=$rc $out"; fi
+git -C "$RP" worktree remove --force "$OPW" >/dev/null 2>&1; git -C "$RP" worktree remove --force "$OPB" >/dev/null 2>&1
+git -C "$RP" branch -D claude/operator claude/op-basename >/dev/null 2>&1
+out="$(cd "$RP" && FACTORY_PROJECT=$FP "$F" fleet-doctor 2>/dev/null)"
+if ! printf '%s\n' "$out" | grep -q "^ORPHANED" && printf '%s\n' "$out" | tail -1 | grep -q "^FLEET-OK seats 0"; then ok "with the operator trees removed nothing reads ORPHANED: no row was ever written to miss them"; else bad "op removed" "$out"; fi
+rm -f "$R/op1.txt" "$R/op2.txt" "$R/op3.txt" "$R/op4.txt" "$R/op5.txt" "$R/op6.txt" "$R/op7.txt"
 unset FACTORY_FLEET_LOG
 unset FACTORY_ACTIVITY_DIRS
 rm -rf "$R/fd-act" "$R/fd-draft.md" "$R/handoff/rr-wt.md" "$R/spawnfake.sh"
@@ -2688,9 +2932,67 @@ case "$out" in
   *"law 8"*) ok "factory_primary_guard refuses a seat's remote deploy (law 8)" ;;
   *) bad "guard remote" "got '$out'" ;;
 esac
+echo "== factory_primary_guard's no-identity belt: the guard's half of the 1dc9df2fa class (task 1793617711) =="
+# The guard reads pins under `git rev-parse --show-toplevel`, so the scratch
+# primary $GP plays the primary: a consumer pin under its seat root + no
+# identity + a REMOTE probe is refused (a); the same probe declared with
+# FACTORY_DIRECT=1 (b) or in LOCAL mode (c) passes; operator pins alone are
+# no running factory (d); a linked worktree's pin counts exactly as it does
+# to the hook's guard C; and with no pins anywhere the guard fails open as
+# before (e).
+guard_probe() {  # guard_probe <cwd> <mode> [VAR=value ...] -> the guard's stdout+stderr (PASSED when it returns 0); its rc in $?
+  local cwd="$1" mode="$2"; shift 2
+  (cd "$cwd" && env -u FACTORY_WORKER -u FACTORY_DIRECT -u FACTORY_FORCE "$@" bash -c ". '$GUARD'; factory_primary_guard probe $mode && echo PASSED" 2>&1)
+}
+mkdir -p "$GP/.factory/seats/seat-x" && printf 'seat-x\n' > "$GP/.factory/seats/seat-x/.factory-worker"
+out="$(guard_probe "$GP" remote)"; rc=$?
+case "$rc:$out" in
+  1:*"REMOTE deploy from the primary with NO seat identity"*"seat pins: seat-x"*) ok "(a) a consumer pin + no identity + probe remote: exit 1, the belt's refusal naming the pinned seat" ;;
+  *) bad "guard belt (a)" "rc=$rc got '$out'" ;;
+esac
+case "$out" in
+  *"FACTORY_DIRECT=1 bash scripts/deploy.sh"*) ok "(a) the refusal names the declaration: FACTORY_DIRECT=1 bash scripts/deploy.sh <target>" ;;
+  *) bad "guard belt (a) message" "got '$out'" ;;
+esac
+out="$(guard_probe "$GP" remote FACTORY_DIRECT=1)"; rc=$?
+case "$rc:$out" in
+  0:PASSED) ok "(b) the same + FACTORY_DIRECT=1 (the operator's declared rollout) passes" ;;
+  *) bad "guard belt (b)" "rc=$rc got '$out'" ;;
+esac
+out="$(guard_probe "$GP" local)"; rc=$?
+case "$rc:$out" in
+  0:PASSED) ok "(c) the same in LOCAL mode passes untouched (the primary's :8000 venue is the operator's)" ;;
+  *) bad "guard belt (c)" "rc=$rc got '$out'" ;;
+esac
+rm -rf "$GP/.factory"
+mkdir -p "$GP/.claude/worktrees/operator" && printf 'claude-operator\n' > "$GP/.claude/worktrees/operator/.factory-worker"
+mkdir -p "$GP/.factory/seats/op-direct" && printf 'operator\n' > "$GP/.factory/seats/op-direct/.factory-worker"
+printf 'claude-operator\n' > "$R/guard-wt/.factory-worker"
+out="$(guard_probe "$GP" remote)"; rc=$?
+case "$rc:$out" in
+  0:PASSED) ok "(d) operator pins only (claude-operator at .claude/worktrees/operator, operator under the seat root, claude-operator on a linked worktree): probe remote passes - operator pins are no running factory to the guard" ;;
+  *) bad "guard belt (d)" "rc=$rc got '$out'" ;;
+esac
+mkdir -p "$GP/.factory/seats/seat-x" && printf 'seat-x\n' > "$GP/.factory/seats/seat-x/.factory-worker"
+out="$(guard_probe "$GP" remote)"; rc=$?
+pl="$(printf '%s\n' "$out" | sed -n 's/.*(seat pins:\(.*\))\. A drifted.*/\1/p')"
+if [ "$rc" = "1" ] && [ "$pl" = " seat-x" ]; then
+  ok "(d) a consumer pin beside the operator pins is refused, the refusal listing the consumer seat alone (seat pins:$pl)"
+else
+  bad "guard belt (d) beside" "rc=$rc pins list '$pl' got '$out'"
+fi
+rm -rf "$GP/.factory" "$GP/.claude"; rm -f "$R/guard-wt/.factory-worker"
+printf 'claude-guard-seat\n' > "$R/guard-wt/.factory-worker"
+out="$(guard_probe "$GP" remote)"; rc=$?
+case "$rc:$out" in
+  1:*"seat pins: guard-wt"*) ok "a linked worktree's pin anywhere counts to the guard's belt too (git worktree list - the hook's own list: a seat minted at an unusual path is a running factory to BOTH belts)" ;;
+  *) bad "guard belt linked worktree" "rc=$rc got '$out'" ;;
+esac
+rm -f "$R/guard-wt/.factory-worker"
+unset -f guard_probe
 out="$(cd "$R/guard-wt" && bash -c ". '$GUARD'; env -u FACTORY_WORKER true; factory_primary_guard probe remote && echo PASSED-OPEN" 2>&1 || true)"
 case "$out" in
-  *PASSED-OPEN*) ok "factory_primary_guard fails open without a seat identity" ;;
+  *PASSED-OPEN*) ok "(e) factory_primary_guard fails open only with no factory running (no pins anywhere)" ;;
   *) bad "guard open" "got '$out'" ;;
 esac
 

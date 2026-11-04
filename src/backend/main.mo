@@ -181,7 +181,7 @@ persistent actor Uplands {
   // DIAGNOSTIC half: getAppVersion / getCanisterInfo.appVersion let anyone
   // see which release the backend runs, so a mixed frontend/backend deploy
   // is visible at a glance. Transient for the same reason as DEPLOY_MODE.
-  transient let APP_VERSION : Text = "1.75.0";
+  transient let APP_VERSION : Text = "1.80.0";
 
   // Runtime TARGET — ORTHOGONAL to DEPLOY_MODE (the posture axis above). It
   // governs WHO PAYS for cycles, and therefore how many cycles a call attaches
@@ -13703,26 +13703,27 @@ persistent actor Uplands {
     let baseLtv = switch (Types.marginLTV(baseToken)) { case (?x) { x }; case null { 0 } };
     let qp = if (execPrice > 0) { execPrice } else { oracle };
     // Collateral delta per unit of base filled (signed), valued worst-case
-    // (fill at the price ceiling/floor, base leg marked at oracle × LTV).
-    let haircut : Int = Fixed.mul(oracle, baseLtv, false);
+    // (fill at the price ceiling/floor, base leg marked at oracle × LTV) —
+    // BorrowEngine.fillDeltaPerUnit, the ONE source of this inequality,
+    // shared with previewOpenPosition (task 1793732895: the preview used to
+    // size a long by the BORROW gate alone — the borrowed quote valued at
+    // LTV 1.0 — and promised 5× for a fill this clamp held to ~2.2×; it now
+    // asks this very clamp, on its discarded post-top-up query state).
+    // H-34 / D5 (d): a POOL's re-levering excess is BORROWED at the fill
+    // (poolFundForFill), not swapped out of pre-borrowed funds — so per
+    // unit the debt side grows by the borrowed value (quote at the fill
+    // price for a long; base at the mark, valued UP, for a short) and the
+    // health line demands INITIAL_HEALTH_RATIO × that, while the collateral
+    // side gains the leg bought (base at ltv × mark; quote at 1.0). For a
+    // short this is the fill-time borrowCheck's own inequality; for a long it
+    // is STRICTER (borrowCheck values the borrowed quote at 1.0 before it is
+    // spent on base at the base's LTV), so a fill this clamp releases never
+    // fails the fill's own borrow. Conservative: the whole excess is scored
+    // as borrowed (the pool's own free funds are not credited — they only
+    // make the fill's borrow smaller, never larger). A wallet-era caller (no
+    // pool, no borrow at the fill) scores the collateral swap only.
     let poolIdOf = Map.get(poolByPrincipal, Text.compare, Principal.toText(user));
-    let deltaPerUnit : Int = switch (poolIdOf, side) {
-      // H-34 / D5 (d): a POOL's re-levering excess is BORROWED at the fill
-      // (poolFundForFill), not swapped out of pre-borrowed funds — so per
-      // unit the debt side grows by the borrowed value (quote at the fill
-      // price for a long; base at the mark, valued UP, for a short) and the
-      // health line demands INITIAL_HEALTH_RATIO × that, while the collateral
-      // side gains the leg bought (base at ltv × mark; quote at 1.0). This is
-      // the fill-time borrowCheck's own inequality, so the release clamp and
-      // the fill agree; conservative: the whole excess is scored as borrowed
-      // (the pool's own free funds are not credited — they only make the
-      // fill's borrow smaller, never larger).
-      case (?_, #buy)   { haircut - (Fixed.mul(qp, Types.INITIAL_HEALTH_RATIO, true) : Int) };
-      case (?_, #sell)  { (qp : Int) - (Fixed.mul(oracle, Types.INITIAL_HEALTH_RATIO, true) : Int) };
-      // Wallet-era shape (no borrow at the fill): the collateral swap only.
-      case (null, #buy)  { haircut - (qp : Int) };
-      case (null, #sell) { (qp : Int) - haircut };
-    };
+    let deltaPerUnit : Int = BorrowEngine.fillDeltaPerUnit(Option.isSome(poolIdOf), side, oracle, baseLtv, qp);
     // DE-LEVER ESCAPE. The scoring above is purely the instantaneous
     // LTV-weighted COLLATERAL delta; it never sees the debt the fill retires
     // (deleveragePool runs after settlement). Closing a short means buying back
@@ -13833,8 +13834,9 @@ persistent actor Uplands {
     if (h.debtUsd == 0 and Option.isNull(poolIdOf)) {
       return if (held == 0) { #full } else { #partial({ qty = quantity - held; held }) };
     };
-    // required collateral rounded UP (conservative) → smaller headroom.
-    let headroom : Int = (h.collateralUsd : Int) - (Fixed.mul(Types.INITIAL_HEALTH_RATIO, h.debtUsd, true) : Int);
+    // required collateral rounded UP (conservative) → smaller headroom
+    // (BorrowEngine.fillHeadroom — shared with the preview, see above).
+    let headroom : Int = BorrowEngine.fillHeadroom(h.collateralUsd, h.debtUsd);
     if (headroom <= 0) {
       // At/below the initial floor: no re-levering, but flattening still passes
       // (its equity-held part waits rather than dying with the excess).
@@ -13847,7 +13849,9 @@ persistent actor Uplands {
     };
     // q* = headroom / |deltaPerUnit| (both >0 here); round DOWN (largest safe
     // EXCESS qty); the de-lever portion always passes and is added back.
-    let maxExcess = Fixed.div(Int.abs(headroom), Int.abs(deltaPerUnit), false);
+    // (BorrowEngine.fillRoom's null — deltaPerUnit ≥ 0 — cannot reach here:
+    // that shape returned #full above; excessQty keeps the arm total.)
+    let maxExcess = switch (BorrowEngine.fillRoom(headroom, deltaPerUnit)) { case (?q) { q }; case null { excessQty } };
     if (maxExcess >= excessQty) {
       return if (held == 0) { #full } else { #partial({ qty = deLeverQty + excessQty; held }) };
     };
@@ -14660,7 +14664,9 @@ persistent actor Uplands {
     # "the reply's stagedBudget — since funds reserved by open orders cannot convert; a swap that stops short of the amount asked records an outcome saying how much converted and why.\n\n"
     # "## Margin (pools & positions)\n"
     # "Leverage lives in segregated POOLS (sub-accounts), never the wallet: createMarginPool, fundMarginPool, withdrawMarginPool; openPosition/closePosition "
-    # "(optional limitPrice = exact-price entry/exit; a market close is never refused but is BOUNDED at release — in price to the AMM ladder edge, or ±2% of mid when the AMM is not quoting that side, and in size so the pool's post-fill equity stays ≥ 0 at the worst-case price; the remainder re-stages for up to 5 requotes, then drops with a getMyReleaseRejections record. A short's market close reserves its buy-back at the MARK, not at the slippage cap — the release-time price cap and equity bound, not the reservation, bound what fills — so a pool whose free ICPUSD covers the position at the mark stages ALL of it; if the free ICPUSD (or, for a long, free base) still covers less than the position, closePosition stages what it can and records the un-staged remainder — \"Staged N of M … is NOT staged\" in getMyReleaseRejections — close again for the rest. LEVERAGE IS BORROWED AT THE FILL, never at placement: openPosition only CHECKS that the vault could lend the shortfall at today's marks (refusing up front if not) and stages the whole size; a staged or resting entry holds NO vault debt and pays no interest, and each fill borrows exactly its own shortfall from the vault at that instant (the pool as TAKER when its staged entry releases, as MAKER when a resting entry is hit later) — so interest accrues from the fill, cancelling an unfilled entry repays nothing, and a resting entry can fail to fill if the vault cannot lend when it is hit (vault cap, pool health, or a stale mark): that slice does not settle, the remainder is cancelled — never partially settled, never re-rested — and ONE getMyReleaseRejections record names the vault's reason);getMyMarginPools, getMyPositions, getMyMarginHealth, getMyPositionEpisodes (history). A pool's working "
+    # "(optional limitPrice = exact-price entry/exit; a market close is never refused but is BOUNDED at release — in price to the AMM ladder edge, or ±2% of mid when the AMM is not quoting that side, and in size so the pool's post-fill equity stays ≥ 0 at the worst-case price; the remainder re-stages for up to 5 requotes, then drops with a getMyReleaseRejections record. A short's market close reserves its buy-back at the MARK, not at the slippage cap — the release-time price cap and equity bound, not the reservation, bound what fills — so a pool whose free ICPUSD covers the position at the mark stages ALL of it; if the free ICPUSD (or, for a long, free base) still covers less than the position, closePosition stages what it can and records the un-staged remainder — \"Staged N of M … is NOT staged\" in getMyReleaseRejections — close again for the rest. LEVERAGE IS BORROWED AT THE FILL, never at placement: openPosition only CHECKS that the vault could lend the shortfall at today's marks (refusing up front if not) and stages the whole size; a staged or resting entry holds NO vault debt and pays no interest, and each fill borrows exactly its own shortfall from the vault at that instant (the pool as TAKER when its staged entry releases, as MAKER when a resting entry is hit later) — so interest accrues from the fill, cancelling an unfilled entry repays nothing, and a resting entry can fail to fill if the vault cannot lend when it is hit (vault cap, pool health, or a stale mark): that slice does not settle, the remainder is cancelled — never partially settled, never re-rested — and ONE getMyReleaseRejections record names the vault's reason). "
+    # "OPENING LEVERAGE is capped per asset by the fill-time initial-margin bound the release clamp enforces (clampToInitialMargin): post-fill LTV-weighted collateral ÷ debt ≥ 1.25 with the WHOLE fill scored as borrowed, i.e. notional ≤ margin / (1.25 − LTV) — BTC/ETH ≈ 2.9×, SOL ≈ 2.5×, ICP ≈ 2.2× (LTV 0.90 / 0.85 / 0.80) — the SAME ceiling for longs and shorts; a long's own margin is not credited against the asset it buys (whether it should be — 1 / (1 − LTV/1.25), ICP ≈ 2.8× — is an open operator decision, task 1793733873). previewOpenPosition applies that bound to EITHER side: maxSizeBase = min(the vault's lending room, the clamp's room at the worst-case price — a limit's price; a market order's slippage cap for a long, its slippage FLOOR for a short) and canOpen = false past it, so a size the preview accepts is never 'reduced at release' at that price. For a short the floor is what matters: the clamp scores the post-sale world — proceeds at the floor against the base debt at 1.25× the mark, notional ≤ margin / (0.25 + slippage) — and binds below the borrow gate once slippage exceeds 1 − LTV (BTC/ETH 10 %, SOL 15 %, ICP 20 %). The release's ladder-edge cap only ever moves the worst-case price toward the mark, so the preview is the release's floor, never its ceiling: a wide-slippage market short it refuses can still fill in full against a quoting ladder (task 1793733917). "
+    # "getMyMarginPools, getMyPositions, getMyMarginHealth, getMyPositionEpisodes (history). A pool's working "
     # "orders rest under the POOL's principal — cancel via cancelMyOrder or cancelPoolOrder (neither repays anything: an unfilled entry holds no borrow; debt a FILL left idle against free funds is the owner's to retire — next). "
     # "DECISION (1788533844, 2026-09-06): idle debt is retired by the owner via repayPoolDebt; the liquidation pass never repays. repayPoolDebt(poolId, token, amount) pays min(amount, debt, free) in kind — free = the pool's available balance minus the earmark of its RESTING EXITS in that token (an entry borrows at its fill and holds nothing back), so no live exit is unfunded; the loan is accrued first, so paying ≥ the debt retires it whole. fundMarginPool is margin, not repayment (fund → place the previewed order keeps working; the owner's leverage is the owner's choice), and a top-up sitting idle is never turned into a repayment by the heartbeat.\n\n"
     # "## Market data\n"
@@ -15302,7 +15308,15 @@ persistent actor Uplands {
     // Hypothetical wallet top-up — discarded with the query's state copy.
     if (extraQuote > 0) { Accounts.addBalance(accounts, poolP, Types.QUOTE_TOKEN, extraQuote) };
 
-    // Same gauntlet, same order, same messages as openPosition.
+    // Same gauntlet, same order, same messages as openPosition — its two
+    // stale-mark refusals included (task 1793732895: the release clamp this
+    // preview now consults fails closed on a stale mark with a release-
+    // flavoured reason; the preview says what openPosition would say).
+    if (not marginPriceFresh(baseToken)) { return refuse("oracle price stale for " # baseToken # " — try again shortly", borrowTok, 0) };
+    switch (userStaleMarkAt(poolP, Time.now())) {
+      case (?t) { return refuse("oracle price stale for " # t # " (this pool's collateral/debt) — try again shortly", borrowTok, 0) };
+      case null {};
+    };
     if (poolIsolated(pool)) {
       var otherMarket = false;
       forPoolPositions(pidN, func(_, pos) {
@@ -15359,9 +15373,62 @@ persistent actor Uplands {
     // could still borrow (initial-health room ∧ vault cap), sized to base.
     let haveBorrowTok = getAvailable(poolP, borrowTok);
     let borrowRoom = BorrowEngine.maxBorrowable(loans, marginAccounts, accounts, reservedBalance, ammPrincipal(), poolP, borrowTok, now, marginPriceLookup);
-    let maxSizeBase : Nat = switch (side) {
+    var maxSizeBase : Nat = switch (side) {
       case (#sell) { haveBorrowTok + borrowRoom };
       case (#buy)  { Fixed.div(haveBorrowTok + borrowRoom, execPrice, false) };
+    };
+    // The SECOND gate, for EITHER side (task 1793732895 for longs, 1793733917
+    // for shorts). The borrow room above is borrowCheck's closed form, which
+    // values the borrowed token at its own LTV BEFORE the fill: the quote at
+    // 1.0 for a long — notional ≤ 5 × margin for every asset, which the fill
+    // then SPENDS on base at the base's LTV — and the base at its LTV for a
+    // short — notional ≤ m / (1.25 − ltv). The release holds the FILL to the
+    // post-fill health through clampToInitialMargin (releaseDeferred), the
+    // whole fill scored as borrowed at the worst-case price qp
+    // (BorrowEngine.fillDeltaPerUnit carries the rule). A long's collateral
+    // gains q·ltv·oracle against 1.25·q·qp of debt: a fresh pool with margin
+    // m releases at most m / (1.25·qp − ltv·oracle) — ICP 2.2×, SOL 2.5×,
+    // BTC/ETH 2.9× at the mark. A short's gains the sale proceeds q·qp
+    // against 1.25·q·oracle of base debt: m / (1.25·oracle − qp), which at a
+    // floor qp = oracle·(1 − slip) is m / (oracle × (0.25 + slip)) — 3.3× at
+    // 5 % slippage, 2.5× at 15 %, 2.2× at 20 %, 2.0× at 25 % — so for a
+    // short the clamp binds BELOW the borrow gate exactly when 1 − slip <
+    // ltv: ICP past 20 % slippage, SOL past 15 %, BTC/ETH past 10 % (the
+    // corner the #buy-only gate missed: a 20 % BTC market short previewed
+    // canOpen = true at 2.75× and was cut to 2.2× at release). Ask THAT
+    // clamp, on this query's discarded post-top-up state, at the same
+    // worst-case price the release will use — a limit's price exactly; a
+    // market's slippage cap (buy) or floor (sell), which the release's
+    // ladder-edge cap (#3a) only ever moves TOWARD the mark — lowering a
+    // buy's cap, raising a sell's floor to the AMM's deepest bid — both of
+    // which WIDEN the room, so this never over-promises: a wide-slippage
+    // market short the preview refuses may still fill in full at release
+    // against a quoting ladder (the preview is the release's floor, never
+    // its ceiling; test_initial_margin §H7-H8 pin both halves). The probe at
+    // the borrow room's size reads the capacity; the call at the requested
+    // size is the release's literal verdict for it, so a size accepted here
+    // is never "reduced at release" at this price. (The doctrine question of
+    // crediting a long's own margin is task 1793733873.)
+    var clampRefusal : ?Text = null;
+    let probe = Nat.max(sizeBase, maxSizeBase);
+    if (probe > 0) {
+      let probed = clampToInitialMargin(poolP, baseToken, side, probe, execPrice);
+      let room : Nat = switch (probed) { case (#full) { probe }; case (#partial(p)) { p.qty }; case (#none(_)) { 0 } };
+      if (room < maxSizeBase) { maxSizeBase := room };
+      if (sizeBase > 0) {
+        let verdict = if (probe == sizeBase) { probed } else { clampToInitialMargin(poolP, baseToken, side, sizeBase, execPrice) };
+        clampRefusal := switch (verdict) {
+          case (#full) { null };
+          case (#partial(p)) {
+            ?("Size exceeds the initial-margin bound for " # (switch (side) { case (#buy) { "a long" }; case (#sell) { "a short" } }) #
+              ": filled at the worst-case price, the pool's LTV-weighted collateral would fall below " #
+              r2n(Types.INITIAL_HEALTH_RATIO) # "× its debt, so the release would cut this fill to the bound" #
+              (if (p.held > 0) { " (and hold the flattening part the pool's equity cannot absorb for a later requote)" } else { "" }) #
+              ". Reduce the size or add margin.")
+          };
+          case (#none(why)) { ?why };
+        };
+      };
     };
 
     // The borrow the requested size would need, and its exact health verdict.
@@ -15379,6 +15446,11 @@ persistent actor Uplands {
         #ok({ canOpen = false; reason = ?e; borrowToken = borrowTok; borrowNeeded = needed; projHealth = null; maxSizeBase; estLiqPrice = null });
       };
       case (#ok(h)) {
+        // The borrow gate passed; the release clamp's verdict (either side) rules next.
+        switch (clampRefusal) {
+          case (?e) { return #ok({ canOpen = false; reason = ?e; borrowToken = borrowTok; borrowNeeded = needed; projHealth = null; maxSizeBase; estLiqPrice = null }) };
+          case null {};
+        };
         // Est. liquidation price: SIMULATE the open on the discarded state —
         // the real borrow, then the fill at the gate price — and read the liq
         // through positionLiqPrice, the SAME routine the Positions table uses.

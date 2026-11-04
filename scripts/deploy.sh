@@ -723,9 +723,13 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-# Law-5/8 tripwires (scripts/factory_guard.sh; fail-open without a seat
-# identity): a consumer seat never deploys a remote target, and never runs
-# a local deploy against the PRIMARY checkout. cwd is the repo top here.
+# Law-5/8 tripwires (scripts/factory_guard.sh): a consumer seat never deploys
+# a remote target, and never runs a local deploy against the PRIMARY checkout.
+# With no seat identity a LOCAL target fails open; a REMOTE target with no
+# identity is REFUSED while a consumer seat is pinned (the no-identity belt:
+# a drifted executor subagent deploys exactly like that) unless the operator's
+# rollout declares itself - FACTORY_DIRECT=1 bash scripts/deploy.sh <target>.
+# cwd is the repo top here.
 . scripts/factory_guard.sh
 case "$TARGET" in
   cloud|engine|subnet) factory_primary_guard "deploy.sh $TARGET" remote ;;

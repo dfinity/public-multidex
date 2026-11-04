@@ -2594,6 +2594,9 @@ async function refreshBalances() {
       userAvailBalances = {};
       for (const [t, a] of avails) userAvailBalances[t] = Number(a) / 1e8;
     } catch { /* keep last known */ }
+    if (takerFeeBpsL0 === null && appState.actor.getTreasury) {
+      try { const t = await appState.actor.getTreasury(); takerFeeBpsL0 = Number(t.takerFeeBps || 0); } catch { /* sized without the fee until it answers */ }
+    }
     userBalances = {};
     for (const [token, amount] of bals) {
       userBalances[token] = amount;
@@ -2944,6 +2947,7 @@ async function refreshUserOrders() {
     uomOpenOrders = mine.filter(isOpen);
     uomPoolOrders = pool.filter(isOpen);
     renderUserOrdersMobile();
+    updateOrderSideUI();   // the box's "Resting orders" row
   } catch (e) {
     console.warn("Failed to fetch user orders:", e);
   }
@@ -10950,7 +10954,7 @@ function selectMarket(marketId, opts) {
   const market = markets.find((m) => m.id === marketId);
   if (market) {
     updatePriceChange(market);
-    document.getElementById("order-qty-label").textContent = `${orderMode === "margin" ? "Size" : "Quantity"} (${market.baseToken})`;
+    syncOrderMarketLabels(market);
     updateOrderSideUI();
   }
 
@@ -11549,7 +11553,14 @@ function refreshOrderPoolSelect() {
 // the side buttons (Buy/Sell ⇄ Long/Short), and refresh the preview + button.
 function applyOrderMode() {
   const isMargin = orderMode === "margin";
-  document.querySelectorAll(".order-mode-btn").forEach((b) => b.classList.toggle("active", b.dataset.mode === orderMode));
+  document.querySelectorAll(".order-mode-btn").forEach((b) => {
+    const on = b.dataset.mode === orderMode;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  // The frame reads the account too (orderform.css: Margin adds the inner hairline).
+  const panel = document.querySelector(".order-panel");
+  if (panel) panel.dataset.mode = orderMode;
   const mc = document.getElementById("margin-controls");
   if (mc) mc.style.display = isMargin ? "" : "none";
   const prev = document.getElementById("margin-preview");
@@ -11560,8 +11571,12 @@ function applyOrderMode() {
   if (buyBtn)  buyBtn.textContent  = isMargin ? "Long"  : "Buy";
   if (sellBtn) sellBtn.textContent = isMargin ? "Short" : "Sell";
   const market = markets.find((m) => m.id === selectedMarket);
-  const lbl = document.getElementById("order-qty-label");
-  if (lbl && market) lbl.textContent = `${isMargin ? "Size" : "Quantity"} (${market.baseToken})`;
+  syncOrderMarketLabels(market);
+  if (isMargin) { deriveMarginFromSize(); deriveSizeFromMargin(); }   // a size typed on Spot becomes a margin here
+  paintMarginControls();
+  // Expiry only applies to spot limit orders; margin limit entries rest as GTC.
+  const eg = document.getElementById("limit-expiry-group");
+  if (eg) eg.style.display = (orderType === "limit" && !isMargin) ? "" : "none";
   if (isMargin) {
     refreshOrderPoolSelect();
     // Ensure the pool list is loaded even if the user never opened the Account
@@ -11594,7 +11609,6 @@ let _poolPreviewSeq = 0;
 
 function updateMarginPreview() {
   const box = document.getElementById("margin-preview");
-  const placeBtn = document.getElementById("place-order-btn");
   if (!box) return;
   const sideStr = orderSide === "buy" ? "long" : "short";
   const size = parseFloat(document.getElementById("order-quantity").value) || 0;
@@ -11615,18 +11629,17 @@ function updateMarginPreview() {
   }
 
   if (!(size > 0) || !(entry > 0)) {
-    box.innerHTML = `<span class="mp-muted">Enter a size${isLimit ? " and limit price" : ""} to preview the position.</span>`;
-    if (placeBtn) {
-      placeBtn.disabled = true;
-      placeBtn.textContent = sideStr === "long" ? "Long" : "Short";
-      placeBtn.style.background = "var(--bg-hover)";
-      placeBtn.style.color = "var(--text-muted)";
-    }
+    box.innerHTML = `<span class="mp-muted">Set a margin${isLimit ? " and a limit price" : ""} to preview the position.</span>`;
+    renderPlaceBtn(false, sideStr === "long" ? "Long" : "Short", "", "");
     return;
   }
 
   const notional = size * entry;
-  const margin   = notional / lev;
+  // The margin backing the order is the one the trader set (the size was
+  // derived from it); recomputing it from the rounded size drifted a few
+  // cents above the wallet and lit a false shortfall. notional / lev is the
+  // fallback for a size that arrived by another route.
+  const margin   = marginInput > 0 ? marginInput : notional / lev;
   const oracle = market ? (market.markPrice > 0 ? market.markPrice : market.lastPrice) : 0;
   const slipSel = parseFloat(document.getElementById("order-slippage")?.value || "0.05") || 0.05;
   const cash     = userAvailBalances["ICPUSD"] || 0;   // spendable, net of reservations
@@ -11634,6 +11647,7 @@ function updateMarginPreview() {
   const free     = pool ? Number(pool.freeQuote) || 0 : 0;
   const need     = Math.max(0, margin - free);        // extra to pull from wallet
   const shortCash = need > cash + 0.0000001;          // not enough wallet cash
+
 
   // Pool-capacity verdict — ONE source of truth: previewOpenPosition runs
   // openPosition's exact gauntlet (isolated rules, price band, borrow need
@@ -11651,6 +11665,7 @@ function updateMarginPreview() {
       if (r.err) { poolBlocked = true; poolWarn = r.err; }
       else {
         estLiq = r.estLiqPrice;
+        applyLeverageCeiling(r.maxSizeBase, entry);   // the leverage slider's right-hand stop, for this margin
         if (r.maxSizeBase > 0) {
           capacityRow = `<span class="mp-row"><span title="The largest size this pool could open right now — a check at today's prices, not a reservation. Leverage is borrowed at the fill, so the vault's capacity is consumed by live positions only and this is re-checked when the order fills.">Pool capacity</span><b>~${formatNum(r.maxSizeBase)} ${base}</b></span>`;
         }
@@ -11684,7 +11699,7 @@ function updateMarginPreview() {
 
   const rows = [];
   rows.push(`<span class="mp-row"><span>Notional</span><b>${fmtUsd(notional)}</b></span>`);
-  rows.push(`<span class="mp-row"><span>Margin (${lev}×)</span><b>${fmtUsd(margin)}</b></span>`);
+  rows.push(`<span class="mp-row"><span>Margin (${fmtLev(lev)})</span><b>${fmtUsd(margin)}</b></span>`);
   rows.push(`<span class="mp-row"><span>Est. entry</span><b>${fmtUsd(entry)}</b></span>`);
   rows.push(`<span class="mp-row"><span>Est. liq.</span><b>${estLiq != null ? fmtUsd(estLiq) : "—"}</b></span>`);
   if (capacityRow) rows.push(capacityRow);
@@ -11694,18 +11709,160 @@ function updateMarginPreview() {
   }
   let warn = "";
   if (poolBlocked)    warn = poolWarn;
-  else if (shortCash) warn = `Need ${fmtUsd(need)} margin — only ${fmtUsd(cash)} in wallet.`;
+  else if (shortCash) warn = `Needs ${formatNum(need)} ICPUSD of margin from the wallet — ${formatNum(cash)} there (short by ${formatNum(need - cash)}).`;
   else if (!isLimit && exhausted) warn = `Order book too thin for full size — slippage may be higher.`;
   box.innerHTML = `<div class="mp-grid">${rows.join("")}</div>${warn ? `<div class="mp-alert">${escH(warn)}</div>` : ""}`;
 
-  if (placeBtn) {
-    const blocked = poolBlocked || shortCash;
-    placeBtn.disabled = blocked;
-    placeBtn.textContent = sideStr === "long" ? "Open Long" : "Open Short";
-    placeBtn.style.background = blocked ? "var(--bg-hover)" : (sideStr === "long" ? "var(--green)" : "var(--red)");
-    placeBtn.style.color      = blocked ? "var(--text-muted)" : (sideStr === "long" ? "var(--green-text)" : "var(--red-text)");
-    placeBtn.style.opacity = "";
+  const blocked = poolBlocked || shortCash;
+  renderPlaceBtn(!blocked, sideStr === "long" ? "Long" : "Short", `${fmtQtyG(size)} ${base}`,
+    blocked ? "" : `${fmtLev(lev)} · ${fmtUsd(notional)} notional`);
+}
+
+// ── Margin as the input (multidex-mocks page 7, treatment V1) ───────
+// On Margin the ticket takes the COLLATERAL first: `marginInput` is how much
+// of the trader's money backs this order (a field plus a slider over the
+// pool's free margin and then the wallet), the LEVERAGE slider runs 1x to the
+// engine's ceiling, and the Size field is derived - margin x leverage /
+// price - and still typable (it back-solves the margin at the chosen
+// leverage, clamped at what the trader has). Why this way round: leverage is
+// what lets collateral carry a bigger position than it could pay for, so a
+// higher leverage must mean MORE of the asset at the same margin - the old
+// size-first ticket had it inverted (a higher chip pulled less margin for the
+// same size and could only make an order less fundable).
+//
+// The ceiling is the engine's, never a client-side LTV table (the doctrine at
+// the top of this file): previewOpenPosition - the call updateMarginPreview
+// already makes for the top-up this margin implies - answers with
+// maxSizeBase, the largest size the engine would open for it, and the
+// ceiling is simply maxSizeBase x price / margin (applyLeverageCeiling). It
+// is whatever the engine currently enforces for the open: task 1793732895
+// aligns that answer with the release clamp, and this control follows it
+// without changes. A cross pool's spare collateral can make the engine's
+// number large for a small margin, so the slider is capped at LEV_CAP.
+// #order-leverage (hidden) and #order-quantity remain the values every
+// preview and submit path reads.
+let marginInput = 0;    // ICPUSD backing this order: the pool's free margin first, then the wallet
+let levCeiling  = 5;    // the engine's ceiling for the current margin; 5 (today's fresh-pool answer) until it has spoken
+const LEV_MIN = 1, LEV_CAP = 10;
+
+function marginPoolFree()   { const p = selectedOrderPool(); return p ? Number(p.freeQuote) || 0 : 0; }
+// The SPENDABLE balance of a token - net of what resting orders already
+// reserve (getMyAvailableBalances), falling back to the wallet total until
+// that query has answered. Every sizing and every "available" row reads it,
+// so 100% is never more than a reservation can take.
+function spendableOf(token) { const a = userAvailBalances[token]; return typeof a === "number" ? a : (userBalances[token] || 0); }
+function marginWalletFree() { return spendableOf("ICPUSD"); }
+// The L0 taker fee (bps) a BUY's reservation is inflated by at staging - read
+// from the engine once per session (refreshBalances), never a client-side
+// constant; sized without it until it answers.
+let takerFeeBpsL0 = null;
+function marginTotal()      { return marginPoolFree() + marginWalletFree(); }
+// The price the size is derived at: the typed limit price, else the mark.
+function marginEntryPrice() {
+  const market = markets.find((m) => m.id === selectedMarket);
+  const limitPx = parseFloat(document.getElementById("order-price").value) || 0;
+  if (orderType === "limit" && limitPx > 0) return limitPx;
+  return market ? (market.markPrice > 0 ? market.markPrice : market.lastPrice) : 0;
+}
+function currentLeverage() { return parseFloat(document.getElementById("order-leverage")?.value || "1") || 1; }
+// Leverage figures print to two decimals with a trailing zero dropped (2.2x, 1.96x).
+const fmtLev = (l) => (Math.round(l * 100) / 100).toFixed(2).replace(/0$/, "") + "×";
+function setLeverage(lev) {
+  lev = Math.max(LEV_MIN, Math.min(levCeiling, Math.round(lev * 100) / 100));
+  const h = document.getElementById("order-leverage");
+  if (h) h.value = String(lev);
+  return lev;
+}
+// margin x leverage / price -> #order-quantity (left alone while the trader is typing in it)
+function deriveSizeFromMargin() {
+  const px = marginEntryPrice(), lev = currentLeverage();
+  // floored to the asset's quantity precision (never rounded up): the size's
+  // cost at this leverage must not exceed the margin that was set, or the
+  // preview reads a few cents of "not enough in the wallet" at 100% margin
+  const dp = orderQtyDecimals(), f = Math.pow(10, dp);
+  const size = px > 0 ? Math.floor(((marginInput * lev) / px) * f) / f : 0;
+  const q = document.getElementById("order-quantity");
+  if (q && document.activeElement !== q) q.value = size > 0 ? size.toFixed(dp) : "";
+  return size;
+}
+// a typed size -> the margin it needs at the current leverage, clamped at what the trader has; true = clamped
+function deriveMarginFromSize() {
+  const px = marginEntryPrice(), lev = currentLeverage();
+  const size = parseFloat(document.getElementById("order-quantity").value) || 0;
+  const want = px > 0 ? (size * px) / lev : 0;
+  marginInput = Math.max(0, Math.min(marginTotal(), want));
+  return want > marginInput + 1e-9;
+}
+// The engine's answer for this margin: maxSizeBase x entry / margin, floored
+// to a tenth, within [LEV_MIN, LEV_CAP]. A leverage now above the ceiling
+// snaps to it and the size is re-derived (the preview re-runs on its own).
+function applyLeverageCeiling(maxSizeBase, entry) {
+  if (!(maxSizeBase > 0) || !(entry > 0) || !(marginInput > 0)) return;
+  const ceil = Math.max(LEV_MIN, Math.min(LEV_CAP, Math.floor(((maxSizeBase * entry) / marginInput) * 100) / 100));
+  if (Math.abs(ceil - levCeiling) < 0.005) return;
+  levCeiling = ceil;
+  if (currentLeverage() > levCeiling) {
+    setLeverage(levCeiling);
+    deriveSizeFromMargin();
+    setTimeout(updateOrderTotal, 0);   // not re-entrantly: this runs inside updateMarginPreview
   }
+  paintMarginControls();
+}
+function paintMarginControls(note) {
+  const total = marginTotal(), pool = marginPoolFree();
+  marginInput = Math.max(0, Math.min(total, marginInput));
+  const f = document.getElementById("order-margin");
+  if (f && document.activeElement !== f) f.value = marginInput > 0 ? marginInput.toFixed(2) : "";
+  const pct = total > 0 ? Math.round((marginInput / total) * 100) : 0;
+  const row = document.getElementById("order-margin-row");
+  if (row) {
+    row.style.setProperty("--p", String(pct / 100));
+    row.style.setProperty("--poolshare", total > 0 ? `${(pool / total) * 100}%` : "0%");
+    row.style.setProperty("--poolfrac", total > 0 ? String(pool / total) : "0");
+    row.style.setProperty("--poolmark", pool > 0 && pool < total ? "1" : "0");
+    row.querySelectorAll(".order-pct-dots i").forEach((d, i) => d.classList.toggle("on", i * 25 <= pct));
+    const sl = document.getElementById("order-margin-slider"); if (sl) sl.value = String(pct);
+    const bx = document.getElementById("order-margin-pct"); if (bx && document.activeElement !== bx) bx.value = String(pct);
+  }
+  const hint = document.getElementById("order-margin-hint");
+  if (hint) hint.textContent = total > 0 ? `of ${formatNum(total)} ${pool > 0 ? "pool + wallet" : "in the wallet"}` : "";
+  const split = document.getElementById("order-margin-split");
+  if (split) {
+    const fromPool = Math.min(marginInput, pool), fromWallet = marginInput - fromPool;
+    split.textContent = marginInput > 0
+      ? (pool > 0 ? `${formatNum(fromPool)} from the pool's free margin · ${formatNum(fromWallet)} from the wallet` : "all of it from the wallet")
+      : "";
+  }
+  // leverage: value, slider range, fill, the ticked stops and the Max label
+  const lev = currentLeverage(), span = Math.max(0.1, levCeiling - LEV_MIN);
+  const lv = document.getElementById("order-lev-value"); if (lv) lv.textContent = fmtLev(lev);
+  const ls = document.getElementById("order-lev-slider");
+  if (ls) { ls.min = String(LEV_MIN * 100); ls.max = String(Math.round(levCeiling * 100)); ls.value = String(Math.round(lev * 100)); }
+  const lrow = document.getElementById("order-lev-row");
+  if (lrow) lrow.style.setProperty("--p", String((lev - LEV_MIN) / span));
+  const stops = [1, 1.5, 2, 2.5, 3, 4, 5, 7.5].filter((v) => v < levCeiling - 0.05); stops.push(levCeiling);
+  const at = (v) => `${((v - LEV_MIN) / span) * 100}%`;
+  const ticks = document.getElementById("order-lev-ticks");
+  if (ticks) ticks.innerHTML = stops.map((v) => `<i class="${v === levCeiling ? "max" : ""}${v <= lev + 0.001 ? " on" : ""}" style="left:${at(v)}"></i>`).join("");
+  const labels = document.getElementById("order-lev-labels");
+  // a stop within the first sixth or the last third of the track keeps its tick but loses its label: the
+  // "Max N.Nx" label is ~62px wide and right-aligned, a third of the 240px column's track (4x sat under it)
+  if (labels) labels.innerHTML = stops.filter((v) => v === levCeiling || v === LEV_MIN || ((v - LEV_MIN) / span > 0.15 && (levCeiling - v) / span > 0.33))
+    .map((v, i) => `<i class="${i === 0 ? "first" : ""}${v === levCeiling ? " max" : ""}${Math.abs(v - lev) < 0.005 ? " on" : ""}" style="left:${at(v)}">${v === levCeiling ? "Max " + fmtLev(levCeiling) : v + "×"}</i>`).join("");
+  // Why the ceiling is where it is: a MARKET order is scored at its slippage
+  // cap, so its ceiling sits below a limit order's at the mark.
+  const lnote = document.getElementById("order-lev-note");
+  if (lnote) lnote.textContent = orderType === "market"
+    ? `ceiling at the ${Math.round((parseFloat(document.getElementById("order-slippage")?.value || "0.05") || 0.05) * 100)}% slippage cap · a limit order at the mark allows more`
+    : "";
+  // the derived size's cost line
+  const px = marginEntryPrice(), size = px > 0 ? (marginInput * lev) / px : 0, notional = size * px;
+  const sub = document.getElementById("order-size-sub");
+  if (sub) sub.textContent = note || (size > 0
+    ? `≈ ${formatNum(notional)} ICPUSD notional · ${formatNum(Math.max(0, notional - marginInput))} borrowed · ${fmtLev(lev)}`
+    : "move either slider, or type a size");
+  const snote = document.getElementById("order-size-note");
+  if (snote) snote.textContent = orderMode === "margin" ? "margin × leverage ÷ price" : "";
 }
 
 // Submit a margin position: ensure a funded pool, pull the margin shortfall from
@@ -11730,7 +11887,7 @@ async function placeMarginPosition() {
   }
   const entry = isLimit ? limitPx : estimateFill(selectedMarket, orderSide, size).avg;
   if (!(entry > 0)) { showToast("No price available — try again in a moment", "error"); return; }
-  const margin = (size * entry) / lev;
+  const margin = marginInput > 0 ? marginInput : (size * entry) / lev;   // the margin the trader set (the size was derived from it)
   const slip = isLimit ? 0.05 : parseFloat(document.getElementById("order-slippage").value || "0.05");
   const limitOpt = isLimit ? [toE8(limitPx)] : [];
 
@@ -11788,7 +11945,7 @@ async function placeMarginPosition() {
     showToast("Position failed: " + e.message, "error");
   } finally {
     btn.disabled = false;
-    if (orderMode === "margin") updateMarginPreview(); else { btn.textContent = orderSide === "buy" ? "Buy" : "Sell"; }
+    updateOrderTotal();   // margin → updateMarginPreview; spot → the spot CTA
   }
 }
 
@@ -11879,9 +12036,7 @@ async function placeOrder() {
     showToast("Order failed: " + e.message, "error");
   } finally {
     btn.disabled = false;
-    btn.textContent = orderSide === "buy" ? "Buy" : "Sell";
-    btn.style.background = orderSide === "buy" ? "var(--green)" : "var(--red)";
-    btn.style.color = orderSide === "buy" ? "var(--green-text)" : "var(--red-text)";
+    updateOrderTotal();   // re-derive the CTA (text, colour, enabled) from the form
   }
 }
 
@@ -11913,6 +12068,11 @@ function updateUI() {
     document.getElementById("order-price"),
     document.getElementById("order-quantity"),
     document.getElementById("order-slippage"),
+    document.getElementById("order-pct-input"),
+    document.getElementById("order-margin"),
+    document.getElementById("order-margin-slider"),
+    document.getElementById("order-margin-pct"),
+    document.getElementById("order-lev-slider"),
   ].filter(Boolean);
 
   // Order panel auth overlay
@@ -11931,7 +12091,7 @@ function updateUI() {
     // updateOrderTotal, margin via updateMarginPreview (which it delegates to) —
     // rather than being force-enabled here (which let "Buy" click at qty 0).
     updateOrderTotal();
-    document.querySelectorAll(".order-type-btn, .side-btn").forEach((b) => { b.disabled = false; });
+    document.querySelectorAll(".order-type-btn, .side-btn, #order-price-src button").forEach((b) => { b.disabled = false; });
     if (authOverlay) authOverlay.style.display = "none";
   } else {
     authBtn.textContent = "Sign In";
@@ -11944,7 +12104,7 @@ function updateUI() {
     placeBtn.style.background = "";
     document.getElementById("balance-display").style.display = "none";
     orderInputs.forEach((i) => { i.disabled = true; });
-    document.querySelectorAll(".order-type-btn, .side-btn").forEach((b) => { b.disabled = true; });
+    document.querySelectorAll(".order-type-btn, .side-btn, #order-price-src button").forEach((b) => { b.disabled = true; });
 
     // Create or show the auth overlay on the order panel
     if (orderPanel) {
@@ -12992,24 +13152,42 @@ function setupEventListeners() {
   // Order type toggle
   document.querySelectorAll(".order-type-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll(".order-type-btn").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
       orderType = btn.dataset.type;
-      document.getElementById("limit-price-group").style.display    = orderType === "limit"  ? "block" : "none";
-      document.getElementById("market-slippage-group").style.display = orderType === "market" ? "block" : "none";
+      document.querySelectorAll(".order-type-btn").forEach((b) => {
+        const on = b.dataset.type === orderType;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-checked", on ? "true" : "false");
+      });
+      // "" (not "block"): the option rows are flex, so the stylesheet picks.
+      document.getElementById("limit-price-group").style.display    = orderType === "limit"  ? "" : "none";
+      document.getElementById("market-slippage-group").style.display = orderType === "market" ? "" : "none";
       const eg = document.getElementById("limit-expiry-group");
       // Expiry only applies to spot limit orders; margin limit entries rest as GTC.
-      if (eg) eg.style.display = (orderType === "limit" && orderMode === "spot") ? "block" : "none";
+      if (eg) eg.style.display = (orderType === "limit" && orderMode === "spot") ? "" : "none";
       updateOrderTotal();
     });
   });
 
-  // Margin controls: leverage / pool changes re-preview.
-  document.getElementById("order-leverage")?.addEventListener("change", () => {
-    updateMarginPreview();
-    syncOrderPctSlider();   // leverage rescales what 100% means
-  });
-  document.getElementById("order-pool")?.addEventListener("change", () => { updateOrderSideUI(); updateMarginPreview(); });
+  // Margin controls (margin as the input): the margin field, its slider and %
+  // box set marginInput; the leverage slider sets #order-leverage; each then
+  // re-derives the size and re-previews. The pool changes what can be
+  // committed, so the margin is re-clamped against it.
+  const marginChanged = () => { deriveSizeFromMargin(); paintMarginControls(); updateOrderSideUI(); updateOrderTotal(); };
+  const mField = document.getElementById("order-margin");
+  if (mField) {
+    mField.addEventListener("input", () => { if (mField.disabled) return; marginInput = Math.max(0, Math.min(marginTotal(), parseFloat(mField.value) || 0)); marginChanged(); });
+    mField.addEventListener("blur", () => paintMarginControls());
+  }
+  const mSlider = document.getElementById("order-margin-slider");
+  if (mSlider) mSlider.addEventListener("input", () => { marginInput = (marginTotal() * (parseInt(mSlider.value, 10) || 0)) / 100; marginChanged(); });
+  const mPct = document.getElementById("order-margin-pct");
+  if (mPct) {
+    mPct.addEventListener("input", () => { if (mPct.disabled) return; marginInput = (marginTotal() * Math.max(0, Math.min(100, parseInt(mPct.value, 10) || 0))) / 100; marginChanged(); });
+    mPct.addEventListener("blur", () => paintMarginControls());
+  }
+  const lSlider = document.getElementById("order-lev-slider");
+  if (lSlider) lSlider.addEventListener("input", () => { setLeverage((parseInt(lSlider.value, 10) || 100) / 100); marginChanged(); });
+  document.getElementById("order-pool")?.addEventListener("change", () => { updateOrderSideUI(); updateOrderTotal(); });
 
   // Order side toggle
   document.querySelectorAll(".side-btn").forEach((btn) => {
@@ -13021,6 +13199,7 @@ function setupEventListeners() {
       savedOrderPrices[orderSide] = priceInput.value;
       // Switch side
       orderSide = btn.dataset.side;
+      markPriceSrc(null);
       // Restore saved price for new side (empty string triggers initOrderPrice)
       priceInput.value = savedOrderPrices[orderSide];
       initOrderPrice();
@@ -13036,19 +13215,49 @@ function setupEventListeners() {
   // leverage through the entry price (margin). updateOrderTotal syncs the
   // thumb back whenever the quantity changes by any other route (typing,
   // side/mode switches, price edits).
-  document.getElementById("order-pct-slider").addEventListener("input", (e) => {
-    const pct = parseInt(e.target.value, 10) || 0;
+  const applyOrderPct = (pct) => {
+    pct = Math.max(0, Math.min(100, pct));
     // A disabled slider fires no input events, so being here means signed-in
     // with a market — write the sized quantity even when it's zero. Decimals
     // follow the per-asset Order Book rule (orderQtyDecimals), not a flat 6.
-    document.getElementById("order-quantity").value = ((orderMaxQty() * pct) / 100).toFixed(orderQtyDecimals());
+    const dp = orderQtyDecimals(), f = Math.pow(10, dp);   // floored, never rounded past what 100% can pay for
+    document.getElementById("order-quantity").value = (Math.floor(((orderMaxQty() * pct) / 100) * f) / f).toFixed(dp);
     setOrderPctUI(pct);
     updateOrderTotal();
+  };
+  document.getElementById("order-pct-slider").addEventListener("input", (e) => applyOrderPct(parseInt(e.target.value, 10) || 0));
+  // The % box beside the slider: typing a share sizes the order the same way
+  // the thumb does; blur re-syncs the box to the quantity actually written.
+  const pctBox = document.getElementById("order-pct-input");
+  if (pctBox) {
+    pctBox.addEventListener("input", () => { if (!pctBox.disabled) applyOrderPct(parseInt(pctBox.value, 10) || 0); });
+    pctBox.addEventListener("blur", () => syncOrderPctSlider());
+  }
+  // Price sources: Mid · Bid · Ask from the live book, at the book's precision.
+  document.querySelectorAll("#order-price-src button").forEach((b) => b.addEventListener("click", () => {
+    if (b.disabled) return;
+    const px = orderPriceFromBook(b.dataset.priceSrc);
+    if (!(px > 0)) return;
+    document.getElementById("order-price").value = px.toFixed(priceDecimals([px]));
+    markPriceSrc(b.dataset.priceSrc);
+    updateOrderTotal();
+  }));
+  // Order total calculation (a typed price un-lights the Mid/Bid/Ask source)
+  document.getElementById("order-price").addEventListener("input", () => { markPriceSrc(null); updateOrderTotal(); });
+  // A typed size: on Margin it back-solves the margin first (clamped at what
+  // the trader has - the cost line says so); the field itself is left alone
+  // while it has focus and normalised on blur.
+  const qField = document.getElementById("order-quantity");
+  qField.addEventListener("input", () => {
+    if (orderMode === "margin") {
+      const clamped = deriveMarginFromSize();
+      updateOrderTotal();
+      if (clamped) paintMarginControls(`clamped to what ${formatNum(marginTotal())} ICPUSD carries at ${fmtLev(currentLeverage())} — raise the leverage for more`);
+      return;
+    }
+    updateOrderTotal();
   });
-
-  // Order total calculation
-  document.getElementById("order-price").addEventListener("input", updateOrderTotal);
-  document.getElementById("order-quantity").addEventListener("input", updateOrderTotal);
+  qField.addEventListener("blur", () => { if (orderMode === "margin") { deriveSizeFromMargin(); paintMarginControls(); } });
 
   // Place order
   document.getElementById("place-order-btn").addEventListener("click", placeOrder);
@@ -13156,30 +13365,42 @@ function estimateFill(marketId, side, sizeBase) {
 // gate would happily accept. Leverage is a funding calculator in a cross
 // pool — the pool-capacity verdict now comes from previewOpenPosition.)
 
-// What quantity "100%" means for the current mode/side: spot buy sizes the
-// wallet's ICPUSD through the price, spot sell is simply the base balance,
-// margin is buying power (wallet cash + pool free margin) × leverage through
-// the entry price. Same basis as the form's "Available:" line (total wallet
-// balances — what the old 25/50/75/100 buttons used).
+// What quantity "100%" means for the current mode/side, on the SPENDABLE
+// balances (spendableOf): a spot LIMIT buy sizes the cash through the limit
+// price; a spot MARKET buy through the cap the engine stages it at - the
+// reference price x (1 + max slippage) - because that is what the
+// reservation takes (placeMarketOrder -> parkDeferred reserves qty x cap plus
+// the L0 taker fee and TRIMS an under-funded buy to what the balance covers,
+// so a 100% sized at the mark came back smaller than the slider promised, and
+// a 100% costed at the book's average read "not enough in the wallet" when
+// the asks sat above the mark); both carry the fee. A spot sell is the base
+// balance; margin is buying power (cash + pool free margin) x leverage through
+// the entry price.
 function orderMaxQty() {
   if (!selectedMarket || !appState.isAuthenticated) return 0;
   const market = markets.find((m) => m.id === selectedMarket);
   if (!market) return 0;
   if (orderMode === "margin") {
-    const lev = parseFloat(document.getElementById("order-leverage")?.value || "1") || 1;
-    const pool = selectedOrderPool();
-    const free = pool ? Number(pool.freeQuote) || 0 : 0;
-    const marginAvail = (userBalances["ICPUSD"] || 0) + free;
+    const lev = currentLeverage();
+    const marginAvail = marginWalletFree() + marginPoolFree();
     const px = orderType === "limit"
       ? (parseFloat(document.getElementById("order-price").value) || market.lastPrice)
       : (market.markPrice > 0 ? market.markPrice : market.lastPrice);
     return px > 0 ? (marginAvail * lev) / px : 0;
   }
   if (orderSide === "buy") {
-    const price = parseFloat(document.getElementById("order-price").value) || market.lastPrice;
-    return price > 0 ? (userBalances["ICPUSD"] || 0) / price : 0;
+    const cash = spendableOf("ICPUSD");
+    const feeMul = 1 + (takerFeeBpsL0 || 0) / 10000;
+    if (orderType === "limit") {
+      const price = parseFloat(document.getElementById("order-price").value) || market.lastPrice;
+      return price > 0 ? cash / (price * feeMul) : 0;
+    }
+    const ref = market.markPrice > 0 ? market.markPrice : market.lastPrice;
+    const slip = parseFloat(document.getElementById("order-slippage")?.value || "0.05") || 0.05;
+    const cap = ref * (1 + slip);
+    return cap > 0 ? cash / (cap * feeMul) : 0;
   }
-  return userBalances[market.baseToken] || 0;
+  return spendableOf(market.baseToken);
 }
 
 // Decimal places for the size field — the Order Book / Trades quantity rule
@@ -13199,9 +13420,15 @@ function setOrderPctUI(pct) {
   const slider = document.getElementById("order-pct-slider");
   if (!slider) return;
   slider.value = String(pct);
-  slider.style.setProperty("--pct", pct + "%");
-  const readout = document.getElementById("order-pct-readout");
-  if (readout) readout.textContent = pct + "%";
+  // The drawn track reads --p (0–1) from the row for the fill width; the
+  // quarter stops light up once the fill has passed them.
+  const row = document.getElementById("order-pct-row");
+  if (row) {
+    row.style.setProperty("--p", String(pct / 100));
+    row.querySelectorAll(".order-pct-dots i").forEach((d, i) => d.classList.toggle("on", i * 25 <= pct));
+  }
+  const box = document.getElementById("order-pct-input");
+  if (box && document.activeElement !== box) box.value = String(pct);
 }
 
 // The thumb follows the quantity field whichever way it was filled (typed,
@@ -13212,55 +13439,73 @@ function setOrderPctUI(pct) {
 function syncOrderPctSlider() {
   const slider = document.getElementById("order-pct-slider");
   if (!slider) return;
-  slider.disabled = !appState.isAuthenticated || !markets.find((m) => m.id === selectedMarket);
+  const market = markets.find((m) => m.id === selectedMarket);
+  const off = !appState.isAuthenticated || !market;
+  slider.disabled = off;
+  const box = document.getElementById("order-pct-input");
+  if (box) box.disabled = off;
   const max = orderMaxQty();
   const qty = parseFloat(document.getElementById("order-quantity").value) || 0;
   setOrderPctUI(max > 0 ? Math.max(0, Math.min(100, Math.round((qty / max) * 100))) : 0);
+  // What the far end means, in the asset — on margin that is buying power
+  // through the entry price, which a bare % never tells you.
+  const hint = document.getElementById("order-pct-max");
+  if (hint) {
+    const f = Math.pow(10, orderQtyDecimals());
+    // What 100% is net of, so the figure never reads as "not all my money": a
+    // buy reserves the taker fee; a MARKET buy reserves the slippage cap too
+    // (the engine stages it at ref x (1 + max slippage); the fill at the
+    // book's average costs less and the rest comes back).
+    let net = "";
+    if (orderSide === "buy") {
+      const feeTxt = takerFeeBpsL0 > 0 ? ` and the ${(takerFeeBpsL0 / 100).toFixed(2)}% fee` : "";
+      net = orderType === "market"
+        ? ` after the ${Math.round((parseFloat(document.getElementById("order-slippage")?.value || "0.05") || 0.05) * 100)}% slippage cap${feeTxt}`
+        : (feeTxt ? ` after the ${(takerFeeBpsL0 / 100).toFixed(2)}% fee` : "");
+    }
+    hint.textContent = (!off && max > 0) ? `100% = ${fmtQtyG(Math.floor(max * f) / f)} ${market.baseToken}${net}` : "";
+  }
 }
 
 function updateOrderTotal() {
   // Every quantity-affecting path funnels through here — keep the slider
   // thumb tracking the quantity before any early return below.
   syncOrderPctSlider();
-  // Margin mode previews a leveraged position rather than a spot total.
-  if (orderMode === "margin") { updateMarginPreview(); return; }
+  // Margin mode: the size follows the margin and leverage (left alone while
+  // the trader types a size - that path back-solved the margin first), then
+  // the position preview rather than a spot total.
+  if (orderMode === "margin") { deriveSizeFromMargin(); paintMarginControls(); updateMarginPreview(); return; }
 
-  const price = parseFloat(document.getElementById("order-price").value)    || 0;
+  const market = markets.find((m) => m.id === selectedMarket);
   const qty   = parseFloat(document.getElementById("order-quantity").value) || 0;
+  // A limit order totals at the typed price; a market order at the book's
+  // average fill for this size (estimateFill walks the cached depth), so the
+  // Bid/Ask line and the CTA say what the order would actually cost.
+  const isLimit = orderType === "limit";
+  const limitPx = parseFloat(document.getElementById("order-price").value) || 0;
+  const price = isLimit ? limitPx : (qty > 0 && selectedMarket ? estimateFill(selectedMarket, orderSide, qty).avg : 0);
   const total = price * qty;
   document.getElementById("order-total-value").textContent = formatNum(total) + " ICPUSD";
 
-  const placeBtn = document.getElementById("place-order-btn");
-  if (!placeBtn) return;
-  const market = markets.find((m) => m.id === selectedMarket);
+  if (!document.getElementById("place-order-btn")) return;
+  const verb = orderSide === "buy" ? "Buy" : "Sell";
   // Not submittable (no quantity, or a limit order with no price) → DISABLE the
   // button. The old early-return here left it enabled from updateUI, so "Buy"
   // stayed clickable at quantity 0.
-  const needsPrice = orderType === "limit";
-  if (!appState.isAuthenticated || !market || qty <= 0 || (needsPrice && price <= 0)) {
-    placeBtn.disabled = true;
-    placeBtn.textContent = orderSide === "buy" ? "Buy" : "Sell";
-    placeBtn.style.background = "var(--bg-hover)";
-    placeBtn.style.color = "var(--text-muted)";
-    placeBtn.style.opacity = "";
+  if (!appState.isAuthenticated || !market || qty <= 0 || (isLimit && limitPx <= 0)) {
+    renderPlaceBtn(false, verb, "", "");
     return;
   }
 
   // Spot is pure Wallet custody: a buy needs the cash, a sell needs the base.
   // Trading beyond what you hold (leverage / short) is a position — Margin mode.
-  let ok, label;
-  if (orderSide === "buy") {
-    ok = (userAvailBalances["ICPUSD"] || 0) + 0.0000001 >= total;
-    label = "Buy";
-  } else {
-    ok = (userAvailBalances[market.baseToken] || 0) + 0.0000001 >= qty;
-    label = "Sell";
-  }
-  placeBtn.disabled = !ok;
-  placeBtn.textContent = label;
-  placeBtn.style.background = ok ? (orderSide === "buy" ? "var(--green)" : "var(--red)") : "var(--bg-hover)";
-  placeBtn.style.color      = ok ? (orderSide === "buy" ? "var(--green-text)" : "var(--red-text)") : "var(--text-muted)";
-  placeBtn.style.opacity = "";
+  const ok = orderSide === "buy"
+    ? (userAvailBalances["ICPUSD"] || 0) + 0.0000001 >= total
+    : (userAvailBalances[market.baseToken] || 0) + 0.0000001 >= qty;
+  const sub = !ok
+    ? (orderSide === "buy" ? "Not enough ICPUSD in the wallet" : `Not enough ${market.baseToken} in the wallet`)
+    : (price > 0 ? `≈ ${formatNum(total)} ICPUSD ${isLimit ? "at " + formatPrice(price) : "at market"}` : "");
+  renderPlaceBtn(ok, verb, `${fmtQtyG(qty)} ${market.baseToken}`, sub);
 }
 
 function initOrderPrice() {
@@ -13288,6 +13533,58 @@ function initOrderPrice() {
   updateOrderTotal();
 }
 
+// The market's name on the box: the pair trailing the header tabs, the unit
+// badge inside the size field, and the size label — Quantity on spot, Size on
+// margin; the unit lives in the field now, not in the label.
+function syncOrderMarketLabels(market) {
+  const lbl = document.getElementById("order-qty-label");
+  if (lbl) lbl.textContent = orderMode === "margin" ? "Size" : "Quantity";
+  if (!market) return;   // the label follows the mode even before a market is selected
+  const unit = document.getElementById("order-unit");
+  if (unit) unit.innerHTML = `<img class="market-logo market-logo-sm" src="/assets/${escH(market.baseToken)}.svg" alt="" data-hide-on-error>${escH(market.baseToken)}`;
+  const pair = document.getElementById("order-pair");
+  if (pair) pair.textContent = `${market.baseToken} / ${market.quoteToken || "ICPUSD"}`;
+}
+
+// Price sources (Mid · Bid · Ask inside the price field): one click sets the
+// limit price from the live book. The chosen source stays lit until the
+// price is typed over or the side changes.
+function orderPriceFromBook(src) {
+  const snap = lastOrderBookSnapshot;
+  if (!snap) return null;
+  const bid = snap.bids && snap.bids.length ? snap.bids[0].price : 0;
+  const ask = snap.asks && snap.asks.length ? snap.asks[0].price : 0;
+  if (src === "bid") return bid > 0 ? bid : null;
+  if (src === "ask") return ask > 0 ? ask : null;
+  if (bid > 0 && ask > 0) return (bid + ask) / 2;
+  return ask > 0 ? ask : (bid > 0 ? bid : null);
+}
+function markPriceSrc(src) {
+  document.querySelectorAll("#order-price-src button").forEach((b) => b.classList.toggle("on", b.dataset.priceSrc === src));
+}
+
+// The CTA states the order — "Buy 503.1 ICP" with the money beneath — in the
+// side's colour when it is live, the muted skin (bare verb, or the reason)
+// when it is not. Every path that used to set the button's text goes
+// through here, so the two lines and the colour can never disagree.
+// Quantities shown as TEXT in the ticket (the CTA, the hints, the resting
+// row) carry thousands separators like the money figures beside them; the
+// typed fields stay raw digits - a number input cannot hold a comma.
+const fmtQtyG = (n) => Number((Number(n) || 0).toFixed(5)).toLocaleString("en-US", { maximumFractionDigits: 5 });
+
+function renderPlaceBtn(ok, verb, qtyTxt, sub) {
+  const btn = document.getElementById("place-order-btn");
+  if (!btn) return;
+  btn.disabled = !ok;
+  btn.innerHTML = `<span class="po-main">${escH(verb)}${qtyTxt ? " " + escH(qtyTxt) : ""}</span>${sub ? `<span class="btn-subline">${escH(sub)}</span>` : ""}`;
+  btn.style.background = ok ? (orderSide === "buy" ? "var(--green)" : "var(--red)") : "var(--bg-hover)";
+  btn.style.color      = ok ? (orderSide === "buy" ? "var(--green-text)" : "var(--red-text)") : "var(--text-muted)";
+  btn.style.opacity = "";
+}
+
+// "Available to trade" — the tail is a span the 185px mobile column drops.
+const AVAIL_LABEL = 'Available<span class="order-info-tail"> to trade</span>';
+
 function updateOrderSideUI() {
   // The size slider enables/scales off the same data as the Available line,
   // and every path that refreshes that line (sign-in, balance polls, deposits,
@@ -13295,32 +13592,54 @@ function updateOrderSideUI() {
   // returns below can't strand the slider in a stale enabled/disabled state.
   syncOrderPctSlider();
 
+  // The side's colour on the box (the slider fill, thumb and lit stops read
+  // --side from the panel), and the side radios' state.
+  const panel = document.querySelector(".order-panel");
+  if (panel) panel.dataset.side = orderSide;
+  document.querySelectorAll(".side-btn").forEach((b) => b.setAttribute("aria-checked", b.dataset.side === orderSide ? "true" : "false"));
+
   // Total label: Bid for buy/long, Ask for sell/short.
   const label = document.getElementById("order-total-label");
   if (label) label.textContent = orderSide === "buy" ? "Bid: " : "Ask: ";
 
+  // Money rows above the inputs: what this side can spend (the same wallet
+  // totals the slider's 100% is sized against), then the mode's own rows.
   const el = document.getElementById("order-available");
   if (!el) return;
-  if (!appState.isAuthenticated || !selectedMarket) { el.innerHTML = ""; return; }
+  const row = (k, v) => `<div class="r"><span>${k}</span><b>${v}</b></div>`;
   const market = markets.find((m) => m.id === selectedMarket);
-  if (!market) { el.innerHTML = ""; return; }
-
-  if (orderMode === "margin") {
-    // Margin: show wallet cash available to commit + the selected pool's free margin.
-    const cash = userBalances["ICPUSD"] || 0;
-    const p = selectedOrderPool();
-    const poolNote = p ? ` <span class="avail-borrow">(${escH(p.name)}: ${formatNum(Number(p.freeQuote) || 0)} free)</span>` : "";
-    el.innerHTML = `Margin: <span>${formatNum(cash)} ICPUSD</span> in wallet${poolNote}`;
+  if (!appState.isAuthenticated || !market) {
+    el.innerHTML = row(AVAIL_LABEL, "—");
     return;
   }
 
-  if (orderSide === "buy") {
-    const bal = userBalances["ICPUSD"] || 0;
-    el.innerHTML = `Available: <span>${formatNum(bal)} ICPUSD</span>`;
-  } else {
-    const bal = userBalances[market.baseToken] || 0;
-    el.innerHTML = `Available: <span>${formatNum(bal)} ${market.baseToken}</span>`;
+  if (orderMode === "margin") {
+    // Margin: the wallet cash that can be committed, buying power at the
+    // chosen leverage over cash + the pool's free margin (what the two
+    // sliders reach at their right-hand ends), the pool's free margin.
+    const cash = marginWalletFree();
+    const lev  = currentLeverage();
+    const p = selectedOrderPool();
+    const free = marginPoolFree();
+    el.innerHTML = row("Wallet free", `${formatNum(cash)} ICPUSD`)
+      + row(`Buying power <span class="mut">· ${fmtLev(lev)}</span>`, `${formatNum((cash + free) * lev)} ICPUSD`)
+      + (p ? row(`${escH(p.name)} <span class="mut">free margin</span>`, `${formatNum(free)} ICPUSD`) : "");
+    deriveSizeFromMargin();   // balances or the pool moved: the margin stays the intent, the size follows
+    paintMarginControls();
+    return;
   }
+
+  const bal  = spendableOf(orderSide === "buy" ? "ICPUSD" : market.baseToken);   // spendable - the slider's and the CTA's basis
+  const unit = orderSide === "buy" ? "ICPUSD" : market.baseToken;
+  // Resting spot orders on this market, from the activity panel's cache
+  // ("—" until the first refreshUserOrders lands).
+  let resting = "—";
+  if (Array.isArray(uomOpenOrders)) {
+    const mine = uomOpenOrders.filter((o) => o.marketId === market.id);
+    const left = mine.reduce((sum, o) => sum + Math.max(0, Number(o.quantity) - Number(o.filled)), 0);
+    resting = mine.length ? `${mine.length} <span class="mut">· ${fmtQtyG(left)} ${escH(market.baseToken)}</span>` : "none";
+  }
+  el.innerHTML = row(AVAIL_LABEL, `${formatNum(bal)} ${escH(unit)}`) + row("Resting orders", resting);
 }
 
 // ── Utilities ───────────────────────────────────────────────────

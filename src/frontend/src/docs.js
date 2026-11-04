@@ -1160,16 +1160,20 @@ export const DOCS_PAGES = [
       <table>
         <tr><th>Asset</th><th class="docs-c">LTV weight</th><th class="docs-c">Max opening leverage*</th><th class="docs-c">Borrow APR</th></tr>
         <tr><td>ICPUSD (cash)</td><td class="docs-c">1.00</td><td class="docs-c">—</td><td class="docs-c">5%</td></tr>
-        <tr><td>BTC</td><td class="docs-c">0.90</td><td class="docs-c">≈ 3.6×</td><td class="docs-c">8%</td></tr>
-        <tr><td>ETH</td><td class="docs-c">0.90</td><td class="docs-c">≈ 3.6×</td><td class="docs-c">8%</td></tr>
-        <tr><td>SOL</td><td class="docs-c">0.85</td><td class="docs-c">≈ 3.1×</td><td class="docs-c">10%</td></tr>
-        <tr><td>ICP</td><td class="docs-c">0.80</td><td class="docs-c">≈ 2.8×</td><td class="docs-c">10%</td></tr>
+        <tr><td>BTC</td><td class="docs-c">0.90</td><td class="docs-c">≈ 2.9×</td><td class="docs-c">8%</td></tr>
+        <tr><td>ETH</td><td class="docs-c">0.90</td><td class="docs-c">≈ 2.9×</td><td class="docs-c">8%</td></tr>
+        <tr><td>SOL</td><td class="docs-c">0.85</td><td class="docs-c">≈ 2.5×</td><td class="docs-c">10%</td></tr>
+        <tr><td>ICP</td><td class="docs-c">0.80</td><td class="docs-c">≈ 2.2×</td><td class="docs-c">10%</td></tr>
       </table>
       </div>
-      <p class="docs-dim">*For a long bought with borrowed ICPUSD: opening requires
-      LTV-weighted collateral ÷ debt ≥ 1.25, which works out to max leverage = 1 / (1 − LTV/1.25).
-      The leverage menu on the ticket is a sizing calculator — it decides how much margin the
-      ticket commits for the notional you type; the ceiling itself is enforced by the check below.</p>
+      <p class="docs-dim">*The ceiling the engine enforces today, long or short: when a fill is
+      checked, the whole position is scored as borrowed and the pool's LTV-weighted collateral must
+      stay ≥ 1.25 × its debt — max leverage = 1 / (1.25 − LTV). A long's own margin is not credited
+      against the asset it buys (crediting it would lift the long ceilings to 1 / (1 − LTV/1.25):
+      ≈ 2.8× ICP, 3.1× SOL, 3.6× BTC/ETH — an open design decision, tracked as task 1793733873).
+      On the ticket you set the margin you commit and the leverage you run, and the size follows
+      (margin × leverage ÷ price); the leverage slider stops at the ceiling the engine reports for that
+      margin, and the ceiling itself is enforced by the check below.</p>
       <p><b>What the ticket's "Pool capacity" means.</b> As you type, the ticket asks the engine
       the question the fill will ask: the largest size this pool could open <i>right now</i> — the
       opening-health rule above, plus whether the vault could lend the shortfall at today's prices.
@@ -1277,7 +1281,7 @@ export const DOCS_PAGES = [
         <tr><th>Thing</th><th>Value / where</th></tr>
         <tr><td>Open / maintenance / restore health</td><td>1.25 / 1.15 / 1.25 (LTV-weighted collateral ÷ debt)</td></tr>
         <tr><td>LTV weights</td><td>ICPUSD 1.00 · BTC 0.90 · ETH 0.90 · SOL 0.85 · ICP 0.80</td></tr>
-        <tr><td>Max opening leverage</td><td>1 / (1 − LTV/1.25) → BTC/ETH ≈3.6×, SOL ≈3.1×, ICP ≈2.8×</td></tr>
+        <tr><td>Max opening leverage</td><td>1 / (1.25 − LTV), long or short → BTC/ETH ≈2.9×, SOL ≈2.5×, ICP ≈2.2× (the whole fill scored as borrowed; the ticket's "Pool capacity" is this bound at today's price)</td></tr>
         <tr><td>Borrow APR (interest on borrows only)</td><td>ICPUSD 5% · BTC/ETH 8% · SOL/ICP 10%, continuous, paid to the <a href="#docs/earn">Earn vault</a></td></tr>
         <tr><td>Funding rate</td><td>None — real borrow interest instead</td></tr>
         <tr><td>When leverage is borrowed</td><td>At the <b>fill</b>, never at placement — a staged or resting entry holds no debt and accrues no interest; cancelling it repays nothing; a fill the vault cannot fund fails closed with a recorded reason</td></tr>
@@ -1823,6 +1827,76 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
       on-chain asset swap and order-book exchange, with an order-book AMM, where assets on
       multiple chains can be trustlessly deposited, traded, and withdrawn directly, and AIware
       functionality lets users analyze the markets and their positions, and trade, via AI.</p>
+
+      <h3>1.80 — 4 November 2026</h3>
+      <ul>
+        <li><b>The Place Order box reads top-down, as you decide.</b> Spot | Margin are the
+        header's tabs, Buy | Sell (Long | Short on Margin) is the one coloured surface, the money
+        rows — what you can trade and your resting orders; on Margin your wallet margin, buying
+        power and the pool's free margin — come before the inputs they constrain, Limit | Market
+        sits on the price field it swaps, the price field offers Mid / Bid / Ask from the live
+        book, the unit sits inside the size field, the size slider is a drawn track with quarter
+        stops, an editable % box and a "100% = N ICP" line, expiry, max slippage and margin pool
+        are one-line rows, and the button states the order it will place. The frame is feedback:
+        its outline takes the side's hue (mint buy, clay sell) and Margin adds a second hairline
+        inside the edge; the rows wrap instead of overflowing, so the box never grows a sideways
+        scrollbar.</li>
+        <li><b>Margin: the collateral first.</b> A Margin field and slider over everything you can
+        commit — the pool's free margin first, shaded on the rail, then your wallet — and a
+        Leverage slider from 1× up to the ceiling the engine allows for that margin ("Max
+        N.NNx"); the Size is derived (margin × leverage ÷ price) and still typable, back-solving
+        the margin. The ceiling is the engine's own answer, never a table in the page, and the
+        leverage chips are gone. The preview and the order use the margin you set, the size is
+        floored to the asset's precision (no more "Need $22,112 margin — only $22,112 in wallet"),
+        and a real shortfall is stated to the cent.</li>
+        <li><b>100% is what your wallet can actually reserve.</b> A market buy is sized at the
+        slippage cap plus the taker fee — what the engine reserves — a limit buy at its price plus
+        the fee, every size on your spendable balance (net of resting orders, which "Available to
+        trade" now shows), and the hint says what the figure is net of: "100% = N ICP after the 5%
+        slippage cap and the 0.10% fee". A market long's note explains its lower ceiling
+        ("ceiling at the 5% slippage cap — a limit order at the mark allows more"), and the
+        ceiling keeps two decimals (Max 1.96x, not 1.9x).</li>
+        <li><b>Quantities carry thousands separators.</b> "Long 108,265.4 ICP", "100% = 2,012.4
+        ICP" and the resting-orders row read like the money figures beside them; the Size field
+        you type into keeps raw digits, and the order book and trades stay ungrouped.</li>
+        <li><b>The preview says what the fill will be held to.</b> For a long and for a short, the
+        margin preview's maximum size is the smaller of what the vault can lend and what the
+        opening-health bar allows at the worst-case price, and past it the preview says no and
+        names the side — before, a long's preview could promise what the fill then clamped. The
+        Margin page here (§5 and the quick reference) states the ceilings the engine enforces
+        today, 1 / (1.25 − LTV): BTC/ETH ≈2.9×, SOL ≈2.5×, ICP ≈2.2×.</li>
+        <li><b>The launch notice.</b> The strip above the header carries the launch text (shown
+        once more if you had dismissed the old one); on a phone it collapses to its first sentence
+        and the story link with a Read more / Show less you can operate from the keyboard, and
+        its ✕ sits in the strip's top-right corner instead of trailing the text.</li>
+        <li><b>The fuel banner.</b> The freeze countdown shows only inside 24 hours (System →
+        Canisters keeps its 72-hour view), the treasury sentence matches the venue — on a play
+        venue it says the self-funding treasury holds no real assets — and is painted right the
+        first time rather than after the next poll, and the donation tiers step aside on phones
+        while the frozen tier stays on every width.</li>
+        <li><b>Sign-in on the current Internet Identity library.</b> The Internet Identity window
+        opens at <code>id.ai</code>, an idle hour signs you out and reloads as before, signing
+        out revokes the session at Internet Identity, and a session that ends elsewhere — expiry,
+        a sign-out in another tab — is noticed within 15 seconds and toasted.</li>
+        <li><b>A missing history segment no longer stalls your history.</b> A sealed archive
+        segment whose canister is gone is tolerated everywhere it is read: the trade-history
+        backfill closes that source and appends "· segment N unavailable" to its progress line,
+        and Account → Archive skips the dead hop with a per-segment note instead of parking on it.
+        The controller can name the failure and retire the row, declaring the hole on the tape as
+        a <code>#gap</code> event, as an archive shed does.</li>
+        <li><b>Local venues.</b> A venue served from a port of its own is registered as a sign-in
+        origin when it is deployed, so Verify-with-Google — and the play deposits it unlocks —
+        work there too.</li>
+        <li><b>Bot authors: nothing to change.</b> apiVersion stays <b>6.0.0</b> and the interface
+        is the one the 1.75 drop published; the archived-events pagers' new
+        <code>unavailable</code> field is optional, so a 6.0.0 decoder reads the reply unchanged.
+        See the <a href="https://github.com/dfinity/public-multidex/blob/HEAD/candid/README.md" target="_blank" rel="noopener noreferrer">API docs</a>.</li>
+        <li><b>Under the hood.</b> The build carries the sixth one-shot state migration — it sweeps
+        the fossils the 6.0.0 removal left in stable memory — applied once per venue at this
+        upgrade and then retired like its five predecessors. The loading page's badge reads
+        <b>VERSION 1.80</b>; a tab left open on 1.75 refreshes itself, and System → Canisters
+        shows the backend answering 1.80.0 beside it.</li>
+      </ul>
 
       <h3>1.75 — 1 November 2026</h3>
       <ul>

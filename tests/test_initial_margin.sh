@@ -376,7 +376,16 @@ release   # fresh mark postdates the entry → releases; 49,500 sits under the A
 GD2=$(gdebt); GV2=$(gbal "$AMM" ICPUSD); GL2=$(glent); GN2=$(gnord "$GPID")
 if [ "${GN2:-0}" = "1" ] && [ "${GD2:-x}" = "0" ]; then ok "G1: RESTING entry (1 pool order) → pool debt still exactly 0"; else nok "G1: a resting entry must hold no vault debt" "orders=$GN2 debtUsd=$GD2"; fi
 if [ "${GV2:-0}" = "${GV0:-1}" ]; then ok "G1: vault balance unmoved by the resting entry"; else nok "G1: vault moved while the entry rests" "V0=$GV0 V2=$GV2"; fi
-if [ -n "${GL0:-}" ] && [ "${GL2:-x}" = "$GL0" ] && [ "${GL1:-x}" = "$GL0" ]; then ok "G1: getMaxInstantWithdraw.vaultLentOutUsd unmoved by a staged AND a resting entry (\$$(from_e8 "$GL0"))"; else nok "G1: LP instant liquidity must not move for an unfilled entry" "lent: before=$GL0 staged=$GL1 resting=$GL2"; fi
+# "Unmoved" means NO BORROW HAPPENED, not a byte-equal read (the same frame as
+# G3's debt check): vaultLentOutUsd sums the loan book's PRINCIPALS at the
+# marks, and the requote inside `release` accrues the loans earlier sections
+# leave open (§E's re-levered pool, §F3's ICP short) — a few seconds of carry,
+# ≈ 10k units/s here (observed +23,370 / +25,600 over one release, task
+# 1793732895). So the STAGED read is exact and the RESTING read may carry
+# that interest: 0 ≤ delta < 1_000_000 units (one cent); a placement-time
+# borrow would add ≥ $9,800.
+GLD=$(( ${GL2:-0} - ${GL0:-0} ))
+if [ -n "${GL0:-}" ] && [ "${GL1:-x}" = "$GL0" ] && [ "$GLD" -ge 0 ] && [ "$GLD" -lt 1000000 ]; then ok "G1: getMaxInstantWithdraw.vaultLentOutUsd unmoved by a staged AND a resting entry (\$$(from_e8 "$GL0"); resting read +$GLD units of requote carry on earlier loans, < \$0.01, no borrow)"; else nok "G1: LP instant liquidity must not move for an unfilled entry" "lent: before=$GL0 staged=$GL1 resting=$GL2 (bound: staged exact, resting 0 ≤ delta < 1_000_000)"; fi
 # Cancel repays NOTHING (there is nothing): debt 0 → 0, vault untouched.
 GOID=$(goid "$GPID")
 GX=$(gusr cancelPoolOrder "($GPID : nat, ${GOID:-0} : nat)")
@@ -454,6 +463,210 @@ if mdx_ok "$GO" && [ -n "${GD7:-}" ] && [ "$GD7" -ge "${GD5:-0}" ] && [ "$GD7" -
 release   # the fresh AMM ladder releases and fills it (4 BTC a side)
 GSZ8=$(sfld size "$(gusr getMyPositions '()')"); GD8=$(gdebt)
 if [ -n "${GSZ8:-}" ] && [ "$GSZ8" -gt "$(e8 0.4)" ] && [ -n "${GD8:-}" ] && [ "$GD8" -gt "${GD7:-0}" ]; then ok "G4: the fill borrowed — long 0.4 → $(from_e8 "$GSZ8") BTC, debt \$$(from_e8 "$GD7") → \$$(from_e8 "$GD8")"; else nok "G4: the #market fill should borrow at the fill" "size=$GSZ8 debt=${GD7}→${GD8} orders=$(gnord "$GPID")"; fi
+
+echo "── H. task 1793732895: previewOpenPosition judges a LONG by the release clamp — canOpen / maxSizeBase / est. liq say what the fill will be held to ──"
+# A fresh pool with $10k of margin, BTC at 50,000 (LTV 0.90). The BORROW gate
+# alone (the borrowed quote at LTV 1.0) allows notional 5 × margin = 1.0 BTC;
+# the release clamp (clampToInitialMargin — the whole fill scored as borrowed:
+# coll + q·0.9·50,000 ≥ 1.25·q·50,000) holds a fresh pool to
+# m / (1.25 × 50,000 − 0.9 × 50,000) = 10,000 / 17,500 = 0.57142857 BTC (2.86×),
+# BorrowEngine.fillDeltaPerUnit / fillRoom — the closed form both now share.
+# Pre-fix the preview answered canOpen = true, "capacity ~1.0 BTC" and an est.
+# liq ABOVE the entry for the 1.0-BTC long; the release then cut it to 0.5714
+# with an "Order reduced at release" record (the engine, 2026-11-03: 10,000 ICP
+# at 5×, ~4,444 released). A LIMIT entry makes the release's worst-case price
+# the preview's exactly (no ladder-edge walk), so the two must be EQUAL to the
+# base unit — §H5 places the orders and reads the release's own clampedTo.
+LID=imgl; mdx_identity_new $LID
+LP=$(icp identity principal --identity $LID 2>/dev/null | tail -1)
+lusr() { icp canister call --candid "$MDX_CANDID" --identity $LID backend "$@" 2>&1; }
+lq()   { icp canister call --candid "$MDX_CANDID" --identity $LID backend "$@" --query 2>&1; }
+lnord() { lusr getPoolOrders "($1 : nat)" | grep -c "id ="; }
+loid()  { lusr getPoolOrders "($1 : nat)" | tr -d '_' | grep -oE "id = [0-9]+" | head -1 | grep -oE "[0-9]+"; }
+lreduced() { lusr getMyReleaseRejections '()' | grep -c "Order reduced at release" || true; }
+pfld() { echo "$2" | tr -d '_' | grep -oE "$1 = (opt \\()?[0-9]+" | head -1 | grep -oE "[0-9]+$"; }   # candid prints an option as `opt (N : nat)`
+adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", $(e8 10000000.0) : nat)" >/dev/null
+adm setTestBalance "(principal \"$AMM\", \"BTC\",    $(e8 100.0) : nat)"      >/dev/null
+adm setTestBalance "(principal \"$LP\",  \"ICPUSD\", $(e8 50000.0) : nat)"    >/dev/null
+release
+LR=$(lusr createMarginPool '("preview-clamp pool", false)')
+LPID=$(echo "$LR" | tr -d '_' | grep -oE 'ok = [0-9]+' | grep -oE '[0-9]+' | head -1)
+lusr fundMarginPool "($LPID, $(e8 10000.0) : nat)" >/dev/null
+LC=$(fld collateralUsd "$(lusr getMyMarginPools '()')")
+if [ "${LC:-0}" = "$(e8 10000)" ]; then ok "H: pool $LPID funded (\$10k collateral, no debt)"; else nok "H: pool setup" "coll=$LC"; fi
+PX=$(e8 50000.0)
+Q_CLAMP=57142857   # 10,000e8 × 1e8 / (1.25 × 50,000e8 − 0.9 × 50,000e8), rounded down — the clamp's exact quantity at the mark
+pv()  { lq previewOpenPosition "($1, \"BTC-ICPUSD\", variant { $2 }, $3 : nat, $(e8 0.05) : nat, opt ($PX : nat), $4 : nat)"; }   # pv <poolId|null> <buy|sell> <size e8> <extraQuote e8> — a LIMIT at the mark
+pvm() { lq previewOpenPosition "($1, \"BTC-ICPUSD\", variant { $2 }, $3 : nat, $(e8 0.05) : nat, null, 0 : nat)"; }              # the MARKET shape (5 % slippage cap)
+
+echo "── H1. LONG 1.0 BTC (5×) at a 50,000 limit: canOpen = false, the reason names the initial-margin bound, maxSizeBase == the clamp's 0.57142857 BTC ──"
+P5=$(pv "opt ($LPID : nat)" buy "$(e8 1.0)" 0)
+if echo "$P5" | grep -q "canOpen = false"; then ok "H1: the 5× long is refused by the preview"; else nok "H1: the preview must refuse a 5× long (pre-fix: canOpen = true, capacity ~1.0 BTC)" "$P5"; fi
+if echo "$P5" | grep -q "initial-margin bound"; then ok "H1: the reason names the initial-margin bound"; else nok "H1: the reason must name the initial-margin bound" "$P5"; fi
+M5=$(pfld maxSizeBase "$P5")
+if [ "${M5:-x}" = "$Q_CLAMP" ]; then ok "H1: maxSizeBase == $(from_e8 "$M5") BTC — the clamp's exact release quantity (2.86×), not the borrow gate's 1.0 BTC (5×)"; else nok "H1: maxSizeBase must equal the clamp's quantity" "got=$M5 expected=$Q_CLAMP"; fi
+if echo "$P5" | grep -q "estLiqPrice = null"; then ok "H1: no est. liq for a size the release would cut"; else nok "H1: estLiqPrice should be null on a refusal" "$P5"; fi
+
+echo "── H2. LONG 0.4 BTC (2×): canOpen = true, maxSizeBase ≥ size, est. liq BELOW the entry ──"
+P2=$(pv "opt ($LPID : nat)" buy "$(e8 0.4)" 0)
+if echo "$P2" | grep -q "canOpen = true"; then ok "H2: the 2× long is allowed"; else nok "H2: a 2× long must pass" "$P2"; fi
+M2=$(pfld maxSizeBase "$P2"); L2=$(pfld estLiqPrice "$P2")
+if [ -n "${M2:-}" ] && [ "$M2" -ge "$(e8 0.4)" ] && [ "$M2" = "$Q_CLAMP" ]; then ok "H2: maxSizeBase $(from_e8 "$M2") BTC ≥ 0.4 — and still the clamp's capacity, not the borrow gate's"; else nok "H2: capacity" "maxSizeBase=$M2"; fi
+if [ -n "${L2:-}" ] && [ "$L2" -gt 0 ] && [ "$L2" -lt "$PX" ]; then ok "H2: est. liq \$$(from_e8 "$L2") < the \$50,000 entry — a long liquidates BELOW its entry"; else nok "H2: a long's est. liq must sit below its entry (pre-fix: liq above entry beside canOpen = true)" "estLiqPrice=$L2"; fi
+
+echo "── H3. the UI's 'New pool (auto)' path — poolId = null, extraQuote = \$10k — and the MARKET shape answer the same way ──"
+PN=$(pv null buy "$(e8 1.0)" "$(e8 10000.0)"); MN=$(pfld maxSizeBase "$PN")
+if echo "$PN" | grep -q "canOpen = false" && [ "${MN:-x}" = "$Q_CLAMP" ]; then ok "H3: hypothetical fresh pool: 5× refused, maxSizeBase == $(from_e8 "$MN") BTC"; else nok "H3: the null-pool preview must match the funded pool's answer" "$PN"; fi
+PN2=$(pv null buy "$(e8 0.4)" "$(e8 10000.0)")
+if echo "$PN2" | grep -q "canOpen = true"; then ok "H3: …and its 2× long is allowed"; else nok "H3: null-pool 2× long" "$PN2"; fi
+# The market shape's worst-case price is the 5 % cap (52,500): tighter, never looser.
+PM=$(pvm "opt ($LPID : nat)" buy "$(e8 1.0)"); MM=$(pfld maxSizeBase "$PM")
+if echo "$PM" | grep -q "canOpen = false" && [ -n "${MM:-}" ] && [ "$MM" -gt 0 ] && [ "$MM" -le "$Q_CLAMP" ]; then ok "H3: market 5× long refused too; capacity at the 52,500 cap is $(from_e8 "$MM") BTC ≤ the limit answer"; else nok "H3: market-shape preview" "$PM"; fi
+
+echo "── H4. SHORTS unchanged: 3× refused by the borrow gate, 2× allowed with est. liq ABOVE the entry — and the same capacity as the long ──"
+S3=$(pv "opt ($LPID : nat)" sell "$(e8 0.6)" 0)
+if echo "$S3" | grep -q "canOpen = false" && echo "$S3" | grep -q "initial-margin requirement"; then ok "H4: 3× short refused by borrowCheck ((10k + 0.9 × 30k) / 30k = 1.23 < 1.25)"; else nok "H4: 3× short" "$S3"; fi
+MS3=$(pfld maxSizeBase "$S3")
+if [ "${MS3:-x}" = "$Q_CLAMP" ]; then ok "H4: the short's capacity is the same 0.57142857 BTC — longs and shorts now read one ceiling"; else nok "H4: short capacity" "maxSizeBase=$MS3"; fi
+S2=$(pv "opt ($LPID : nat)" sell "$(e8 0.4)" 0); LS2=$(pfld estLiqPrice "$S2")
+if echo "$S2" | grep -q "canOpen = true" && [ -n "${LS2:-}" ] && [ "$LS2" -gt "$PX" ]; then ok "H4: 2× short allowed, est. liq \$$(from_e8 "${LS2:-0}") > the entry"; else nok "H4: 2× short" "$S2"; fi
+
+echo "── H5. the release AGREES: the 5× long is cut to exactly the preview's maxSizeBase (clampedTo); the 2× long the preview accepted is never 'reduced at release' ──"
+# Placed at 49,500 (§G1's resting price: under the AMM's asks, so nothing
+# fills and the pool stays clean between the two legs). The clamp at that
+# limit: 10,000e8 × 1e8 / (1.25 × 49,500e8 − 0.9 × 50,000e8) = 0.59259259 BTC.
+PXR=$(e8 49500.0); Q_REST=59259259
+P5R=$(lq previewOpenPosition "(opt ($LPID : nat), \"BTC-ICPUSD\", variant { buy }, $(e8 1.0) : nat, $(e8 0.05) : nat, opt ($PXR : nat), 0 : nat)")
+M5R=$(pfld maxSizeBase "$P5R")
+if echo "$P5R" | grep -q "canOpen = false" && [ "${M5R:-x}" = "$Q_REST" ]; then ok "H5: preview at the 49,500 limit: refused, maxSizeBase $(from_e8 "$M5R") BTC"; else nok "H5: preview at 49,500" "$P5R"; fi
+R0=$(lreduced)
+O5=$(lusr openPosition "($LPID, \"BTC-ICPUSD\", variant { buy }, $(e8 1.0) : nat, $(e8 0.05) : nat, opt ($PXR : nat))")
+if mdx_ok "$O5"; then ok "H5: the 5× limit entry stages (the placement gate is the borrow check, which 5× passes)"; else nok "H5: the 5× entry should stage" "$O5"; fi
+release   # a fresh mark postdates the entry → releases; the clamp runs at the limit price; 49,500 sits under the asks → rests
+RJH=$(lusr getMyReleaseRejections '()')
+CT=$(echo "$RJH" | tr -d '_' | grep -oE 'clampedTo = opt \(?[0-9]+' | tail -1 | grep -oE '[0-9]+$')
+if [ "$(lreduced)" -eq $((R0 + 1)) ] && [ "${CT:-x}" = "$M5R" ] && [ "${CT:-x}" = "$Q_REST" ]; then ok "H5: the release cut the 1.0-BTC long to clampedTo = $(from_e8 "$CT") BTC == the preview's maxSizeBase, to the base unit"; else nok "H5: the release's clamp and the preview's maxSizeBase must be the same number" "reduced=$(lreduced) (was $R0) clampedTo=$CT preview=$M5R expected=$Q_REST :: $(echo "$RJH" | tr '\n' ' ' | tail -c 300)"; fi
+LOID=$(loid "$LPID"); [ -n "${LOID:-}" ] && lusr cancelPoolOrder "($LPID : nat, $LOID : nat)" >/dev/null 2>&1
+if [ "$(lnord "$LPID")" = "0" ]; then ok "H5: the clamped remainder cancelled (clean pool)"; else nok "H5: cleanup" "orders=$(lnord "$LPID")"; fi
+R1=$(lreduced)
+O2=$(lusr openPosition "($LPID, \"BTC-ICPUSD\", variant { buy }, $(e8 0.4) : nat, $(e8 0.05) : nat, opt ($PXR : nat))")
+if mdx_ok "$O2"; then ok "H5: the 2× entry stages"; else nok "H5: the 2× entry should stage" "$O2"; fi
+release
+if [ "$(lreduced)" -eq "$R1" ] && [ "$(lnord "$LPID")" = "1" ]; then ok "H5: the 2× long the preview accepted released in FULL — no 'Order reduced at release' record, the whole 0.4 BTC rests"; else nok "H5: a size the preview accepted must never be reduced at release" "reduced=$(lreduced) (was $R1) orders=$(lnord "$LPID") :: $(lusr getMyReleaseRejections '()' | tr '\n' ' ' | tail -c 300)"; fi
+LOID2=$(loid "$LPID"); [ -n "${LOID2:-}" ] && lusr cancelPoolOrder "($LPID : nat, $LOID2 : nat)" >/dev/null 2>&1
+
+echo "── H6. task 1793733917: SHORTS read the release clamp too — a MARKET short at a 20 % floor is bound by the clamp's post-sale rule (2.22×), at 5 % by the borrow gate (2.86×) ──"
+# Two closed forms for a short on a fresh $10k pool, BTC @ 50,000 (LTV 0.90):
+#   borrowCheck values the borrowed base at its LTV BEFORE the sale —
+#     coll + q·0.9·50,000 ≥ 1.25·q·50,000 → q ≤ 10,000 / 17,500 = 0.57142857 BTC (2.86×, Q_CLAMP);
+#   the release clamp (clampToInitialMargin; BorrowEngine.fillDeltaPerUnit's #sell
+#   arm, qp − 1.25·oracle) scores the POST-sale world at the floor qp = 50,000·(1 − slip) —
+#     coll + q·qp ≥ 1.25·q·50,000 → q ≤ 10,000 / (62,500 − qp):
+#     20 % (qp 40,000): 10,000 / 22,500 = 0.44444444 BTC (2.22×); 5 % (qp 47,500): 0.66666666 BTC (3.33×).
+# The clamp binds BELOW the borrow gate exactly when 1 − slip < LTV (BTC: past
+# 10 % slippage). Pre-fix the preview ran the clamp for #buy only, so the 20 %
+# short answered canOpen = true, maxSizeBase 0.57142857 (borrowCheck alone);
+# now maxSizeBase = min(borrow room, clamp room) for either side and the
+# refusal names "a short".
+Q_SHORT20=44444444   # 10,000e8 × 1e8 / (1.25 × 50,000e8 − 40,000e8), rounded down — the clamp's quantity at the 20 % floor
+pvs() { lq previewOpenPosition "($1, \"BTC-ICPUSD\", variant { sell }, $2 : nat, $3 : nat, null, $4 : nat)"; }   # pvs <poolId|null> <size e8> <maxSlippage e8> <extraQuote e8> — the MARKET short shape
+S20=$(pvs "opt ($LPID : nat)" "$(e8 0.55)" "$(e8 0.20)" 0)
+if echo "$S20" | grep -q "canOpen = false"; then ok "H6: the 2.75× market short at 20 % slippage is refused by the preview"; else nok "H6: the preview must refuse a 2.75× short at a 20 % floor (pre-fix: canOpen = true — borrowCheck's 2.86× alone)" "$S20"; fi
+if echo "$S20" | grep -q "initial-margin bound for a short"; then ok "H6: the reason names the initial-margin bound for a SHORT"; else nok "H6: the reason must name the initial-margin bound for a short" "$S20"; fi
+MS20=$(pfld maxSizeBase "$S20")
+if [ "${MS20:-x}" = "$Q_SHORT20" ]; then ok "H6: maxSizeBase == $(from_e8 "$MS20") BTC — the clamp's quantity at the 40,000 floor (2.22×), under the borrow gate's 0.57142857"; else nok "H6: maxSizeBase must be the clamp's quantity at the floor" "got=$MS20 expected=$Q_SHORT20"; fi
+if echo "$S20" | grep -q "estLiqPrice = null"; then ok "H6: no est. liq for a size the release would cut"; else nok "H6: estLiqPrice should be null on a refusal" "$S20"; fi
+S05=$(pvs "opt ($LPID : nat)" "$(e8 0.55)" "$(e8 0.05)" 0); MS05=$(pfld maxSizeBase "$S05"); LS05=$(pfld estLiqPrice "$S05")
+if echo "$S05" | grep -q "canOpen = true" && [ "${MS05:-x}" = "$Q_CLAMP" ]; then ok "H6: the same short at 5 % is allowed — the borrow gate binds at $(from_e8 "$MS05") BTC (the clamp's room at the 47,500 floor is 0.6667)"; else nok "H6: the 5 % short must pass with maxSizeBase == the borrow gate's 0.57142857" "$S05"; fi
+if [ -n "${LS05:-}" ] && [ "$LS05" -gt "$PX" ]; then ok "H6: est. liq \$$(from_e8 "$LS05") > the \$50,000 entry — a short liquidates ABOVE"; else nok "H6: a short's est. liq must sit above its entry" "estLiqPrice=$LS05"; fi
+SN=$(pvs null "$(e8 0.55)" "$(e8 0.20)" "$(e8 10000.0)"); MSN=$(pfld maxSizeBase "$SN")
+if echo "$SN" | grep -q "canOpen = false" && [ "${MSN:-x}" = "$Q_SHORT20" ]; then ok "H6: the 'New pool (auto)' path (poolId = null, extraQuote \$10k) answers the same — refused, maxSizeBase $(from_e8 "$MSN") BTC"; else nok "H6: the null-pool short preview must match the funded pool's answer" "$SN"; fi
+S44=$(pvs "opt ($LPID : nat)" "44000000" "$(e8 0.20)" 0)
+if echo "$S44" | grep -q "canOpen = true" && [ "$(pfld maxSizeBase "$S44")" = "$Q_SHORT20" ]; then ok "H6: 0.44 BTC at 20 % (just under the clamp's 0.4444) is allowed, capacity unchanged"; else nok "H6: a size under the clamp's quantity must pass at 20 %" "$S44"; fi
+
+echo "── H7. the release AGREES at a common price: with the AMM's bids withdrawn (cash floor), a LIMIT short at the 40,000 floor is cut to exactly the preview's maxSizeBase (clampedTo) ──"
+# A MARKET short's release does not run at its raw floor: releaseDeferred's #3a
+# ladder-edge cap RAISES a sell's effLimit to the AMM's deepest bid (≈ 2 % under
+# the mark here) — §H8 pins that — so the one way to watch the release and the
+# preview evaluate the SAME 40,000 is a LIMIT at that price. A sell limit that
+# crosses a resting bid is "marketable" and collared to ±5 % of the mark
+# (priceBandCheck / MARKETABLE_BAND_BPS), so the bid side must be EMPTY first:
+# AMM ICPUSD → 0 engages the cash floor (ammCashFloorEngaged: cash < 5 % of
+# holdings) and the requote withdraws the bids. The clamp then runs at
+# effLimit = 40,000 exactly, the released 0.4444 BTC rests (nothing to hit),
+# and the remainder is cancelled BEFORE the bids come back (the AMM sweep
+# would otherwise lift a 40,000 ask).
+amm_bids() { adm getAmmPools '()' --query | tr -d '_\n' | perl -ne 'if (/baseToken = "BTC"[^}]*?activeBidIds = vec \{([^}]*)\}/) { my @i = ($1 =~ /\d+/g); print scalar(@i), "\n" } else { print "?\n" }'; }   # live AMM bids on BTC-ICPUSD (getTakeableDepth never counts AMM quotes: they are non-takeable to the immediate paths)
+pos_size() { lusr getMyPositions '()' | tr -d '_' | perl -0777 -sne 'for (split /record \{/) { if (/poolId = (\d+) : nat/ and $1 == $id and /size = (-?\d+) : int/) { print "$1\n"; last } }' -- -id="$1"; }   # signed size of THIS pool's position ('' = none)
+adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", 0 : nat)" >/dev/null
+# The requote DIFFS the ladder against the resting quotes (a level whose price
+# AND size are unchanged is KEPT, ammApplyQuotes), so the floor alone only
+# blocks NEW bids — a level that happens to coincide survives (observed: 2 of
+# 8). Nudge the mark by $10 first so every level moves: all resting bids are
+# cancelled and none can be re-placed; then back to 50,000 (bid prices snap to
+# $1 at this magnitude, so no level lands on an old one; the vol sample of a
+# 2 bps move is ≈ 0).
+adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50010.0) : nat)" >/dev/null; adm requoteAmm '("BTC-ICPUSD")' >/dev/null
+release
+TB0=$(amm_bids)
+if [ "${TB0:-x}" = "0" ]; then ok "H7: AMM bid side withdrawn (cash floor) — 0 live AMM bids on BTC-ICPUSD"; else nok "H7: expected an empty bid side" "amm_bids=$TB0"; fi
+PXF=$(e8 40000.0)
+P20L=$(lq previewOpenPosition "(opt ($LPID : nat), \"BTC-ICPUSD\", variant { sell }, $(e8 0.55) : nat, $(e8 0.05) : nat, opt ($PXF : nat), 0 : nat)")
+M20L=$(pfld maxSizeBase "$P20L")
+if echo "$P20L" | grep -q "canOpen = false" && [ "${M20L:-x}" = "$Q_SHORT20" ]; then ok "H7: preview of the LIMIT short at 40,000: refused, maxSizeBase $(from_e8 "$M20L") BTC (the same 10,000 / 22,500 as the 20 % market floor)"; else nok "H7: preview at the 40,000 limit" "$P20L"; fi
+R2=$(lreduced)
+O20=$(lusr openPosition "($LPID, \"BTC-ICPUSD\", variant { sell }, $(e8 0.55) : nat, $(e8 0.05) : nat, opt ($PXF : nat))")
+if mdx_ok "$O20"; then ok "H7: the 0.55 BTC limit short stages (the placement gate is the borrow check, which 2.75× passes)"; else nok "H7: the short should stage (band: no bid to cross → not marketable)" "$O20"; fi
+release   # a fresh mark postdates the entry → releases; the clamp runs at the 40,000 limit; no bids → the released part rests
+RJS=$(lusr getMyReleaseRejections '()')
+CTS=$(echo "$RJS" | tr -d '_' | grep -oE 'clampedTo = opt \(?[0-9]+' | tail -1 | grep -oE '[0-9]+$')
+if [ "$(lreduced)" -eq $((R2 + 1)) ] && [ "${CTS:-x}" = "$M20L" ] && [ "${CTS:-x}" = "$Q_SHORT20" ]; then ok "H7: the release cut the 0.55-BTC short to clampedTo = $(from_e8 "$CTS") BTC == the preview's maxSizeBase, to the base unit"; else nok "H7: the release's clamp and the preview's maxSizeBase must be the same number" "reduced=$(lreduced) (was $R2) clampedTo=$CTS preview=$M20L expected=$Q_SHORT20 :: $(echo "$RJS" | tr '\n' ' ' | tail -c 300)"; fi
+SOID=$(loid "$LPID"); [ -n "${SOID:-}" ] && lusr cancelPoolOrder "($LPID : nat, $SOID : nat)" >/dev/null 2>&1
+if [ "$(lnord "$LPID")" = "0" ] && [ -z "$(pos_size "$LPID")" ]; then ok "H7: the clamped remainder cancelled, no position (clean pool)"; else nok "H7: cleanup" "orders=$(lnord "$LPID") size=$(pos_size "$LPID")"; fi
+# Back ABOVE the floor: $100M of cash (what §E/§F ran with). §G's $10M sat AT
+# the 5 % line — the floor measures cash against the AMM's WHOLE holdings and
+# §E left it 1,000,000 SOL (≈ $150M) — so at $10M the bids never return and
+# §H8's market shorts would find nothing to hit (observed: both re-parked).
+adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", $(e8 100000000.0) : nat)" >/dev/null
+release
+TB1=$(amm_bids)
+if [ -n "${TB1:-}" ] && [ "$TB1" -gt 0 ] 2>/dev/null; then ok "H7: AMM bids restored ($TB1 live AMM bids on BTC-ICPUSD)"; else nok "H7: the bid side should be back" "amm_bids=$TB1"; fi
+
+echo "── H8. MARKET shorts placed: the 5 % short the preview accepted fills in FULL with no reduction record; the 20 % short the preview refused is never cut BELOW its maxSizeBase — the release's floor is the ladder's deepest bid, so it fills in full too ──"
+# Fresh pools so each leg starts from $10k with no debt. The second half pins
+# the physics §H7 works around: on a quoting venue a market sell's effLimit is
+# max(floor, the AMM's deepest bid) — ≈ 49,050 here (15 bps half-spread +
+# 7 × 25 bps), far above the 45,000 (1 − LTV) crossover — so the clamp's room
+# (10,000 / 13,450 ≈ 0.74 BTC) clears 0.55 and the release fills what the
+# preview refused (8 levels × 0.5 BTC of bids absorb it). The preview at
+# the raw floor is the release's FLOOR (it never over-promises), not its
+# ceiling; whether it should walk the ladder itself is a follow-up task.
+LR2=$(lusr createMarginPool '("short 5pct pool", false)')
+LPID2=$(echo "$LR2" | tr -d '_' | grep -oE 'ok = [0-9]+' | grep -oE '[0-9]+' | head -1)
+lusr fundMarginPool "($LPID2, $(e8 10000.0) : nat)" >/dev/null
+S05B=$(pvs "opt ($LPID2 : nat)" "$(e8 0.55)" "$(e8 0.05)" 0)
+if echo "$S05B" | grep -q "canOpen = true"; then ok "H8: fresh pool $LPID2 — the 5 % short previews canOpen = true"; else nok "H8: 5 % preview on the fresh pool" "$S05B"; fi
+R3=$(lreduced)
+O05=$(lusr openPosition "($LPID2, \"BTC-ICPUSD\", variant { sell }, $(e8 0.55) : nat, $(e8 0.05) : nat, null)")
+if mdx_ok "$O05"; then ok "H8: the 5 % market short stages"; else nok "H8: the 5 % short should stage" "$O05"; fi
+release
+PS05=$(pos_size "$LPID2")
+if [ "${PS05:-x}" = "-$(e8 0.55)" ] && [ "$(lreduced)" -eq "$R3" ]; then ok "H8: the 5 % short filled in FULL (short $(from_e8 "$PS05") BTC) — no 'Order reduced at release' record, exactly as the preview said"; else nok "H8: a size the preview accepted must fill without a reduction record" "size=$PS05 reduced=$(lreduced) (was $R3) orders=$(lnord "$LPID2")"; fi
+LR3=$(lusr createMarginPool '("short 20pct pool", false)')
+LPID3=$(echo "$LR3" | tr -d '_' | grep -oE 'ok = [0-9]+' | grep -oE '[0-9]+' | head -1)
+lusr fundMarginPool "($LPID3, $(e8 10000.0) : nat)" >/dev/null
+S20B=$(pvs "opt ($LPID3 : nat)" "$(e8 0.55)" "$(e8 0.20)" 0); M20B=$(pfld maxSizeBase "$S20B")
+if echo "$S20B" | grep -q "canOpen = false" && [ "${M20B:-x}" = "$Q_SHORT20" ]; then ok "H8: fresh pool $LPID3 — the 20 % short previews canOpen = false, maxSizeBase $(from_e8 "$M20B") BTC"; else nok "H8: 20 % preview on the fresh pool" "$S20B"; fi
+R4=$(lreduced)
+O20M=$(lusr openPosition "($LPID3, \"BTC-ICPUSD\", variant { sell }, $(e8 0.55) : nat, $(e8 0.20) : nat, null)")
+if mdx_ok "$O20M"; then ok "H8: the 20 % market short still STAGES — placement gates on the borrow check (2.75× < 2.86×); the preview is advisory"; else nok "H8: the 20 % short should stage" "$O20M"; fi
+release
+PS20=$(pos_size "$LPID3")
+RJ20=$(lusr getMyReleaseRejections '()' | tr -d '_')
+CT20=$(echo "$RJ20" | grep -oE 'clampedTo = opt \(?[0-9]+' | tail -1 | grep -oE '[0-9]+$')
+NEW20=$(( $(lreduced) - R4 ))
+if [ "$NEW20" -eq 0 ] || { [ -n "${CT20:-}" ] && [ "$CT20" -ge "$Q_SHORT20" ]; }; then ok "H8: the release never cut the 20 % short BELOW the preview's maxSizeBase ($NEW20 new reduction records; last clampedTo=${CT20:-none}) — the preview never over-promises"; else nok "H8: the release cut below the preview's capacity — the preview over-promised" "clampedTo=$CT20 preview=$Q_SHORT20"; fi
+if [ "${PS20:-x}" = "-$(e8 0.55)" ] && [ "$NEW20" -eq 0 ]; then ok "H8: …and it filled in FULL (short $(from_e8 "$PS20") BTC, no reduction record): the release's floor was the ladder's deepest bid, above the 45,000 crossover — the preview at the raw 40,000 floor under-promised by design (its floor, not its ceiling)"; else nok "H8: expected the 20 % market short to fill in full against the quoting ladder (effLimit = the deepest bid, not the raw floor)" "size=$PS20 new_reduced=$NEW20 orders=$(lnord "$LPID3") :: $(echo "$RJ20" | tr '\n' ' ' | tail -c 300)"; fi
 
 adm setTestTimersPaused '(false)' >/dev/null 2>&1 || true
 echo ""

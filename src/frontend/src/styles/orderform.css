@@ -1,82 +1,423 @@
 /* ── Order Form ──────────────────────────────────────────────────── */
-.order-type-toggle, .order-side-toggle {
-  display: flex;
-  background: var(--bg-input);
-  border-radius: var(--radius-sm);
-  padding: 3px;
-  margin-bottom: 12px;
-}
-/* Match the Limit/Market → side-toggle gap to the Spot/Margin → Limit/Market
-   gap above it (.order-mode-toggle's 8px). The side toggle keeps 12px to the
-   form below. */
-.order-type-toggle { margin-bottom: 8px; }
-.order-type-btn, .side-btn {
-  flex: 1;
-  padding: 6px 8px;   /* slightly shorter rows — frees vertical room in the box */
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  border-radius: 6px;
-  transition: all 0.2s;
-}
-/* Glacier (info accent) fill — Limit/Market is the execution-mechanics choice,
-   sitting between the amber mode toggle and the mint/clay side toggle; it needs
-   equal visual weight, in a hue that belongs to neither neighbour.
-   Active states: lighter weight (600 → 520) compensated by DARKER on-colour
-   text (≈45% darker than the --*-text tokens, hue kept) — thinner strokes stay
-   crisp against the colour fill. Scoped here; the global tokens are unchanged. */
-.order-type-btn.active { background: var(--glacier); color: var(--glacier-text); font-weight: 480; }
-.side-btn.buy.active { background: var(--green); color: var(--green-text); font-weight: 480; }
-.side-btn.sell.active { background: var(--red); color: var(--red-text); font-weight: 480; }
+/* The box reads top-down as the trader decides: the ACCOUNT (Spot | Margin —
+   text tabs in the header, the outermost frame: it re-skins everything
+   below), the DIRECTION (Buy | Sell, the one coloured surface above the
+   fields), the MONEY (what this side can spend), the EXECUTION (Limit |
+   Market, a quiet segment on the field it swaps), the inputs, the options as
+   one-line rows, the total / preview and a CTA that states the order in the
+   side's colour. One semantic hue — mint or clay, carried as --side — plus
+   the cyan accent for the tab underline and focus, where the old stack of
+   three equal segmented controls ran amber, glacier and mint at once.
+   Design pass: multidex-mocks/place-order (page 4, composition C1). */
+.order-panel { --side: var(--green); --side-text: var(--green-text); }
+.order-panel[data-side="sell"] { --side: var(--red); --side-text: var(--red-text); }
 
-/* ── Spot | Margin mode toggle ─────────────────────────────────────
-   Top-level switch on the Place Order box: Spot trades the Wallet, Margin
-   opens a leveraged/short position in a pool. Accent-tinted active state so it
-   reads as a distinct control from the Limit/Market type toggle below it. */
-.order-mode-toggle {
+/* The frame as feedback (multidex-mocks page 6, treatment M1). HUE says the
+   direction: the outline takes the side's colour - mint on a buy, clay on a
+   sell - at 58%, a step stronger than the cyan action-card family's 45% so
+   it reads as a choice, not a tint. LINE says the account: on Margin a
+   second hairline runs 3px inside the edge (an inset box-shadow) - two
+   lines for a position on top of borrowed money - and leaves on Spot. The
+   hover bloom the action cards share (shell.css) is restated in the side's
+   hue, and the Margin hover carries the inner line in the same box-shadow,
+   or hovering would wipe it. `.market-content` in the selectors outranks
+   responsive.css's mobile `.market-content .order-panel` outline, which is
+   imported later. [data-side] is set by updateOrderSideUI, [data-mode] by
+   applyOrderMode; index.html carries both at rest (buy, spot). */
+.market-content .order-panel[data-side] { border-color: color-mix(in srgb, var(--side) 58%, transparent); }
+.market-content .order-panel[data-mode="margin"] {
+  box-shadow: inset 0 0 0 3px var(--bg), inset 0 0 0 4px color-mix(in srgb, var(--side) 55%, transparent);
+}
+@media (hover: hover) {
+  .market-content .order-panel[data-side]:hover {
+    border-color: color-mix(in srgb, var(--side) 80%, transparent);
+    box-shadow: 0 0 28px color-mix(in srgb, var(--side) 13%, transparent), 0 0 3px color-mix(in srgb, var(--side) 22%, transparent);
+  }
+  .market-content .order-panel[data-mode="margin"]:hover {
+    box-shadow:
+      inset 0 0 0 3px var(--bg), inset 0 0 0 4px color-mix(in srgb, var(--side) 55%, transparent),
+      0 0 28px color-mix(in srgb, var(--side) 13%, transparent), 0 0 3px color-mix(in srgb, var(--side) 22%, transparent);
+  }
+}
+
+/* Header tabs — the activity panel's .uom-tab look: text, a 2px accent
+   underline under the active one, the market pair trailing. */
+.order-mode-tabs {
   display: flex;
-  background: var(--bg-input);
-  border-radius: var(--radius-sm);
-  padding: 3px;
-  margin-bottom: 8px;
+  align-items: flex-end;
+  gap: 20px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 10px;
+  flex-shrink: 0;
 }
 .order-mode-btn {
-  flex: 1;
-  padding: 8px;
+  position: relative;
+  padding: 2px 0 8px;
   border: none;
   background: transparent;
-  color: var(--text-dim);
+  color: var(--text-muted);
   font-size: 13px;
-  font-weight: 480;  /* lighter (was 600); active compensates w/ darker text */
+  font-weight: 400;
   cursor: pointer;
-  border-radius: 6px;
-  transition: all 0.2s;
+  transition: color 0.15s;
 }
-.order-mode-btn.active { background: var(--accent); color: var(--accent-text); }
+.order-mode-btn:hover { color: var(--text); }
+.order-mode-btn.active { color: var(--text); font-weight: 500; }
+.order-mode-btn.active::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+.order-pair {
+  margin-left: auto;
+  padding-bottom: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 
-/* Margin-only controls (pool + leverage), shown in Margin mode. The row needs
-   its own class: the legacy .margin-row (Earn-card rows) adds margin-top:10px,
-   which would push this below the side toggle deeper than the spot form's
-   rhythm. Labels stay inline (no block/margin-bottom) so the first text line
-   sits exactly where the spot form's "Price" label does. */
-.margin-controls { margin-bottom: 12px; }
-.margin-ctl-row { display: flex; gap: 8px; }
-.margin-col-pool { flex: 1; min-width: 0; }
-.margin-col-lev  { width: 84px; flex: none; }
-.margin-controls label { font-size: 12px; color: var(--text-dim); }
-.margin-controls select {
+/* Side: a segmented well. The chosen half fills solid in its hue with dark
+   text; the other half is plain text that tints 10% in ITS hue on hover — a
+   hint of what the switch does, and proof it is a button. */
+.order-side-toggle {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+  background: var(--bg-input);
+  border-radius: 9px;
+}
+.side-btn {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s;
+}
+.side-btn.buy  { --hue: var(--green); --hue-text: var(--green-text); }
+.side-btn.sell { --hue: var(--red);   --hue-text: var(--red-text); }
+.side-btn:hover:not(:disabled):not(.active) { color: var(--text); background: color-mix(in srgb, var(--hue) 10%, transparent); }
+.side-btn.active { background: var(--hue); color: var(--hue-text); font-weight: 520; }
+.side-btn:disabled { cursor: default; }
+
+/* Money rows (updateOrderSideUI): label left, figure right, tabular. */
+.order-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 10px;
+  min-height: 19px;
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+.order-info .r {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+.order-info .r > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.order-info .r > b {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.order-info .mut { color: var(--text-muted); font-weight: 400; }
+
+/* Execution: the quiet segment. Neutral fill — the box's colour is the side's. */
+.order-type-toggle {
+  display: flex;
+  padding: 2px;
+  background: var(--bg-input);
+  border-radius: 7px;
+}
+.order-type-btn {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.order-type-btn:hover:not(:disabled) { color: var(--text); }
+.order-type-btn.active { background: var(--bg-hover); color: var(--text); }
+.order-type-btn:disabled { cursor: default; }
+
+.order-form { display: flex; flex-direction: column; gap: 10px; overflow-x: hidden; }   /* orderbook.css scrolls it vertically; never sideways */
+.order-form > div { min-width: 0; }
+.order-form label { font-size: 12px; color: var(--text-dim); }
+.order-form input, .order-form select {
   width: 100%;
   background: var(--bg-input);
   border: 1px solid var(--border);
   color: var(--text);
-  padding: 9px 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.order-form input:focus, .order-form select:focus { border-color: var(--accent); outline: none; }
+
+/* Inputs with a trailing addon: the price sources, the size unit. */
+.order-field { position: relative; }
+.order-form .order-field input { padding-right: 96px; }
+.order-field-addon {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.order-price-src button {
+  padding: 2px 5px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.order-price-src button:hover:not(:disabled) { color: var(--text); background: var(--text-tint-1); }
+.order-price-src button.on { color: var(--accent); font-weight: 500; }
+.order-price-src button:disabled { cursor: default; opacity: 0.5; }
+.order-unit {
+  right: 12px;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  pointer-events: none;
+}
+.order-unit img { width: 14px; height: 14px; border-radius: 50%; }
+
+/* Order-size slider: a drawn track (rail, fill in the side's colour, five
+   quarter stops that light up as the fill passes them) with the REAL range
+   input laid transparently over it — keyboard, Home/End and the screen-
+   reader value come free. The 16px thumb travels 8px short of each edge, so
+   every stop and the fill are placed against that travel, not the box. --p
+   (0–1) and the lit dots are set by setOrderPctUI. */
+.order-pct-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  --p: 0;
+  --tw: 16px;
+}
+.order-pct-track { position: relative; flex: 1; min-width: 0; height: 22px; }
+.order-pct-rail, .order-pct-fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 2px;
+}
+.order-pct-rail { right: 0; background: var(--border); }
+.order-pct-fill { background: var(--side); width: calc(var(--tw) / 2 + (100% - var(--tw)) * var(--p)); }
+.order-pct-dots {
+  position: absolute;
+  left: calc(var(--tw) / 2);
+  right: calc(var(--tw) / 2);
+  top: 0; bottom: 0;
+  pointer-events: none;
+}
+.order-pct-dots i {
+  position: absolute;
+  top: 50%;
+  width: 6px; height: 6px;
+  margin: -3px 0 0 -3px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: background 0.12s;
+}
+.order-pct-dots i:nth-child(1) { left: 0; }
+.order-pct-dots i:nth-child(2) { left: 25%; }
+.order-pct-dots i:nth-child(3) { left: 50%; }
+.order-pct-dots i:nth-child(4) { left: 75%; }
+.order-pct-dots i:nth-child(5) { left: 100%; }
+.order-pct-dots i.on { background: var(--side); }
+.order-form .order-pct-track input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.order-pct-track input[type="range"]:focus { outline: none; }
+.order-pct-track input[type="range"]::-webkit-slider-runnable-track { height: 22px; background: transparent; }
+.order-pct-track input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: var(--tw);
+  height: var(--tw);
+  margin-top: calc((22px - var(--tw)) / 2);
+  border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid var(--side);
+  box-shadow: 0 0 0 1px var(--bg);
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+.order-pct-track input[type="range"]:hover::-webkit-slider-thumb,
+.order-pct-track input[type="range"]:focus-visible::-webkit-slider-thumb {
+  transform: scale(1.12);
+  box-shadow: 0 0 0 1px var(--bg), 0 0 0 5px color-mix(in srgb, var(--side) 18%, transparent);
+}
+.order-pct-track input[type="range"]::-moz-range-track { background: transparent; }
+.order-pct-track input[type="range"]::-moz-range-thumb {
+  width: var(--tw); height: var(--tw);
+  border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid var(--side);
+}
+.order-pct-track input[type="range"]:disabled { cursor: default; }
+.order-pct-track input[type="range"]:disabled::-webkit-slider-thumb { transform: none; box-shadow: 0 0 0 1px var(--bg); }
+.order-pct-slider-row:has(input[type="range"]:disabled) { opacity: 0.45; }
+/* The % box — editable; typing a share sizes the order like the thumb does. */
+.order-pct-box {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  width: 56px;
+  height: 32px;
+  padding: 0 8px;
+  flex-shrink: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   font-size: 13px;
+  color: var(--text);
+  cursor: text;
 }
-.margin-controls select:focus { border-color: var(--accent); outline: none; }
+.order-pct-box:focus-within { border-color: var(--accent); }
+.order-form .order-pct-box input {
+  width: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  font-size: 13px;
+  text-align: right;
+  color: var(--text);
+}
+.order-form .order-pct-box input:focus { outline: none; }
+.order-pct-readout { font-size: 12px; color: var(--text-dim); }
+/* What the far end means, in the asset ("100% = 2,012.4 ICP") — on margin
+   that is buying power through the entry price, which a bare % never says. */
+.order-pct-max {
+  margin-top: 4px;
+  min-height: 15px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Options as one-line rows: the label left, the current value ▾ right. The
+   value is the native <select>, drawn borderless until hovered, so nothing
+   about its behaviour changes — only the ~58px label-plus-well it used to
+   cost for a value that is the default almost every time. */
+.order-opt-row {
+  display: flex;
+  flex-wrap: wrap;          /* a value too wide for the line beside its label drops under it, right-aligned - never sideways overflow */
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 10px;
+  min-height: 26px;
+}
+.order-form .order-opt-row label { margin: 0; white-space: nowrap; }
+.order-form .order-opt-select {
+  width: auto;
+  max-width: 100%;
+  margin-left: auto;        /* right-aligned on its own line too, once the row wraps */
+  padding: 3px 22px 3px 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  text-align: right;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+    linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 12px) 50%, calc(100% - 8px) 50%;
+  background-size: 4px 4px;
+  background-repeat: no-repeat;
+}
+.order-form .order-opt-select:hover:not(:disabled) { border-color: var(--border); background-color: var(--text-tint-1); }
+.order-form .order-opt-select:focus { border-color: var(--accent); outline: none; }
+.order-form .order-opt-select:disabled { cursor: default; }
+.order-form .order-opt-select option { background: var(--bg-card); color: var(--text); text-align: left; }
+/* ── Margin as the input (mocks page 7, V1) ───────────────────────
+   Label rows carry a note on the right (the margin's "of N in the wallet",
+   the size's "margin x leverage / price"); the margin slider reuses the size
+   slider's drawn track with the pool's free margin shaded on the rail and a
+   mark where the wallet takes over; the leverage slider runs 1x to the
+   engine's ceiling with the common stops ticked and the ceiling labelled
+   "Max"; on Margin the size block becomes a derived readout and the spot %
+   slider under it hides. */
+.order-lrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; min-height: 18px; }
+.order-form .order-lrow label { margin: 0; white-space: nowrap; }
+.order-note { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.order-lev-value { font-size: 13px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.order-margin-row .order-pct-rail { background: linear-gradient(to right, var(--accent-tint-3) var(--poolshare, 0%), var(--border) var(--poolshare, 0%)); }
+.order-margin-row .order-pct-track::after {
+  content: ""; position: absolute; top: 4px; bottom: 4px; width: 1px;
+  left: calc(var(--tw) / 2 + (100% - var(--tw)) * var(--poolfrac, 0));
+  background: var(--accent); opacity: var(--poolmark, 0);
+}
+.order-lev-row { --p: 0; --tw: 16px; }
+.order-lev-row .order-pct-track { height: 22px; }
+.order-lev-ticks { position: absolute; left: calc(var(--tw) / 2); right: calc(var(--tw) / 2); top: 0; bottom: 0; pointer-events: none; }
+.order-lev-ticks i { position: absolute; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%; background: var(--text-muted); }
+.order-lev-ticks i.on { background: var(--side); }
+.order-lev-ticks i.max { width: 8px; height: 8px; margin: -4px 0 0 -4px; background: transparent; border: 2px solid var(--text-muted); }
+.order-lev-ticks i.max.on { border-color: var(--side); }
+.order-lev-labels { position: relative; height: 15px; margin: 0 calc(var(--tw, 16px) / 2); }
+.order-lev-labels i { position: absolute; top: 0; font-style: normal; font-size: 10.5px; color: var(--text-muted); transform: translateX(-50%); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.order-lev-labels i.first { transform: none; }
+.order-lev-labels i.max { color: var(--text-dim); font-weight: 600; transform: translateX(-100%); }
+.order-lev-labels i.on { color: var(--text); }
+.order-panel:not([data-mode="margin"]) #order-size-sub { display: none; }
+.order-panel[data-mode="margin"] #order-pct-row,
+.order-panel[data-mode="margin"] #order-pct-max { display: none; }
+.order-panel[data-mode="margin"] .order-size-block { padding: 8px 10px 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-input); }
+.order-panel[data-mode="margin"] .order-size-block .order-field input { background: transparent; border-color: transparent; padding-left: 0; font-size: 18px; font-weight: 600; }
+.order-panel[data-mode="margin"] .order-size-block .order-field input:focus { border-color: var(--accent); }
+.order-panel[data-mode="margin"] .order-size-block .order-unit { right: 2px; }
+/* Margin-only rows (pool + leverage), inside the form's rhythm. */
+.margin-controls { display: flex; flex-direction: column; gap: 6px; }
 
 /* Position preview (notional / leverage / margin / est. entry / liq / slippage). */
 .margin-preview {
@@ -122,83 +463,23 @@
   font-weight: 500;
 }
 
-.order-form { display: flex; flex-direction: column; gap: 10px; }
-.order-form label { font-size: 12px; color: var(--text-dim); }
-.order-form input, .order-form select {
-  width: 100%;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  color: var(--text);
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
-}
-.order-form input:focus { border-color: var(--accent); outline: none; }
-/* Order-size slider (replaces the 25/50/75/100 buttons): the track fills
-   with an accent gradient up to --pct (set from JS) so the chosen fraction
-   reads at a glance; the datalist ticks mark the old quarter stops. The
-   range must override the .order-form input skin (width/padding/border). */
-.order-pct-slider-row {
+/* Commit: a hairline, the total (spot) or the preview (margin), the CTA. */
+.order-divider { border-top: 1px solid var(--border); }
+.order-total {
   display: flex;
-  align-items: center;
+  justify-content: space-between;
+  align-items: baseline;
   gap: 10px;
-  margin-top: 6px;
-}
-.order-pct-slider-row input[type="range"] {
-  -webkit-appearance: none;
-  appearance: none;
-  flex: 1;
-  width: auto;
-  height: 4px;
-  padding: 0;
-  border: none;
-  border-radius: 2px;
-  background: linear-gradient(to right, var(--accent) var(--pct, 0%), var(--border) var(--pct, 0%));
-  cursor: pointer;
-}
-.order-pct-slider-row input[type="range"]:focus { outline: none; }
-.order-pct-slider-row input[type="range"]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--bg-input);
-  box-shadow: 0 0 0 1px var(--border);
-  transition: transform 0.15s;
-}
-.order-pct-slider-row input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.15); }
-.order-pct-slider-row input[type="range"]::-moz-range-thumb {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--bg-input);
-  box-shadow: 0 0 0 1px var(--border);
-}
-.order-pct-slider-row input[type="range"]:disabled { opacity: 0.4; cursor: default; }
-.order-pct-slider-row input[type="range"]:disabled::-webkit-slider-thumb { transform: none; }
-.order-pct-readout {
-  min-width: 38px;
-  text-align: right;
-  font-size: 11px;
-  font-weight: 500;
+  font-size: 13px;
   color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
 }
-.order-total { font-size: 13px; color: var(--text-dim); }
-#order-total-value { color: var(--text); font-weight: 500; }
+#order-total-value { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 .order-bottom { margin-top: auto; }
-.order-available {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-}
-.order-available span { color: var(--text-dim); font-weight: 500; }
-/* "(incl. … to borrow)" hint on the Available line — dimmer than the figure. */
-.order-available .avail-borrow { color: var(--text-muted); font-weight: 400; }
-/* Second line on the Buy/Sell button when borrowing is involved
-   ("Buy" / "(borrow N ICPUSD)"). */
+/* The CTA states the order: "Buy 503.1 ICP" on the first line, the money
+   ("≈ 1,234.56 ICPUSD at 2.45" / "3× · $3,680 notional") beneath, in the
+   side's colour — the choice made at the top, repeated at the commitment. */
+#place-order-btn .po-main { display: block; }
+#place-order-btn:has(.btn-subline) { padding-top: 9px; padding-bottom: 9px; }
 .btn-subline {
   display: block;
   font-size: 11px;

@@ -136,8 +136,8 @@ if [ -z "$HISTORY_DAYS" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Law-5 tripwire (scripts/factory_guard.sh; fail-open without a seat
-# identity): a consumer seat never cold-starts the PRIMARY checkout's venue.
+# Law-5 tripwire (scripts/factory_guard.sh, local mode - fail-open without a
+# seat identity): a consumer seat never cold-starts the PRIMARY checkout's venue.
 . "$SCRIPT_DIR/factory_guard.sh"
 factory_primary_guard "cold_start.sh" local
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -156,6 +156,41 @@ ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
 warn() { echo -e "  ${YELLOW}!${NC} $1"; }
 err()  { echo -e "  ${RED}✗${NC} $1" >&2; }
 hdr()  { echo -e "\n${YELLOW}═══ $1 ═══${NC}"; }
+
+# ── Verify-with-Google on THIS venue ─────────────────────────────
+# The backend trusts only the origins in its frontend_origins env var, and
+# icp.yaml's LOCAL-DEV value names the primary's :8000 and vite's :3100 only
+# (128-char env-value cap). A seat venue serves the app from its OWN
+# OS-assigned gateway port, so its origin is never on that list: Internet
+# Identity's sign-in finish refuses it (#FrontendOriginMismatch) and the
+# Deposit page's unlock card fails closed - "operator: add
+# http://frontend.local.localhost:<port> to frontend_origins" - which is how
+# no seat venue could fund a play account (2026-11-03). So the deploy phase
+# appends the venue's own origin to the canister's list. It has to ride EVERY
+# deploy: `icp deploy` re-stamps the yaml value on each install (the CLI says
+# so - "overridden on next settings sync"), so a one-off hand edit dies with
+# the next upgrade. Idempotent (:8000 is already listed, so the primary's
+# venue is a no-op); `--identity anonymous` is the local controller (law 10);
+# the yaml pair plus one seat origin is 96 characters, inside the cap.
+stamp_local_frontend_origin() {
+  local port origin yaml_list
+  port=$(mdx_local_gateway || true); port=${port##* }
+  if [ -z "$port" ]; then
+    warn "frontend_origins: gateway port unknown - Verify-with-Google works on the :8000 origin only"
+    return 0
+  fi
+  origin="http://frontend.local.localhost:${port}"
+  yaml_list=$(sed -n 's/^[[:space:]]*frontend_origins:[[:space:]]*"\([^"]*\)".*/\1/p' icp.yaml | head -1 || true)
+  case ",${yaml_list}," in
+    *",${origin},"*) ok "frontend_origins: ${origin} already listed in icp.yaml"; return 0 ;;
+  esac
+  if icp canister settings update backend --identity anonymous \
+       --add-environment-variable "frontend_origins=${yaml_list:+${yaml_list},}${origin}" > /dev/null 2>&1; then
+    ok "frontend_origins: + ${origin} (Verify-with-Google and play deposits work on this venue)"
+  else
+    warn "frontend_origins: settings update failed - Verify-with-Google refuses this venue's origin (${origin}); by hand: icp canister settings update backend --identity anonymous --add-environment-variable \"frontend_origins=${yaml_list:+${yaml_list},}${origin}\""
+  fi
+}
 
 # ── Posture ↔ mode guard ─────────────────────────────────────────
 # The repo's default posture is #play (DEPLOY_MODE in src/backend/main.mo):
@@ -495,6 +530,10 @@ if $DO_DEPLOY; then
     icp canister call backend setAnthropicApiKey "(\"$ANTHROPIC_KEY\")" --identity anonymous > /dev/null 2>&1 \
       && ok "Anthropic key wired (assistant on Anthropic)" || warn "setAnthropicApiKey failed"
   fi
+  # This venue's own gateway origin into the backend's frontend_origins
+  # (the function's comment says why; re-applied on every deploy because the
+  # install re-stamps icp.yaml's list).
+  stamp_local_frontend_origin
 else
   hdr "Deploy (skipped)"
 fi

@@ -393,6 +393,52 @@ resolve_pin() {
 
 branch_worker() { git branch --show-current 2>/dev/null | tr '/' '-' | tr -d '[:space:]'; }
 
+# --- MULTI/DEX overlay: operator == claude-operator (same_principal) ---------
+# `claim --operator` stamps the literal `operator` and files the claim under
+# tasks/claimed/operator/ (the engine's spelling, kept as-is), while the
+# standing operator seat (.claude/worktrees/operator, branch claude/operator)
+# resolves as `claude-operator` - the flattened branch, which is what its
+# FACTORY_WORKER export or its .factory-worker pin says. Both spellings name
+# the ONE operator principal: factory_guard.sh and .githooks/pre-commit already
+# read them as one (`operator|claude-operator`), and so do the two law-3 belts
+# that compare a claim's holder with this seat - warn_owner_mismatch (done /
+# requeue) and merge_lock_claim_check (merge-lock acquire / merge-land --task).
+# Before this, every operator `done`/`requeue` warned and the belt REFUSED an
+# operator-claimed task until the operator exported FACTORY_WORKER=operator
+# (task 1793613786, 2026-11-02). Equal names are one principal too; nothing
+# else is - a foreign seat still warns, the belt still refuses.
+same_principal() {  # same_principal <a> <b>: 0 when a and b name the same principal
+  [ "$1" = "$2" ] && return 0
+  case "$1" in operator|claude-operator) case "$2" in operator|claude-operator) return 0 ;; esac ;; esac
+  return 1
+}
+
+# --- MULTI/DEX overlay: the operator seat is not a roster seat (operator_seat) ---
+# The standing operator seat (.claude/worktrees/operator, pinned claude-operator
+# so its claims and the subagents it spawns resolve an identity) is NOT a
+# consumer: the fleet doctor's pinned-worktree walk skips it before any verdict,
+# respawn, roster adoption or `seen` mark, and its ORPHANED pass then reads
+# every roster seat the walk did not see. The roster's two WRITERS - worker-pin
+# and handoff-clear's pin refresh, both through roster_register - had no
+# matching skip, so either command run in the operator tree wrote the row
+# `operator <path> claude-operator claude/operator <iso>` plus the factory-seat
+# tripwire, and every later doctor pass read it ORPHANED (FLEET-DEGRADED, a
+# bogus fleet-orphaned anchor, and only seat-retire - which removes the
+# worktree - drops a row); the hand-written pin was the only safe shape (task
+# 1793616271, 2026-11-02). ONE predicate now decides both sides, the doctor's
+# three arms unchanged: the pin reads operator|claude-operator, or the
+# worktree's basename is operator. seat-retire refuses by it too (task
+# 1793617638): off the roster, the operator tree was exactly the shape its
+# `git worktree list` fallback resolved - and removed. A row this principal
+# nonetheless holds (a pre-1793616271 writer, a hand edit, a roster restore)
+# is stale by construction: the doctor's ORPHANED pass drops it itself
+# (roster_drop_operator_row, task 1793621537) instead of reading it ORPHANED
+# with a remedy pair both halves of which refuse the operator seat.
+operator_seat() {  # operator_seat <worker> <seat-basename>: 0 when the pin or the basename names the operator seat
+  case "$1/$2" in operator/*|claude-operator/*|*/operator) return 0 ;; esac
+  return 1
+}
+
 # Non-fatal ownership check for requeue/done: a claimed task belongs to its
 # worker (law 3). These commands find their task BY ID across all workers on
 # purpose - the operator legitimately acts on any claim - so this only says so.
@@ -401,7 +447,7 @@ warn_owner_mismatch() {  # $1 = the claimed task file
   resolve_pin
   [ -n "$PIN_NAME" ] || return 0
   owner="$(basename "$(dirname "$1")")"
-  if [ "$owner" != "$PIN_NAME" ]; then
+  if ! same_principal "$owner" "$PIN_NAME"; then   # MULTI/DEX overlay: operator == claude-operator
     info "warning: this task is claimed by '$owner' but this seat is pinned as '$PIN_NAME' ($PIN_PATH) - law 3: a claimed task belongs to its worker"
   fi
   return 0
@@ -1502,7 +1548,8 @@ cmd_worker_pin() {  # write <worktree-root>/.factory-worker (the seat's boot ste
   # The seat is now KNOWN: register it on the fleet roster (the doctor's
   # memory of which seats exist - a vanished worktree reads ORPHANED instead
   # of silently dropping out of the count) and stamp the git admin dir
-  # tripwire. See the roster section.
+  # tripwire. See the roster section. (The operator seat is the exception:
+  # roster_register skips it and says so - MULTI/DEX overlay, operator_seat.)
   roster_register "$top" "$name"
   # The desktop app's keep sentinel: its untracked-dir GC keeps a worktree
   # carrying .worktree-keep before any age/clean check (the seat-root
@@ -3339,13 +3386,17 @@ cmd_seat_root() {  # seat-root [seat]: print the seat root (created on demand), 
 # 2026-09-16 - the seat-root section above.) So the doctor now REMEMBERS:
 #   - tasks/factory/fleet-roster: one seat per line,
 #     "<seat>\t<worktree>\t<worker>\t<branch>\t<registered-iso>", written by
-#     worker-pin (every seat's boot step, and handoff-clear's pin refresh),
+#     worker-pin (every seat's boot step, and handoff-clear's pin refresh;
+#     never for the operator seat - operator_seat, MULTI/DEX overlay),
 #     ADOPTED by fleet-doctor for any pinned worktree it enumerates that is
 #     not on it yet (so a running fleet converges on the doctor's first pass
 #     with no seat action - adoption only ever ADDS a seat whose worktree
-#     exists), and dropped ONLY by `seat-retire`. A roster seat whose
-#     worktree is missing reads ORPHANED and the summary line reads
-#     FLEET-DEGRADED n missing of N - never FLEET-OK.
+#     exists), and dropped ONLY by `seat-retire` - except a row for the
+#     OPERATOR principal, stale by construction (no writer mints one and
+#     seat-retire refuses that seat): the doctor's ORPHANED pass drops it
+#     (roster_drop_operator_row; MULTI/DEX overlay, task 1793621537). A
+#     roster seat whose worktree is missing reads ORPHANED and the summary
+#     line reads FLEET-DEGRADED n missing of N - never FLEET-OK.
 #   - tasks/factory/fleet-orphaned: "<seat>\t<first-missing-iso>" - the FIRST
 #     pass that saw the worktree missing, the forensic anchor (with the
 #     seat's parent dir's mtime, which brackets the deletion, and whether
@@ -3385,6 +3436,11 @@ roster_register() {  # roster_register <worktree-top> <worker> [branch]: add or 
   local top="$1" worker="$2" branch="${3:-}" seat gitdir rf tmp
   top="$(cd "$top" 2>/dev/null && pwd -P || printf '%s' "$top")"
   seat="$(basename "$top")"
+  # The operator seat is pinned but never a roster seat: no row, no tripwire
+  # (the doctor's walk skips it before marking it seen, so its row could only
+  # ever read ORPHANED). Said on stderr, so worker-pin / handoff-clear there
+  # are not silent about what they did not do.
+  if operator_seat "$worker" "$seat"; then info "operator seat: not a roster seat (MULTI/DEX overlay)"; return 0; fi   # MULTI/DEX overlay: operator_seat
   # Only a LINKED worktree is a seat the doctor can enumerate (it walks
   # `git worktree list` of the primary); a standalone checkout pinned by
   # hand would sit on the roster as a permanent orphan, so it is not listed.
@@ -3402,13 +3458,47 @@ roster_register() {  # roster_register <worktree-top> <worker> [branch]: add or 
   printf '%s\n' "$seat" > "$gitdir/factory-seat" 2>/dev/null || true
 }
 
-roster_remove() {  # drop <seat>'s row (seat-retire only)
+roster_remove() {  # drop <seat>'s row (seat-retire; and the doctor's roster_drop_operator_row - MULTI/DEX overlay, task 1793621537)
   local seat="$1" rf tmp
   rf="$(roster_path)"
   [ -f "$rf" ] || return 0
   tmp="$rf.$$"
   { grep -v "^$seat	" "$rf" || true; } > "$tmp" && mv -f "$tmp" "$rf" || rm -f "$tmp"
   orphaned_forget "$seat"
+}
+
+# --- MULTI/DEX overlay: the doctor drops a stale operator-principal roster row (roster_drop_operator_row) ---
+# Since 1793616271 no writer mints a roster row for the operator principal
+# (roster_register skips operator_seat) and since 1793617638 seat-retire - the
+# only other roster_remove caller - refuses that seat, so a row that exists
+# anyway (a pre-1793616271 factory.sh, a hand edit, a roster backup restored)
+# had NO engine-side dropper: the doctor's walk skips the operator tree before
+# marking it seen, its ORPHANED pass read the row ORPHANED + FLEET-DEGRADED on
+# every pass and minted a fleet-orphaned anchor, and the remedy pair it printed
+# was a dead end for it (seat-recreate refuses while the tree exists and mints
+# CONSUMER seats; seat-retire refuses the operator principal) - a hand edit of
+# tasks/factory/fleet-roster was the only cure (task 1793621537, 2026-11-02).
+# The row cannot be legitimate ("no row by design"), so the ORPHANED pass
+# treats it as stale by construction, by the SAME predicate the walk,
+# roster_register and seat-retire share: dropped through roster_remove (which
+# forgets any anchor an earlier pass left), one stderr line, one fleet-log
+# record - never an ORPHANED verdict, never counted missing, never an anchor.
+# --dry-run touches nothing: it says "would drop" and leaves the row, the
+# verdict and the count withheld the same way, so the dry pass reads as the
+# live one will. (Under launchd stderr is the log too - the plist routes both
+# streams there - so the record sits beside the stderr line; by hand the
+# record is what reaches the log.)
+roster_drop_operator_row() {  # roster_drop_operator_row <seat> <worker> <path> <branch> <dry>: 0 = the operator principal's row, handled (withhold the ORPHANED verdict); 1 = not its row
+  local seat="$1" worker="$2" rpath="$3" rbranch="$4" dry="$5"
+  operator_seat "$worker" "$seat" || return 1
+  if [ "$dry" = true ]; then
+    info "roster: would drop stale operator-principal row $seat - dry-run (MULTI/DEX overlay)"
+  else
+    roster_remove "$seat"
+    info "roster: dropped stale operator-principal row $seat (MULTI/DEX overlay)"
+    fleet_log_append "fleet-doctor $(now_iso) $seat: dropped stale operator-principal roster row (worker $worker, worktree $rpath, branch ${rbranch:-?}) - the operator seat is not a roster seat (MULTI/DEX overlay)"
+  fi
+  return 0
 }
 
 roster_row() {  # roster_row <seat> -> the row, or nothing
@@ -3656,13 +3746,17 @@ transcript_dir_for() {  # transcript_dir_for <cwd path> -> the CLI's transcript 
 transcript_newest() {  # transcript_newest <dir> -> the newest top-level session transcript (mtime), or nothing
   local d="$1" listing
   [ -d "$d" ] || return 0
-  listing="$(ls -t "$d"/*.jsonl 2>/dev/null || true)"
+  local -a files=("$d"/*.jsonl)   # MULTI/DEX overlay: nullglob-safe (task 1793664290) - with no top-level transcript, nullglob (main) emptied the glob and this ran as a bare `ls -t` of the CWD, so the listing held the cwd's entry names; upstream has the same line - carry this
+  [ ${#files[@]} -gt 0 ] || return 0
+  listing="$(ls -t "${files[@]}" 2>/dev/null || true)"
   printf '%s' "${listing%%$'\n'*}"
 }
 transcript_named() {  # transcript_named <dir> <session-name> -> the newest transcript (of the newest 40) whose tail carries the session's agent-name line, or nothing
   local d="$1" sname="$2" f n=0 listing
   [ -d "$d" ] || return 0
-  listing="$(ls -t "$d"/*.jsonl 2>/dev/null || true)"
+  local -a files=("$d"/*.jsonl)   # MULTI/DEX overlay: nullglob-safe (task 1793664290) - with no top-level transcript, nullglob (main) emptied the glob and this ran as a bare `ls -t` of the CWD, so the listing held the cwd's entry names; upstream has the same line - carry this
+  [ ${#files[@]} -gt 0 ] || return 0
+  listing="$(ls -t "${files[@]}" 2>/dev/null || true)"
   [ -n "$listing" ] || return 0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -3956,6 +4050,16 @@ cmd_seat_retire() {
     branch="$(git -C "$path" branch --show-current 2>/dev/null || true)"; [ -n "$branch" ] || branch="?"
     info "seat-retire: '$seat' is not on the roster - resolved worktree $path, worker $worker, branch $branch from git"
   fi
+  # MULTI/DEX overlay: the OPERATOR seat is wound up by hand, never by this command (task 1793617638).
+  # Both arms above have resolved worker and branch. Since 1793616271 the operator seat is OFF the
+  # roster by design, so it is exactly the off-roster pinned shape the git fallback resolves:
+  # `seat-retire operator` from the primary reached .claude/worktrees/operator with only the live-cwd
+  # check (absent after a handoff, an app restart or a reboot) in the way. Same predicate as the
+  # doctor's walk and roster_register; no FACTORY_FORCE override (the PRIMARY refusal below has none
+  # either); the plan prints only after this, so --dry-run refuses the same way.
+  if operator_seat "$worker" "$seat"; then   # MULTI/DEX overlay: operator_seat
+    die "seat-retire refused: '$seat' is the OPERATOR seat (pin $worker) - it is wound up by hand, never by this command (MULTI/DEX overlay)"
+  fi
   [ "$path" != "$primary" ] || die "seat-retire refused: $seat resolves to the PRIMARY checkout (law 5) - there is no override"
   here="$(pwd -P 2>/dev/null || pwd)"
   if [ "$here" = "$path" ] || [ "${here#"$path"/}" != "$here" ]; then
@@ -4201,8 +4305,10 @@ EOF
     [ -f "$wt/$PIN_FILE" ] || continue        # unpinned worktrees are not seats
     # MULTI/DEX overlay: the OPERATOR seat is pinned (claude-operator) so its
     # claims resolve, but it is not a consumer - no verdict, never respawned
-    # as an executor (SKILL.md Operator seat).
-    case "$(head -1 "$wt/$PIN_FILE" 2>/dev/null | tr -d '[:space:]')/$(basename "$wt")" in operator/*|claude-operator/*|*/operator) continue ;; esac
+    # as an executor (SKILL.md Operator seat). operator_seat is the ONE
+    # predicate roster_register shares, so the roster can never hold a row
+    # this walk would not mark seen (task 1793616271).
+    if operator_seat "$(head -1 "$wt/$PIN_FILE" 2>/dev/null | tr -d '[:space:]')" "$(basename "$wt")"; then continue; fi   # MULTI/DEX overlay: operator_seat
     n_seat=$((n_seat+1))
     seat="$(basename "$wt")"
     worker="$(head -1 "$wt/$PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
@@ -4329,10 +4435,15 @@ EOF
   # no longer a pinned linked worktree). Never respawned here (no tree to
   # boot into): the line carries everything the operator needs to decide
   # between seat-recreate and seat-retire, plus the forensic anchors.
+  # (MULTI/DEX overlay, task 1793621537: a row for the OPERATOR principal -
+  # the one pinned tree the walk skips - never reaches the verdict: it is
+  # stale by construction and roster_drop_operator_row drops it first, so
+  # the remedy pair below is sound for every row that does reach it.)
   for seat in $(roster_seats); do
     case "$seen" in *" $seat "*) continue ;; esac
     row="$(roster_row "$seat")"
     rpath="$(printf '%s' "$row" | cut -f2)"; worker="$(printf '%s' "$row" | cut -f3)"; rbranch="$(printf '%s' "$row" | cut -f4)"
+    if roster_drop_operator_row "$seat" "$worker" "$rpath" "$rbranch" "$dry"; then continue; fi   # MULTI/DEX overlay: a stale operator-principal row is dropped, never ORPHANED (task 1793621537)
     n_orphan=$((n_orphan+1))
     first="$(orphaned_mark "$seat")"
     pids="$(name_pids "$prefix-executor-$seat")"
@@ -4730,7 +4841,24 @@ EOF
 # acking one broadcast it would wake every parked poll ten times for no
 # work. Only the signal FILES (*.md - an order landing, appending, or being
 # deleted) count; the ledger dir's own mtime never enters the listing.
-watch_sig() { { ls -Rl "$QUEUE" "$CLAIMED" "$ARCHIVE"; ls -l "$SIGNAL"/*.md; } 2>/dev/null | cksum; }
+# The signal half is nullglob-SAFE (task 1793664290). main() runs `shopt -s
+# nullglob`, so with no signal standing - the normal state - the former
+# `ls -l "$SIGNAL"/*.md` lost its operand and ran as a bare `ls -l` of the
+# watch PROCESS'S cwd: the seat's worktree root, the primary's for the
+# prioritizer. Every top-level change there - an npm build rewriting dist/
+# and node_modules/, git merge main touching a root file, an editor save of
+# icp.yaml - fired CHANGED with nothing in queue/claimed/archive/signal
+# moved: a full-context model turn per false wake (four empty prioritizer
+# wakes in an hour on 2026-11-02, each coinciding with a frontend build). The
+# matches are gathered into an array first and ls runs only when there is at
+# least one (bash 3.2: local -a is fine; the if keeps the group's status 0
+# with no signal, as the bare ls's was, so pipefail sees what it saw). The
+# listing itself is byte-identical to before whenever a signal stands.
+watch_sig() {   # MULTI/DEX overlay: nullglob-safe signal half (task 1793664290) - the one-line form stands upstream in open-saas-ng too; carry this
+  local -a sig_files=("$SIGNAL"/*.md)
+  { ls -Rl "$QUEUE" "$CLAIMED" "$ARCHIVE"
+    if [ ${#sig_files[@]} -gt 0 ]; then ls -l "${sig_files[@]}"; fi; } 2>/dev/null | cksum
+}
 
 # The watch obituary (task 1788458457). A backgrounded watch that dies by
 # signal leaves the harness's bare "[killed]" marker in its output file, which
@@ -4896,7 +5024,7 @@ merge_lock_claim_check() {  # merge_lock_claim_check <id>: 0 = claimed by this s
     fi
   fi
   me="$(hosted_seat_worker)"
-  if [ -n "$me" ] && [ -n "$holder" ] && [ "$holder" != "$me" ]; then
+  if [ -n "$me" ] && [ -n "$holder" ] && ! same_principal "$holder" "$me"; then   # MULTI/DEX overlay: operator == claude-operator
     echo "merge-lock refused: task $id is claimed by '$holder' and this seat resolves as '$me' (FACTORY_WORKER > .factory-worker pin > the cwd branch) - law 3: a claimed task belongs to its worker; the operator acting on another seat's claim acquires without --task"
     return 1
   fi
@@ -5250,6 +5378,10 @@ factory.sh - the software-factory task queue (.claude/skills/mdex-software-facto
                                     desktop app's keep sentinel (its 30-min untracked-dir GC over
                                     .claude/worktrees/ removed idle seats: task 1789581979) - the belt for
                                     a seat still at that LEGACY location (named on stderr).
+                                    The OPERATOR seat (pin operator|claude-operator, or basename operator)
+                                    gets the pin + sentinel only, never a roster row: the doctor's walk
+                                    skips it, so its row could only read ORPHANED ("operator seat: not a
+                                    roster seat" on stderr; MULTI/DEX overlay, task 1793616271).
                                     DUPLICATE-SESSION (task 1789588684): refuses when ANOTHER live process
                                     carries this session's --name and is OLDER (the caller's own tree
                                     exempt; a mid-exit predecessor is re-checked after FACTORY_DUP_GRACE_S,
@@ -5527,7 +5659,14 @@ factory.sh - the software-factory task queue (.claude/skills/mdex-software-facto
                                     out: every respawn held, the one-login remedy on the line). The
                                     roster (tasks/factory/fleet-roster) is written by
                                     worker-pin, ADOPTS any pinned worktree the doctor enumerates that is
-                                    not on it yet, and is dropped only by seat-retire. REPORT-ONLY by
+                                    not on it yet, and is dropped only by seat-retire - except a row for
+                                    the OPERATOR principal (pin operator|claude-operator or basename
+                                    operator; stale by construction: no writer mints one since
+                                    1793616271 and seat-retire refuses that seat), which the pass itself
+                                    drops - "roster: dropped stale operator-principal row <seat>" on
+                                    stderr + a fleet-log record, never an ORPHANED verdict, never counted
+                                    missing, never a fleet-orphaned anchor; --dry-run says "would drop"
+                                    and leaves it (MULTI/DEX overlay, task 1793621537). REPORT-ONLY by
                                     default; --respawn (or FACTORY_FLEET_RESPAWN=1 - operator opt-in)
                                     writes a takeover handoff (with the COMPLETE/PARTIAL/ABSENT triage
                                     note when a claim is held), kills ONLY the pids carrying the seat's
@@ -5558,7 +5697,11 @@ factory.sh - the software-factory task queue (.claude/skills/mdex-software-facto
                                     always keeps), the handoff file, the roster row, a line in the
                                     fleet-doctor log (FACTORY_FLEET_LOG overrides ~/Library/Logs/<prefix>-
                                     fleet-doctor.log). Retiring an ORPHANED seat skips the tree steps.
-                                    Refuses the primary and refuses to run from inside the seat
+                                    Refuses the primary, refuses to run from inside the seat, and REFUSES
+                                    the OPERATOR seat (pin operator|claude-operator or basename operator -
+                                    operator_seat, the doctor's predicate): it is wound up by hand, never
+                                    by this command; --dry-run refuses the same way and FACTORY_FORCE is no
+                                    override (MULTI/DEX overlay, task 1793617638)
   drill-worktree-prune [--dry-run]  HYGIENE door (task 1791286192; from any worktree, acts on the PRIMARY's
                                     registry): remove the abandoned upgrade-drill scratch worktrees - the
                                     REGISTERED git worktrees under this project's Claude scratchpads
@@ -5607,6 +5750,8 @@ factory.sh - the software-factory task queue (.claude/skills/mdex-software-facto
                                     tasks/claimed/<worker>/, hosted the canister's state), so a requeue
                                     that landed while you worked stops the merge instead of landing
                                     behind it. The operator acting on another seat's claim omits --task;
+                                    on its OWN claims (stamped 'operator') it acquires resolving as either
+                                    operator or claude-operator - one principal (MULTI/DEX overlay).
                                     FACTORY_FORCE=1 turns the refusal into a warning
   merge-lock release [label]        release: the label must be the owner's (FACTORY_FORCE=1 overrides)
   merge-lock status                 the holder and the age of the hold

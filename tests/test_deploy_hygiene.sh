@@ -5556,8 +5556,30 @@ H34_LM=$(mo_code < src/backend/lib/LiquidityManager.mo)
 src_has   "§6au: ...via the exits-only pool adjuster (balance shrink, no wallet caps)"      "$H34_LM" 'public func adjustPoolOrders('
 src_has   "§6au: ...whose shrink skips the named entries"                                   "$H34_LM" 'if (OrderBook.isOpen(o) and not skip(o)) {'
 H34_CLAMP=$(mo_func src/backend/main.mo "func clampToInitialMargin(" | mo_code)
-src_has   "§6au: the release clamp scores a pool's re-levering excess as BORROWED at the fill (buy)"  "$H34_CLAMP" 'case (?_, #buy)   { haircut - (Fixed.mul(qp, Types.INITIAL_HEALTH_RATIO, true) : Int) };'
-src_has   "§6au: ...(sell: the base debt valued UP at the mark)"                            "$H34_CLAMP" 'case (?_, #sell)  { (qp : Int) - (Fixed.mul(oracle, Types.INITIAL_HEALTH_RATIO, true) : Int) };'
+# Task 1793732895: the per-unit inequality moved out of the clamp into
+# BorrowEngine.fillDeltaPerUnit (+ fillHeadroom / fillRoom), the ONE source
+# previewOpenPosition shares with the release — the arm literals are pinned
+# THERE, and both call sites are pinned here so the two can never drift again.
+H34_FILL=$(mo_func src/backend/lib/BorrowEngine.mo "func fillDeltaPerUnit(" | mo_code)
+[ -n "$H34_FILL" ] || _fail "§6au: could not extract BorrowEngine.fillDeltaPerUnit()"
+src_has   "§6au: the release clamp scores a pool's re-levering excess as BORROWED at the fill (buy)"  "$H34_FILL" 'case (true, #buy)   { haircut - (Fixed.mul(qp, Types.INITIAL_HEALTH_RATIO, true) : Int) };'
+src_has   "§6au: ...(sell: the base debt valued UP at the mark)"                            "$H34_FILL" 'case (true, #sell)  { (qp : Int) - (Fixed.mul(oracle, Types.INITIAL_HEALTH_RATIO, true) : Int) };'
+src_has   "§6au: ...and the clamp takes its per-unit delta from that shared function"      "$H34_CLAMP" 'let deltaPerUnit : Int = BorrowEngine.fillDeltaPerUnit(Option.isSome(poolIdOf), side, oracle, baseLtv, qp);'
+src_has   "§6au: ...its headroom too"                                                       "$H34_CLAMP" 'let headroom : Int = BorrowEngine.fillHeadroom(h.collateralUsd, h.debtUsd);'
+src_has   "§6au: ...and its room"                                                           "$H34_CLAMP" 'let maxExcess = switch (BorrowEngine.fillRoom(headroom, deltaPerUnit)) { case (?q) { q }; case null { excessQty } };'
+H34_PREVIEW=$(mo_func src/backend/main.mo "func previewOpenPosition(" | mo_code)
+[ -n "$H34_PREVIEW" ] || _fail "§6au: could not extract previewOpenPosition()"
+# Task 1793733917: the probe and the verdict run for `side` as given — the
+# #buy-only gate of 1793732895 is gone (a 20 % BTC market short previewed
+# canOpen = true at 2.75× while the release's post-sale rule, qp − 1.25·oracle,
+# cut it to 2.2×); the clamp's #sell arm already carried the right delta, so
+# maxSizeBase = min(borrow room, clamp room) now reads for either side and the
+# refusal names the side.
+src_has   "§6au: previewOpenPosition judges EITHER side by the release clamp itself (the capacity probe)"  "$H34_PREVIEW" 'let probed = clampToInitialMargin(poolP, baseToken, side, probe, execPrice);'
+src_has   "§6au: ...and the requested size by the same clamp (the release's literal verdict)" "$H34_PREVIEW" 'let verdict = if (probe == sizeBase) { probed } else { clampToInitialMargin(poolP, baseToken, side, sizeBase, execPrice) };'
+src_lacks "§6au: ...no #buy-gated clamp call survives in the preview (1793733917)"           "$H34_PREVIEW" 'clampToInitialMargin(poolP, baseToken, #buy,'
+src_has   "§6au: ...and the refusal names the side"                                          "$H34_PREVIEW" 'case (#buy) { "a long" }; case (#sell) { "a short" }'
+src_has   "§6au: ...reporting min(borrow room, clamp room) as the capacity"                 "$H34_PREVIEW" 'if (room < maxSizeBase) { maxSizeBase := room };'
 src_has   "§6au: ...and a debt-free POOL no longer skips the gate (its first entry IS the borrow)" "$H34_CLAMP" 'if (h.debtUsd == 0 and Option.isNull(poolIdOf)) {'
 src_has   "§6au: getApiDoc says leverage is borrowed at the fill"                           "$H06_MAIN" 'LEVERAGE IS BORROWED AT THE FILL, never at placement'
 src_has   "§6au: test_initial_margin §G1 pins zero debt for a staged entry"                 "$(uncommented tests/test_initial_margin.sh)" 'ok "G1: STAGED entry → pool debt exactly 0 (no placement-time borrow)"'

@@ -432,3 +432,24 @@ to re-derive:
    The `#play` negative control cannot be driven in a browser without a
    `#play` backend (`appState` is a module binding) -
    `tests/frontend_security.test.mjs` §O6 is the proof.
+
+## Verify-with-Google (play deposits) on a seat venue
+
+The backend admits a play deposit only for a Google-verified Internet Identity, and
+the sign-in finish accepts only the origins in its `frontend_origins` canister env var.
+`icp.yaml` lists the primary's `http://frontend.local.localhost:8000` and vite's
+`http://localhost:3100`, and every install re-stamps that list - so a seat venue,
+served from its own OS-assigned gateway port, refused verification with
+`#FrontendOriginMismatch` and the Deposit page's unlock card read "operator: add
+http://frontend.local.localhost:<port> to frontend_origins" (2026-11-03; before
+that no seat venue could fund a play account through the browser).
+
+Since that date `cold_start.sh`'s deploy phase appends the venue's own origin
+(`stamp_local_frontend_origin`: `icp canister settings update backend
+--add-environment-variable "frontend_origins=<yaml list>,http://frontend.local.localhost:<port>"
+--identity anonymous`) after every deploy - the re-stamp is why it must ride the deploy
+and not a hand edit. Read it back with `icp canister status backend --identity anonymous
+| grep frontend_origins`. The `WARN ... overridden on next settings sync` the CLI prints
+is the expected shape: the next deploy re-stamps the yaml list and the next cold_start
+re-appends. A venue deployed before this landed needs one cold_start (or the settings
+update above by hand) before "Sign in using Google" works on it.

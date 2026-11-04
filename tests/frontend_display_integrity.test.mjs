@@ -4688,13 +4688,27 @@ console.log("\n§N4. Home page — #home routed, the logo is its anchor, the emp
         && (body.match(/\.launch-rest\b/g) || []).length === 2 && !/^\.launch-banner(\.expanded)? \.launch-rest/m.test(body));
       check("stats.css: the expand control is display: none outside any media query (desktop never sees it)",
         /^\.launch-banner \.launch-expand \{ display: none; \}$/m.test(body));
-      check("stats.css: ONE @media (max-width: 480px) block carries the collapse — a .launch-banner::after clearfix (the strip CONTAINS its floated ✕ when the last line is full instead of letting it hang over the header; not display: flow-root, which the inline display renderLaunchBanner sets would beat), .launch-rest display none, .launch-banner.expanded .launch-rest display inline, .launch-expand display inline-block",
+      check("stats.css: ONE @media (max-width: 480px) block carries the collapse — .launch-rest display none, .launch-banner.expanded .launch-rest display inline, .launch-expand display inline-block — and NO clearfix: the 1793575027 .launch-banner::after is gone (the ✕ no longer floats on phones, so there is nothing to contain), no clear: both, no flow-root",
         mq !== null && (body.match(/@media \(max-width: 480px\)/g) || []).length === 1
-        && /^  \.launch-banner::after \{ content: ""; display: block; clear: both; \}$/m.test(mq[1])
-        && !/flow-root/.test(mq[1])
+        && !/::after|clear: both|flow-root/.test(mq[1])
         && /^  \.launch-banner \.launch-rest \{ display: none; \}$/m.test(mq[1])
         && /^  \.launch-banner\.expanded \.launch-rest \{ display: inline; \}$/m.test(mq[1])
         && /^  \.launch-banner \.launch-expand \{\n(?:    [^\n]*\n)*    display: inline-block;/m.test(mq[1]));
+      // Task 1793577015 (operator option 1, 2026-11-02): on phones the ✕ sits in
+      // the strip's top-right corner. The strip is the positioning context with
+      // SYMMETRIC 32px side padding (the centred text stays centred; the text
+      // column narrows to 336px at 400px) and the control is absolutely placed
+      // at top 7px / right 10px, float and margin cleared — the floated ✕ took a
+      // 7th line of its own when the strip was expanded at 400px. Phones only:
+      // desktop and the fuel/oracle banners keep the shared end-of-text float.
+      check("stats.css: inside the ≤480px block the strip is the positioning context with SYMMETRIC 32px side padding — .launch-banner { position: relative; padding-right: 32px; padding-left: 32px; } (one line; the centred text stays centred)",
+        mq !== null && /^  \.launch-banner \{ position: relative; padding-right: 32px; padding-left: 32px; \}$/m.test(mq[1]));
+      check("stats.css: inside the ≤480px block the ✕ is absolutely placed in the strip's top-right corner — .launch-banner .banner-dismiss { position: absolute; top: 7px; right: 10px; float: none; margin: 0; } (one line)",
+        mq !== null && /^  \.launch-banner \.banner-dismiss \{ position: absolute; top: 7px; right: 10px; float: none; margin: 0; \}$/m.test(mq[1]));
+      check("stats.css: the corner ✕ is phones-only — .launch-banner .banner-dismiss is spelled ONCE in the file, inside the media query; the desktop .launch-banner rule carries no position; the shared .banner-dismiss rule (the fuel/oracle banners' end-of-text ✕) still opens with float: right outside any media query",
+        mq !== null && (body.match(/\.launch-banner \.banner-dismiss\b/g) || []).length === 1 && /\.launch-banner \.banner-dismiss\b/.test(mq[1])
+        && !/^\.launch-banner \{[^}]*position:/m.test(body)
+        && /^\.banner-dismiss \{\n  float: right;/m.test(body));
       check("stats.css: the control is a text button in the accent — background none, border none, font inherit, color var(--accent), cursor pointer, nowrap — with a :focus-visible ring in the accent (keyboard operable, visibly)",
         mq !== null && /\.launch-banner \.launch-expand \{[^}]*background: none;[^}]*border: none;[^}]*font: inherit;[^}]*color: var\(--accent\);[^}]*cursor: pointer;[^}]*white-space: nowrap;[^}]*\}/.test(mq[1])
         && /\.launch-banner \.launch-expand:focus-visible \{ outline: 2px solid var\(--accent\); outline-offset: 2px; \}/.test(mq[1]));

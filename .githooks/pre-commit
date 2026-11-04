@@ -8,14 +8,18 @@
 #      primary (law 5, .claude/skills/mdex-software-factory/SKILL.md).
 #   C. the no-identity belt (open-saas task 1791133471, the 1dc9df2fa breach
 #      class): a commit on the primary's main with NO seat identity while
-#      any seat is pinned is refused too - a drifted executor subagent
-#      commits exactly like that. The operator's direct round declares
-#      itself with FACTORY_DIRECT=1 (or the identity 'operator').
+#      any CONSUMER seat is pinned is refused too - a drifted executor
+#      subagent commits exactly like that. The operator's direct round
+#      declares itself with FACTORY_DIRECT=1 (or the identity 'operator' /
+#      'claude-operator'). The operator seat's own pin (claude-operator at
+#      .claude/worktrees/operator) is NO running factory to the belt - the
+#      fleet doctor's overlay skip and scripts/factory_guard.sh's belt read
+#      it the same way (task 1793617711).
 #
 # Guarded repo: the PRIMARY checkout only (git-dir == common-dir). Any
 # resolution failure fails OPEN. FACTORY_FORCE=1 overrides with a warning.
-# Wired by `git config core.hooksPath .githooks` (tests/test_deploy_hygiene.sh
-# pins the wiring and the refusal).
+# Wired by `git config core.hooksPath .githooks` (scripts/factory-selftest.sh
+# pins the wiring and the refusals in a scratch primary, guard C included).
 set -u
 # ---- B. the law-5 primary-checkout guard (+ C, the no-identity belt) --------
 # Guarded repo: the PRIMARY checkout only. In the primary, git-dir and the
@@ -51,11 +55,16 @@ if [ -z "$seat" ] || [ "$seat" = "operator" ] || [ "$seat" = "claude-operator" ]
   [ -n "$top" ] || exit 0
   pins=""
   for f in "$top"/.factory/seats/*/.factory-worker "$top"/.claude/worktrees/*/.factory-worker; do
-    [ -f "$f" ] && pins="$pins $(basename "$(dirname "$f")")"
+    [ -f "$f" ] || continue
+    case "$(head -1 "$f" 2>/dev/null | tr -d '[:space:]')" in operator|claude-operator) continue ;; esac   # the operator seat's pin: no running factory (factory_guard.sh's belt and the fleet doctor agree)
+    pins="$pins $(basename "$(dirname "$f")")"
   done
-  # Linked worktrees anywhere else (a seat minted at an unusual path).
+  # Linked worktrees anywhere else (a seat minted at an unusual path) - the
+  # same list factory_guard.sh's belt reads, so a seat is a running factory
+  # to BOTH belts or to neither (task 1793617711).
   while IFS= read -r w; do
     [ -n "$w" ] && [ "$w" != "$top" ] && [ -f "$w/.factory-worker" ] || continue
+    case "$(head -1 "$w/.factory-worker" 2>/dev/null | tr -d '[:space:]')" in operator|claude-operator) continue ;; esac
     case " $pins " in *" $(basename "$w") "*) ;; *) pins="$pins $(basename "$w")" ;; esac
   done <<EOF
 $(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')

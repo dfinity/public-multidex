@@ -10,6 +10,93 @@ only on a breaking change. Bot authors watch the second number; everyone else th
 Entries are written in user terms. The design detail lives in the documents each entry
 cites.
 
+## 1.80.0 — 2026-11-04
+
+Everything landed since the 1.75 build the live targets took on 2026-11-01 (`main` 1851081):
+the operator's Place Order round of 2026-11-02/03, the margin preview's agreement with the
+release clamp, and the round that landed on 2026-11-01/02 after that build was cut — the
+launch notice, the fuel banner, the sign-in library, the archive's tolerance of a missing
+segment — which rode the 1.75 public drop of 2026-11-02 and reaches the live targets with this
+release. A minor: nothing in the public API changed (apiVersion stays 6.0.0).
+
+Source: the merge commits on `main` (`git log --first-parent 1851081..`), one task id per
+item; the operator's frontend round landed as direct commits and carries none ("operator
+round"). The Docs → Change log carries the same list in the app.
+
+- **The Place Order box reads top-down, as a trader decides** (operator round, 2026-11-02).
+  Spot | Margin are the header's tabs, Buy | Sell (Long | Short on Margin) is the one coloured
+  surface, the money rows — "Available to trade" and the resting orders; on Margin the wallet
+  margin, the buying power and the pool's free margin — come before the inputs they constrain,
+  Limit | Market sits on the price field it swaps, the price field offers Mid / Bid / Ask from
+  the live book, the unit sits inside the size field, the size slider is a drawn track with
+  quarter stops, an editable % box and a "100% = N ICP" line, expiry, max slippage and margin
+  pool are one-line rows, and the button states the order it will place. The frame is
+  feedback: the outline takes the side's hue (mint buy, clay sell) and Margin adds a second
+  hairline inside the edge; the option rows wrap instead of overflowing, so the box never
+  grows a sideways scrollbar at any width.
+- **The Margin ticket takes the collateral first** (operator round, 2026-11-03). A Margin
+  field and slider over everything you can commit — the pool's free margin first, shaded on
+  the rail, then the wallet — and a Leverage slider from 1× up to the ceiling the engine
+  allows for that margin, labelled "Max N.NNx"; the Size is derived (margin × leverage ÷
+  price) and still typable, back-solving the margin. The ceiling is the engine's own answer
+  (`previewOpenPosition`), never a table in the page, and the leverage chips are gone. The
+  preview and the order use the margin you set, the derived size is floored to the asset's
+  precision (no more "Need $22,112 margin — only $22,112 in wallet"), and a real shortfall is
+  stated to the cent.
+- **The slider's 100% is what the wallet can actually reserve** (operator round, 2026-11-03).
+  A market buy is sized at the slippage cap plus the taker fee — the figure the engine
+  reserves — a limit buy at its price plus the fee, every size on the spendable balance (net
+  of resting orders, which "Available to trade" now shows), and the hint says what the figure
+  is net of: "100% = N ICP after the 5% slippage cap and the 0.10% fee". A market long's
+  leverage note explains its lower ceiling ("ceiling at the 5% slippage cap — a limit order at
+  the mark allows more"), and the ceiling keeps two decimals (Max 1.96x, not 1.9x).
+- **Quantities carry thousands separators** (operator round, 2026-11-03). "Long 108,265.4
+  ICP", "100% = 2,012.4 ICP" and the resting-orders row read like the money figures beside
+  them; the typed Size field keeps raw digits, and the order book and trades stay ungrouped.
+- **The preview judges a long and a short by the clamp the fill is held to** (1793732895,
+  1793733917). `previewOpenPosition`'s `maxSizeBase` is the smaller of what the vault can lend
+  and what the opening-health bar allows at the worst-case price, for either side, and
+  `canOpen` is false past it with the side named — before, a long's preview promised what the
+  release then clamped. Docs → Margin (§5 and the quick reference) and `getApiDoc` state the
+  ceilings the engine enforces today, 1 / (1.25 − LTV): BTC/ETH ≈2.9×, SOL ≈2.5×, ICP ≈2.2×.
+- **The launch notice** (1793573913, 1793575027, 1793577015). The strip above the header
+  carries the operator's launch text (shown once more to anyone who had dismissed the old
+  one); on phones (≤480 px) it collapses to its first sentence and the story link with a
+  keyboard-operable Read more / Show less, and its ✕ sits in the strip's top-right corner
+  instead of trailing the text.
+- **The fuel banner** (1793572114, 1793575028, 1793575742). The freeze countdown shows only
+  inside 24 hours (System → Canisters keeps its 72-hour view), the treasury sentence matches
+  the venue's posture — on a play venue it says the self-funding treasury holds no real
+  assets — and is painted right the first time rather than after the next poll, and the
+  donation tiers (the 24-hour countdown, the low-fuel appeal) step aside on phones while the
+  frozen tier stays on every width.
+- **Sign-in on the current Internet Identity library** (1787222434). `@icp-sdk/auth` 11.1.0
+  and `@icp-sdk/core` 6.1.1: the Internet Identity window opens at `id.ai`, an idle hour signs
+  you out and reloads as before, signing out revokes the session at Internet Identity, and a
+  session that ends elsewhere — expiry, a sign-out in another tab — is noticed within
+  15 seconds and toasted. [`docs/session-policy.md`](session-policy.md) describes the
+  mechanics.
+- **A missing history segment no longer stalls your history** (1793569495). A sealed archive
+  segment whose canister is gone is tolerated everywhere it is read: the trade-history
+  backfill closes that source and appends "· segment N unavailable" to its progress line, and
+  Account → Archive skips the dead hop with a per-segment note instead of parking on it. The
+  controller can name the failure (`adminUpgradeArchives` reports "N upgraded, B skipped,
+  F failed — <canister>: <reason>") and retire the row (`adminDropMissingArchive` drops a
+  verified-missing segment and declares the hole on the tape as a `#gap` event, as an
+  archive shed does).
+- **Local venues** (operator round, 2026-11-03). A venue served from a port of its own is
+  registered as a sign-in origin when it is deployed, so Verify-with-Google — and the play
+  deposits it unlocks — work on it, not only on the canonical `:8000` venue.
+- **For bot authors: nothing to change.** apiVersion stays 6.0.0 and `candid/backend.did` is
+  the one the 1.75 drop published. The archive item's `unavailable` field on the
+  archived-events pagers is additive and optional (a 6.0.0 decoder reads the reply unchanged),
+  and the two methods it adds are controller-only.
+- **Under the hood** (1788744109). The build carries the sixth one-shot state migration — it
+  sweeps the six PendingMatch-era fossils the 6.0.0 removal left in stable memory — so this
+  upgrade of each live target is a migrating one, applied once and then retired like its five
+  predecessors. The loading page's badge reads `VERSION 1.80`; a tab left open on 1.75
+  refreshes itself, and System → Canisters shows the backend answering `1.80.0` beside it.
+
 ## 1.75.0 — 2026-11-01
 
 The first product release since 1.60 (stamped 2026-08-07) — one release, shipped in two

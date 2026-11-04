@@ -375,18 +375,31 @@
   .ob-cumulative-btn { font-size: 11px; padding: 2px 6px; }
   .orderbook-toolbar { padding: 4px 0 0; }
 
-  /* Order form compact on mobile */
-  .order-panel h3 { display: none; }
-  .order-type-toggle, .order-side-toggle { margin-bottom: 6px; }
-  .order-type-btn, .side-btn { padding: 5px; font-size: 11px; }
+  /* Order form compact on mobile (the C1 box: header tabs, side well,
+     money rows, option rows — each a step tighter than desktop). */
+  .order-mode-tabs { margin-bottom: 6px; gap: 16px; }
+  .order-mode-btn { font-size: 12px; padding-bottom: 6px; }
+  .order-pair, .order-pct-max, .order-info-tail { display: none; }
+  .order-side-toggle { margin-bottom: 6px; }
+  .side-btn { height: 28px; font-size: 12px; }
+  .order-info { font-size: 11px; gap: 2px; margin-bottom: 6px; }
+  .order-type-btn { height: 22px; font-size: 11px; }
   .order-form { gap: 6px; }
   .order-form label { font-size: 10px; }
   .order-form input, .order-form select { padding: 6px 8px; font-size: 12px; }
+  .order-form .order-field input { padding-right: 84px; }
+  .order-price-src button { font-size: 11px; padding: 1px 4px; }
+  .order-unit { font-size: 12px; }
   .order-pct-slider-row { gap: 6px; margin-top: 4px; }
-  .order-pct-slider-row input[type="range"] { padding: 0; }
-  .order-pct-readout { font-size: 9px; min-width: 30px; }
+  .order-pct-box { width: 50px; height: 26px; font-size: 11px; padding: 0 6px; }
+  .order-form .order-pct-box input { width: 22px; font-size: 11px; }
+  .order-pct-readout { font-size: 10px; }
+  .order-opt-row { min-height: 22px; }
+  .order-form .order-opt-select { font-size: 11px; padding: 2px 16px 2px 4px; background-position: calc(100% - 9px) 50%, calc(100% - 5px) 50%; }
+  .order-lev-labels { font-size: 9.5px; }
+  .order-note { font-size: 10px; }
+  .order-panel[data-mode="margin"] .order-size-block .order-field input { font-size: 15px; }
   .order-total { font-size: 11px; }
-  .order-available { font-size: 10px; margin-bottom: 4px; }
   .market-content .order-panel {
     display: flex;
     flex-direction: column;
