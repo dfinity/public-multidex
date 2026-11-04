@@ -10,6 +10,53 @@ only on a breaking change. Bot authors watch the second number; everyone else th
 Entries are written in user terms. The design detail lives in the documents each entry
 cites.
 
+## 1.81.0 — 2026-11-04
+
+Everything landed since the 1.80 build the live targets took on 2026-11-03/04 (`main`
+63307e2): the operator's phone round of 2026-11-04 — the account value in the header opens
+into a ledger of what it is made of, the menu on phones is a drawer over the page, the
+Account area's phone fixes — and, under the hood, the retirement of the one-shot migration
+the 1.80 upgrade applied. A minor: nothing in the public API changed (apiVersion stays 6.0.0).
+
+Source: the commits on `main` (`git log 63307e2..`); the operator's frontend round landed as
+direct commits and carries no task ids, so the short shas are cited instead. The Docs → Change
+log carries the same list in the app.
+
+- **The account value opens** (9fc6915, 422b8a0). The figure beside your name in the header is
+  a button: click it for a compact ledger of what it is made of — the wallet's assets with
+  their quantities, each margin pool on its own line with its legs, leverage and distance to
+  liquidation (red inside 20 %), the AMM Vault and Insurance Fund stakes with their LP / shares,
+  a cooldown and a staged withdrawal — every row a link into the Account tab it belongs to, and
+  what has changed since you last looked, attributed to prices, positions, yield and trades &
+  fees exactly to the cent. The baseline is your last look (the sign-in snapshot before any;
+  the first open says so), a venue you hold nothing in reads "nothing yet", and while the
+  ledger is open it follows every balance refresh, a row whose figure moved flashing once.
+  Opening it closes the user menu; a click elsewhere, Escape or following a row closes it. On
+  phones the same ledger is a sheet from the bottom over a scrim.
+- **The menu on phones is a drawer** (6f63df9). The hamburger slides a 248 px panel in from
+  the left over the page — which stays exactly where it was, instead of being pushed down by a
+  header that grew — with the lockup, the theme switch and a close at its head, the sections as
+  rows, your username pill, and Sign in / out at its foot; the close, the scrim, Escape or a
+  tap on a row puts it away. **Platform** (the former System) and the pill carry a chevron: a
+  tap opens their sections as a titled list with a "Menu" row back. **AI** is an icon tab —
+  last in the desktop nav, and on phones in the header itself, after the account value.
+- **Signing out clears the account value** (c8daaed). On phones the header's figure used to
+  keep its last reading after Sign out until the next refresh; it now goes with the session.
+- **Two phone fixes in the Account area** (838a66e). The profile card stacks on phones — the
+  avatar beside the name and ID, the principal and the member line across the card, the
+  regenerate control a foot row with its count beside it — instead of squeezing its details
+  into a sliver that broke the username at its hyphens and wrapped the principal every eight
+  characters; and the drawer's account pill is avatar, name and chevron only — the account
+  value stays in the header, in view beside the open drawer — with a long username ellipsised
+  on one line.
+- **For bot authors: nothing to change.** apiVersion stays 6.0.0 and `candid/backend.did` is
+  the one the 1.80 drop published, byte for byte.
+- **Under the hood** (1793580820). The sixth one-shot state migration, which the 1.80 upgrade
+  applied once to each live target, is retired from the build — its frozen pre-6.0.0 shapes
+  and their test leave the tree — so this upgrade is a plain one. The loading page's badge
+  reads `VERSION 1.81`; a tab left open on 1.80 refreshes itself, and Platform → Canisters
+  shows the backend answering `1.81.0` beside it.
+
 ## 1.80.0 — 2026-11-04
 
 Everything landed since the 1.75 build the live targets took on 2026-11-01 (`main` 1851081):
@@ -186,6 +233,66 @@ id per item; the Docs → Change log carries the same list in the app.
   cached files carry an ETag so the browser revalidates (304) instead of re-downloading.
 - **Local venues: a stale or foreign venue cookie no longer breaks the app** (1793499221).
   The app picks its own venue row, self-heals once and names the mismatch in the banner.
+
+### Also in the 1.75 build (landed 2026-11-01, after the entry above was cut)
+
+The entry above was written from `main` at efc2f7c (2026-11-01, 17:06 +0100); the 1.75
+build the live targets took that evening (21:44Z) was `main` 1851081. Everything that landed
+between the two shipped live as 1.75 and is recorded here — the 1.80.0 entry deliberately
+starts at 1851081. Source: `git log --first-parent efc2f7c..1851081`, one task id per item
+(the test, smoke-harness and deploy-tooling merges in that range are not entries); the
+Docs → Change log carries the same items at the end of its 1.75 entry.
+
+- **Earn: a one-tap Max for the LP withdraw field** (1793553361, 1788746837). A Max button
+  between the field and its submit fills it with the most you can withdraw instantly — the
+  figure the placeholder already quoted, which you used to retype, commas and all, into a
+  number box that rejects them — and is disabled while there is nothing to fill or the submit
+  is paused. The figure is your instant maximum less a 0.01% drift allowance, named in the
+  field's hint ("max now N after a 0.01% drift allowance"), so the request settles even if the
+  vault re-prices between the quote and your request's settlement; the tiles keep the exact
+  quote and the backend's cap check stays exact.
+- **Earn: a settled deposit is reported settled** (1793558036, 1793560085). Since apiVersion
+  6.0.0 a deposit answers with a staged request, but the card still read the reply as the
+  old immediate mint and never recognised the settlement — twelve polls, then "Your deposit
+  is still staged" under a position that had minted seconds earlier. The card now reads the
+  request id and reports "Settled: minted N LP at the post-request NAV." (or that the request
+  was cancelled, and why), and a lingering "still staged" line clears itself against the next
+  staged view. Separately, a slower render started before settlement could finish after a
+  newer one and repaint LP 0.00 with the stale "Staged deposit #N" line over the minted
+  position; the newest render now owns the paint.
+- **A season seal cancels pending staged LP requests, on the tape** (1788731610). A deposit or
+  withdrawal still staged when the season is sealed (or the exchange reset) is cancelled
+  before the wipe — "season sealed before settlement; nothing settled, funds released" in
+  your recent outcomes and as a `vault` row on the tape, the reservation released — so the
+  cancellations open the new epoch's record instead of the requests vanishing with the old
+  world. `getApiDoc` states the rule; [`docs/amm-vault-design.md`](amm-vault-design.md)
+  records it under the season boundary.
+- **The vault's expected-loss provision is priced on accrued debt** (1788736589). The
+  provision the Earn card shows (and the NAV deducts) — the expected loss on under-water or
+  near-liquidation margin loans beyond the insurance fund's first-loss — is refreshed on
+  every mark update and heartbeat; that scan now accrues each margin pool's loans to the scan
+  instant first, so it prices the debt the liquidator would see rather than a figure the
+  interest since the last booking had left behind. A scan driven by your own deposit or
+  withdrawal settling does not accrue, so your request never moves the NAV you were quoted
+  at. [`docs/amm-vault-design.md`](amm-vault-design.md), the per-loan impairment reserve.
+- **Agent Chat on the sign-in edge** (1793554545, 1793551778). Signing in while Agent Chat is
+  the open view shows the greeting at once — after a sign-out on the tab, the next sign-in
+  used to leave the pane empty until you left and came back — and a page loaded on
+  `#ai/agent-chat` restores your conversation once the session names your principal, exactly
+  once and never across principals; the sign-out purge is unchanged.
+- **Agent Chat reads the leaderboard in dollars** (1793551691). The OQL leaderboard entity
+  serves `profitUsd` / `capitalUsd` / `equityUsd` in human units like the market, position
+  and user-event money columns (`returnBps` stays basis points), and the chat's standing
+  instructions list it among them — "Who is top of the leaderboard?" had printed a $10,000
+  capital as $10,000,000. The candid `getLeaderboard` is unchanged.
+- **Home, as it went live** (1793554905, 1793553989, 1793554661, 1793554852, 1793554039). The
+  "What is MULTI/DEX?" introduction under the hero is gone (the Docs keep the page); the
+  hero's sub-paragraph is the operator's text; the Swap and Markets boxes carry product
+  screenshots and the Earn box a rising-value sketch, each with the operator's copy; the
+  open-source section is headed "Open source and verifiable" and carries the operator's two
+  paragraphs with the repository link (the issues/bounties paragraph left Home — the Docs and
+  the Account view keep theirs); and "Read how it works" opens Docs → What is MULTI/DEX?
+  rather than The launch.
 
 ### For bot authors: apiVersion 6.0.0 (breaking)
 

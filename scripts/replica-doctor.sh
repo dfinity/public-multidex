@@ -49,6 +49,8 @@
 #       a metric gap can never disable recycling.
 #       Exit codes: 0 = under budget and under age (or no replica at all),
 #       3 = OVER budget or past the age belt, 2 = usage error.
+#       Every verdict's TOTAL line carries the oldest owned main's age as
+#       `<n>h [<raw etime>]` - age_label, ONE formatter for all three shapes.
 #   ./scripts/replica-doctor.sh --rss-all     (also the default, no flags)
 #       Machine-wide sweep: every pocket-ic main, grouped by owning
 #       project/worktree, one footprint line each - the prioritizer's
@@ -154,6 +156,31 @@ age_read() {
 }
 # The printing form (the start doctor's callers): -1 = unreadable.
 age_secs() { age_read "$1"; printf '%s' "$AGE_SECS"; }
+
+# -- the age label (task 1793750605) ------------------------------------------
+# ONE formatter for the oldest owned main's age, used by EVERY --rss verdict
+# line - healthy, OVER budget, past the AGE BELT - so the bracketed raw etime
+# rides all of them: "<n>h [<raw>]", the hours first and the raw `ps -o
+# etime=` read bracketed beside them ("22h [22:14:33]" - the next wobble is
+# diagnosable from the one line seats already log), or the UNREADABLE label
+# when no owned main's etime parsed this pass. `$1` is an optional word
+# between the hours and the bracket: the age-belt verdict reads `is <n>h old
+# [<raw>]`. The `<n>h` token stays FIRST either way: factory.sh's claim gate
+# parses `oldest main <n>h` and `is <n>h old` (recycle_gate) - keep those
+# two shapes byte-compatible. Reads OLDEST_PID / OLDEST_AGE / OLDEST_RAW,
+# the --rss loop's maximum over the owned mains (initialised here so the
+# lib seam below exposes the formatter to tests/test_deploy_hygiene.sh §6bd).
+# Before this the over-age verdict rendered its TOTAL line by hand, WITHOUT
+# the bracket (the raw rode the next line only), and §6bd's live pin went
+# red on any machine whose venue was past the belt (the operator's, 50 h,
+# 2026-11-04 - the 1.80 rollout pre-flight).
+OLDEST_AGE=0
+OLDEST_PID=""
+OLDEST_RAW=""
+age_label() {
+  if [ -n "$OLDEST_PID" ]; then printf '%sh %s[%s]' "$(( OLDEST_AGE / 3600 ))" "${1:+$1 }" "$OLDEST_RAW"
+  else printf '%s' "UNREADABLE this pass (no owned main's etime parsed - see the note above)"; fi
+}
 
 # Test seam: `REPLICA_DOCTOR_LIB=1 . scripts/replica-doctor.sh` defines the
 # functions above and stops here (tests/test_deploy_hygiene.sh §6bd).
@@ -488,9 +515,6 @@ fi
 WT="$(cd "$RSS_TARGET" && pwd)"
 TOTAL_KB=0
 OWNED=""
-OLDEST_AGE=0
-OLDEST_PID=""
-OLDEST_RAW=""
 ANY_RSS=false
 echo "Replica footprint for $WT (budget ${BUDGET_GB}GB resident+compressed; override REPLICA_RSS_BUDGET_GB):"
 for pid in $MAINS; do
@@ -515,14 +539,11 @@ if [ -z "$OWNED" ]; then
   exit 0
 fi
 TOTAL_MB=$(( TOTAL_KB / 1024 ))
-# The oldest main's age with its RAW etime beside it ("22h [22:14:33]") so
-# the next wobble is diagnosable from the one line seats already log. The
-# `<n>h` token stays first: factory.sh's claim gate parses `oldest main <n>h`
-# and `is <n>h old` (recycle_gate) - keep those two shapes byte-compatible.
-if [ -n "$OLDEST_PID" ]; then OLDEST_LABEL="$(( OLDEST_AGE / 3600 ))h [$OLDEST_RAW]"
-else OLDEST_LABEL="UNREADABLE this pass (no owned main's etime parsed - see the note above)"; fi
+# Every verdict's TOTAL line renders the oldest main's age through age_label
+# (one formatter, above): the bracketed raw etime rides all three shapes, and
+# factory.sh's `oldest main <n>h` / `is <n>h old` parses stay byte-compatible.
 if [ "$TOTAL_MB" -gt $(( BUDGET_GB * 1024 )) ]; then
-  info "TOTAL: ${TOTAL_MB} MB footprint - OVER the ${BUDGET_GB}GB budget (oldest main $OLDEST_LABEL)"
+  info "TOTAL: ${TOTAL_MB} MB footprint - OVER the ${BUDGET_GB}GB budget (oldest main $(age_label))"
   info "recycle at your next task boundary: icp network stop from THIS worktree root"
   info "(its ICP_HOME exported), then cold_start per the posture rhythm (flip #dev,"
   info "bash scripts/cold_start.sh --mode full --no-simulate, restore #play)."
@@ -532,8 +553,10 @@ fi
 # dark) must never disable recycling, so an old-enough replica is a recycle
 # verdict regardless of what was measured.
 if [ "$MAX_AGE_H" -gt 0 ] && [ "$OLDEST_AGE" -ge $(( MAX_AGE_H * 3600 )) ]; then
-  info "TOTAL: ${TOTAL_MB} MB footprint - under the ${BUDGET_GB}GB budget, BUT main PID $OLDEST_PID"
-  info "is $(( OLDEST_AGE / 3600 ))h old [$OLDEST_RAW] - past the ${MAX_AGE_H}h AGE BELT (override REPLICA_MAX_AGE_HOURS; 0 disables)."
+  # ONE line, every word of the former two kept: the TOTAL line is the age
+  # line here as well (hygiene §6bd reads the first TOTAL line; the claim
+  # gate reads `is <n>h old` anywhere in the output).
+  info "TOTAL: ${TOTAL_MB} MB footprint - under the ${BUDGET_GB}GB budget, BUT main PID $OLDEST_PID is $(age_label old) - past the ${MAX_AGE_H}h AGE BELT (override REPLICA_MAX_AGE_HOURS; 0 disables)."
   info "Recycle at this boundary regardless of measured memory: icp network stop from"
   info "THIS worktree root (its ICP_HOME exported), then cold_start per the posture rhythm."
   exit 3
@@ -541,5 +564,5 @@ fi
 if [ "$ANY_RSS" = true ]; then
   info "note: some or all of that total is ps rss (an underestimate) - the age belt is the recycling guarantee."
 fi
-info "TOTAL: ${TOTAL_MB} MB footprint - under the ${BUDGET_GB}GB budget (oldest main $OLDEST_LABEL of the ${MAX_AGE_H}h age belt)"
+info "TOTAL: ${TOTAL_MB} MB footprint - under the ${BUDGET_GB}GB budget (oldest main $(age_label) of the ${MAX_AGE_H}h age belt)"
 exit 0

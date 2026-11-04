@@ -76,22 +76,35 @@
              Populated by renderBalances alongside the desktop pill's figure
              (both carry .balance-display); CSS shows exactly one per
              breakpoint, so only one is ever visible. -->
-        <div id="balance-display-mobile" class="balance-display balance-display-mobile" style="display:none"></div>
-        <button id="menu-toggle" class="menu-toggle" aria-label="Menu">
+        <div id="balance-display-mobile" class="balance-display balance-display-mobile" style="display:none">
+          <button type="button" id="wealth-trigger-mobile" class="wealth-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="wealth-pop" title="Account value — tap for the breakdown"><span class="amount"></span></button>
+        </div>
+        <!-- Phones: AI lives in the header, after the account value (the
+             drawer hides its own AI row). A .tab like the nav's — the tab
+             handler routes it, activateTab lights it. -->
+        <button class="tab tab-ai tab-ai-hdr" data-tab="intelli" aria-label="AI" title="AI"><svg class="ai-icon" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10.01,5.56l1.36,5.6c.18.76.78,1.35,1.55,1.54l5.63,1.35c.56.13.56.92,0,1.06l-5.63,1.35c-.77.18-1.36.78-1.55,1.54l-1.36,5.6c-.13.55-.93.55-1.06,0l-1.36-5.6c-.18-.76-.78-1.35-1.55-1.54L.42,15.1c-.56-.13-.56-.92,0-1.06l5.63-1.35c.77-.18,1.36-.78,1.55-1.54l1.36-5.6c.13-.55.93-.55,1.06,0"/><path fill="currentColor" d="M18.18.27l.88,3.64c.12.49.51.88,1.01,1l3.66.88c.36.09.36.6,0,.69l-3.66.88c-.5.12-.89.51-1.01,1l-.88,3.64c-.09.36-.6.36-.69,0l-.88-3.64c-.12-.49-.51-.88-1.01-1l-3.66-.88c-.36-.09-.36-.6,0-.69l3.66-.88c.5-.12.89-.51,1.01-1l.88-3.64c.09-.36.6-.36.69,0"/></svg></button>
+        <button id="menu-toggle" class="menu-toggle" aria-label="Menu" aria-expanded="false">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
         </button>
       </div>
+      <!-- Phones: the nav is a DRAWER over the page (responsive.css) — this
+           scrim dims the page behind it and closes it on tap. Inert on desktop. -->
+      <div id="drawer-scrim" class="drawer-scrim"></div>
       <nav class="tabs">
         <!-- Mobile drawer only (desktop hides it — the round toggle at the
              far right of the header serves there): the same sun/moon switch as
              a full-width row at the TOP of the list. Deliberately not a .tab:
              the tab click handler routes by data-tab, and this navigates
              nowhere. theme.js keeps its label in step. -->
+        <div class="drawer-head">
+          <svg class="drawer-lockup" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176.99 37.93" role="img" aria-label="MULTI/DEX"><g><rect style="fill:var(--accent)" x="23.59" y="14.22" width="1.15" height="23.7"/><rect style="fill:var(--accent)" x="17.4" y="11.3" width="1.15" height="16.88"/><path style="fill:var(--accent)" d="M22.53,22.1h3.27c.45,0,.82.37.82.82v11.29c0,.45-.37.82-.82.82h-3.27c-.45,0-.82-.37-.82-.82v-11.29c0-.45.37-.82.82-.82Z"/><rect style="fill:var(--accent)" x="15.52" y="14.3" width="4.91" height="10.24" rx=".82" ry=".82"/><rect style="fill:var(--accent)" x="35.98" y="11.3" width="1.15" height="16.88"/><rect style="fill:var(--accent)" x="29.79" y="14.22" width="1.15" height="23.7"/><path style="fill:var(--accent)" d="M28.73,22.1h3.27c.45,0,.82.37.82.82v11.29c0,.45-.37.82-.82.82h-3.27c-.45,0-.82-.37-.82-.82v-11.29c0-.45.37-.82.82-.82Z"/><rect style="fill:var(--accent)" x="34.1" y="14.3" width="4.91" height="10.24" rx=".82" ry=".82"/><rect style="fill:var(--accent)" x="11.21" y="11.52" width="1.15" height="7.93"/><rect style="fill:var(--accent)" x="9.32" y="13.22" width="4.91" height="5.01" rx=".76" ry=".76"/><path style="fill:var(--accent);fill-rule:evenodd" d="M9.91,13.22c-7.7,0-8.34-8.29.09-12.43.77-.38.47-.94-.14-.75-13.73,4.14-12.47,17.72-.28,17.72h1.62l-.57-4.54h-.73Z"/><rect style="fill:var(--accent)" x="42.18" y="11.52" width="1.15" height="7.93"/><rect style="fill:var(--accent)" x="40.29" y="13.22" width="4.91" height="5.01" rx=".76" ry=".76"/><path style="fill:var(--accent);fill-rule:evenodd" d="M44.62,13.22c7.7,0,8.34-8.29-.09-12.43-.77-.38-.47-.94.14-.75,13.73,4.14,12.47,17.72.28,17.72h-1.62l.57-4.54h.73Z"/><path style="fill:var(--text)" d="M68.14,12.8v.89c.48-.88.93-1.48,1.35-1.82s.95-.5,1.59-.5c1.3,0,2.25.77,2.86,2.32.45-.85.91-1.46,1.37-1.8s1.06-.52,1.79-.52,1.43.25,2.03.73c.66.55,1.12,1.33,1.37,2.33.17.67.26,1.73.26,3.18v5.26c0,.84,0,1.35.02,1.53.07.73.24,1.1.51,1.1.09,0,.23-.04.41-.11.18-.07.32-.11.41-.11.46,0,.69.31.69.92,0,.71-.27,1.07-.79,1.07-.2,0-.5-.04-.9-.11-.4-.07-.71-.11-.92-.11-.23,0-.55.04-.98.11-.43.07-.76.11-.98.11-.56,0-.83-.36-.83-1.07,0-.61.21-.92.64-.92.05,0,.19.02.4.06.08.04.19.06.32.06.23,0,.37-.17.43-.52.06-.35.1-1.21.11-2.59v-3.88c0-1.4-.07-2.43-.21-3.07-.14-.64-.4-1.15-.78-1.51s-.82-.55-1.31-.55c-.94,0-1.59.5-1.96,1.5-.29.79-.44,2.18-.44,4.15v2.17c0,1.91.03,3.11.09,3.59.06.48.22.72.47.72.08,0,.2-.02.35-.06s.27-.06.35-.06c.19,0,.34.1.47.29.13.19.19.43.19.71,0,.66-.31.99-.93.99-.2,0-.49-.04-.88-.12s-.69-.12-.88-.12c-.28,0-.58.04-.91.12s-.62.12-.87.12c-.54,0-.81-.35-.81-1.04,0-.63.2-.95.6-.95.15,0,.26.03.34.08.19.09.32.13.42.13.32,0,.48-.52.5-1.56l.06-1.44v-4.45c0-1.78-.16-3.02-.47-3.71-.31-.7-.86-1.04-1.66-1.04-.87,0-1.54.49-2.01,1.47-.38.8-.58,2.19-.58,4.17v4.08c0,.82,0,1.3.02,1.44.05.7.2,1.04.44,1.04.07,0,.21-.06.42-.17.03,0,.07-.01.12-.04h.14c.52,0,.77.34.77,1.01s-.3.98-.89.98c-.23,0-.5-.03-.83-.09-.45-.08-.83-.12-1.15-.12-.16,0-.45.03-.87.09-.57.08-.91.12-1.03.12-.53,0-.79-.35-.79-1.04,0-.63.26-.95.77-.95h.12c.05.02.09.03.12.03l.51.15s.04.03.08.03c.36,0,.56-.5.59-1.5v-6.41c0-1.73-.03-2.81-.09-3.24-.06-.43-.22-.64-.49-.64-.05,0-.24.05-.56.15-.13.04-.24.06-.32.06-.49,0-.73-.33-.73-.98,0-.69.27-1.04.81-1.04.15,0,.34.02.6.06.25.04.47.06.66.06h.36l.48-.12h.06c.32,0,.48.29.48.88Z"/><path style="fill:var(--text)" d="M91.41,26.38v-.95c-.72,1.49-1.78,2.23-3.18,2.23-1.59,0-2.7-.74-3.32-2.23-.27-.65-.42-1.41-.45-2.29-.01-.43-.02-1.32-.02-2.69v-2.53c0-2.79-.2-4.18-.59-4.18-.08,0-.21.02-.39.05-.18.03-.31.05-.41.05-.48,0-.72-.33-.72-.99s.29-.96.87-.96c.13,0,.33.03.6.08s.46.08.6.08c.12,0,.33-.03.63-.09.2-.04.32-.06.34-.06.42,0,.63.39.63,1.16v2.62l-.06,2.26v1.98c0,1.77.09,3.04.28,3.82.31,1.28,1.05,1.92,2.23,1.92.58,0,1.09-.2,1.54-.59.45-.4.76-.92.93-1.57.22-.79.32-2.3.32-4.52v-3.66c-.07-.98-.24-1.47-.53-1.47h-.61c-.47,0-.71-.31-.71-.92,0-.69.26-1.04.79-1.04.12,0,.31.02.56.06.25.04.44.06.56.06.11,0,.27-.02.49-.06.22-.04.38-.06.49-.06.41,0,.61.33.61.98,0,.29-.01.51-.04.67-.07.77-.1,1.92-.1,3.43v4.71c0,1.24,0,1.94.02,2.08.07,1.08.26,1.62.57,1.62.09,0,.23-.03.41-.08.18-.05.31-.08.41-.08.46,0,.69.34.69,1.01s-.28,1.04-.85,1.04c-.12,0-.3-.02-.53-.06-.34-.06-.55-.09-.63-.09-.04,0-.18.02-.43.06-.16.06-.3.09-.43.09-.38,0-.57-.29-.57-.89Z"/><path style="fill:var(--text)" d="M100.42,14.4v9.48c.01,1.04.2,1.55.56,1.55.08,0,.26-.05.52-.15.17-.04.28-.06.33-.06.46,0,.69.35.69,1.04s-.28,1.01-.84,1.01c-.22,0-.57-.04-1.05-.12-.48-.08-.85-.12-1.11-.12-.22,0-.55.04-.99.12-.44.08-.76.12-.97.12h-.1c-.58,0-.86-.37-.86-1.1,0-.63.24-.95.71-.95h.15c.08.03.15.04.19.04.35.11.55.17.6.17.25,0,.41-.16.47-.47.06-.32.1-1.14.11-2.47l.02-2.14v-10.2c-.01-.61-.03-1.02-.06-1.23-.1-.47-.29-.7-.58-.7-.04,0-.22.04-.54.12-.15.04-.28.06-.37.06-.47,0-.7-.33-.7-.98s.28-1.01.83-1.01c.15,0,.28,0,.39.03l.5.09c.22.04.41.06.56.06.14,0,.34-.03.62-.09.28-.06.48-.09.62-.09.32,0,.48.29.48.88,0,.2,0,.36-.02.46-.1,1.57-.14,3.78-.14,6.64Z"/><path style="fill:var(--text)" d="M110.67,22.93v-1.95c.01-.83.27-1.25.76-1.25s.74.47.74,1.4c0,2.22-.2,3.76-.59,4.64-.53,1.18-1.4,1.77-2.61,1.77-1.12,0-1.91-.52-2.38-1.56-.35-.75-.52-2.04-.52-3.85v-7.33c0-.43-.14-.64-.41-.64h-.69c-.23,0-.42-.11-.57-.32-.15-.21-.23-.47-.23-.78,0-.29.07-.54.22-.76.15-.22.31-.33.49-.33h.82c.24,0,.36-.19.36-.58v-3.14c0-.77.27-1.16.82-1.16.51,0,.76.39.76,1.16v3.27c0,.3.13.46.38.46h2.29c.53,0,.8.36.8,1.07,0,.75-.29,1.13-.86,1.13h-2.32c-.2,0-.29.21-.29.64v7.51c0,2.14.49,3.21,1.47,3.21s1.52-.86,1.56-2.59Z"/><path style="fill:var(--text)" d="M118.88,18.29v3.97c0,1.02,0,1.62.02,1.8.07.92.26,1.37.58,1.37.07,0,.25-.05.54-.15.07-.04.18-.06.32-.06.54,0,.81.34.81,1.01,0,.29-.09.53-.27.73-.18.2-.41.31-.68.31-.23,0-.58-.05-1.04-.14-.47-.09-.81-.14-1.04-.14-.37,0-.79.04-1.25.12-.56.1-.93.15-1.12.15-.57,0-.86-.35-.86-1.04s.25-1.01.74-1.01c.12,0,.28.03.51.09.22.06.39.09.51.09.35,0,.56-.65.63-1.95v-7.82c-.07-1.28-.29-1.92-.65-1.92-.12,0-.28.04-.49.11-.21.07-.36.11-.47.11-.52,0-.78-.33-.78-.98,0-.69.31-1.04.94-1.04.27,0,.46.01.58.03.46.08.75.12.88.12.11,0,.29-.03.53-.08.24-.05.41-.08.53-.08.41,0,.62.4.62,1.19,0,.08,0,.2-.02.37-.01.16-.02.29-.02.37-.01.16-.02.79-.03,1.89-.01.83-.02,1.69-.02,2.56ZM117.76,10.29c-.33,0-.61-.17-.85-.5-.24-.34-.35-.74-.35-1.21s.12-.87.35-1.19c.24-.33.52-.49.85-.49s.61.16.85.49.35.72.35,1.19-.12.87-.35,1.21c-.24.33-.52.5-.85.5Z"/><path style="fill:var(--accent)" d="M125.42,29.92c-.09.33-.18.67-.27,1.02-.1.36-.19.74-.29,1.15-.16.67-.46,1.01-.9,1.01h-.68c-.44,0-.66-.24-.66-.73,0-.08,0-.16.01-.23,0-.07.03-.15.05-.23l.22-.7.24-.85v.03l5.46-19.51.13-.46.59-2.26v.03c.04-.2.09-.4.14-.58.05-.18.1-.38.14-.58.15-.59.46-.89.94-.89h.63c.42,0,.63.24.63.73,0,.16-.07.48-.22.95l-.17.67v-.03l-6.01,21.46Z"/><path style="fill:var(--text)" d="M138.5,11.36c1.47,0,2.57.78,3.29,2.35v-3.08c0-.81-.02-1.31-.04-1.5-.07-.63-.28-.95-.62-.95-.12,0-.29.03-.5.09-.22.06-.38.09-.5.09-.55,0-.82-.33-.82-.98s.37-1.01,1.11-1.01c.12,0,.33.02.65.06.47.06.72.09.73.09.13,0,.33-.03.58-.08.25-.05.44-.08.58-.08.42,0,.62.41.62,1.22v.34c-.01.06-.03.6-.04,1.62,0,.12-.02.91-.07,2.35-.03,1.02-.04,1.79-.04,2.32v8.1c.02,1.35.06,2.18.14,2.51.08.33.26.49.54.49.2,0,.35-.02.45-.06.24-.04.41-.06.5-.06.56,0,.84.34.84,1.01s-.33,1.04-1,1.04c-.15,0-.37-.03-.68-.08-.3-.05-.53-.08-.68-.08-.04,0-.22.02-.51.06-.18.06-.33.09-.47.09-.4,0-.6-.37-.6-1.1v-.67c-.78,1.45-1.92,2.17-3.42,2.17s-2.72-.75-3.64-2.26c-.92-1.51-1.38-3.48-1.38-5.92s.45-4.43,1.36-5.91c.9-1.48,2.11-2.21,3.63-2.21ZM141.71,22.14c.06-.67.09-1.54.09-2.59,0-1.36-.04-2.29-.11-2.78-.13-1.02-.46-1.81-.96-2.38-.6-.67-1.28-1.01-2.06-1.01-1.05,0-1.86.54-2.45,1.62-.59,1.08-.88,2.55-.88,4.43s.31,3.46.92,4.56c.61,1.11,1.45,1.66,2.51,1.66.81,0,1.48-.32,2.02-.96.54-.64.85-1.49.94-2.55Z"/><path style="fill:var(--text)" d="M159.29,18.17c0,.77-.04,1.25-.11,1.42-.08.17-.29.26-.66.26h-7.2c-.2,0-.32.04-.38.11-.06.07-.09.19-.09.35,0,1.53.34,2.8,1.02,3.82.68,1.02,1.52,1.53,2.54,1.53.66,0,1.27-.24,1.82-.73.55-.49.91-1.11,1.08-1.86l.2-.88c.11-.49.35-.73.75-.73.56,0,.84.39.84,1.16,0,1.32-.5,2.5-1.49,3.53-1,1.03-2.13,1.54-3.4,1.54-1.58,0-2.85-.72-3.78-2.15-.94-1.43-1.4-3.36-1.4-5.78s.5-4.5,1.49-6.04c1-1.55,2.29-2.32,3.89-2.32,1.42,0,2.59.64,3.51,1.92.92,1.28,1.38,2.91,1.38,4.88ZM151.07,17.38c0,.29.17.43.5.43h5.41c.32,0,.48-.14.48-.43,0-1.08-.3-2.01-.91-2.81-.6-.79-1.31-1.19-2.13-1.19s-1.62.41-2.31,1.24-1.04,1.75-1.04,2.76Z"/><path style="fill:var(--text)" d="M165.58,24.08l3.2-4.88-3.2-5.03c-.22-.33-.48-.49-.78-.49-.12,0-.22.01-.28.04l-.39.14c-.06.02-.17.04-.32.04-.51,0-.76-.33-.76-.98,0-.69.31-1.04.94-1.04h.07s.4.03,1.15.09c.38.08.71.12.97.12s.64-.04,1.13-.11c.49-.07.86-.11,1.11-.11.63,0,.94.35.94,1.04,0,.65-.29.98-.88.98-.12,0-.24-.02-.35-.07l-.35-.14h-.14c-.06,0-.09.02-.09.06.03.12.1.27.21.43l2.1,3.41,2.19-3.41c.14-.21.21-.35.21-.43-.02-.04-.05-.06-.11-.06-.08,0-.2.04-.38.11-.17.07-.31.11-.4.11-.55,0-.82-.34-.82-1.02s.32-.99.97-.99c-.03,0,.38.05,1.22.15.34.04.7.06,1.08.06s.79-.04,1.22-.11.74-.11.92-.11c.68,0,1.01.34,1.01,1.02s-.26.99-.79.99c-.12,0-.3-.04-.53-.11-.23-.07-.41-.11-.53-.11-.37,0-.88.49-1.53,1.47l-2.68,4.04,3.59,5.63c.21.35.48.52.78.52.09,0,.23-.02.43-.06s.33-.06.43-.06c.55,0,.83.33.83.98,0,.71-.32,1.07-.97,1.07h-.18l-.9-.15c-.25-.04-.61-.06-1.11-.06-.42,0-.83.03-1.24.09l-.83.12h-.25c-.72,0-1.08-.33-1.08-.98,0-.71.28-1.07.85-1.07.2,0,.48.04.85.12.03.02.08.03.16.03.15,0,.23-.08.23-.24,0-.06-.02-.12-.07-.18l-.07-.12-2.56-3.97-2.6,3.97c-.11.16-.16.29-.16.37,0,.1.08.15.23.15.11,0,.27-.02.48-.06.21-.04.38-.06.48-.06.66,0,.99.36.99,1.07,0,.65-.33.98-.99.98h-.32l-.92-.12c-.46-.06-.87-.09-1.22-.09-.28,0-.61.03-.99.09-.52.08-.91.12-1.15.12-.65,0-.97-.35-.97-1.04s.28-1.01.83-1.01c.09,0,.23.02.42.05.18.03.32.05.41.05.29,0,.71-.41,1.24-1.23Z"/></g></svg>
         <button class="drawer-theme" id="theme-toggle-mobile" type="button" data-theme-toggle aria-label="Switch to light mode" aria-pressed="false" title="Switch to light mode">
           <svg class="theme-icon theme-icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
           <svg class="theme-icon theme-icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>
           <span class="theme-toggle-label">Switch to light mode</span>
         </button>
+          <button type="button" id="drawer-close" class="drawer-close" aria-label="Close menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg></button>
+        </div>
         <!-- Home: the landing page. On desktop the logo is the Home control (no
              nav tab, by convention); the lockup is small in the mobile drawer,
              so the drawer carries an explicit Home row at the top of the NAV list
@@ -105,7 +118,7 @@
              #ai at the routing boundary (ROUTE_TO_TAB / TAB_TO_ROUTE in
              main.js). Old #stats / #intelli / #intelligence hashes still
              resolve. -->
-        <button class="tab" data-tab="stats">System</button>
+        <button class="tab" data-tab="stats">Platform<svg class="tab-chevron" width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         <button class="tab" data-tab="ledger">Ledger</button>
         <button class="tab" data-tab="leaderboard">Leaderboard</button>
         <!-- Shortcut into Account → Earn (like Deposit): staking the AMM vault
@@ -113,14 +126,15 @@
              arrow marks it as a redirect into Account rather than a page of
              its own. -->
         <button class="tab" data-tab="earn">Earn<svg class="tab-redirect-arrow" width="9" height="9" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M8 2H3.8M8 2v4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-        <button class="tab" data-tab="intelli">AI</button>
         <button class="tab" data-tab="docs">Docs</button>
+        <button class="tab tab-ai" data-tab="intelli" aria-label="AI" title="AI"><svg class="ai-icon" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10.01,5.56l1.36,5.6c.18.76.78,1.35,1.55,1.54l5.63,1.35c.56.13.56.92,0,1.06l-5.63,1.35c-.77.18-1.36.78-1.55,1.54l-1.36,5.6c-.13.55-.93.55-1.06,0l-1.36-5.6c-.18-.76-.78-1.35-1.55-1.54L.42,15.1c-.56-.13-.56-.92,0-1.06l5.63-1.35c.77-.18,1.36-.78,1.55-1.54l1.36-5.6c.13-.55.93-.55,1.06,0"/><path fill="currentColor" d="M18.18.27l.88,3.64c.12.49.51.88,1.01,1l3.66.88c.36.09.36.6,0,.69l-3.66.88c-.5.12-.89.51-1.01,1l-.88,3.64c-.09.36-.6.36-.69,0l-.88-3.64c-.12-.49-.51-.88-1.01-1l-3.66-.88c-.36-.09-.36-.6,0-.69l3.66-.88c.5-.12.89-.51,1.01-1l.88-3.64c.09-.36.6-.36.69,0"/></svg></button>
         <!-- Account lives in the far-right user dropdown on desktop; in the
              mobile drawer it appears as the username pill (avatar + name,
              filled by renderProfileChip; reads "Account" until signed in). -->
         <button class="tab tab-mobile-only tab-account-pill" data-tab="account">
           <span class="user-menu-avatar" id="drawer-acct-avatar" style="display:none">?</span>
           <span id="drawer-acct-name">Account</span>
+          <svg class="tab-chevron" width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
         <!-- Mobile drawer, second level: tapping the username pill swaps the
              nav list for the Account sections (main.js toggles .acct-menu on
@@ -128,8 +142,9 @@
              carries the same list there. -->
         <div class="drawer-acct" id="drawer-acct-menu">
           <button class="drawer-acct-back" id="drawer-acct-back" aria-label="Back to menu">
-            <span aria-hidden="true">←</span> Menu
+            <span aria-hidden="true">‹</span> Menu
           </button>
+          <div class="drawer-acct-title">Sections<b>Account</b></div>
           <button class="drawer-acct-item" data-acct-go="overview">Overview</button>
           <button class="drawer-acct-item" data-acct-go="deposit">Deposit</button>
           <button class="drawer-acct-item" data-acct-go="wallet">Wallet</button>
@@ -145,8 +160,9 @@
              Mirrors the System page's own sub-tab row. -->
         <div class="drawer-acct drawer-sys" id="drawer-sys-menu">
           <button class="drawer-acct-back" id="drawer-sys-back" aria-label="Back to menu">
-            <span aria-hidden="true">←</span> Menu
+            <span aria-hidden="true">‹</span> Menu
           </button>
+          <div class="drawer-acct-title">Sections<b>Platform</b></div>
           <button class="drawer-acct-item" data-sys-go="overview">Overview</button>
           <button class="drawer-acct-item" data-sys-go="issues">Issues</button>
           <button class="drawer-acct-item" data-sys-go="pnl">AMM</button>
@@ -155,7 +171,22 @@
           <button class="drawer-acct-item" data-sys-go="canister">Canisters</button>
           <button class="drawer-acct-item" data-sys-go="events">Events</button>
         </div>
+        <!-- The drawer's foot (phones only): Sign in / out. #auth-btn lives in
+             .header-right, which phones never show; this mirrors its label
+             (updateUI) and clicks it. -->
+        <div class="drawer-foot">
+          <button type="button" id="drawer-auth" class="drawer-auth">Sign In</button>
+        </div>
       </nav>
+      <!-- Account value, opened: the ledger under the figure (desktop, anchored
+           to the figure's right edge by placeWealthPop) or a sheet from the
+           bottom over the scrim (phones, responsive.css). Rendered by wealth.js
+           on open and on every balance refresh while open; every row is an
+           anchor into its Account tab. Sits between the nav and .header-right:
+           outside the latter (phones hide it until the drawer opens) and
+           ahead of it, so the theme toggle stays .header-right's last control. -->
+      <div id="wealth-scrim" class="wealth-scrim" hidden></div>
+      <div id="wealth-pop" class="wealth-pop" role="dialog" aria-label="Account value breakdown" hidden></div>
       <div class="header-right">
         <!-- Signed-in user menu (desktop far-right dropdown): trigger pill +
              Account / Sign out. Hidden on mobile (the drawer carries Account
@@ -183,7 +214,12 @@
             <button type="button" class="user-menu-item" role="menuitem" tabindex="-1" data-useraction="signout">Sign out</button>
           </div>
         </div>
-        <div id="balance-display" class="balance-display" style="display:none"></div>
+        <!-- The figure is a BUTTON (the user pill's capsule, borderless at rest):
+             it opens #wealth-pop below — the ledger of what the figure is made
+             of (wealth.js). The odometer renders into .amount as before. -->
+        <div id="balance-display" class="balance-display" style="display:none">
+          <button type="button" id="wealth-trigger" class="wealth-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="wealth-pop" title="Account value — click for the breakdown"><span class="amount"></span></button>
+        </div>
         <button id="auth-btn" class="btn btn-primary">Sign In</button>
         <!-- Theme toggle (sun / moon) — the FAR RIGHT of the header, visible
              signed in or out. The glyph is the DESTINATION (a sun while dark,

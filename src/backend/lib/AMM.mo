@@ -42,8 +42,9 @@ module {
     // migration, task 1788744109: `pools` is a stable map of this record and
     // enhanced orthogonal persistence refuses even a record-field drop on a
     // plain upgrade as a "Memory-incompatible program upgrade" (IC0503, seen
-    // live 2026-09-07), so the sweep maps every stored pool onto this shape.
-    // See the NOTE above the actor in main.mo.)
+    // live 2026-09-07), so the sweep mapped every stored pool onto this
+    // shape — applied to both mainnet targets 2026-11-03/04 and RETIRED with
+    // 1793580820. See the NOTE above the actor in main.mo.)
     enabled             : Bool;
 
     // Inventory target & skew parameters (used in Phase 4).

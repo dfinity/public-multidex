@@ -1553,6 +1553,11 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
       closes, trades), <b>Positions</b> (margin pools and episodes), <b>Earn</b> (vault and
       insurance stakes), <b>Archive</b> (deep history), and <b>Fee Level</b> (your earned level and
       scorecard — the live view of <a href="#docs/levels">the rulebook</a>).</p>
+      <p>The <b>account value</b> beside your name in the header is a button. Click it for a compact
+      ledger of what the figure is made of — the wallet's assets, each margin pool with its distance
+      to liquidation, your AMM Vault and Insurance Fund stakes — and what has changed since you
+      last looked, split into prices, positions, yield and trades &amp; fees. Every line is a link
+      into the tab above; on a phone the ledger slides up from the bottom.</p>
 
       <h2 id="docs-sec-archive">A permanent archive, not a rolling buffer</h2>
       <p>Exchanges love to forget: histories that stop at 90 days are the norm. MULTI/DEX ships every
@@ -1828,6 +1833,39 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
       multiple chains can be trustlessly deposited, traded, and withdrawn directly, and AIware
       functionality lets users analyze the markets and their positions, and trade, via AI.</p>
 
+      <h3>1.81 — 4 November 2026</h3>
+      <ul>
+        <li><b>The account value opens.</b> The figure beside your name in the header is now a
+        button: click it for a compact ledger of what it is made of — the wallet's assets, each
+        margin pool with its distance to liquidation, your AMM Vault and Insurance Fund stakes —
+        and what has changed since you last looked, split into prices, positions, yield and
+        trades &amp; fees. Every line is a link into the Account tab it belongs to, a venue you
+        hold nothing in reads "nothing yet", and the ledger keeps up with every balance refresh
+        while it is open; on a phone it slides up from the bottom.</li>
+        <li><b>The menu on phones is a drawer.</b> The hamburger slides a panel in from the
+        left over the page — which stays exactly where it was, instead of being pushed down by a
+        header that grew — with the lockup, the theme switch and a close at its head, the sections
+        as rows, your username pill, and Sign out at the foot.
+        <b>Platform</b> (the former System) and the pill carry a chevron: a tap opens their
+        sections as a list with a "Menu" row back. <b>AI</b> is now an icon: last in the desktop
+        nav, and on phones in the header itself, beside your account value.</li>
+        <li><b>Signing out clears the account value.</b> On a phone the header's figure used to
+        keep its last reading after Sign out; it now goes with the session.</li>
+        <li><b>Two phone fixes in the Account area.</b> The profile card stacks on a phone — the
+        avatar beside your name and ID, the principal and the member line across the card, the
+        regenerate control a foot row with its count beside it — instead of squeezing its details
+        into a sliver that broke the username at its hyphens and wrapped the principal every
+        eight characters; and the drawer's account pill is avatar, name and chevron only — your
+        account value stays in the header, in view beside the open drawer — with a long username
+        ellipsised on one line.</li>
+        <li><b>Bot authors: nothing to change.</b> apiVersion stays <b>6.0.0</b> and the interface
+        is the one the 1.80 drop published, byte for byte. See the <a href="https://github.com/dfinity/public-multidex/blob/HEAD/candid/README.md" target="_blank" rel="noopener noreferrer">API docs</a>.</li>
+        <li><b>Under the hood.</b> The sixth one-shot state migration, which the 1.80 upgrade
+        applied once per venue, is retired from the build, so this upgrade is a plain one. The
+        loading page's badge reads <b>VERSION 1.81</b>; a tab left open on 1.80 refreshes itself,
+        and Platform → Canisters shows the backend answering 1.81.0 beside it.</li>
+      </ul>
+
       <h3>1.80 — 4 November 2026</h3>
       <ul>
         <li><b>The Place Order box reads top-down, as you decide.</b> Spot | Margin are the
@@ -1894,7 +1932,7 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         <li><b>Under the hood.</b> The build carries the sixth one-shot state migration — it sweeps
         the fossils the 6.0.0 removal left in stable memory — applied once per venue at this
         upgrade and then retired like its five predecessors. The loading page's badge reads
-        <b>VERSION 1.80</b>; a tab left open on 1.75 refreshes itself, and System → Canisters
+        <b>VERSION 1.80</b>; a tab left open on 1.75 refreshes itself, and Platform → Canisters
         shows the backend answering 1.80.0 beside it.</li>
       </ul>
 
@@ -2032,6 +2070,45 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         ETag so a return visit revalidates them instead of downloading them again. On a
         local venue, a stale or foreign venue cookie no longer breaks the app — it picks its
         own venue row, heals once and names the mismatch in the banner.</li>
+        <li><b>Earn: one-tap Max on the LP withdraw field.</b> A Max button beside the field
+        fills it with the most you can withdraw right now — the figure the placeholder quoted,
+        which you used to retype, commas and all, into a box that rejects them — and is greyed
+        out while there is nothing to fill or the submit is paused. The figure is your instant
+        maximum less a 0.01% drift allowance, and the hint says so: a request that settles even
+        if the vault re-prices between the quote and your settlement, while the tiles above keep
+        the exact figure.</li>
+        <li><b>Earn: a settled deposit says so.</b> Since the sealed doors a deposit answers with
+        a staged request, but the card still read the reply as the old immediate mint and never
+        recognised the settlement — twelve polls, then "Your deposit is still staged" under a
+        position that had minted seconds earlier. It now reports "Settled: minted N LP at the
+        post-request NAV." (or that the request was cancelled, and why), a lingering "still
+        staged" line clears itself at the next refresh, and a slow refresh started before
+        settlement can no longer repaint LP 0.00 and the stale "Staged deposit" line over your
+        minted position — the newest refresh owns the card.</li>
+        <li><b>A season seal cancels what is still staged.</b> A deposit or withdrawal still
+        staged when the season is sealed (or the exchange reset) is cancelled before the wipe —
+        "season sealed before settlement; nothing settled, funds released" in your recent
+        outcomes and as a vault row on the tape, the reservation released — rather than
+        vanishing with the old world.</li>
+        <li><b>The vault's provision is priced on accrued debt.</b> The expected-loss provision
+        the Earn card shows (and the NAV deducts) is refreshed on every price update and
+        heartbeat; that scan now accrues each margin pool's loans to the instant first, so it
+        prices the debt the liquidator would see rather than a figure the interest since the
+        last booking had left behind. Your own deposit or withdrawal settling does not accrue,
+        so your request never moves the NAV you were quoted at.</li>
+        <li><b>Agent Chat on sign-in.</b> Signing in while Agent Chat is the open view shows the
+        greeting at once (after a sign-out on the tab, the next sign-in used to leave the pane
+        empty until you left and came back), and a page loaded on <code>#ai/agent-chat</code>
+        restores your conversation once your principal is known — once, and never someone
+        else's. Its leaderboard reads come in dollars: profit, capital and equity are human
+        figures like the other money columns it queries (the return stays in basis points), so
+        "Who is top of the leaderboard?" no longer prints a $10,000 capital as $10,000,000.</li>
+        <li><b>Home, as it went live.</b> The "What is MULTI/DEX?" introduction under the hero
+        is gone (the Docs keep the page), the hero's sub-paragraph and the three boxes are
+        reworded — the Swap and Markets boxes now with screenshots of the pages, the Earn box
+        with a rising-value sketch — the open-source section is headed "Open source and
+        verifiable" with the repository link, and "Read how it works" opens Docs → What is
+        MULTI/DEX? rather than The launch.</li>
       </ul>
 
       <h3>1.60 — 7 August 2026</h3>
@@ -2095,7 +2172,7 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         never leave the canister. Every fix is pinned by a test that fails on the pre-fix
         tree.</li>
         <li>The first pull requests from outside the core team were adopted. The one you can
-        see: System → Canisters reports the exchange's <b>real memory ceiling</b>, read back
+        see: Platform → Canisters reports the exchange's <b>real memory ceiling</b>, read back
         from the platform rather than hand-copied from the source — the dashboard had once read
         45% while the exchange sat at 79% of its true limit.</li>
         <li>The footer's version badge is stamped into the page at build time, so it shows from
@@ -2113,7 +2190,7 @@ node scripts/verify_ledger.mjs --backend &lt;canister-id&gt; \\
         background quietly refreshes itself, so you come back to a current app without ever seeing
         a prompt. Reloading costs nothing: orders, positions and balances live on-chain, and the
         page you were on is preserved. This is the last release you'll need to refresh by hand.
-        System → Canisters also now shows the <b>backend's version</b>, so you can see at a glance
+        Platform → Canisters also now shows the <b>backend's version</b>, so you can see at a glance
         which build the exchange is running.</li>
         <li>Earn: depositing to or withdrawing from the AMM Vault, and staking or unstaking the
         Insurance Fund, now confirm with the same <b>toast</b> every other action uses — the result

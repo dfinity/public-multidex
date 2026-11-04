@@ -18,158 +18,141 @@
   /* The per-pool positions table shares its container with the pool's header
      row, so make the table itself the horizontal scroll region. */
   .pool-block .positions-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  /* ── Header: hamburger dropdown ──────────────────────────────── */
+  /* ── Header + the drawer ──────────────────────────────────────────
+     Phones keep the header as ONE 56px row: lockup, the account value, the
+     AI icon, ☰. The nav (.tabs) is a DRAWER: a fixed 248px panel that slides
+     in from the left over a scrim (#drawer-scrim), the page staying exactly
+     where it was — the old column layout grew the header and pushed the page
+     down. .header.menu-open opens it; .acct-menu / .sys-menu swap the list
+     for a level-2 list as before (main.js). The drawer's head row carries a
+     second lockup, the round theme toggle (#theme-toggle-mobile — the one
+     control per breakpoint, theme.js keeps its label) and ✕; its foot the
+     Sign in / out button (#drawer-auth mirrors #auth-btn, which stays in the
+     desktop-only .header-right). Mocks: multidex-mocks/place-order/09. */
   .menu-toggle { display: block; }
-  .header {
-    flex-wrap: wrap;
-    height: auto;
-    min-height: 56px;
-    padding: 10px 12px;
-    /* stickiness lives on #top-chrome (banner + header stick together) */
-  }
-  .header-left { width: 100%; justify-content: space-between; }
-  /* tabs and header-right are direct children of header; hide by default.
-     Reset the desktop left-justify margins so the stacked dropdown is flush. */
-  .tabs,
-  .header-right {
-    display: none;
-    width: 100%;
-    margin-left: 0;
-  }
-  /* When menu open, show tabs then auth button as one unified dropdown */
-  .header.menu-open .tabs {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 8px 0 0;
-    order: 10;
-  }
-  .header.menu-open .header-right {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 0 0 8px;
-    order: 11;
-  }
-  /* Account appears in the mobile drawer (desktop hides it in favour of the
-     far-right user dropdown). Shown regardless of auth state; when signed in
-     it renders as the username pill — avatar + name (renderProfileChip). */
-  .header.menu-open .tabs .tab-mobile-only {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .header.menu-open .tabs .tab-account-pill .user-menu-avatar { flex-shrink: 0; }
-  /* Signed in, the Account entry IS the username pill: a faint capsule
-     outline, set off from the nav items above by a full-width divider
-     (drawn as a ::before so it doesn't merge with the pill's own border). */
-  .header.authed.menu-open .tabs .tab-account-pill {
-    border: 1px solid var(--accent);
-    border-radius: 999px;
-    position: relative;
-    margin-top: 22px;   /* room for the divider + clear air beneath it */
-  }
-  .header.authed.menu-open .tabs .tab-account-pill::before {
-    content: "";
-    position: absolute;
-    top: -14px;
-    left: 2px;
-    right: 2px;
-    height: 1px;
-    background: var(--border);
-  }
-  /* The desktop user dropdown never appears on mobile — the drawer carries
-     Account (a tab) and Sign out (the auth button) instead. */
+  .header { height: 56px; padding: 0 12px; }
+  .header-left { width: 100%; justify-content: space-between; gap: 10px; }
+  .header-right { display: none; }
+  /* The desktop user dropdown never appears on phones — the drawer carries
+     Account (the pill) and Sign out (the foot) instead. */
   .header .user-menu { display: none !important; }
-  /* …so restore the auth button in the drawer even when signed in (desktop
-     hides it because Sign out lives in the dropdown). The parent header-right
-     is display:none until the menu opens, so this only shows in the drawer. */
-  .header.authed #auth-btn { display: block; }
-  /* All menu items — tabs, the theme row and the auth btn — share the same row style */
-  .header.menu-open .tabs .tab,
-  .header.menu-open .tabs .drawer-theme,
-  .header.menu-open .header-right #auth-btn {
-    width: 100%;
-    text-align: left;
-    padding: 10px 12px;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    border: none;
-    color: var(--text-dim);
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-  .header.menu-open .tabs .tab:hover,
-  .header.menu-open .tabs .drawer-theme:hover,
-  .header.menu-open .header-right #auth-btn:hover {
-    background: var(--bg-input);
-    color: var(--text);
-  }
-  /* The theme switch heads the drawer as a row — icon + "Switch to … mode".
-     One control per breakpoint: the round header toggle is hidden here. */
-  .header.menu-open .tabs .drawer-theme { display: flex; align-items: center; gap: 10px; }
-  .header.menu-open .header-right .theme-toggle { display: none; }
-  .header.menu-open .tabs .tab.active {
-    background: var(--accent);
-    color: var(--accent-text);
-  }
-  /* The DESKTOP figure (in .header-right, beside the user pill) is hidden
-     here; its mobile twin lives in .header-left, just left of the hamburger,
-     so the account value stays glanceable without opening the drawer. */
+  /* The DESKTOP figure (beside the user pill) is hidden here; its phone twin
+     lives in .header-left, before the AI icon and ☰. */
   .header-right .balance-display { display: none !important; }
   .balance-display-mobile {
     display: flex !important;   /* beats the desktop-side !important hide */
-    margin-left: auto;          /* hug the hamburger, whatever the logo's width */
-    margin-right: 12px;
+    margin-left: auto;          /* hug the right cluster, whatever the logo's width */
     font-size: 15px;
   }
   /* Signed out, renderBalances leaves it display:none inline — keep it gone. */
   .balance-display-mobile[style*="display: none"],
   .balance-display-mobile[style*="display:none"] { display: none !important; }
+  /* AI in the header: a 34px icon button; lit like a tab when its view is up. */
+  .tab-ai-hdr { display: inline-flex; width: 34px; height: 34px; padding: 0; border-radius: 999px; color: var(--text-dim); }
+  .tab-ai-hdr:hover { color: var(--accent); background: var(--bg-input); }
+  .tab-ai-hdr.active { color: var(--accent); background: var(--accent-tint-2); }
 
-  /* ── Drawer level 2: Account sections ─────────────────────────
-     Tapping the username pill swaps the nav list for this one (main.js sets
-     .acct-menu on the header). Hidden entirely on desktop — the far-right
-     user dropdown carries the same list there. */
-  .drawer-acct { display: none; flex-direction: column; gap: 4px; }
-  .header.menu-open.acct-menu .tabs .tab,
-  .header.menu-open.sys-menu .tabs .tab { display: none; }
-  /* Each level-2 list shows only under ITS OWN class, so opening System can
-     never reveal the Account list (both carry .drawer-acct for styling). */
-  .header.menu-open.acct-menu #drawer-acct-menu { display: flex; }
-  .header.menu-open.sys-menu #drawer-sys-menu { display: flex; }
-  .header.menu-open.acct-menu .header-right,
-  .header.menu-open.sys-menu .header-right { display: none; }
+  /* The scrim and the panel. Both sit inside #top-chrome's stacking context
+     (sticky, z 100), above the page; the account-value sheet (299/300)
+     stays above them. */
+  .drawer-scrim { display: block; position: fixed; inset: 0; z-index: 150; background: color-mix(in srgb, var(--bg) 62%, transparent); opacity: 0; pointer-events: none; transition: opacity 0.22s; }
+  .header.menu-open .drawer-scrim { opacity: 1; pointer-events: auto; }
+  .tabs {
+    display: flex; flex-direction: column; gap: 2px;
+    position: fixed; top: 0; bottom: 0; left: 0; width: 248px; max-width: 84vw;
+    margin: 0; padding: 0 10px calc(14px + env(safe-area-inset-bottom, 0px));
+    background: var(--bg-card); border-right: 1px solid var(--border); box-shadow: var(--shadow-pop);
+    overflow-y: auto; z-index: 151;
+    transform: translateX(-102%); visibility: hidden;
+    transition: transform 0.22s ease, visibility 0s linear 0.22s;
+  }
+  .header.menu-open .tabs { transform: none; visibility: visible; transition: transform 0.22s ease, visibility 0s; }
+  body.drawer-open { overflow: hidden; }
+  @media (prefers-reduced-motion: reduce) { .tabs, .drawer-scrim { transition: none; } }
+  /* The head row: lockup · theme toggle · ✕ */
+  .drawer-head { display: flex; align-items: center; gap: 6px; min-height: 56px; padding: 0 2px 0 6px; margin-bottom: 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .drawer-lockup { height: 23px; width: auto; display: block; margin-right: auto; }
+  /* The theme switch, round like the desktop toggle — one control per
+     breakpoint, the round header toggle hidden here as before. */
+  .header.menu-open .tabs .drawer-theme { display: inline-flex; }
+  .tabs .drawer-theme {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 34px; height: 34px; padding: 0; flex-shrink: 0;
+    background: transparent; border: 1px solid var(--border); border-radius: 999px;
+    color: var(--text-dim); cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .tabs .drawer-theme:hover { color: var(--accent); border-color: var(--accent-outline); background: var(--accent-tint-1); }
+  .tabs .drawer-theme .theme-toggle-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .header.menu-open .header-right .theme-toggle { display: none; }
+  .drawer-close { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; padding: 0; border: none; border-radius: 999px; background: transparent; color: var(--text-dim); cursor: pointer; }
+  .drawer-close:hover { background: var(--bg-input); color: var(--text); }
+  /* The rows — nav tabs, the back row, the level-2 items — share one shape. */
+  .tabs .tab,
   .drawer-acct-back,
   .drawer-acct-item {
-    width: 100%;
-    text-align: left;
-    padding: 10px 12px;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    border: none;
-    color: var(--text-dim);
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    width: 100%; display: flex; align-items: center; gap: 10px;
+    min-height: 44px; padding: 0 12px;
+    border-radius: var(--radius-sm); background: transparent; border: none;
+    color: var(--text-dim); font-size: 14.5px; font-weight: 500; text-align: left;
+    cursor: pointer; transition: background 0.12s, color 0.12s;
   }
-  .drawer-acct-back {
-    color: var(--accent);
-    font-weight: 600;
-    margin-bottom: 4px;
-    border-bottom: 1px solid var(--border);
-    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-    padding-bottom: 12px;
-  }
-  /* Indent the section rows under the back/title row so the list reads as a
-     LEVEL below it, not as a replacement for the top-level nav it swapped out. */
-  .drawer-acct-item { padding-left: 28px; }
-  .drawer-acct-back:hover,
-  .drawer-acct-item:hover { background: var(--bg-input); color: var(--text); }
-  .drawer-acct-item.active { background: var(--accent); color: var(--accent-text); }
+  .tabs .tab:hover, .drawer-acct-back:hover, .drawer-acct-item:hover { background: var(--bg-input); color: var(--text); }
+  /* The current section: accent ink on an accent tint — quieter than the
+     filled row the growing header used. */
+  .tabs .tab.active, .drawer-acct-item.active { background: var(--accent-tint-2); color: var(--accent); }
+  .tabs .tab-mobile-only { display: flex; }
+  .tabs .tab-ai { display: none; }          /* AI sits in the header on phones */
+  .tabs .tab .tab-redirect-arrow { margin-left: 4px; }
+  .tab-chevron { display: inline-block; margin-left: auto; color: var(--text-muted); flex-shrink: 0; }
+  /* The account pill: avatar · name · ›, the capsule outline when signed
+     in, set off from the nav rows by a divider. The account value stays in
+     the header, which the 248px drawer leaves in view beside it. */
+  .tabs .tab-account-pill { margin-top: 12px; position: relative; color: var(--text); }
+  .tabs .tab-account-pill .user-menu-avatar { flex-shrink: 0; }
+  /* A long username ellipsises on one line; the dev-identity marker keeps its full label (§O). */
+  #drawer-acct-name:not(.dev-identity) { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .header.authed .tabs .tab-account-pill { border: 1px solid var(--accent); border-radius: 999px; margin-top: 22px; }
+  .header.authed .tabs .tab-account-pill::before { content: ""; position: absolute; top: -14px; left: 2px; right: 2px; height: 1px; background: var(--border); }
+  /* ── The Account profile card: two rows, not three columns ────────
+     The desktop row (avatar · details · regenerate) squeezed the details
+     into a sliver on a 390px card: the username broke at its hyphens, the
+     principal wrapped every eight characters, "Member since" ran four
+     lines. Phones keep the avatar beside the name and ID, give the
+     principal and the member line the full width beneath, and make the
+     regenerate control a foot row (button and remaining count side by side). */
+  /* Carried by the card's id: archive.css (the base rules) is imported AFTER
+     this sheet, so an equal-specificity rule here would lose the cascade. */
+  #account-profile-card { padding: 18px; }
+  #account-profile-card .profile-row { flex-wrap: wrap; align-items: flex-start; gap: 12px 14px; }
+  #account-profile-card .profile-avatar { width: 48px; height: 48px; font-size: 19px; }
+  #account-profile-card .profile-details { flex: 1 1 200px; min-width: 0; }
+  #account-profile-card .profile-username { font-size: 18px; overflow-wrap: anywhere; }
+  #account-profile-card .profile-principal { font-size: 11.5px; }
+  #account-profile-card .regen-btn-area { flex: 1 1 100%; flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; padding-top: 12px; border-top: 1px solid var(--border); }
+  #account-profile-card .regen-btn-area .btn { flex-shrink: 0; }
+  #account-profile-card .regen-remaining { text-align: right; }
+
+  /* ── Drawer level 2: the Account and Platform sections ────────────
+     Tapping the pill or Platform swaps the list for its level-2 list (main.js
+     sets .acct-menu / .sys-menu on the header). Each list shows only under
+     ITS OWN class, so opening one can never reveal the other. */
+  .drawer-acct { display: none; flex-direction: column; gap: 2px; }
+  .header.menu-open.acct-menu .tabs .tab,
+  .header.menu-open.sys-menu .tabs .tab { display: none; }
+  .header.menu-open.acct-menu #drawer-acct-menu { display: flex; }
+  .header.menu-open.sys-menu #drawer-sys-menu { display: flex; }
+  .header.menu-open.acct-menu .drawer-foot,
+  .header.menu-open.sys-menu .drawer-foot { display: none; }
+  .drawer-acct-back { color: var(--accent); font-weight: 600; }
+  .drawer-acct-title { display: block; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; padding: 6px 12px 4px; }
+  .drawer-acct-title b { display: block; margin-top: 1px; font-size: 15px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--text); }
+  /* Indent the section rows under the title so the list reads as a LEVEL
+     below it, not as a replacement for the nav it swapped out. */
+  .drawer-acct-item { min-height: 40px; padding-left: 30px; font-size: 14px; }
+  /* The foot: Sign in / out, pinned below the list. */
+  .drawer-foot { display: block; margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); flex-shrink: 0; }
+  .drawer-auth { width: 100%; display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: var(--radius-sm); background: transparent; border: none; color: var(--text-dim); font-size: 14.5px; font-weight: 500; text-align: left; cursor: pointer; }
+  .drawer-auth:hover { background: var(--bg-input); color: var(--text); }
 
 
   /* ── Markets container mobile ────────────────────────────────── */
@@ -477,4 +460,29 @@
   /* ── Account tables scroll ───────────────────────────────────── */
   .history-scroll { overflow-x: auto; }
 
+}
+
+/* ── Account value, opened — the ledger as a sheet (header.css has the
+   desktop popover; wealth.js renders both). The mobile figure sits before
+   the hamburger, so its capsule is a touch tighter; the ledger itself is a
+   fixed sheet from the bottom over a scrim, 40px rows for thumbs, the
+   "Open Account" CTA as the long form. */
+@media (max-width: 900px) {
+  .balance-display-mobile .wealth-trigger { height: 32px; padding: 0 8px; }
+  .wealth-pop {
+    position: fixed; top: auto; left: 0; right: 0 !important; bottom: 0;
+    width: auto; max-height: 88vh; overflow: auto;
+    padding: 8px 16px 16px;
+    border-radius: 16px 16px 0 0; border-left: none; border-right: none; border-bottom: none;
+    z-index: 300;
+  }
+  .wealth-pop::before { content: ""; display: block; width: 36px; height: 4px; border-radius: 2px; background: var(--text-tint-2); margin: 0 auto 10px; }
+  .wealth-scrim { display: block; position: fixed; inset: 0; background: color-mix(in srgb, var(--bg) 62%, transparent); z-index: 299; }
+  .wealth-scrim[hidden] { display: none; }
+  .wealth-row { height: 40px; font-size: 14px; }
+  .wealth-row.sub { height: 34px; font-size: 13px; }
+  .wealth-total { font-size: 26px; }
+  .wealth-cta { display: block; text-align: center; margin-top: 14px; padding: 12px; border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-text); font-weight: 600; text-decoration: none; font-size: 14px; }
+  .wealth-cta:hover { background: var(--accent-hover); text-decoration: none; }
+  .wealth-nudge { display: none; }
 }

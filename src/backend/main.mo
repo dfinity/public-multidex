@@ -62,7 +62,7 @@ import Expose "oql/Expose";
 import OqlJson "oql/Json"; // OQL query-JSON parser (for the History proxy; distinct from mo:json)
 import Json "mo:json"; // request-body build + response parse for the AI proxy
 
-// NOTE: FIVE one-shot EOP migrations have been applied to the live canister
+// NOTE: SIX one-shot EOP migrations have been applied to the live canister
 // and are RETIRED here: dropping `nextDeferredId` (2026-06-01, git
 // 684124e→6ed3362), dropping the legacy stable `IS_PRODUCTION` field after
 // the flag became `transient` (2026-06-10), re-keying the order book's
@@ -72,7 +72,7 @@ import Json "mo:json"; // request-body build + response parse for the AI proxy
 // element kind with #gap (W2-04) plus the #config constructor riding the
 // same per-element rebuild (#47.4) — applied to the cloud engine and the
 // dedicated subnet on 2026-08-26 (rehearsed 2026-08-24 against the subnet's
-// 69d1f51-era state; retirement task 1786992189), and the fossil sweep
+// 69d1f51-era state; retirement task 1786992189), the fossil sweep
 // (migration.mo, tasks 1787222803 + 1787207569 — one one-shot for BOTH
 // fossil-parked stable fields, the slot being single-occupancy):
 // `counterpartyStats` (#49.5 retirement, task 1787182537 — empty on every
@@ -84,59 +84,39 @@ import Json "mo:json"; // request-body build + response parse for the AI proxy
 // dedicated subnet on 2026-09-03, users and retained trades carried exactly
 // on both (rehearsed 2026-09-01 on a scratch replica with a stripped-wiring
 // negative control refusing IC0503; rollout task 1788285793, retirement
-// task 1788285811). A one-shot migration runs only on upgrade and must be
-// removed once applied — re-running a consume-the-field one traps
-// ("stable variable … expected but not found":
-// the fossil sweep's own SECOND upgrade refused exactly so in rehearsal,
-// and every venue born from post-sweep code hit it on its FIRST plain
-// upgrade until this retirement), and a transform one refuses the upgrade
-// outright because the stored state no longer matches its domain
-// (post-W2-04 that refusal was IC0503 "Memory-incompatible program
-// upgrade" on every born-widened venue's first plain upgrade, mainnet's
-// second upgrades included). New code and the migrated state agree, so the
-// plain upgrade is compatible.
-//
-// ACTIVE (the sixth): migration.mo sweeps the SIX PendingMatch-era fossils
-// in one one-shot (the slot is single-occupancy, so they ride together —
-// task 1788744109, the rehearsal the operator scheduled on 2026-11-01 for
-// after the 1.75 rollout): the five stable fields the retired PendingMatch /
-// protection-window machinery wrote (`orderSettlementWindows`,
-// `pendingByMaker`, `nextPendingMatchId`, `pendingQtyByMaker`,
-// `pendingMatches` — fossils since task 1788516198, empty / at their
-// initial value on every live target) are consumed and DROPPED, and the
-// stable `pools` map is mapped from the stored AMM.Pool WITH its fossil
-// `protectionWindowSec` onto the field-less record (apiVersion 6.0.0 had
-// projected it out through AMM.PoolView; that projection collapsed back
-// into Pool, the Candid record name kept as an alias — the published
-// contract is byte-identical). Types.PendingMatch / PendingMatchStatus went
-// with the map (frozen in migration.mo). See migration.mo for the frozen
-// shapes and the retirement rule. Remove the clause + file once every live
-// target (cloud engine, subnet) has upgraded through it once — the rollout
-// task and the retirement task are filed beside 1788744109.
-//
-// KNOWN LOCAL SYMPTOM until that retirement (same as the fifth's): a venue
-// cold-started from post-sweep code is BORN without the fossil fields and
-// with the field-less pool record, so its very FIRST plain `icp deploy`
-// upgrade is refused — "RTS error: Memory-incompatible program upgrade"
-// (IC0503): the domain's `pools` is a mutable Map of the OLD record and a
-// mutable Map is invariant in its element type, so the check fires before
-// the migration body ever runs (on moc 1.9.0 it is this RTS text, not the
-// fifth's "stable variable … expected but not found"). The clause working
-// as designed, not state corruption: the sweep's own SECOND upgrade refused
-// exactly so in rehearsal (2026-11-02, seat replica), with the read set
-// byte-identical before and after the refusal. Seat/dev venues until the
-// retirement: swap builds with `icp build backend` + `icp canister install
-// backend --mode reinstall -y --identity anonymous`, then reseed with
-// `cold_start.sh --mode full --no-simulate --no-deploy` (cold_start's own
-// deploy phase is a plain upgrade and would be refused the same way).
-// Rolling BACK a migrated venue to pre-sweep code is refused with the same
-// text (the stored pools no longer match the old record) — a rollback is a
-// reinstall. Only a venue installed from PRE-sweep code (the mainnet
-// targets, older local venues) actually runs this migration on its next
-// upgrade.
-import Migration "migration";
-
-(with migration = Migration.run)
+// task 1788285811), and the PendingMatch-era fossil sweep (migration.mo,
+// task 1788744109 — one one-shot for the SIX fossils of the retired
+// PendingMatch / protection-window machinery, the slot being
+// single-occupancy): the five stable fields that machinery wrote
+// (`orderSettlementWindows`, `pendingByMaker`, `nextPendingMatchId`,
+// `pendingQtyByMaker`, `pendingMatches` — fossils since task 1788516198,
+// empty / at their initial value on every live target) consumed and
+// DROPPED, and the stable `pools` map mapped from the stored AMM.Pool WITH
+// its fossil `protectionWindowSec` onto the field-less record (apiVersion
+// 6.0.0 had projected it out through AMM.PoolView; that projection
+// collapsed back into Pool, the Candid record name kept as an alias — the
+// published contract byte-identical; Types.PendingMatch / PendingMatchStatus
+// went with the map) — applied to the cloud engine 2026-11-03T23:54Z
+// (canary) and the dedicated subnet 2026-11-04T00:05Z, both from main
+// 63307e2, module hash 0xb50a4367… → 0xd7f7df48… on both, every
+// state-bearing read identical across the upgrade (users 42→42 engine,
+// 2,152→2,152 subnet; lpSupply / costBasis / pools / leaderboard / index
+// audit exact; rehearsed 2026-11-02 on a seat replica with a
+// six-drops-no-migration negative control refusing IC0503; rollout task
+// 1793580819, retirement task 1793580820). A one-shot migration runs only
+// on upgrade and must be removed once applied — re-running a
+// consume-the-field one traps ("stable variable … expected but not found":
+// the fifth sweep's own SECOND upgrade refused exactly so in rehearsal, and
+// every venue born from post-sweep code hit it on its FIRST plain upgrade
+// until that retirement), and a transform one refuses the upgrade outright
+// because the stored state no longer matches its domain (post-W2-04 that
+// refusal was IC0503 "Memory-incompatible program upgrade" on every
+// born-widened venue's first plain upgrade, mainnet's second upgrades
+// included; the sixth's domain — `pools` as a mutable Map of the OLD
+// record, invariant in its element type — refused the same way on moc
+// 1.9.0, both mainnet targets' next upgrade and every born-swept venue's
+// first plain upgrade alike, until its retirement with 1793580820). New
+// code and the migrated state agree, so the plain upgrade is compatible.
 persistent actor Uplands {
 
   // ── Deployment posture ───────────────────────────────────────────
@@ -181,7 +161,7 @@ persistent actor Uplands {
   // DIAGNOSTIC half: getAppVersion / getCanisterInfo.appVersion let anyone
   // see which release the backend runs, so a mixed frontend/backend deploy
   // is visible at a glance. Transient for the same reason as DEPLOY_MODE.
-  transient let APP_VERSION : Text = "1.80.0";
+  transient let APP_VERSION : Text = "1.81.0";
 
   // Runtime TARGET — ORTHOGONAL to DEPLOY_MODE (the posture axis above). It
   // governs WHO PAYS for cycles, and therefore how many cycles a call attaches
@@ -239,7 +219,8 @@ persistent actor Uplands {
   // (The settlement-window map `orderSettlementWindows` — orderId → window
   // (ns), the per-order protection-window record of the retired PendingMatch
   // machinery, a fossil since task 1788516198 — was consumed and DROPPED by
-  // the sixth one-shot migration, task 1788744109; see the NOTE above the
+  // the sixth one-shot migration, task 1788744109 (applied to both mainnet
+  // targets 2026-11-03/04, RETIRED with 1793580820); see the NOTE above the
   // actor and the retirement note near ownerIdxAdd.)
 
   // orderExpiry : orderId → expiry timestamp (ns). An order past its expiry is
@@ -313,10 +294,11 @@ persistent actor Uplands {
   // `pendingByMaker` (the void-on-cancel index), `nextPendingMatchId` (its
   // id counter) and `pendingQtyByMaker` (the maker quantity lock) — fossils
   // since task 1788516198, were consumed and DROPPED by the sixth one-shot
-  // migration, task 1788744109: EOP refuses a stable-field drop or retype
-  // on a plain upgrade (IC0503), so they had to wait for a sweep. See the
-  // NOTE above the actor; getStagedIndexAudit.pmLive stays in the Candid as
-  // a constant 0.)
+  // migration, task 1788744109 (applied to both mainnet targets
+  // 2026-11-03/04, RETIRED with 1793580820): EOP refuses a stable-field drop
+  // or retype on a plain upgrade (IC0503), so they had to wait for a sweep.
+  // See the NOTE above the actor; getStagedIndexAudit.pmLive stays in the
+  // Candid as a constant 0.)
 
   // ── Deferred AMM execution (defer-until-fresh model) ──────────────
   // The marketable (AMM-crossing) remainder of a taker order is parked HERE,
@@ -1849,10 +1831,11 @@ persistent actor Uplands {
   // nextPendingMatchId, pendingQtyByMaker — EOP refuses a stable-field drop
   // or retype on a plain upgrade, IC0503) outlived 6.0.0 declared, never
   // written and cleared by resetExchange, until the sixth one-shot
-  // migration (task 1788744109) consumed and DROPPED all five — see the
-  // NOTE above the actor. getStagedIndexAudit.pmLive stays in the Candid as
-  // a constant 0; Types.PendingMatch went with the map (its frozen shape
-  // lives in migration.mo until the retirement).
+  // migration (task 1788744109; applied to both mainnet targets
+  // 2026-11-03/04, RETIRED with 1793580820) consumed and DROPPED all five —
+  // see the NOTE above the actor. getStagedIndexAudit.pmLive stays in the
+  // Candid as a constant 0; Types.PendingMatch went with the map (its frozen
+  // shape lived in migration.mo until that retirement).
 
   // Test-only quiescence: when true, every recurring timer (finaliser / AMM tick
   // / liquidation / price refresh) no-ops, so isolated tests fully drive state

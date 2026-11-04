@@ -211,6 +211,7 @@ and what they hit in the drop's factory/operator note.
 | `aac2da9` | 2026-09-01 | SECURITY.md public-by-default policy (single-file sync) | `5799839` |
 | `1fff1d7` | 2026-09-01 | dependabot version-update PRs off (single-file sync) | `5425683` |
 | `a225a74` | 2026-11-02 | MULTI/DEX 1.75 drop, 519 files; the 8 `docs/tasks/drafts-w6-05/` paths held, CONTRIBUTORS substituted; `docs/tasks/README.md` + the done/ briefs INCLUDED for the first time; the GHSA-h888 row rides it (round-18 outward batch posted the same sitting) | `9dd48f5` |
+| `7bcdde6` | 2026-11-04 | MULTI/DEX 1.80 drop, 519 files; same composition as 1.75 (8 drafts paths held, CONTRIBUTORS substituted, README + done/ briefs included); re-cut on the final main after both targets were verified | `63307e2` |
 
 Next drop: the operator says when; composition per the sections above.
 

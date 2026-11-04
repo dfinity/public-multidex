@@ -3692,10 +3692,6 @@ GSELF_ALLOW=(
   'if grep -qE '"'"'^i1_tol_e8=[0-9]+$'"'"' tests/_lib.sh'
   # §8b: [ -z "$EXIT_SET" ] → _fail
   'EXIT_SET=$(printf '"'"'%s\n'"'"' "$INSPECT_FN" | mo_code | sed -n '"'"'/let exitCandidate'
-  # §6bd: the -z branch's src_has on DR_LIVE → _fail whenever a replica is owned (indistinguishable from none owned otherwise)
-  'DR_TOTAL="$(printf '"'"'%s\n'"'"' "$DR_LIVE" | grep -E'
-  # §6bd: the FOUND branch is the _ok; rc 2 lands in the else _fail
-  'elif printf '"'"'%s'"'"' "$DR_TOTAL" | grep -qE'
   # §6be: assert_eq against the two setters → _fail
   'FA_ARM_TAGS=$(printf '"'"'%s\n'"'"' "$INSPECT_FN" | mo_code | sed -n '"'"'/if (isFundingAuthority(caller)) {/'
 )
@@ -6885,8 +6881,24 @@ src_has "§6bd: the sentinel is -1, never 0"                                 "$D
 src_lacks "§6bd: no arm of the parser prints 0 for an unreadable etime"     "$(printf '%s\n' "$DOCTOR_UNC" | sed -n '/^etime_secs() {/,/^}/p')" "printf '0'"
 src_has "§6bd: the --rss loop keeps the previous best on an unreadable age"  "$DOCTOR_UNC" 'if [ "$a" -lt 0 ]; then'
 src_has "§6bd: ...and says so loudly, with the raw read"                     "$DOCTOR_UNC" 'info "note: age of main PID $pid unreadable this pass (raw: '"'"'$AGE_RAW'"'"') after 3 ps reads - previous best kept, never a smaller number"'
-src_has "§6bd: the TOTAL line carries the raw etime beside the hours"       "$DOCTOR_UNC" 'OLDEST_LABEL="$(( OLDEST_AGE / 3600 ))h [$OLDEST_RAW]"'
-src_has "§6bd: the age-belt line keeps 'is <n>h old' first, raw after"      "$DOCTOR_UNC" 'info "is $(( OLDEST_AGE / 3600 ))h old [$OLDEST_RAW] - past the ${MAX_AGE_H}h AGE BELT'
+# 1793750605: ONE formatter (age_label) renders the oldest main's age on EVERY
+# verdict line. The over-age verdict used to print its TOTAL line by hand -
+# "..., BUT main PID <pid>", no bracket, the raw etime on the NEXT line only -
+# and the live smoke below read that first TOTAL line red on any machine whose
+# venue was past the 48h belt (the operator's, 50 h, 2026-11-04 - the 1.80
+# rollout pre-flight). Now every TOTAL line goes through the one function.
+src_has "§6bd: the doctor defines the one age formatter"                       "$DOCTOR_UNC" 'age_label() {'
+src_has "§6bd: ...hours first, the raw etime bracketed after, an optional word between" "$DOCTOR_UNC" 'printf '"'"'%sh %s[%s]'"'"' "$(( OLDEST_AGE / 3600 ))" "${1:+$1 }" "$OLDEST_RAW"'
+src_has "§6bd: ...or the UNREADABLE label when no owned main's etime parsed"   "$DOCTOR_UNC" 'else printf '"'"'%s'"'"' "UNREADABLE this pass (no owned main'"'"'s etime parsed - see the note above)"; fi'
+src_has "§6bd: the formatter sits above the lib seam (pinnable without a venue)" "$(printf '%s\n' "$DOCTOR_UNC" | sed -n '1,/REPLICA_DOCTOR_LIB/p')" 'age_label() {'
+grep_count DR_TOTAL_N  "$DOCTOR_UNC" 'info "TOTAL: '
+grep_count DR_TOTAL_FN "$DOCTOR_UNC" 'info "TOTAL: .*\$\(age_label( old)?\)'
+assert_eq "§6bd: the doctor prints three TOTAL verdict shapes (healthy / OVER budget / past the AGE BELT)" "3" "$DR_TOTAL_N"
+assert_eq "§6bd: ...and every one of them renders the age through age_label"  "$DR_TOTAL_N" "$DR_TOTAL_FN"
+src_lacks "§6bd: no verdict renders the age by hand any more"                  "$DOCTOR_UNC" 'h [$OLDEST_RAW]'
+src_has "§6bd: the healthy line keeps 'oldest main <n>h [raw] of the <b>h age belt'" "$DOCTOR_UNC" 'under the ${BUDGET_GB}GB budget (oldest main $(age_label) of the ${MAX_AGE_H}h age belt)"'
+src_has "§6bd: the OVER line keeps 'oldest main <n>h [raw]'"                   "$DOCTOR_UNC" 'OVER the ${BUDGET_GB}GB budget (oldest main $(age_label))"'
+src_has "§6bd: the age-belt verdict is ONE TOTAL line: 'BUT main PID <pid> is <n>h old [raw] - past the <n>h AGE BELT'" "$DOCTOR_UNC" 'under the ${BUDGET_GB}GB budget, BUT main PID $OLDEST_PID is $(age_label old) - past the ${MAX_AGE_H}h AGE BELT (override REPLICA_MAX_AGE_HOURS; 0 disables)."'
 src_has "§6bd: the start doctor never turns an unreadable age into WEDGED"  "$DOCTOR_UNC" 'if [ "$elapsed" -lt 0 ]; then'
 src_has "§6bd: the lib seam stops before the arg parser"                    "$DOCTOR_UNC" 'if [ "${REPLICA_DOCTOR_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi'
 FACTORY_UNC=$(uncommented scripts/factory.sh)
@@ -6925,27 +6937,146 @@ DR_NEVER="$(cd "$ROOT" && DR_COUNT="$DR_TMP/count" DR_OK_AT=99 PATH="$DR_TMP:$PA
 if [ "$DR_NEVER" = "-1 []" ] && [ "$(cat "$DR_TMP/count")" = "3" ]; then _ok "§6bd: age_read is -1 with an empty raw after exactly 3 empty reads"
 else _fail "§6bd: age_read under an always-empty ps gave '$DR_NEVER' after $(cat "$DR_TMP/count") call(s) — expected '-1 []' after exactly 3"; fi
 [ -n "${TEST_SCRATCH:-}" ] || rm -rf "$DR_TMP"
-# The exit-code contract, byte-compatible with factory.sh's parser: the
-# regexes above, applied verbatim to the new line shapes, still yield the
-# hours (and nothing for the UNREADABLE label, which factory.sh renders '?').
+# The exit-code contract, byte-compatible with factory.sh's parser: its two
+# sed shapes, applied verbatim to each verdict line, still yield the hours
+# (and nothing for the UNREADABLE label, which factory.sh renders '?'); its
+# MB shape reads the footprint off the same line.
 dr_age_of() { printf '%s\n' "$1" | sed -n -e 's/.*is \([0-9][0-9]*\)h old.*/\1/p' -e 's/.*oldest main \([0-9][0-9]*\)h.*/\1/p' | head -1; }
-assert_eq "§6bd: factory.sh's parser reads the OVER line with the raw etime"  "22" "$(dr_age_of '  TOTAL: 3500 MB footprint - OVER the 3GB budget (oldest main 22h [22:14:33])')"
-assert_eq "§6bd: ...and the age-belt line with the raw etime"                 "43" "$(dr_age_of '  is 43h old [01-19:22:50] - past the 48h AGE BELT (override REPLICA_MAX_AGE_HOURS; 0 disables).')"
-assert_eq "§6bd: ...and yields nothing (-> ?) for an UNREADABLE label"        ""   "$(dr_age_of '  TOTAL: 3500 MB footprint - OVER the 3GB budget (oldest main UNREADABLE this pass (no owned main'"'"'s etime parsed - see the note above))')"
-# Live smoke (read-only ps/lsof/top, no icp): whatever this worktree owns,
-# --rss exits 0 or 3 - never 2 - and any TOTAL line carries a bracketed raw
-# etime or the UNREADABLE label, never a bare hour.
+dr_mb_of()  { printf '%s\n' "$1" | sed -n 's/.*TOTAL: \([0-9][0-9]*\) MB.*/\1/p' | head -1; }
+assert_eq "§6bd: factory.sh's parser reads the healthy line with the raw etime" "38" "$(dr_age_of '  TOTAL: 445 MB footprint - under the 3GB budget (oldest main 38h [01-14:26:24] of the 48h age belt)')"
+assert_eq "§6bd: ...the OVER line with the raw etime"                          "22" "$(dr_age_of '  TOTAL: 3500 MB footprint - OVER the 3GB budget (oldest main 22h [22:14:33])')"
+assert_eq "§6bd: ...the one-line age-belt verdict with the raw etime"          "51" "$(dr_age_of '  TOTAL: 439 MB footprint - under the 3GB budget, BUT main PID 48126 is 51h old [02-03:00:00] - past the 48h AGE BELT (override REPLICA_MAX_AGE_HOURS; 0 disables).')"
+assert_eq "§6bd: ...and yields nothing (-> ?) for an UNREADABLE label"         ""   "$(dr_age_of '  TOTAL: 3500 MB footprint - OVER the 3GB budget (oldest main UNREADABLE this pass (no owned main'"'"'s etime parsed - see the note above))')"
+# The formatter itself, pure, through the lib seam (no venue, no ps).
+dr_label() { bash -c "$DR_LIB; OLDEST_PID=\"\$1\"; OLDEST_AGE=\"\$2\"; OLDEST_RAW=\"\$3\"; age_label \$4" _ "$1" "$2" "$3" "$4" 2>/dev/null; }
+assert_eq "§6bd: age_label renders the hours first, the raw etime bracketed after" "38h [01-14:26:24]" "$(dr_label 12345 138384 01-14:26:24 '')"
+assert_eq "§6bd: ...with the belt's word between them on request"              "51h old [2-03:00:00]" "$(dr_label 12345 183600 2-03:00:00 old)"
+assert_eq "§6bd: ...a young main reads 0h, never a bare number"                "0h [12:34]" "$(dr_label 12345 754 12:34 '')"
+assert_eq "§6bd: ...and no parsed main is the UNREADABLE label, never 0h"      "UNREADABLE this pass (no owned main's etime parsed - see the note above)" "$(dr_label '' 0 '' '')"
+# ── §6bd 1793750605: every verdict shape DRIVEN against stubbed pgrep/ps/lsof/top - deterministic on any machine ─
+# The live smoke used to be the only test of the verdict lines, so its answer
+# depended on whatever venue the machine running hygiene happened to own: a
+# healthy 38h seat printed the bracketed shape, the operator's 50h venue the
+# over-age shape - whose hand-rendered TOTAL line had no bracket. Here a COPY
+# of the doctor runs against fake pgrep/ps/lsof/top first on PATH (the H-02
+# copy-harness idiom): one fake main, lsof-attributed to this scratch dir, its
+# etime and footprint chosen per case - so every shape is produced on demand,
+# no venue read, no launcher touched, the real binaries never consulted (an
+# argv the fakes do not model exits 2 with a loud line, and the exact-line
+# assertions red on it).
+DR2_TMP=$(mktemp -d "${TEST_SCRATCH:-${TMPDIR:-/tmp}}/dr2.XXXXXX")
+DR2_WT="$(cd "$DR2_TMP" && pwd)"
+mkdir -p "$DR2_TMP/bin"
+cp scripts/replica-doctor.sh "$DR2_TMP/replica-doctor.sh"
+cat > "$DR2_TMP/bin/pgrep" <<'EOF2'
+#!/usr/bin/env bash
+# the main enumerator answers the one fake main (DR2_MAIN; empty = no venue); the tree walk (-P) has no children
+case "$*" in
+  "-f pocket-ic --ttl") [ -n "${DR2_MAIN:-}" ] || exit 1; printf '%s\n' "$DR2_MAIN" ;;
+  "-P "*) exit 1 ;;
+  *) echo "dr2 fake pgrep: unmodelled argv: $*" >&2; exit 2 ;;
+esac
+EOF2
+cat > "$DR2_TMP/bin/ps" <<'EOF2'
+#!/usr/bin/env bash
+# the age read answers DR2_ETIME, BSD-padded (empty = the degraded read, every time); the attribution's ppid; the rss fallback
+case "$*" in
+  "-o etime= -p "*) [ -z "${DR2_ETIME:-}" ] || printf ' %s\n' "$DR2_ETIME" ;;
+  "-o ppid= -p "*)  printf ' 1\n' ;;
+  "-o rss= -p "*)   printf ' 1024\n' ;;
+  *) echo "dr2 fake ps: unmodelled argv: $*" >&2; exit 2 ;;
+esac
+EOF2
+cat > "$DR2_TMP/bin/lsof" <<'EOF2'
+#!/usr/bin/env bash
+# the attribution marker: an open fd under <scratch>/.icp/cache/networks/ names the scratch dir as the owner
+case "$*" in
+  "-p "*) printf 'pocket-ic %s dr2 txt REG 1,4 0 0 %s/.icp/cache/networks/local/state/x\n' "$2" "$DR2_WT" ;;
+  *) echo "dr2 fake lsof: unmodelled argv: $*" >&2; exit 2 ;;
+esac
+EOF2
+cat > "$DR2_TMP/bin/top" <<'EOF2'
+#!/usr/bin/env bash
+# the one footprint sample fp_snapshot normalizes: the fake main at DR2_MEM
+case "$*" in
+  "-l 1 -stats pid,mem") printf 'PID MEM\n%s %s\n' "${DR2_MAIN:-0}" "${DR2_MEM:-400M}" ;;
+  *) echo "dr2 fake top: unmodelled argv: $*" >&2; exit 2 ;;
+esac
+EOF2
+chmod +x "$DR2_TMP/bin/pgrep" "$DR2_TMP/bin/ps" "$DR2_TMP/bin/lsof" "$DR2_TMP/bin/top"
+# dr2_run <etime|''> <top MEM> <main pid|''> [REPLICA_MAX_AGE_HOURS=48]: the copy, budget 3GB, stderr folded in (a fake's loud line reds the exact-line asserts)
+dr2_run() {
+  DR2_OUT="$(DR2_MAIN="$3" DR2_ETIME="$1" DR2_MEM="$2" DR2_WT="$DR2_WT" REPLICA_RSS_BUDGET_GB=3 REPLICA_MAX_AGE_HOURS="${4:-48}" PATH="$DR2_TMP/bin:$PATH" bash "$DR2_TMP/replica-doctor.sh" --rss "$DR2_TMP" 2>&1)"; DR2_RC=$?
+  DR2_TOTAL="$(printf '%s\n' "$DR2_OUT" | grep -F 'TOTAL:' | head -1 | sed 's/^ *//')"
+}
+# The ONE predicate the live smoke below applies: a TOTAL line whose age
+# carries the bracketed raw etime ([[dd-]hh:]mm:ss) or the UNREADABLE label.
+dr2_bracketed() { grep_has "$1" 'TOTAL: [0-9]+ MB footprint - .*([0-9]+h (old )?\[([0-9]+-)?[0-9]+:[0-9]+(:[0-9]+)?\]|UNREADABLE this pass)'; }
+dr2_shape_ok() { if dr2_bracketed "$DR2_TOTAL"; then _ok "§6bd/stub: ...$1 passes the live smoke's predicate"; else _fail "§6bd/stub: $1 fails the live smoke's predicate (no bracketed etime / UNREADABLE label): $DR2_TOTAL"; fi; }
+dr2_run '' 400M ''
+assert_eq "§6bd/stub: no owned main -> rc 0"                                   "0" "$DR2_RC"
+src_has   "§6bd/stub: ...and the doctor says so"                               "$DR2_OUT" 'no PocketIC instance owned by this worktree - nothing to measure'
+assert_eq "§6bd/stub: ...with no TOTAL line"                                   "" "$DR2_TOTAL"
+dr2_run 12:34 400M 12345
+assert_eq "§6bd/stub: a young main (12:34) -> rc 0"                            "0" "$DR2_RC"
+assert_eq "§6bd/stub: ...the healthy TOTAL line reads 0h with the raw etime bracketed" "TOTAL: 400 MB footprint - under the 3GB budget (oldest main 0h [12:34] of the 48h age belt)" "$DR2_TOTAL"
+assert_eq "§6bd/stub: ...factory.sh's age parse reads 0"                       "0" "$(dr_age_of "$DR2_OUT")"
+assert_eq "§6bd/stub: ...and its MB parse 400"                                 "400" "$(dr_mb_of "$DR2_OUT")"
+dr2_shape_ok "the young healthy line"
+dr2_run 01-14:26:24 400M 12345
+assert_eq "§6bd/stub: a 38h main (01-14:26:24, a seat's day-old venue) -> rc 0" "0" "$DR2_RC"
+assert_eq "§6bd/stub: ...the healthy TOTAL line carries 38h [01-14:26:24]"     "TOTAL: 400 MB footprint - under the 3GB budget (oldest main 38h [01-14:26:24] of the 48h age belt)" "$DR2_TOTAL"
+assert_eq "§6bd/stub: ...factory.sh's age parse reads 38"                      "38" "$(dr_age_of "$DR2_OUT")"
+dr2_shape_ok "the day-old healthy line"
+dr2_run 2-03:00:00 400M 12345
+assert_eq "§6bd/stub: a 51h main (2-03:00:00) -> rc 3, the recycle verdict"    "3" "$DR2_RC"
+assert_eq "§6bd/stub: ...the age-belt verdict is ONE TOTAL line carrying 51h old [2-03:00:00] (the 2026-11-04 red, now bracketed)" "TOTAL: 400 MB footprint - under the 3GB budget, BUT main PID 12345 is 51h old [2-03:00:00] - past the 48h AGE BELT (override REPLICA_MAX_AGE_HOURS; 0 disables)." "$DR2_TOTAL"
+assert_eq "§6bd/stub: ...factory.sh's age parse reads 51"                      "51" "$(dr_age_of "$DR2_OUT")"
+assert_eq "§6bd/stub: ...and its MB parse 400"                                 "400" "$(dr_mb_of "$DR2_OUT")"
+src_has   "§6bd/stub: ...the recycle remedy still follows"                     "$DR2_OUT" 'Recycle at this boundary regardless of measured memory: icp network stop from'
+dr2_shape_ok "the age-belt line"
+dr2_run 12:34 4000M 12345
+assert_eq "§6bd/stub: a 4000 MB young main -> rc 3, the recycle verdict"       "3" "$DR2_RC"
+assert_eq "§6bd/stub: ...the OVER TOTAL line carries 0h [12:34]"               "TOTAL: 4000 MB footprint - OVER the 3GB budget (oldest main 0h [12:34])" "$DR2_TOTAL"
+assert_eq "§6bd/stub: ...factory.sh's age parse reads 0"                       "0" "$(dr_age_of "$DR2_OUT")"
+assert_eq "§6bd/stub: ...and its MB parse 4000"                                "4000" "$(dr_mb_of "$DR2_OUT")"
+src_has   "§6bd/stub: ...the recycle remedy still follows"                     "$DR2_OUT" 'recycle at your next task boundary: icp network stop from THIS worktree root'
+dr2_shape_ok "the OVER line"
+dr2_run 2-03:00:00 4000M 12345
+assert_eq "§6bd/stub: over budget AND past the belt -> rc 3"                   "3" "$DR2_RC"
+assert_eq "§6bd/stub: ...the OVER line wins and carries 51h [2-03:00:00]"      "TOTAL: 4000 MB footprint - OVER the 3GB budget (oldest main 51h [2-03:00:00])" "$DR2_TOTAL"
+dr2_shape_ok "the OVER-and-old line"
+dr2_run '' 400M 12345
+assert_eq "§6bd/stub: an unreadable etime (three empty reads) -> rc 0, never a recycle on a guess" "0" "$DR2_RC"
+src_has   "§6bd/stub: ...the loud note names the empty raw read"               "$DR2_OUT" "note: age of main PID 12345 unreadable this pass (raw: '') after 3 ps reads - previous best kept, never a smaller number"
+assert_eq "§6bd/stub: ...the healthy TOTAL line carries the UNREADABLE label, not 0h" "TOTAL: 400 MB footprint - under the 3GB budget (oldest main UNREADABLE this pass (no owned main's etime parsed - see the note above) of the 48h age belt)" "$DR2_TOTAL"
+assert_eq "§6bd/stub: ...factory.sh's age parse yields nothing (-> ?)"         "" "$(dr_age_of "$DR2_OUT")"
+dr2_shape_ok "the UNREADABLE line"
+dr2_run 2-03:00:00 400M 12345 0
+assert_eq "§6bd/stub: the belt disabled (REPLICA_MAX_AGE_HOURS=0) -> rc 0 for the 51h main" "0" "$DR2_RC"
+assert_eq "§6bd/stub: ...the healthy line names the 0h belt, the raw etime still bracketed" "TOTAL: 400 MB footprint - under the 3GB budget (oldest main 51h [2-03:00:00] of the 0h age belt)" "$DR2_TOTAL"
+dr2_shape_ok "the belt-disabled line"
+# Negative control: the pre-fix TOTAL line, verbatim from the operator's red
+# run of 2026-11-04 - the predicate must reject it, or it cannot see the bug.
+DR2_OLD='  TOTAL: 439 MB footprint - under the 3GB budget, BUT main PID 48126'
+if dr2_bracketed "$DR2_OLD"; then _fail "§6bd negative control: the predicate accepted the pre-fix TOTAL line (no bracket) - it cannot see the 2026-11-04 red: $DR2_OLD"
+else _ok "§6bd negative control: the predicate rejects the pre-fix TOTAL line (no bracketed etime) - the belt sees the bug it pins"; fi
+[ -n "${TEST_SCRATCH:-}" ] || rm -rf "$DR2_TMP"
+# ONE live smoke (read-only ps/lsof/top, no icp), tolerant of every shape this
+# machine can be in - no venue / healthy / OVER budget / past the belt /
+# UNREADABLE: --rss exits 0 or 3 (never 2), and either says "nothing to
+# measure" or prints a TOTAL line the predicate above accepts. The shapes
+# themselves are pinned against the fakes; this only proves the installed
+# doctor runs here.
 DR_LIVE="$(cd "$ROOT" && bash scripts/replica-doctor.sh --rss "$ROOT" 2>&1)"; DR_RC=$?
-case "$DR_RC" in 0|3) _ok "§6bd: --rss on this worktree exits $DR_RC (the 0/3 contract)" ;;
-  *) _fail "§6bd: --rss on this worktree exited $DR_RC — factory.sh treats anything but 0/3 as a broken measurement: $(printf '%s' "$DR_LIVE" | tr '\n' '|' | head -c 300)" ;; esac
-DR_TOTAL="$(printf '%s\n' "$DR_LIVE" | grep -E 'TOTAL:|is [0-9]+h old' | head -1)"
-if [ -z "$DR_TOTAL" ]; then
-  src_has "§6bd: no owned replica -> the doctor says so (nothing to measure)" "$DR_LIVE" 'no PocketIC instance owned by this worktree - nothing to measure'
-elif printf '%s' "$DR_TOTAL" | grep -qE '[0-9]+h (old )?\[([0-9]+-)?[0-9]+:[0-9]+(:[0-9]+)?\]|UNREADABLE this pass'; then
-  _ok "§6bd: the live age line carries the raw etime: $(printf '%s' "$DR_TOTAL" | sed 's/^ *//')"
-else
-  _fail "§6bd: the live age line has no bracketed raw etime: $DR_TOTAL"
-fi
+DR_LIVE_LINE="$(printf '%s\n' "$DR_LIVE" | grep -F 'TOTAL:' | head -1 | sed 's/^ *//')"
+DR_LIVE_OK=no
+case "$DR_RC" in 0|3)
+  if [ -n "$DR_LIVE_LINE" ]; then dr2_bracketed "$DR_LIVE_LINE" && DR_LIVE_OK=yes
+  else case "$DR_LIVE" in *'no PocketIC instance owned by this worktree - nothing to measure'*) DR_LIVE_OK=yes ;; esac; fi ;;
+esac
+if [ "$DR_LIVE_OK" = yes ]; then _ok "§6bd: live --rss on this worktree: rc $DR_RC, ${DR_LIVE_LINE:-no owned replica (nothing to measure)}"
+else _fail "§6bd: live --rss on this worktree: rc $DR_RC (0/3 is the contract) and its age line must carry a bracketed raw etime or the UNREADABLE label: $(printf '%s' "$DR_LIVE" | tr '\n' '|' | head -c 300)"; fi
 
 # ── §6be 1789609263: a controller-designated FUNDING AUTHORITY signs the fleet's refills ─
 # The unattended launchd subnet fleet refilled its bots via `fund_call` =

@@ -80,8 +80,9 @@ module {
   // `pendingMatches` map — enhanced orthogonal persistence refuses to drop
   // or retype a stable field on a plain upgrade (IC0503). The sixth
   // one-shot migration, task 1788744109, consumed and dropped that map and
-  // the types went with it; their FROZEN shape lives in
-  // src/backend/migration.mo until the migration's retirement.)
+  // the types went with it; their FROZEN shape lived in
+  // src/backend/migration.mo until the migration's retirement — applied to
+  // both mainnet targets 2026-11-03/04, RETIRED with 1793580820.)
 
   public type MarketInfo = {
     id : MarketId;

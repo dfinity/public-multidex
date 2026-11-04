@@ -92,7 +92,8 @@ folds these in (each names its task) and moves the entry into "Major bumps so fa
      `AMM.PoolView`, the same record with the field projected out. (Both parkings ended
      with the sixth one-shot migration, task 1788744109 — the five stable fields consumed
      and dropped, `pools` mapped onto the field-less record, `PoolView` kept only as the
-     Candid's name for the stored `Pool`; the .did is byte-identical across the sweep. See
+     Candid's name for the stored `Pool`; the .did is byte-identical across the sweep;
+     applied to both mainnet targets 2026-11-03/04 and RETIRED with 1793580820. See
      the NOTE above the actor in `src/backend/main.mo`.)
      Installing the bump itself needs icp's Candid-compatibility bypass ONCE per venue
      (`icp deploy --yes`; `cold_start.sh` forwards it under the hand-set

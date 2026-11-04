@@ -30,6 +30,7 @@ import { oqlRowsToObjects, oqlFormatCell, dxEsc } from "./oql.js";
 import { setupIntelli, dxApplyShareLink, dxEnsureSchema, dxOnAuthChange, dxUpdateIdentity } from "./explorer.js";
 import { setupAssistant, assistantOnShow, assistantOnAuthChange, resetAssistant, assistantRefreshFooter } from "./assistant.js";
 import { setIdenticon } from "./identicon.js";
+import { wealthSnapshot, wealthHtml } from "./wealth.js";
 import { DOCS_PARTS, DOCS_PAGES, docsPage } from "./docs.js";
 import { setupLedger } from "./ledger.js";
 import { startUpdateCheck } from "./update-check.js";
@@ -2342,6 +2343,7 @@ async function logout() {
   userProfile = null;
   cachedUserStatus = null;
   cachedAcctSummary = null;
+  wealthReset();                 // the ledger, its baseline and its nudge belong to the old identity
   lastRejectionTs = null;
   appState.archiveActor = null; _archiveId = null; _archRows = []; _archSeen = new Set(); _archTradeIds = new Set();
   appState.bridgeActor = null;   // drop the Bridge actor bound to the old identity
@@ -2352,6 +2354,7 @@ async function logout() {
   devLoginForget();              // the #dev-login seed belongs to the old identity too — sign-out ends it (task 1793497426)
   if (statusPollInterval) { clearInterval(statusPollInterval); statusPollInterval = null; }
   renderProfileChip();
+  renderBalances();   // the figure's mounts hide on the signed-out path
   renderAccountPage();
   refreshDepositPage();          // clears addresses → signed-out state (no-op network call when on another tab)
   if (!authClient) setupDemoMode();
@@ -2458,6 +2461,7 @@ async function onLogin() {
     seedReleaseRejections(),   // baseline so historical rejections don't toast on sign-in
   ]);
   refreshAiGate();   // re-probe with the signed-in actor (heals a failed startup probe; non-blocking)
+  wealthOnLogin();   // the account-value ledger's baseline: this principal's last look, else stamped now (non-blocking)
   // The sign-in edge (task 1793551778): a pane seeded before this session
   // restored — a page loading on #ai/agent-chat seeds the greeting from
   // showUI(), ahead of the II restore and the #dev-login boot hook — replays
@@ -9899,6 +9903,231 @@ function renderBalances() {
   if (acctEl) acctEl.textContent = fmtUsd(net);
   const walletEl = document.getElementById("wallet-value");
   if (walletEl) walletEl.textContent = fmtUsd(walletVal);
+  wealthOnBalances();   // the open ledger moves with the figure (10 s clock, an Earn action, a fill)
+}
+
+// ── Account value, opened (the header figure as a control) ─────────────
+// The pill-side figure (and its mobile twin) is a button: click, and the
+// ledger from wealth.js opens under it — on phones as a sheet from the bottom
+// (responsive.css) — every row a link into its Account tab. The FACTS are the
+// balance caches the figure itself reads (userBalances / userAvailBalances /
+// markets / cachedAcctSummary) plus ONE fan-out of the pool and Earn queries
+// (wealthFetch), re-run on every balance refresh while the ledger is open, so
+// it moves with the 10 s clock like the figure. The BASELINE the deltas count
+// from is this principal's LAST LOOK (localStorage, per principal: closing
+// the ledger stamps the snapshot it showed, after a 30 s grace so second
+// thoughts keep the old deltas) or, before any look, the sign-in snapshot.
+// Nothing here renders signed out: renderBalances hides the mounts and
+// openWealth refuses.
+const WEALTH_LOOK_GRACE_MS = 30_000;
+const WEALTH_TOKENS = ["ICPUSD", "BTC", "ETH", "SOL", "ICP"];   // the Wallet page's order; other market bases follow
+let wealthOpen = false;
+let wealthFacts = null;       // the last pool / Earn fan-out (wealthFetch)
+let wealthNow = null;         // the snapshot last painted — what the user saw
+let wealthBase = null;        // { kind: "look" | "signin", t, snap } — the baseline
+let wealthLastVals = null;    // data-key → figure of the last paint, for the change flash
+let _wealthFetching = false, _wealthFetchedAt = 0, _wealthGrace = 0, _wealthNudgeTimer = 0;
+
+const wealthIsSheet = () => window.matchMedia("(max-width: 900px)").matches;
+function wealthTriggers() { return ["wealth-trigger", "wealth-trigger-mobile"].map((id) => document.getElementById(id)).filter(Boolean); }
+function wealthStoreKey(suffix = "") { const p = myPrincipalTextSafe(); return p ? `mdx.wealth.v1.${p}${suffix}` : null; }
+function wealthLoadBase() {
+  const k = wealthStoreKey();
+  if (!k) return null;
+  try { const j = JSON.parse(localStorage.getItem(k) || "null"); return j && j.snap && j.t ? j : null; } catch { return null; }
+}
+function wealthStoreBase(kind, snap) {
+  wealthBase = { kind, t: Date.now(), snap };
+  const k = wealthStoreKey();
+  if (!k) return;
+  try { localStorage.setItem(k, JSON.stringify(wealthBase)); } catch { /* private mode: the baseline lives for the session */ }
+}
+function wealthAgo(ms) {
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return `${s} s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h} h ago`;
+  return `${Math.floor(h / 24)} d ago`;
+}
+function wealthSinceLabel() {
+  if (!wealthBase) return "first look";
+  return `${wealthBase.kind === "look" ? "since you last looked" : "since sign-in"} · ${wealthAgo(wealthBase.t)}`;
+}
+// The facts: the caches the figure reads, plus the last fan-out.
+function wealthCollectFacts() {
+  const px = { ICPUSD: 1 };
+  for (const m of markets) if (m.baseToken && m.lastPrice > 0) px[m.baseToken] = m.lastPrice;
+  const order = [...WEALTH_TOKENS];
+  for (const m of markets) if (m.baseToken && !order.includes(m.baseToken)) order.push(m.baseToken);
+  const tokens = order.map((t) => {
+    const qty = Number(userBalances[t] || 0);
+    const avail = userAvailBalances[t];
+    return { t, qty, px: px[t] || 0, held: avail == null ? 0 : Math.max(0, qty - Number(avail)) };
+  });
+  const f = wealthFacts || {};
+  return {
+    tokens,
+    pools: f.pools || [],
+    vault: f.vault || { lp: 0, value: 0, share: 0, staged: 0 },
+    ins: f.ins || { shares: 0, value: 0, unlockMs: 0 },
+    net: cachedAcctSummary ? Number(cachedAcctSummary.netAccountValueUsd) : null,
+  };
+}
+// One fan-out: pools × positions (the per-pool line, its legs and leverage,
+// its distance to liquidation = 1 − marginUsage as on the Positions page),
+// the vault position (+ staged withdrawals), the insurance stake.
+async function wealthFetch() {
+  if (!appState.actor || !appState.isAuthenticated || _wealthFetching) return false;
+  _wealthFetching = true;
+  try {
+    const a = appState.actor;
+    const [pools, positions, vaultPos, insStake, staged] = await Promise.all([
+      a.getMyMarginPools().catch(() => []),
+      a.getMyPositions().catch(() => []),
+      a.getMyVaultPosition().catch(() => null),
+      a.getMyInsuranceStake().catch(() => null),
+      a.getMyStagedLpRequests?.().catch(() => null) ?? null,
+    ]);
+    const byPool = new Map();
+    for (const p of positions || []) {
+      const k = String(p.poolId);
+      if (!byPool.has(k)) byPool.set(k, []);
+      byPool.get(k).push({ leg: `${p.baseToken} ${Number(p.size) < 0 ? "short" : "long"}`, notional: Math.abs(Number(p.notionalUsd) || 0), upnl: Number(p.unrealizedPnl) || 0 });
+    }
+    const poolsF = (pools || []).map((p) => {
+      const list = byPool.get(String(p.id)) || [];
+      const equity = Number(p.valueUsd) || 0;
+      const exposure = list.reduce((s, x) => s + x.notional, 0);
+      const lev = list.length && equity > 0.0000001 ? exposure / equity : null;
+      const legs = [...new Set(list.map((x) => x.leg))].join(", ");
+      return {
+        id: p.id, name: p.name, hasPos: list.length > 0,
+        label: legs ? `${p.name} · ${legs}${lev != null ? ` ${lev.toFixed(1)}×` : ""}` : `${p.name} · ${p.isolated ? "isolated" : "cross"}`,
+        equity, upnl: list.reduce((s, x) => s + x.upnl, 0), usage: Number(p.marginUsage) || 0,
+      };
+    });
+    const stagedLp = (staged?.pending || []).reduce((s, r) => s + (r.kind?.withdraw ? Number(r.kind.withdraw.lpAmount) || 0 : 0), 0);
+    wealthFacts = {
+      pools: poolsF,
+      vault: { lp: Number(vaultPos?.lpBalance) || 0, value: Number(vaultPos?.estimatedValue) || 0, share: Number(vaultPos?.sharePercent) || 0, staged: stagedLp },
+      ins: { shares: Number(insStake?.shares) || 0, value: Number(insStake?.valueUsd) || 0, unlockMs: Number(insStake?.unlockAtNs ?? 0) / 1e6 },
+    };
+    _wealthFetchedAt = Date.now();
+    return true;
+  } catch (e) {
+    console.warn("wealth: fan-out failed:", e);
+    return false;
+  } finally {
+    _wealthFetching = false;
+  }
+}
+function renderWealthPop() {
+  const pop = document.getElementById("wealth-pop");
+  if (!pop || !wealthOpen) return;
+  const now = wealthSnapshot(wealthCollectFacts());
+  pop.innerHTML = wealthHtml({ now, base: wealthBase?.snap || null, since: wealthSinceLabel(), fmt: { qty: formatNum }, mobile: wealthIsSheet() });
+  // Flash what moved since the last paint (the clock, a fill landing).
+  const vals = new Map();
+  for (const el of pop.querySelectorAll("[data-key]")) {
+    vals.set(el.dataset.key, el.dataset.usd);
+    if (wealthLastVals && wealthLastVals.has(el.dataset.key) && wealthLastVals.get(el.dataset.key) !== el.dataset.usd) el.classList.add("chg");
+  }
+  wealthLastVals = vals;
+  wealthNow = now;
+}
+// Desktop: the ledger's right edge is the figure's right edge (the user
+// menu's dropdown anchors to its pill the same way). Phones: the sheet is
+// positioned by responsive.css, the inline offset must not survive a resize.
+function placeWealthPop(trigger) {
+  const pop = document.getElementById("wealth-pop"), header = document.querySelector(".header");
+  if (!pop || !header) return;
+  if (wealthIsSheet()) { pop.style.right = ""; return; }
+  const t = trigger || document.getElementById("wealth-trigger");
+  if (!t) return;
+  const hr = header.getBoundingClientRect(), tr = t.getBoundingClientRect();
+  pop.style.right = `${Math.max(8, Math.round(hr.right - tr.right))}px`;
+}
+async function openWealth(trigger) {
+  const pop = document.getElementById("wealth-pop"), scrim = document.getElementById("wealth-scrim");
+  if (!pop || !appState.isAuthenticated) return;
+  userMenu.setOpen(false);   // one open thing in the header
+  if (_wealthGrace) { clearTimeout(_wealthGrace); _wealthGrace = 0; }   // reopened inside the grace: the old baseline stands
+  wealthDismissNudge();
+  if (!wealthBase) wealthBase = wealthLoadBase();
+  wealthOpen = true;
+  pop.hidden = false;
+  if (scrim) scrim.hidden = false;
+  for (const t of wealthTriggers()) t.setAttribute("aria-expanded", "true");
+  placeWealthPop(trigger);
+  renderWealthPop();
+  pop.querySelector(".wealth-row")?.focus({ preventScroll: true });
+  if (Date.now() - _wealthFetchedAt > 5000 && await wealthFetch()) {
+    if (!wealthBase) wealthStoreBase("signin", wealthSnapshot(wealthCollectFacts()));
+    renderWealthPop();
+  }
+}
+function closeWealth(refocus) {
+  if (!wealthOpen) return;
+  const pop = document.getElementById("wealth-pop"), scrim = document.getElementById("wealth-scrim");
+  wealthOpen = false;
+  if (pop) pop.hidden = true;
+  if (scrim) scrim.hidden = true;
+  for (const t of wealthTriggers()) t.setAttribute("aria-expanded", "false");
+  if (refocus) document.getElementById(wealthIsSheet() ? "wealth-trigger-mobile" : "wealth-trigger")?.focus({ preventScroll: true });
+  // The last look: stamped once the ledger has stayed closed for the grace.
+  const seen = wealthNow;
+  _wealthGrace = setTimeout(() => {
+    _wealthGrace = 0;
+    if (!wealthOpen && seen && appState.isAuthenticated) wealthStoreBase("look", seen);
+  }, WEALTH_LOOK_GRACE_MS);
+}
+async function wealthOnLogin() {
+  wealthBase = wealthLoadBase();
+  if (!wealthBase && await wealthFetch()) wealthStoreBase("signin", wealthSnapshot(wealthCollectFacts()));
+  wealthShowNudge();
+}
+function wealthReset() {
+  closeWealth(false);
+  if (_wealthGrace) { clearTimeout(_wealthGrace); _wealthGrace = 0; }
+  wealthDismissNudge();
+  wealthFacts = null; wealthNow = null; wealthBase = null; wealthLastVals = null; _wealthFetchedAt = 0;
+}
+function wealthOnBalances() {
+  if (!wealthOpen) return;
+  renderWealthPop();
+  wealthFetch().then((ok) => { if (ok && wealthOpen) renderWealthPop(); });
+}
+// The one-time nudge: the first sign-in on this device learns the figure opens.
+function wealthShowNudge() {
+  const mount = document.getElementById("balance-display");
+  const k = wealthStoreKey(".nudged");
+  if (!mount || !k || wealthIsSheet() || mount.style.display === "none") return;
+  try { if (localStorage.getItem(k)) return; localStorage.setItem(k, "1"); } catch { return; }
+  const n = document.createElement("span");
+  n.className = "wealth-nudge";
+  n.setAttribute("role", "status");
+  n.innerHTML = "Your account value · <b>click for the breakdown</b>";
+  mount.appendChild(n);
+  _wealthNudgeTimer = setTimeout(wealthDismissNudge, 10000);
+}
+function wealthDismissNudge() {
+  if (_wealthNudgeTimer) { clearTimeout(_wealthNudgeTimer); _wealthNudgeTimer = 0; }
+  document.querySelector(".wealth-nudge")?.remove();
+}
+function wireWealth() {
+  for (const t of wealthTriggers()) t.addEventListener("click", () => { if (wealthOpen) closeWealth(false); else openWealth(t); });
+  document.getElementById("wealth-scrim")?.addEventListener("click", () => closeWealth(false));
+  // A row is a link: the hash router navigates, the ledger goes.
+  document.getElementById("wealth-pop")?.addEventListener("click", (e) => { if (e.target.closest("a[href]")) closeWealth(false); });
+  document.addEventListener("click", (e) => {
+    if (wealthOpen && !e.target.closest("#wealth-pop") && !e.target.closest(".wealth-trigger")) closeWealth(false);
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && wealthOpen) { e.preventDefault(); closeWealth(true); } });
+  window.addEventListener("hashchange", () => closeWealth(false));
+  window.addEventListener("resize", () => { if (wealthOpen) placeWealthPop(); });
 }
 
 function updateSwapBalances() {
@@ -12057,6 +12286,31 @@ async function cancelOrder(orderId) {
   }
 }
 
+// ── The mobile drawer (responsive.css) ─────────────────────────────
+// One door for open and close: the header's .menu-open (the CSS switch), the
+// level classes reset, the page's scroll locked behind the scrim, the
+// hamburger's aria-expanded, and focus — into the first row on open, back to
+// the hamburger on a close that had the focus inside. Opening closes the
+// account-value ledger (one open thing in the header). Desktop never carries
+// .menu-open, so the calls from activateTab / the tab taps are no-ops there.
+function setDrawerOpen(open) {
+  const header = document.querySelector(".header");
+  if (!header) return;
+  const was = header.classList.contains("menu-open");
+  header.classList.toggle("menu-open", open);
+  header.classList.remove("acct-menu", "sys-menu");   // always (re)open at the top level
+  document.body.classList.toggle("drawer-open", open);
+  const toggle = document.getElementById("menu-toggle");
+  if (toggle) toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open && !was) {
+    closeWealth(false);
+    document.querySelector(".tabs .tab:not(.tab-ai)")?.focus({ preventScroll: true });
+  } else if (!open && was) {
+    const nav = document.querySelector(".tabs");
+    if (nav && document.activeElement && nav.contains(document.activeElement)) toggle?.focus({ preventScroll: true });
+  }
+}
+
 // ── UI Updates ──────────────────────────────────────────────────
 function updateUI() {
   const authBtn  = document.getElementById("auth-btn");
@@ -12081,6 +12335,7 @@ function updateUI() {
 
   if (appState.isAuthenticated) {
     authBtn.textContent = "Sign Out";
+    if (document.getElementById("drawer-auth")) document.getElementById("drawer-auth").textContent = authBtn.textContent;   // the drawer's foot (phones)
     authBtn.className   = "btn btn-secondary";
     // Delegate Swap button text/disabled to updateSwapButtonState so the last
     // preview's filled/partial state is respected post-auth.
@@ -12095,6 +12350,7 @@ function updateUI() {
     if (authOverlay) authOverlay.style.display = "none";
   } else {
     authBtn.textContent = "Sign In";
+    if (document.getElementById("drawer-auth")) document.getElementById("drawer-auth").textContent = authBtn.textContent;   // the drawer's foot (phones)
     authBtn.className   = "btn btn-primary";
     // Swap CTA stays enabled when signed out — clicking it triggers the
     // Internet Identity sign-in flow (see executeSwap).
@@ -12582,7 +12838,7 @@ function activateTab(tabName, subpath) {
     activeView.classList.add("active");
     activeView.scrollTop = 0;
     window.scrollTo(0, 0);
-    document.querySelector(".header")?.classList.remove("menu-open", "acct-menu", "sys-menu");
+    setDrawerOpen(false);
   }
 
   if (tabName === "markets") {
@@ -12766,11 +13022,21 @@ function setupEventListeners() {
     doLogin({ ttlMinutes: parseFloat(min), inMemory, openIdProvider: "google" });
   });
 
-  // Hamburger menu toggle
+  // The drawer: the hamburger toggles; the close button, the scrim and Escape
+  // close; the foot's button is #auth-btn by proxy; a resize past the
+  // breakpoint lets go of the page's scroll lock (the desktop nav needs no
+  // drawer state).
   document.getElementById("menu-toggle").addEventListener("click", () => {
-    const header = document.querySelector(".header");
-    header.classList.toggle("menu-open");
-    header.classList.remove("acct-menu", "sys-menu");   // always reopen at the top level
+    setDrawerOpen(!document.querySelector(".header")?.classList.contains("menu-open"));
+  });
+  document.getElementById("drawer-close")?.addEventListener("click", () => setDrawerOpen(false));
+  document.getElementById("drawer-scrim")?.addEventListener("click", () => setDrawerOpen(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.querySelector(".header")?.classList.contains("menu-open")) { e.preventDefault(); setDrawerOpen(false); }
+  });
+  document.getElementById("drawer-auth")?.addEventListener("click", () => { setDrawerOpen(false); document.getElementById("auth-btn")?.click(); });
+  window.addEventListener("resize", () => {
+    if (!window.matchMedia("(max-width: 900px)").matches && document.querySelector(".header")?.classList.contains("menu-open")) setDrawerOpen(false);
   });
 
   // Market selector — a menu button over the market list (makeDropdown /
@@ -12790,6 +13056,10 @@ function setupEventListeners() {
   // in whichever cell is the trigger; its listeners travel with it.
   wireDisclosure(marketStatsPopup);
   wireDisclosure(marketStatMorePopup);
+
+  // The account-value ledger: its triggers, scrim, outside click, Escape,
+  // the hash router (a row navigates), and re-anchoring on resize.
+  wireWealth();
 
   // Close dropdowns on click outside — every dropdown on the page (the chart
   // cell's view menu and the user menu included) through its own setter
@@ -12844,14 +13114,14 @@ function setupEventListeners() {
       // Alias items (Deposit → Account, Play → the Launch page) aren't
       // sections, so the same-tab guard below doesn't apply to them.
       if (ROUTE_ALIASES[name]) {
-        document.querySelector(".header")?.classList.remove("menu-open", "acct-menu", "sys-menu");
+        setDrawerOpen(false);
         window.location.hash = ROUTE_ALIASES[name];
         return;
       }
       if (currentTab === name) {
         // Same tab tapped — don't thrash history, but on mobile the menu is
         // open and the user expects the tap to dismiss it.
-        document.querySelector(".header")?.classList.remove("menu-open", "acct-menu", "sys-menu");
+        setDrawerOpen(false);
         return;
       }
       // Clicking "Markets" goes to the last-viewed market (if any) so the
@@ -12878,14 +13148,14 @@ function setupEventListeners() {
   });
   document.querySelectorAll("[data-sys-go]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      document.querySelector(".header")?.classList.remove("menu-open", "sys-menu");
+      setDrawerOpen(false);
       window.location.hash = "system/" + btn.dataset.sysGo;
     });
   });
   document.querySelectorAll("[data-acct-go]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const header = document.querySelector(".header");
-      header?.classList.remove("menu-open", "acct-menu", "sys-menu");
+      setDrawerOpen(false);
       window.location.hash = "account/" + btn.dataset.acctGo;
     });
   });

@@ -4034,9 +4034,9 @@ console.log("\n§P. light theme — two token tables, the pre-paint bootstrap, t
         && /\.drawer-theme \{ display: none; \}/.test(headerCss));
   }
   if (respCss) {
-    check("responsive.css: the open drawer shows the theme row styled like the nav rows and hides the round header toggle",
-      /\.header\.menu-open \.tabs \.drawer-theme \{ display: flex;/.test(respCss) && /\.header\.menu-open \.header-right \.theme-toggle \{ display: none; \}/.test(respCss)
-        && /\.header\.menu-open \.tabs \.drawer-theme,/.test(respCss));
+    check("responsive.css: the drawer's head row shows the theme switch as a round 34px button (#theme-toggle-mobile keeps its id, class and data-theme-toggle), the round header toggle stays hidden on phones",
+      /\.header\.menu-open \.tabs \.drawer-theme \{ display: inline-flex; \}/.test(respCss) && /\.header\.menu-open \.header-right \.theme-toggle \{ display: none; \}/.test(respCss)
+        && /\.tabs \.drawer-theme \{[^}]*width: 34px; height: 34px;[^}]*border-radius: 999px;/.test(respCss));
   }
 
   // P11 — the change log names the feature.
@@ -5052,6 +5052,210 @@ console.log("\n§N4. Home page — #home routed, the logo is its anchor, the emp
   if (htmlO) {
     check("O: index.html carries neither the dev-identity class nor the label — the pill is only ever set by renderProfileChip",
       !/dev-identity|LOCAL DEV IDENTITY/.test(htmlO.replace(/<!--[\s\S]*?-->/g, "")));
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// §S. The account value, opened (operator instruction 2026-11-04; the mocks
+//     at multidex-mocks/place-order/08-wealth.html, P1 + T2): the header's
+//     account-value figure is a BUTTON in the user pill's geometry — a ghost
+//     capsule at rest, the outline on hover, the user menu's open look while
+//     the ledger shows — and opens #wealth-pop: a dialog under the figure on
+//     desktop, a sheet from the bottom over a scrim on phones. wealth.js is
+//     the PURE half (no DOM, no actor): main.js hands it the balance caches
+//     plus one fan-out of the pool / Earn queries, it renders the ledger —
+//     the total with cents and its change, a one-hue composition bar, the
+//     venues in the Overview's order (the wallet open to its assets, each
+//     pool with its distance to liquidation, the two Earn stakes), every row
+//     an anchor into its Account tab, the footer attributing the change. The
+//     deltas count from this principal's LAST LOOK (localStorage, stamped on
+//     close after a 30 s grace) or the sign-in snapshot. Lifted run: the
+//     decomposition is exact — rows and parts both sum to the headline
+//     change — shares sum to one, the rows carry their keys and figures, the
+//     empty venues invite, a pool inside 20 % of liquidation is marked, a
+//     negative total is marked, the first look says so.
+// ═════════════════════════════════════════════════════════════════
+console.log("\n§S. account value, opened — the figure is a control, the ledger is exact, the baseline is the last look");
+{
+  const htmlS = must("src/frontend/index.html");
+  const rawS = must("src/frontend/src/main.js");
+  const mainS = rawS === null ? null : stripJsComments(rawS);
+  const hdrS = must("src/frontend/src/styles/header.css");
+  const respS = must("src/frontend/src/styles/responsive.css");
+  if (htmlS) {
+    const h = htmlS.replace(/<!--[\s\S]*?-->/g, "");
+    check("S: both figure mounts wrap the odometer's .amount in a .wealth-trigger button (aria-haspopup=dialog, aria-controls=wealth-pop) — the desktop one and the mobile twin",
+      /id="balance-display" class="balance-display"[^>]*>\s*<button type="button" id="wealth-trigger" class="wealth-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="wealth-pop"[^>]*><span class="amount"><\/span><\/button>/.test(h)
+      && /id="balance-display-mobile"[^>]*>\s*<button type="button" id="wealth-trigger-mobile" class="wealth-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="wealth-pop"[^>]*><span class="amount"><\/span><\/button>/.test(h));
+    check("S: #wealth-pop is a hidden role=dialog between the nav and .header-right (outside the latter, which phones hide until the drawer opens; the toggle stays its last control), its scrim before it",
+      /<\/nav>\s*<div id="wealth-scrim" class="wealth-scrim" hidden><\/div>\s*<div id="wealth-pop" class="wealth-pop" role="dialog" aria-label="Account value breakdown" hidden><\/div>\s*<div class="header-right">/.test(h));
+  }
+  if (mainS) {
+    check("S: main.js imports the pure ledger — wealthSnapshot + wealthHtml from ./wealth.js", /import \{ wealthSnapshot, wealthHtml \} from "\.\/wealth\.js";/.test(mainS));
+    const rb = funcBody(mainS, "function renderBalances()");
+    check("S: renderBalances still finds the figure's .amount by query (the button is never wiped on the normal path) and repaints the open ledger (wealthOnBalances)",
+      rb !== null && /let amt = mount\.querySelector\("\.amount"\);/.test(rb) && /wealthOnBalances\(\);/.test(rb));
+    const cw = funcBody(mainS, "function closeWealth(refocus)");
+    const ow = funcBody(mainS, "async function openWealth(trigger)");
+    check("S: the last-look grace is 30 s — closeWealth arms wealthStoreBase(\"look\", seen) behind WEALTH_LOOK_GRACE_MS, openWealth clears it (second thoughts keep the old deltas)",
+      /^const WEALTH_LOOK_GRACE_MS = 30_000;/m.test(mainS)
+      && cw !== null && /setTimeout\([\s\S]*?wealthStoreBase\("look", seen\)[\s\S]*?WEALTH_LOOK_GRACE_MS\)/.test(cw)
+      && ow !== null && /clearTimeout\(_wealthGrace\)/.test(ow));
+    check("S: the baseline is stored per principal (localStorage mdx.wealth.v1.<principal>) and sign-out resets the ledger beside cachedAcctSummary",
+      /`mdx\.wealth\.v1\.\$\{p\}\$\{suffix\}`/.test(mainS) && /cachedAcctSummary = null;\s*wealthReset\(\);/.test(mainS));
+    const ww = funcBody(mainS, "function wireWealth()");
+    check("S: opening closes the user menu (one open thing in the header); a hashchange closes the ledger (a row navigates); Escape closes and refocuses the figure",
+      ow !== null && /userMenu\.setOpen\(false\);/.test(ow)
+      && ww !== null && /addEventListener\("hashchange", \(\) => closeWealth\(false\)\)/.test(ww)
+      && /e\.key === "Escape" && wealthOpen\) \{ e\.preventDefault\(\); closeWealth\(true\);/.test(ww));
+    check("S: openWealth refuses signed out and the sign-in hook stamps the baseline only when none is stored",
+      ow !== null && /if \(!pop \|\| !appState\.isAuthenticated\) return;/.test(ow)
+      && /async function wealthOnLogin\(\) \{\s*wealthBase = wealthLoadBase\(\);\s*if \(!wealthBase && await wealthFetch\(\)\) wealthStoreBase\("signin"/.test(mainS));
+  }
+  if (hdrS) {
+    const b = hdrS.replace(/\/\*[\s\S]*?\*\//g, "");
+    check("S: header.css: the trigger is a 34px capsule — transparent border at rest, the outline on hover, the user menu's open look while expanded",
+      /\.wealth-trigger \{[^}]*height: 34px;[^}]*border: 1\.5px solid transparent;[^}]*border-radius: 999px;/.test(b)
+      && /\.wealth-trigger:hover \{ border-color: var\(--accent-outline\); \}/.test(b)
+      && /\.wealth-trigger\[aria-expanded="true"\] \{ border-color: var\(--accent\); background: var\(--bg-hover\); \}/.test(b));
+    check("S: header.css: the venue ramp is ONE hue in four steps (--wealth-1..4, mixes of --accent with the card), wired to the bar and the row swatches",
+      /--wealth-1: var\(--accent\);/.test(b) && /--wealth-4: color-mix\(in srgb, var\(--accent\) 44%, var\(--bg-card\)\);/.test(b)
+      && /\.wealth-bar i\[data-v="ins"\],\s*\.wealth-sw\[data-v="ins"\]\s*\{ background: var\(--wealth-4\); \}/.test(b));
+  }
+  if (respS) {
+    const b = respS.replace(/\/\*[\s\S]*?\*\//g, "");
+    check("S: responsive.css: on phones the ledger is a fixed sheet from the bottom over a scrim, with the Open Account CTA shown",
+      /\.wealth-pop \{\s*position: fixed; top: auto; left: 0; right: 0 !important; bottom: 0;/.test(b)
+      && /\.wealth-scrim \{ display: block; position: fixed; inset: 0;/.test(b) && /\.wealth-cta \{ display: block;/.test(b));
+  }
+  // ── lifted run: the arithmetic and the ledger ──
+  let wealth = null;
+  try { wealth = await import(pathToFileURL(path("src/frontend/src/wealth.js")).href); ok("S: wealth.js imports (pure: no DOM, no actor)"); }
+  catch (e) { bad("S: wealth.js imports (pure: no DOM, no actor)", e.message); }
+  if (wealth) {
+    const { wealthSnapshot, wealthDiff, wealthHtml } = wealth;
+    const base = wealthSnapshot({
+      tokens: [{ t: "ICPUSD", qty: 4938.21, px: 1, held: 1200 }, { t: "BTC", qty: 0.0812, px: 67420 }, { t: "ETH", qty: 1.25, px: 3512 }, { t: "SOL", qty: 12.5, px: 148.2 }, { t: "ICP", qty: 812.4, px: 2.4539, held: 100 }],
+      pools: [{ id: 1, name: "Alpha", label: "Alpha · ICP long 2.2×", equity: 3180, upnl: 180, usage: 0.59, hasPos: true }, { id: 2, name: "Beta", label: "Beta · BTC short 1.5×", equity: 1420, upnl: -80, usage: 0.88, hasPos: true }],
+      vault: { lp: 1250, value: 2612.4, share: 0.0034 }, ins: { shares: 900, value: 931.5 }, net: 26792.63,
+    }, 1000);
+    const now = wealthSnapshot({
+      tokens: [{ t: "ICPUSD", qty: 4938.21 - 500.5, px: 1, held: 1200 }, { t: "BTC", qty: 0.0812, px: 67420 * 1.012 }, { t: "ETH", qty: 1.25, px: 3512 }, { t: "SOL", qty: 12.5, px: 148.2 }, { t: "ICP", qty: 1012.4, px: 2.5, held: 100 }],
+      pools: [{ id: 1, name: "Alpha", label: "Alpha · ICP long 2.2×", equity: 3300, upnl: 300, usage: 0.57, hasPos: true }, { id: 2, name: "Beta", label: "Beta · BTC short 1.5×", equity: 1382, upnl: -118, usage: 0.9, hasPos: true }],
+      vault: { lp: 1250, value: 2613.5, share: 0.0034 }, ins: { shares: 900, value: 931.5 }, net: null,
+    }, 2000);
+    const x = wealthDiff(now, base);
+    const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
+    check("S: the decomposition is exact — the four venue rows sum to the headline change", Math.abs(sum(x.rows) - x.total) < 1e-6, `rows ${sum(x.rows)} vs total ${x.total}`);
+    check("S: … and so do the parts (prices, positions, yield, trades & fees, earn flows)", Math.abs(sum(x.parts) - x.total) < 1e-6, `parts ${sum(x.parts)} vs total ${x.total}`);
+    const expPrices = 0.0812 * (67420 * 1.012 - 67420) + 1012.4 * (2.5 - 2.4539);
+    check("S: qty × Δprice is the market — BTC +1.2 % on 0.0812 BTC and ICP 2.4539→2.5 on 1,012.4 ICP are the whole of `prices`", Math.abs(x.parts.prices - expPrices) < 1e-6, `${x.parts.prices} vs ${expPrices}`);
+    check("S: Δqty × price is a flow — the fill (500.5 ICPUSD out, 200 ICP in at the base mark) lands in `flows`, the P&L moves in `positions` (+120 − 38), the vault's value per LP in `yield`",
+      Math.abs(x.parts.flows - (-500.5 * 1 + 200 * 2.4539)) < 1e-6 && Math.abs(x.parts.positions - 82) < 1e-9 && Math.abs(x.parts.yield - 1.1) < 1e-6, JSON.stringify(x.parts));
+    check("S: the venues' shares of the positive mass sum to one", Math.abs(sum(x.d.share) - 1) < 1e-9, JSON.stringify(x.d.share));
+    const html = wealthHtml({ now, base, since: "since you last looked · 6 min ago", fmt: { qty: (n) => String(n) } });
+    check("S: the ledger's rows carry their keys and figures and link into Account (wallet → /wallet, pool:* → /positions, vault & ins → /earn)",
+      /data-key="wallet" data-usd="[0-9.]+" href="#account\/wallet"/.test(html) && /data-key="asset:BTC"/.test(html)
+      && /data-key="pool:1" data-usd="3300\.00" href="#account\/positions"/.test(html) && /data-key="vault"[^>]*href="#account\/earn"/.test(html) && /data-key="ins"[^>]*href="#account\/earn"/.test(html));
+    check("S: a pool inside 20 % of liquidation is marked risk (Beta at 10 %); the resting-orders line links to Spot; the headline change carries the arrow and cents",
+      /class="wealth-row sub risk" data-key="pool:2"/.test(html) && /href="#account\/spot">[^<]*resting in open orders/.test(html) && /wealth-delta up">▲ \$[0-9,]+\.[0-9]{2}<small>/.test(html));
+    check("S: the footer attributes the change — Prices, Positions +82.00, Yield, Trades & fees — and offers Overview →",
+      /Prices <b class="up">\+/.test(html) && /Positions <b class="up">\+82\.00<\/b>/.test(html) && /Yield <b class="up">\+1\.10<\/b>/.test(html) && /Trades &amp; fees <b class="dn">/.test(html) && /href="#account\/overview">Overview →<\/a>/.test(html));
+    check("S: no baseline is a first look — every delta a dash, the headline says so", wealthDiff(now, null).none === true && />first look</.test(wealthHtml({ now, base: null, since: "first look" })));
+    const emptyHtml = wealthHtml({ now: wealthSnapshot({ tokens: [], pools: [{ id: 1, name: "A", equity: -400, upnl: -3400, usage: 1, hasPos: true }], vault: {}, ins: {} }), base: null, since: "x" });
+    check("S: the empty venues invite (Deposit →, Earn →), an underwater account's total is marked negative, its pool reads 0% to liq",
+      /Deposit →/.test(emptyHtml) && /Earn →/.test(emptyHtml) && /wealth-total neg/.test(emptyHtml) && /0% to liq/.test(emptyHtml));
+    check("S: the mobile render appends the sheet's Open Account CTA; the desktop one does not",
+      /class="wealth-cta" href="#account\/overview">Open Account<\/a>/.test(wealthHtml({ now, base, since: "x", mobile: true })) && !/wealth-cta/.test(html));
+    check("S: pool names are escaped on the way into the ledger", /&lt;b&gt;/.test(wealthHtml({ now: wealthSnapshot({ tokens: [], pools: [{ id: 9, name: "<b>", label: "<b>", equity: 1, upnl: 0, usage: 0, hasPos: false }], vault: {}, ins: {} }), base: null, since: "x" })));
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// §T. The phone menu is a drawer (operator instruction 2026-11-04; the mocks
+//     at multidex-mocks/place-order/09-mobile-menu.html, D1 + S1 + T2): the
+//     nav (.tabs) is a fixed 248px panel that slides in from the left over a
+//     scrim, the page staying put — the growing-header column layout is gone.
+//     Its head row carries a second lockup, the round theme switch (the same
+//     #theme-toggle-mobile) and a close; Platform (the former System) and the
+//     account pill carry a chevron and open their level-2 lists under a
+//     title; the pill shows the account value beside the name; the foot's
+//     Sign in / out mirrors #auth-btn. AI is an ICON tab (currentColor): last
+//     in the desktop nav, and on phones a twin in the header after the
+//     account value (the nav's copy hides there). main.js opens and closes
+//     through ONE door (setDrawerOpen: .menu-open, body scroll lock, the
+//     hamburger's aria-expanded, focus, the ledger closed).
+// ═════════════════════════════════════════════════════════════════
+console.log("\n§T. the phone menu — a drawer over the page, chevrons on the lists, Platform, the AI icon");
+{
+  const htmlT = must("src/frontend/index.html");
+  const rawT = must("src/frontend/src/main.js");
+  const mainT = rawT === null ? null : stripJsComments(rawT);
+  const hdrT = must("src/frontend/src/styles/header.css");
+  const respT = must("src/frontend/src/styles/responsive.css");
+  const docsT = must("src/frontend/src/docs.js");
+  if (htmlT) {
+    const h = htmlT.replace(/<!--[\s\S]*?-->/g, "");
+    check("T: the scrim sits right before the nav; the hamburger announces the drawer (aria-expanded)",
+      /<div id="drawer-scrim" class="drawer-scrim"><\/div>\s*<nav class="tabs">/.test(h) && /<button id="menu-toggle" class="menu-toggle" aria-label="Menu" aria-expanded="false">/.test(h));
+    check("T: the drawer's head row — a second lockup, the SAME #theme-toggle-mobile, a close button — heads the nav",
+      /<nav class="tabs">\s*<div class="drawer-head">\s*<svg class="drawer-lockup"[\s\S]*?id="theme-toggle-mobile"[\s\S]*?<button type="button" id="drawer-close" class="drawer-close" aria-label="Close menu">/.test(h));
+    check("T: System is Platform, with the drawer's chevron; the account pill carries the chevron and no account value (the header keeps the figure in view beside the drawer)",
+      /<button class="tab" data-tab="stats">Platform<svg class="tab-chevron"/.test(h) && !/>System</.test(h)
+        && /<span id="drawer-acct-name">Account<\/span>\s*<svg class="tab-chevron"/.test(h) && !/drawer-acct-value/.test(h));
+    check("T: AI is an icon tab after Docs in the nav and a twin in the phone header after the account value — both .tab[data-tab=intelli], the glyph in currentColor, no text tab left",
+      /<button class="tab" data-tab="docs">Docs<\/button>\s*<button class="tab tab-ai" data-tab="intelli" aria-label="AI" title="AI"><svg class="ai-icon"/.test(h)
+        && /id="balance-display-mobile"[\s\S]*?<\/div>\s*<button class="tab tab-ai tab-ai-hdr" data-tab="intelli" aria-label="AI" title="AI"><svg class="ai-icon"/.test(h)
+        && (h.match(/<svg class="ai-icon"[^>]*><path fill="currentColor"/g) || []).length === 2 && !/lime/.test(h) && !/data-tab="intelli">AI</.test(h));
+    check("T: the level-2 lists carry a title under the back row (Account / Platform) and the foot carries Sign In (#drawer-auth) last in the nav",
+      /<div class="drawer-acct-title">Sections<b>Account<\/b><\/div>/.test(h) && /<div class="drawer-acct-title">Sections<b>Platform<\/b><\/div>/.test(h)
+        && /<div class="drawer-foot">\s*<button type="button" id="drawer-auth" class="drawer-auth">Sign In<\/button>\s*<\/div>\s*<\/nav>/.test(h));
+  }
+  if (mainT) {
+    const door = funcBody(mainT, "function setDrawerOpen(open)");
+    check("T: setDrawerOpen is the one door — .menu-open, the level classes reset, body.drawer-open, the hamburger's aria-expanded, the ledger closed on open",
+      door !== null && /classList\.toggle\("menu-open", open\)/.test(door) && /classList\.remove\("acct-menu", "sys-menu"\)/.test(door)
+        && /document\.body\.classList\.toggle\("drawer-open", open\)/.test(door) && /setAttribute\("aria-expanded", open \? "true" : "false"\)/.test(door) && /closeWealth\(false\)/.test(door));
+    check("T: nothing else removes .menu-open by hand (every close goes through the door)", !/classList\.remove\("menu-open"/.test(mainT) && !/classList\.toggle\("menu-open"\)/.test(mainT));
+    check("T: the close button, the scrim and Escape close; the foot's button clicks #auth-btn; a resize past 900px lets go",
+      /getElementById\("drawer-close"\)\?\.addEventListener\("click", \(\) => setDrawerOpen\(false\)\)/.test(mainT)
+        && /getElementById\("drawer-scrim"\)\?\.addEventListener\("click", \(\) => setDrawerOpen\(false\)\)/.test(mainT)
+        && /e\.key === "Escape" && document\.querySelector\("\.header"\)\?\.classList\.contains\("menu-open"\)\) \{ e\.preventDefault\(\); setDrawerOpen\(false\);/.test(mainT)
+        && /getElementById\("drawer-auth"\)\?\.addEventListener\("click", \(\) => \{ setDrawerOpen\(false\); document\.getElementById\("auth-btn"\)\?\.click\(\); \}\)/.test(mainT)
+        && /matchMedia\("\(max-width: 900px\)"\)\.matches && document\.querySelector\("\.header"\)\?\.classList\.contains\("menu-open"\)\) setDrawerOpen\(false\)/.test(mainT));
+    check("T: logout re-renders the figure right after the profile chip (the mounts hide — the drawer's Sign out leaves no stale figure)",
+      /wealthReset\(\);[\s\S]{0,1200}?renderProfileChip\(\);\s*renderBalances\(\);/.test(mainT));
+    check("T: the foot mirrors #auth-btn's label on both assignments; nothing writes an account value onto the pill",
+      (mainT.match(/getElementById\("drawer-auth"\)\.textContent = authBtn\.textContent/g) || []).length === 2 && !/drawer-acct-value/.test(mainT));
+    check("T: responsive.css: the profile card stacks on phones — the details beside the avatar at full width, the regenerate control a foot row",
+      /#account-profile-card \.profile-row \{ flex-wrap: wrap; align-items: flex-start;/.test(respT) && /#account-profile-card \.profile-details \{ flex: 1 1 200px; min-width: 0; \}/.test(respT)
+        && /#account-profile-card \.regen-btn-area \{ flex: 1 1 100%; flex-direction: row; align-items: center; justify-content: space-between;/.test(respT),
+      "archive.css loads after responsive.css: the phone rules must out-rank its base rules by the card's id");
+  }
+  if (respT) {
+    const b = respT.replace(/\/\*[\s\S]*?\*\//g, "");
+    check("T: responsive.css: the nav is a fixed 248px panel off-screen left, visible and in place under .menu-open; the scrim fades in; the page's scroll locks",
+      /\.tabs \{[^}]*position: fixed; top: 0; bottom: 0; left: 0; width: 248px;[^}]*transform: translateX\(-102%\); visibility: hidden;/.test(b)
+        && /\.header\.menu-open \.tabs \{ transform: none; visibility: visible;/.test(b)
+        && /\.drawer-scrim \{ display: block; position: fixed; inset: 0;/.test(b) && /\.header\.menu-open \.drawer-scrim \{ opacity: 1; pointer-events: auto; \}/.test(b)
+        && /body\.drawer-open \{ overflow: hidden; \}/.test(b));
+    check("T: responsive.css: the growing-header column layout is gone; the header stays one 56px row",
+      !/\.header\.menu-open \.tabs \{\s*display: flex;\s*flex-direction: column;/.test(b) && !/\.header\.menu-open \.header-right \{\s*display: flex;/.test(b) && /\.header \{ height: 56px; padding: 0 12px; \}/.test(b));
+    check("T: responsive.css: a long username on the pill ellipsises on one line; the dev-identity marker is exempt (never clipped, §O)",
+      /#drawer-acct-name:not\(\.dev-identity\) \{ min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; \}/.test(b));
+    check("T: responsive.css: on phones AI shows in the header (34px icon) and hides in the nav; the chevron shows; the active row is the accent tint",
+      /\.tab-ai-hdr \{ display: inline-flex; width: 34px; height: 34px;/.test(b) && /\.tabs \.tab-ai \{ display: none; \}/.test(b)
+        && /\.tab-chevron \{ display: inline-block; margin-left: auto;/.test(b) && /\.tabs \.tab\.active, \.drawer-acct-item\.active \{ background: var\(--accent-tint-2\); color: var\(--accent\); \}/.test(b));
+  }
+  if (hdrT) {
+    const b = hdrT.replace(/\/\*[\s\S]*?\*\//g, "");
+    check("T: header.css: desktop hides the chevron, the header's AI twin and the drawer's head, foot, scrim, close and titles; the icon tab is an 18px glyph",
+      /\.tab-chevron \{ display: none; \}/.test(b) && /\.tab-ai-hdr \{ display: none; \}/.test(b)
+        && /\.drawer-head, \.drawer-foot, \.drawer-scrim, \.drawer-close, \.drawer-acct-title \{ display: none; \}/.test(b) && /\.tab-ai \.ai-icon \{ width: 18px; height: 18px;/.test(b));
+  }
+  if (docsT) {
+    check("T: docs.js says Platform where it pointed at System's sections, and the change log names the drawer, Platform and the AI icon",
+      /Platform → Canisters/.test(docsT) && !/System → /.test(docsT) && /The menu on phones is a drawer\./.test(docsT) && /<b>Platform<\/b>\s*\(the former System\)/.test(docsT));
   }
 }
 
