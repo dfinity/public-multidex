@@ -15,6 +15,7 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
@@ -23,10 +24,10 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
 
-ID=b2bp; icp identity new $ID --storage plaintext 2>/dev/null || true
+ID=b2bp; mdx_identity_new $ID
 P=$(icp identity principal --identity $ID 2>/dev/null | tail -1)
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-usr() { icp canister call --identity $ID backend "$@" 2>&1; }
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+usr() { icp canister call --candid "$MDX_CANDID" --identity $ID backend "$@" 2>&1; }
 release() { adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null; adm requoteAmm '("BTC-ICPUSD")' >/dev/null; }
 fld() { echo "$2" | tr -d '_' | grep -oE "$1 = -?[0-9]+" | head -1 | grep -oE "[0-9]+"; }
 
@@ -34,7 +35,7 @@ adm setTestTimersPaused '(true)' >/dev/null 2>&1 || true
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm createAmmPool '("BTC-ICPUSD")' >/dev/null 2>&1 || true
 adm setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 50000.0) : nat)" >/dev/null
-adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat, 0:nat)" >/dev/null 2>&1 || true
+adm setAmmConfig "(\"BTC-ICPUSD\", 30:nat, $(e8 0.5) : nat, 8:nat, 25:nat)" >/dev/null 2>&1 || true
 adm enableAmm '("BTC-ICPUSD", true)' >/dev/null 2>&1 || true
 AMM=$(adm getAmmPrincipal "()" | grep -oE 'principal "[^"]+"' | head -1 | sed -E 's/principal "(.+)"/\1/')
 adm setTestBalance "(principal \"$AMM\", \"ICPUSD\", $(e8 10000000.0) : nat)" >/dev/null
@@ -46,7 +47,7 @@ R=$(usr createMarginPool '("b2b pool", false)')
 PID=$(echo "$R" | tr -d '_' | grep -oE 'ok = [0-9]+' | grep -oE '[0-9]+' | head -1)
 usr fundMarginPool "($PID, $(e8 30000.0) : nat)" >/dev/null
 O=$(usr openPosition "($PID, \"BTC-ICPUSD\", variant { sell }, $(e8 1.0) : nat, $(e8 0.05) : nat, null)")
-if echo "$O" | grep -q "ok"; then ok "short staged"; else nok "openPosition sell" "$O"; fi
+if mdx_ok "$O"; then ok "short staged"; else nok "openPosition sell" "$O"; fi
 release
 SZ0=$(fld size "$(usr getMyPositions '()')")   # |size| of the short
 D0=$(fld debtUsd "$(usr getMyMarginPools '()')")

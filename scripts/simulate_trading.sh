@@ -171,7 +171,18 @@ rand_idx() {
 }
 
 # Check if Candid response is ok or err
-is_ok()  { echo "$1" | grep -q 'ok'; }
+# Deliberately SELF-CONTAINED — not sourced from scripts/lib/reply.sh: live
+# fleets on other targets run their own copy of this file for hours, and a
+# sourced lib is one more file a mid-run edit could re-parse under them. The
+# needle is mdx_reply_ok's byte for byte (hygiene §7i pins it literally, §6af
+# drives this function with the named and hashed spellings): the tag `ok`
+# OR icp's hash spelling `24_860`, printed when its per-call candid fetch
+# misses ("WARN could not fetch candid type …", task 1788507289) — a filled
+# order answered that way must tally as a fill, never as a refusal. `err`
+# (5_048_165) and `Err` (3_456_837) still refuse.
+is_ok() {
+  printf '%s\n' "$1" | tr -s '[:space:]' ' ' | grep -cE 'variant \{ (ok|24_860)( \}| =)' >/dev/null
+}
 is_err() { echo "$1" | grep -q 'err\|Error'; }
 get_err_msg() { echo "$1" | sed -n 's/.*err = "\([^"]*\)".*/\1/p' | head -1; }
 

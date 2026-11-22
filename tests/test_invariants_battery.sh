@@ -20,7 +20,7 @@ INITIAL_LP=$(extract_float "lpSupply" "$INITIAL_VAULT")
 assert_gt "seeded with vault LP supply" "${INITIAL_LP:-0}" "0"
 
 # ── Run a battery of taker activity ──────────────────────────────
-icp identity new battery --storage plaintext 2>/dev/null || true
+mdx_identity_new battery
 B=$(principal_of battery)
 call setTestBalance "(principal \"$B\", \"ICPUSD\", $(e8 500000.0))" --identity alice > /dev/null
 call setTestBalance "(principal \"$B\", \"BTC\",     $(e8 2.0))"     --identity alice > /dev/null
@@ -46,21 +46,20 @@ sleep 12
 
 # I-A: Sum of LP balances == vaultLPSupply (this is also in the
 # global assert_invariants but we re-verify here as a smoke test on
-# the helper).
+# the helper — with the SAME absolute base-unit tolerance, i1_tol_e8 from
+# _lib.sh: a 1% relative band here let ~300 whole tokens of drift through
+# in the very file that smoke-tests the fix (#51.5 second site).
 VAULT=$(call getVaultValue '()')
-# LP supply + per-user LP are base-unit Nats now — read raw, convert to human
-# units so the tolerance below stays in human scale.
-LP_SUPPLY=$(from_e8 "$(extract_nat "lpSupply" "$VAULT")")
-SUM=0.0
+LP_SUPPLY=$(extract_nat "lpSupply" "$VAULT")
+SUM=0
 for ident in alice bob charlie dave eve battery; do
   PRI=$(principal_of "$ident" 2>/dev/null) || continue
   [ -z "$PRI" ] && continue
   BAL=$(call getMyVaultLp '()' --identity "$ident" | tr -d '_' | grep -oE "[0-9]+" | head -1)
   [ -z "$BAL" ] && BAL=0
-  BAL=$(from_e8 "$BAL")
   SUM=$(python3 -c "print($SUM + $BAL)")
 done
-assert_float_close "Σ user LP == vaultLPSupply" "$LP_SUPPLY" "$SUM" 0.01
+assert_abs_close "Σ user LP == vaultLPSupply (base units, ±${i1_tol_e8})" "${LP_SUPPLY:-0}" "$SUM" "$i1_tol_e8"
 
 # I-B: No 0-qty orders on any book (zombie regression).
 ZOMBIES=0

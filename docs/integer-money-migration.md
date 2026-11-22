@@ -41,7 +41,7 @@ in JS.
    headroom, position size, unrealizedPnl, realizedPnl, valueUsd,
    netAccountValueUsd, gainLossPct, deltaColl). KEEP `IDL.Float64` for the
    deliberate Float islands surfaced over Candid: `PoolValueInfo.volRegime`,
-   `CounterpartyStats` (adverseRate/totalFillValue), `PriceFeed.Aggregate`
+   `PriceFeed.Aggregate`
    (price/stddevBps), and OQL numeric values (the backend exposes those via
    `Fixed.toFloat`). Use `.mops/.build/backend.did` as the authoritative
    per-field reference.
@@ -135,7 +135,7 @@ fix them. Do NOT hand-hunt 341 sites blind.
   price-band clamps `OUT_OF_BAND_PCT 0.06`, `USERS_ONLY_CLAMP_PCT 0.02` → `6_000_000`
   / `2_000_000` if they multiply prices in fixed-point (else keep Float + quantize).
 - **Stay Float** (heuristics, like the AMM islands): the staleness premium
-  (`STALE_RATE_BPS/VOL_Z/MAX_BPS`, `√age`), `aggregateHostilityBps`, requote-drift
+  (`STALE_RATE_BPS/VOL_Z/MAX_BPS`, `√age`), requote-drift
   detection (`AMM_FORCE_REQUOTE_DRIFT_BPS`), `AMM_CASH_FLOOR_FRAC`,
   `AMM_QUOTE_DEPTH_FRACTION`. Read `Nat` via `toFloat`, quantize back where the
   result becomes an order/price.

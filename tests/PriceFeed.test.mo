@@ -599,4 +599,28 @@ if (splitAgg.stddevBps < 500.0) {
 };
 Debug.print("  ✓ 2-source disagreement keeps honest dispersion (floor still refuses)");
 
+// ── Partial-set aggregation (H-37 / F34) ─────────────────────────
+// The fan-out applies the mark on a QUORUM of arrivals (or the deadline),
+// so `aggregate` must price a PARTIAL fleet honestly: four of eight sources
+// in cluster → four survivors (≥ the floor), the median of the four, and a
+// dispersion measured on those four — nothing about the sources that have
+// not answered enters the sample. The missing sources are simply absent
+// from `readings` (a fan-out never fabricates a failed reading for them).
+let partial = PriceFeed.aggregate("SOL", [
+  { sourceId = "okx";      asset = "SOL"; price = 150.10; fetchedAtNs = 10; ok = true; errMessage = null },
+  { sourceId = "kucoin";   asset = "SOL"; price = 150.00; fetchedAtNs = 11; ok = true; errMessage = null },
+  { sourceId = "coinbase"; asset = "SOL"; price = 150.20; fetchedAtNs = 12; ok = true; errMessage = null },
+  { sourceId = "binance";  asset = "SOL"; price = 150.05; fetchedAtNs = 13; ok = true; errMessage = null },
+], 20);
+if (partial.sourceCount != 4) {
+  Runtime.trap("FAIL: partial set of 4 must yield 4 survivors, got " # debug_show partial.sourceCount);
+};
+close("partial set (4 of 8): median of the four",           partial.price, 150.075, 0.001);
+eqBool("partial set (4 of 8): robust enough to move a mark", PriceFeed.canMoveMark(partial), true);
+if (partial.stddevBps > 50.0) {
+  Runtime.trap("FAIL: partial set dispersion must be measured on the four present, got " # debug_show partial.stddevBps);
+};
+Debug.print("  ✓ partial set (4 of 8): dispersion within the gate, absent sources absent (readings 4)");
+if (partial.readings.size() != 4) { Runtime.trap("FAIL: readings must be the four that arrived") };
+
 Debug.print("── PriceFeed.test PASS ──");

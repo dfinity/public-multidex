@@ -27,8 +27,13 @@
 // like a desktop browser quit — boot check again.
 
 const GRACE_MS = 8000;             // ping → census delay; a reload re-appears well within it
-const AUTH_DB  = "auth-client-db"; // @icp-sdk/auth IdbStorage DB (client/db.js: AUTH_DB_NAME).
-                                   // Deleting it removes delegation + base key = logout().
+const AUTH_DB  = "auth-client-db"; // @icp-sdk/auth's IdbCredentialStorage DB (client/db.ts: AUTH_DB_NAME,
+                                   // unchanged 8.x → 11.x; store `ic-keyval`, slots `session` + `app`:
+                                   // each a key pair and its delegation chain). Deleting it removes every
+                                   // credential = the credential half of signOut(). The who-is-signed-in
+                                   // record (localStorage `ic-session-state`) is out of a worker's reach:
+                                   // the next load's restore finds no credential behind it and drops it,
+                                   // and the boot stale-check (main.js) signs out anyway.
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));

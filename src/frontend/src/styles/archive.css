@@ -23,11 +23,11 @@
   padding: 1px 6px; border-radius: 4px; white-space: nowrap;
   background: var(--bg-hover); color: var(--text-dim);
 }
-.arch-cat-fill { background: rgba(94,230,180,0.14); color: var(--green); }
-.arch-cat-liquidation { background: rgba(196,139,217,0.14); color: var(--heather); }
-.arch-cat-rejection { background: rgba(240,122,108,0.14); color: var(--red); }
-.arch-cat-position { background: rgba(59,184,212,0.14); color: var(--glacier); }
-.arch-cat-deposit, .arch-cat-withdrawal, .arch-cat-transfer { background: rgba(229,169,83,0.14); color: var(--accent); }
+.arch-cat-fill { background: var(--green-tint); color: var(--green); }
+.arch-cat-liquidation { background: var(--heather-tint); color: var(--heather); }
+.arch-cat-rejection { background: var(--red-tint); color: var(--red); }
+.arch-cat-position { background: var(--glacier-tint); color: var(--glacier); }
+.arch-cat-deposit, .arch-cat-withdrawal, .arch-cat-transfer { background: var(--cta-tint); color: var(--accent); }
 .arch-badge {
   font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; white-space: nowrap;
 }
@@ -35,7 +35,7 @@
 .arch-pending  { color: var(--accent); border: 1px solid var(--accent); }
 .arch-live     { color: var(--text-muted); border: 1px solid var(--border); }
 .archive-more-wrap { text-align: center; margin-top: 12px; }
-.archive-note { font-size: 12px; color: var(--accent); margin-bottom: 10px; padding: 8px 10px; background: rgba(229,169,83,0.08); border-radius: var(--radius-sm); }
+.archive-note { font-size: 12px; color: var(--accent); margin-bottom: 10px; padding: 8px 10px; background: var(--cta-tint); border-radius: var(--radius-sm); }
 /* Per-card value figure in the header (Wallet value / Pools value) — the two
    components of Account value, so the aggregate is visibly auditable. */
 .card-value { font-size: 12px; color: var(--text-dim); margin-left: auto; margin-right: 14px; }
@@ -127,7 +127,7 @@
 .balance-row-amount { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); }
 /* Wallet figures are click-to-fill for the Withdraw row. The dashed cyan
    underline is the standing "this is clickable" cue; hover commits to accent. */
-.balance-amount-fill { cursor: pointer; text-decoration: underline dashed rgba(56, 189, 240, 0.5); text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.balance-amount-fill { cursor: pointer; text-decoration: underline dashed var(--accent-outline); text-underline-offset: 4px; text-decoration-thickness: 1px; }
 .balance-amount-fill:hover { color: var(--accent); text-decoration-color: var(--accent); }
 
 /* Phase 0: cross-market bid-headroom card. Lives directly under the
@@ -219,6 +219,11 @@
   flex-wrap: wrap; /* let selectors/inputs/buttons wrap on narrow screens */
 }
 .margin-row-end { justify-content: flex-end; }
+/* A disabled action in an Earn-card row READS as disabled — the paused
+   Withdraw submit (applyWithdrawPause) and the one-tap Max with nothing to
+   fill (applyWithdrawMax, task 1793553361); .btn-secondary carries no
+   :disabled rule of its own. The .deposit-card / .events-pager shape. */
+.margin-row .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .margin-collateral-stats {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -267,8 +272,8 @@
   border-radius: var(--radius-sm);
   font-size: 13px;
 }
-.margin-msg-ok  { background: rgba(0, 200, 120, 0.08); color: var(--green); }
-.margin-msg-err { background: rgba(220, 60, 60, 0.08);  color: var(--red); }
+.margin-msg-ok  { background: var(--green-dim); color: var(--green); }
+.margin-msg-err { background: var(--red-dim); color: var(--red); }
 
 /* Margin Phase 1 (basket): per-token breakdown table + token picker. */
 .margin-breakdown {

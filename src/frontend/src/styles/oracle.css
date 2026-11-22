@@ -69,6 +69,24 @@
   margin: -6px 0 10px;   /* tuck under .oracle-asset-meta's bottom margin */
   flex-wrap: wrap;
 }
+/* 1788471187: the USD/USDT line under the fetched meta — which quote group
+   priced the mark and how far the two groups sit apart. Amber (--cta) when
+   the groups have diverged past the depeg alarm: a USDT depeg leaves the
+   pooled mark USDT-dominated while every other number on the card reads
+   healthy, and this is the one line that says so. */
+.oracle-asset-quote {
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+  margin: -6px 0 10px;   /* tuck under .oracle-asset-meta, like .oracle-asset-applied */
+  flex-wrap: wrap;
+}
+.oracle-asset-quote.oracle-quote-diverged {
+  color: var(--cta-ink);
+  font-weight: 600;
+}
 .oracle-sidelined {
   font-size: 9px;
   font-weight: 700;
@@ -123,7 +141,7 @@
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-pop);
   overflow: hidden;
 }
 .oracle-err-pop-head {
@@ -472,5 +490,5 @@
    vault's value but NOT inventory it can quote with, so it is deliberately
    distinct from the asset colours: a muted amber that reads as "committed
    elsewhere" rather than as another token in the basket. */
-.vault-mix-seg.mix-lent { background: repeating-linear-gradient(45deg, #b4822899, #b4822899 4px, #b4822866 4px, #b4822866 8px); }
-.vault-mix-dot.mix-lent { background: #b48228; }
+.vault-mix-seg.mix-lent { background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--cta-hover) 60%, transparent), color-mix(in srgb, var(--cta-hover) 60%, transparent) 4px, color-mix(in srgb, var(--cta-hover) 40%, transparent) 4px, color-mix(in srgb, var(--cta-hover) 40%, transparent) 8px); }
+.vault-mix-dot.mix-lent { background: var(--cta-hover); }

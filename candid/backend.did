@@ -50,6 +50,19 @@ type VaultPrices =
    icp: nat;
    sol: nat;
  };
+type VaultImpairment = 
+ record {
+   computedNs: int;
+   grossExpectedLossUsd: nat;
+   impairedCollateralUsd: nat;
+   impairedDebtUsd: nat;
+   impairedLoans: nat;
+   insuranceFirstLossUsd: nat;
+   loanBookUsd: nat;
+   maintenanceRatio: nat;
+   reserveUsd: nat;
+   stressBps: nat;
+ };
 type VaultBasket = 
  record {
    btc: nat;
@@ -91,6 +104,10 @@ type UserEventKind =
              amount: nat;
              token: TokenId;
            };
+   config: record {
+             setter: text;
+             value: text;
+           };
    debtDelta: record {
                 amount: int;
                 token: TokenId;
@@ -109,6 +126,10 @@ type UserEventKind =
       side: Side;
       tradeId: nat;
     };
+   gap: record {
+          fromSeq: nat;
+          toSeq: nat;
+        };
    insShareDelta: record {amount: int;};
    insuranceStake: record {
                      amountUsd: nat;
@@ -171,10 +192,16 @@ type Trade =
    timestamp: int;
  };
 type TokenId = text;
+type TokenAmount = 
+ record {
+   amount: nat;
+   token: TokenId;
+ };
 type SwapResult = 
  record {
    fromAmount: nat;
    fullyFilled: bool;
+   stagedBudget: opt nat;
    swapOrderId: opt nat;
    toAmount: nat;
  };
@@ -193,6 +220,7 @@ type SwapOutcome =
    fromToken: text;
    id: nat;
    note: text;
+   stopReason: opt StopReason;
    toAmount: nat;
    toToken: text;
    ts: int;
@@ -201,6 +229,38 @@ type SwapMode =
  variant {
    limitOrder: record {limitPrice: nat;};
    marketOrder: record {maxSlippage: nat;};
+ };
+type StopReason = 
+ variant {
+   bookExhausted;
+   budgetExhausted;
+   filled;
+   slippage;
+   unfunded;
+   workBound;
+ };
+type StagedLpView = 
+ record {
+   pending: vec StagedLpRequest;
+   recent: vec LpRequestOutcome;
+ };
+type StagedLpRequest = 
+ record {
+   cancelRefusal: opt text;
+   expiresAt: int;
+   id: nat;
+   kind: StagedLpKind;
+   ts: int;
+   waitingOn: vec text;
+ };
+type StagedLpKind = 
+ variant {
+   deposit: record {
+              baseAmount: nat;
+              marketId: MarketId;
+              quoteAmount: nat;
+            };
+   withdraw: record {lpAmount: nat;};
  };
 type Side = 
  variant {
@@ -258,6 +318,14 @@ type Reading =
    price: float64;
    sourceId: text;
  };
+type QuoteSignal = 
+ record {
+   depegBps: nat;
+   diverged: bool;
+   mark: MarkBasis;
+   usdCount: nat;
+   usdtCount: nat;
+ };
 type PublicTrade = 
  record {
    id: nat;
@@ -285,14 +353,30 @@ type PriceSourceInfo =
  };
 type PriceFeedStats = 
  record {
+   depegAlarmBps: nat;
    failureCount: nat;
+   fanoutAbandoned: nat;
+   fanoutCompleteCount: nat;
+   fanoutDeadlineCount: nat;
+   fanoutDeadlineSec: nat;
+   fanoutDrainedCount: nat;
+   fanoutLateReadings: nat;
+   fanoutOpen: nat;
+   fanoutQuorum: nat;
+   fanoutQuorumCount: nat;
+   fanoutSources: nat;
    intervalSec: nat;
    jumpThresholdBps: float64;
    maxRefPriceAgeSec: nat;
    maxStddevBps: float64;
    minSources: nat;
    panicCancels: nat;
+   quoteSignals: vec record {
+                       text;
+                       QuoteSignal;
+                     };
    refreshInFlight: bool;
+   stagingWindowSec: nat;
    successCount: nat;
    suspendedCount: nat;
  };
@@ -300,6 +384,8 @@ type PositionView =
  record {
    baseToken: TokenId;
    entryPrice: nat;
+   isLiquidatable: bool;
+   liqDir: opt LiqDir;
    liqPrice: opt nat;
    markPrice: nat;
    marketId: MarketId;
@@ -327,6 +413,28 @@ type PositionEpisode =
            long;
            short;
          };
+ };
+type PoolView = 
+ record {
+   activeAskIds: vec nat;
+   activeBidIds: vec nat;
+   baseToken: TokenId;
+   enabled: bool;
+   inventoryTargetBase: nat;
+   lastRebalanceNs: int;
+   lastRequoteNs: int;
+   lastVolSampleNs: int;
+   lastVolSamplePrice: nat;
+   levelSpacingBps: nat;
+   marketId: MarketId;
+   numLevels: nat;
+   quoteDepthBase: nat;
+   refPrice: nat;
+   refPriceUpdatedNs: int;
+   skewIntensityBps: nat;
+   spreadBps: nat;
+   totalLPSupply: nat;
+   volRegime: float64;
  };
 type PoolValueInfo = 
  record {
@@ -359,59 +467,7 @@ type PoolSnapshot =
    totalLPSupply: nat;
    valuePerLP: nat;
  };
-type Pool = 
- record {
-   activeAskIds: vec nat;
-   activeBidIds: vec nat;
-   baseToken: TokenId;
-   enabled: bool;
-   inventoryTargetBase: nat;
-   lastRebalanceNs: int;
-   lastRequoteNs: int;
-   lastVolSampleNs: int;
-   lastVolSamplePrice: nat;
-   levelSpacingBps: nat;
-   marketId: MarketId;
-   numLevels: nat;
-   protectionWindowSec: nat;
-   quoteDepthBase: nat;
-   refPrice: nat;
-   refPriceUpdatedNs: int;
-   skewIntensityBps: nat;
-   spreadBps: nat;
-   totalLPSupply: nat;
-   volRegime: float64;
- };
-type PlaceLimitResult = 
- record {
-   order: Order;
-   pendingMatches: vec PendingMatch;
- };
-type PendingMatchStatus = 
- variant {
-   finalized;
-   pending;
-   voided;
- };
-type PendingMatch = 
- record {
-   createdAtNs: int;
-   expiryNs: int;
-   id: nat;
-   makerDebitAmount: nat;
-   makerDebitToken: TokenId;
-   makerOrderId: nat;
-   makerPrincipal: principal;
-   marketId: MarketId;
-   price: nat;
-   quantity: nat;
-   status: PendingMatchStatus;
-   takerDebitAmount: nat;
-   takerDebitToken: TokenId;
-   takerOrderType: OrderType;
-   takerPrincipal: principal;
-   takerSide: Side;
- };
+type PlaceLimitResult = record {order: Order;};
 type OrderType = 
  variant {
    limit;
@@ -448,6 +504,7 @@ type OrderAdjustment =
    newQuantity: nat;
    oldQuantity: nat;
    orderId: nat;
+   reason: opt AdjustmentReason;
    side: Side;
    timestamp: int;
  };
@@ -475,14 +532,34 @@ type MyVaultPosition =
 type MyInsuranceStake = 
  record {
    shares: nat;
+   unlockAtNs: int;
    valueUsd: nat;
+ };
+type MaxInstantWithdraw = 
+ record {
+   exitFeeBps: nat;
+   lentOutFraction: nat;
+   lockedLp: nat;
+   lpBalance: nat;
+   provisionedLossUsd: nat;
+   totalNavUsd: nat;
+   vaultHoldingsUsd: nat;
+   vaultImpairmentReserveUsd: nat;
+   vaultLentOutUsd: nat;
+   vaultLockedLp: nat;
+   vaultLockedNavUsd: nat;
+   vaultNavUsd: nat;
+   withdrawableNowLp: nat;
+   withdrawableNowUsd: nat;
+   withdrawalPaused: opt text;
  };
 type MatchResult = 
  record {
    affectedUsers: vec principal;
    avgPrice: nat;
-   pendingMatches: vec PendingMatch;
+   quoteSpent: nat;
    remainingQty: nat;
+   stopReason: StopReason;
    totalFilled: nat;
    trades: vec Trade;
  };
@@ -491,12 +568,16 @@ type MarketTele =
    computedNs: int;
    high24h: nat;
    longHealth: opt nat;
+   longLiquidatable: bool;
    longNearLiqBps: opt nat;
+   longNearLiqDir: opt LiqDir;
    longNotionalUsd: nat;
    low24h: nat;
    marketId: MarketId;
    shortHealth: opt nat;
+   shortLiquidatable: bool;
    shortNearLiqBps: opt nat;
+   shortNearLiqDir: opt LiqDir;
    shortNotionalUsd: nat;
    totalDepthUsd: nat;
  };
@@ -538,9 +619,16 @@ type MarketChangesRequest =
    lastUserVersion: nat;
    marketId: opt MarketId;
  };
+type MarkBasis = 
+ variant {
+   pooled;
+   usdGroup;
+ };
 type MarginRiskSummary = 
  record {
    computedNs: int;
+   impairmentGrossUsd: nat;
+   impairmentReserveUsd: nat;
    insuranceValueUsd: nat;
    liquidatableNotionalUsd: nat;
    liquidatablePositions: nat;
@@ -560,9 +648,11 @@ type MarginPoolView =
    health: MarginHealth;
    id: nat;
    isolated: bool;
+   loans: vec TokenAmount;
    marginUsage: nat;
    name: text;
    "principal": text;
+   repayable: vec TokenAmount;
    valueUsd: int;
  };
 type MarginHeatmap = 
@@ -587,6 +677,18 @@ type MarginHealth =
    maintenanceRatio: nat;
  };
 type MarginAccount = record {openedAt: int;};
+type LpRequestOutcome = 
+ record {
+   id: nat;
+   kind: StagedLpKind;
+   outcome: variant {
+              cancelled: text;
+              minted: nat;
+              redeemed: VaultBasket;
+            };
+   settledNs: int;
+   ts: int;
+ };
 type LpPosition = 
  record {
    estimatedBase: nat;
@@ -609,6 +711,11 @@ type LiquidationEvent =
    proceedsUsd: nat;
    timestamp: int;
    user: principal;
+ };
+type LiqDir = 
+ variant {
+   down;
+   up;
  };
 type InsuranceFundInfo = 
  record {
@@ -636,6 +743,22 @@ type HeatBucket =
    longNotionalUsd: nat;
    positions: nat;
    shortNotionalUsd: nat;
+ };
+type FanoutView = 
+ record {
+   arrived: nat;
+   dispatchNs: int;
+   expected: nat;
+   id: nat;
+   late: nat;
+   markets: vec text;
+   open: bool;
+   outcomes: vec record {
+                   text;
+                   text;
+                 };
+   quorum: nat;
+   reason: text;
  };
 type Event = 
  record {
@@ -685,14 +808,6 @@ type DebtEntry =
    debtUsd: nat;
    "principal": nat;
    token: TokenId;
- };
-type CounterpartyStats = 
- record {
-   adverseRate: float64;
-   lastFillNs: int;
-   "principal": principal;
-   totalFillValue: float64;
-   totalFills: nat;
  };
 type CollateralValuation = 
  record {
@@ -767,10 +882,19 @@ type BadgeCriteria =
    uptimeSamplePassed;
  };
 type Asset = text;
+type ArchiveOqlResult = 
+ record {
+   complete: bool;
+   degraded: vec text;
+   hasMore: bool;
+   rows: vec vec Cell;
+   unvisited: vec text;
+ };
 type ArchiveChainEntry = 
  record {
    canisterId: text;
    cycles: opt nat;
+   degraded: opt bool;
    firstSeq: opt nat;
    freezeLimitCycles: opt nat;
    frozen: opt bool;
@@ -823,6 +947,12 @@ type Aggregate =
    stddevBps: float64;
    timestamp: int;
  };
+type AdjustmentReason = 
+ variant {
+   balanceShrank;
+   crossMarketCapExceeded;
+   marketCapExceeded;
+ };
 type AccountSummary = 
  record {
    freeWalletValueUsd: nat;
@@ -841,7 +971,17 @@ service : {
                                                  ok: text;
                                                });
   adminClearAiBan: (user: principal) -> ();
+  adminClearFuelAmbiguous: () -> (variant {
+                                    err: text;
+                                    ok: text;
+                                  });
+  adminDropMissingArchive: (cid: principal) ->
+   (variant {
+      err: text;
+      ok: text;
+    });
   adminForceShipTick: () -> (nat);
+  adminForceSpawnReconcile: () -> ();
   adminFundArchive: (amount: nat) -> (variant {
                                         err: text;
                                         ok: nat;
@@ -850,6 +990,20 @@ service : {
                                        err: text;
                                        ok: nat;
                                      });
+  adminFundCanister: (cid: principal, amount: nat) ->
+   (variant {
+      err: text;
+      ok: nat;
+    });
+  adminPruneUnregisteredResidue: () ->
+   (record {
+      deadmanSwitches: nat;
+      more: bool;
+      owners: nat;
+      pools: nat;
+      poolsRemaining: nat;
+      userStatuses: nat;
+    });
   adminRebuildIndexes: () -> (variant {
                                 err: text;
                                 ok: text;
@@ -897,13 +1051,20 @@ service : {
                                      err: text;
                                      ok: text;
                                    });
+  adminRetireEmptySeasonSegment: (cid: principal) ->
+   (variant {
+      err: text;
+      ok;
+    });
   adminRetryFuelNotify: (block: opt nat) -> (variant {
                                                err: text;
                                                ok: nat;
                                              });
+  adminRunArchiveFuelPass: () -> ();
   adminRunDeferredExpiry: () -> ();
   adminRunDeferredSwaps: () -> ();
   adminRunLiquidationBatch: () -> ();
+  adminRunStagedLp: () -> ();
   adminSpawnCanister: (cycles: nat) -> (variant {
                                           err: text;
                                           ok: principal;
@@ -922,7 +1083,7 @@ service : {
                                  });
   aiConfigured: () -> (bool) query;
   aiProvider: () -> (text) query;
-  archiveExecute: (qJson: text) -> (Result) composite_query;
+  archiveExecute: (qJson: text) -> (ArchiveOqlResult) composite_query;
   archiveSchema: () -> (text) query;
   bulkSetTestBalances: (entries:
    vec
@@ -951,6 +1112,10 @@ service : {
                                                      err: text;
                                                      ok;
                                                    });
+  cancelStagedLpRequest: (requestId: nat) -> (variant {
+                                                err: text;
+                                                ok;
+                                              });
   closePosition: (poolId: nat, marketId: MarketId, maxSlippage: nat,
    limitPrice: opt nat) -> (variant {
                               err: text;
@@ -970,11 +1135,11 @@ service : {
       err: text;
       ok: nat;
     });
-  creditAndRegister: (user: principal, token: TokenId, amount: nat, seq:
-   nat) -> (variant {
-              err: text;
-              ok;
-            });
+  creditAndRegister: (user: principal, token: TokenId, amount: nat, seq: 
+   nat, pendingUnits: opt nat) -> (variant {
+                                     err: text;
+                                     ok;
+                                   });
   debugInspectByUsername: (name: text) ->
    (record {
       balances: vec record {
@@ -991,8 +1156,94 @@ service : {
   depositLp: (marketId: MarketId, baseAmount: nat, quoteAmount: nat) ->
    (variant {
       err: text;
-      ok: nat;
+      ok: StagedLpRequest;
     });
+  devBumpOracleEpoch: () -> (nat);
+  devDriveLiqCycle: (trap: bool) -> ();
+  devGetFanout: (asset: text) -> (opt FanoutView) query;
+  devGetGeptorInFlight: (marketId: MarketId) -> (opt int) query;
+  devGetReleaseRef: (marketId: MarketId) ->
+   (opt record {
+          appliedNs: int;
+          dispatchNs: int;
+        }) query;
+  devPoisonGeptorInFlight: (marketId: MarketId, ageNs: int) -> ();
+  devReleaseParkedReadings: () -> (nat);
+  devSeedEmptyPools: (owner: principal, n: nat) -> (nat);
+  devSeedPreRegFlood: (n: nat, salt: nat) ->
+   (record {
+      evicted: nat;
+      lastInsertInstr: nat64;
+      size: nat;
+    });
+  devStallSource: (sourceId: text, mode: variant {
+                                           clear;
+                                           hold;
+                                           never;
+                                           park;
+                                         }) -> ();
+  devSweepCostProbe: () ->
+   (record {
+      crossSection: nat64;
+      expiryScan: nat64;
+      expiryScanSynth: nat64;
+      expirySynthAtProbe: nat;
+      myArchivePrincipals: nat64;
+      myMarginPools: nat64;
+      myPoolLiquidations: nat64;
+      myPositionFills: nat64;
+      myPositionsPools: nat64;
+      poolsTotal: nat;
+      poolsWalk: nat64;
+      releaseFillBudget: nat;
+      releaseMaxPerPass: nat;
+      releaseSort: nat64;
+      releaseSortSynth: nat64;
+      releaseSynthAtProbe: nat;
+      repointLinksAtProbe: nat;
+      repointSaturated: nat64;
+      sampledPrincipal: text;
+      stagedGlobal: nat;
+      stagedMyIds: nat64;
+      stagedMyOrders: nat64;
+      stagedOwn: nat;
+      stagedPoolElsewhere: nat64;
+      stagedPoolOrders: nat64;
+      swapSort: nat64;
+      swapSortSynth: nat64;
+      swapSynthAtProbe: nat;
+      userBalances: nat64;
+      walkDepth: nat64;
+      walkFokGate: nat64;
+      walkMarket: text;
+      walkScanned: nat;
+      walkSwap: nat64;
+      walkTruncated: bool;
+    }) query;
+  devTickAutoFuel: () -> ();
+  devTickHeatmaps: () -> ();
+  devTickReap: () -> ();
+  devTickTier: () -> ();
+  devTradeHistoryCostProbe: () ->
+   (record {
+      anonHistory: nat64;
+      indexEntriesLive: nat;
+      ownerFillsSeen: nat;
+      ownerPools: nat;
+      ownerPositionFills: nat64;
+      sampledHistory: nat64;
+      sampledOwn: nat;
+      sampledPrincipal: text;
+      sampledSinceId0: nat64;
+      tapeAtProbe: nat;
+      tapeLive: nat;
+      tapePartiesLive: nat;
+      tapeSynthAtProbe: nat;
+      tapeWalk: nat64;
+      virginHistory: nat64;
+      virginHistorySince0: nat64;
+      virginSinceId0: nat64;
+    }) query;
   donateToVault: (amount: nat, fromTreasury: bool) ->
    (variant {
       err: text;
@@ -1003,11 +1254,11 @@ service : {
                                                        ok;
                                                      });
   execute: (qJson: text) -> (Result) query;
-  extMarketSwap: (token: TokenId, side: ArbSide, baseAmount: nat) ->
-   (variant {
-      err: text;
-      ok: nat;
-    });
+  extMarketSwap: (token: TokenId, side: ArbSide, baseAmount: nat, maxMarkE8:
+   opt nat) -> (variant {
+                  err: text;
+                  ok: nat;
+                });
   fetchAndSetRefPrice: (marketId: MarketId) -> (variant {
                                                   err: text;
                                                   ok: nat;
@@ -1051,6 +1302,7 @@ service : {
       openOrderCap: nat;
       scaleBps: nat;
       shedFloor: nat;
+      shipQueueDepth: nat;
       stpPolicy: text;
       thresholds:
        record {
@@ -1066,18 +1318,21 @@ service : {
          mmMinUptimePct: nat;
          refExchangeVolUsd: nat;
          scaleMinBps: nat;
+         shedHardShip: nat;
          shedHardStaged: nat;
+         shedSoftShip: nat;
          shedSoftStaged: nat;
+         shipShearCap: nat;
          stagedCapPerOwner: nat;
        };
+      timersPaused: bool;
     }) query;
-  getAllCounterpartyStats: () -> (vec CounterpartyStats) query;
   getAllTrades: (marketId: MarketId) -> (vec PublicTrade) query;
   getAmmAutoInventory: () -> (bool) query;
   getAmmBookShare: (marketId: MarketId) -> (opt AmmBookShare) query;
   getAmmEverEnabled: () -> (bool) query;
-  getAmmPool: (marketId: MarketId) -> (opt Pool) query;
-  getAmmPools: () -> (vec Pool) query;
+  getAmmPool: (marketId: MarketId) -> (opt PoolView) query;
+  getAmmPools: () -> (vec PoolView) query;
   getAmmPrincipal: () -> (principal) query;
   getAmmRebalanceEnabled: () -> (bool) query;
   getApiDoc: () -> (text) query;
@@ -1111,10 +1366,16 @@ service : {
                             nat;
                           }) query;
   getBridge: () -> (opt principal) query;
+  getBridgeWiring: () ->
+   (record {
+      env: opt principal;
+      override: opt principal;
+    }) query;
   getCandles: (marketId: MarketId, intervalMs: nat, page: nat) ->
    (CandleResponse) query;
   getCanisterInfo: () ->
    (record {
+      ackDivergences: nat;
       appVersion: text;
       arbCycles: nat;
       arbLifetimeTopUp: nat;
@@ -1131,8 +1392,16 @@ service : {
       computeAllocation: nat;
       cycles: nat;
       emergencyRolls: nat;
+      exitCoalesced: nat;
+      exitRowsWithheld: nat;
       freezingLimitCycles: nat;
       fuelLifetimeCycles: nat;
+      fuelPendingNotify:
+       opt record {
+             blockIndex: nat;
+             icpE8s: nat;
+             sinceNs: int;
+           };
       fuelRouteWired: bool;
       heapLiveBytes: nat;
       idleBurnPerDay: nat;
@@ -1149,7 +1418,13 @@ service : {
                               int;
                             };
       ordersRetained: nat;
+      pendingSpawn: opt record {
+                          atNs: int;
+                          cid: text;
+                        };
+      seasonSealing: bool;
       shedEvents: nat;
+      shipBurstBatches: nat;
       shipFailStreak: nat;
       timersPaused: bool;
       tradesRetained: nat;
@@ -1158,13 +1433,18 @@ service : {
       usersRegistered: nat;
       wasmMemoryLimitBytes: nat;
     }) query;
-  getCounterpartyStatsQuery: (p: principal) -> (CounterpartyStats) query;
   getDeployMode: () -> (text) query;
   getDepositAddress: (token: TokenId) -> (text) query;
   getFuelStatus: () ->
    (record {
+      ambiguous: opt record {
+                       atNs: int;
+                       icpE8s: nat;
+                       msg: text;
+                     };
       autoEnabled: bool;
       cmc: opt principal;
+      dailyMaxE8s: nat;
       ledger: opt principal;
       lifetimeCycles: nat;
       lifetimeIcpE8s: nat;
@@ -1173,8 +1453,19 @@ service : {
                            icpE8s: nat;
                            sinceNs: int;
                          };
+      spentTodayE8s: nat;
       treasuryIcpE8s: nat;
     }) query;
+  getFundingAuthority: () -> (opt principal) query;
+  getHbHealth: () ->
+   (vec record {
+          text;
+          record {
+            completions: nat;
+            dispatches: nat;
+            streak: nat;
+          };
+        }) query;
   getInsuranceFund: () -> (InsuranceFundInfo) query;
   getLastAggregate: (asset: text) -> (opt Aggregate) query;
   getLeaderboard: () ->
@@ -1230,6 +1521,7 @@ service : {
   getMarketStatus: (marketId: MarketId) -> (MarketStatus) query;
   getMarketTele: (marketId: MarketId) -> (opt MarketTele) query;
   getMarkets: () -> (vec MarketInfo) query;
+  getMaxInstantWithdraw: () -> (MaxInstantWithdraw) query;
   getMyAccountSummary: () -> (AccountSummary) query;
   getMyAdjustments: () -> (vec OrderAdjustment) query;
   getMyAiUsage: () -> (AiUsageView) query;
@@ -1237,6 +1529,15 @@ service : {
    (record {
       events: vec UserEvent;
       total: nat;
+      unavailable: opt text;
+    }) composite_query;
+  getMyArchivedEventsFiltered: (archiveId: principal, kinds: vec text,
+   offset: nat, limit: nat) ->
+   (record {
+      events: vec UserEvent;
+      filtered: bool;
+      total: nat;
+      unavailable: opt text;
     }) composite_query;
   getMyAvailableBalance: (token: TokenId) -> (nat) query;
   getMyAvailableBalances: () -> (vec record {
@@ -1247,6 +1548,7 @@ service : {
   getMyCancelAllAfter: () ->
    (opt record {
           deadlineNs: int;
+          timersPaused: bool;
           windowNs: int;
         }) query;
   getMyClosedOrders: () -> (vec ClosedOrderRecord) query;
@@ -1256,7 +1558,6 @@ service : {
   getMyLiquidationHistory: () -> (vec LiquidationEvent) query;
   getMyLpBalance: (marketId: MarketId) -> (nat) query;
   getMyLpPosition: (marketId: MarketId) -> (opt LpPosition) query;
-  getMyMarginAccount: () -> (opt MarginAccount) query;
   getMyMarginHealth: () -> (MarginHealth) query;
   getMyMarginPools: () -> (vec MarginPoolView) query;
   getMyOrderStatus: (orderId: nat) ->
@@ -1272,7 +1573,6 @@ service : {
      }) query;
   getMyOrders: () -> (vec Order) query;
   getMyOrdersOnMarket: (marketId: MarketId) -> (vec Order) query;
-  getMyPendingMatches: () -> (vec PendingMatch) query;
   getMyPoolLiquidations: () -> (vec LiquidationEvent) query;
   getMyPoolTransfers: () -> (vec PoolTransfer) query;
   getMyPositionEpisodes: () -> (vec PositionEpisode) query;
@@ -1282,6 +1582,7 @@ service : {
   getMyRecentSwap: () -> (opt SwapOutcome) query;
   getMyReleaseRejections: () -> (vec ReleaseRejection) query;
   getMyReservedBalance: (token: TokenId) -> (nat) query;
+  getMyStagedLpRequests: () -> (StagedLpView) query;
   getMyStagedOrderIds: () -> (vec nat) query;
   getMyTradeHistory: () -> (vec Trade) query;
   getMyTradeHistorySince: (sinceTimestamp: int) -> (vec Trade) query;
@@ -1315,6 +1616,21 @@ service : {
   getPoolOrders: (poolId: nat) -> (vec Order) query;
   getPoolValue: (marketId: MarketId) -> (opt PoolValueInfo) query;
   getPoolValueHistory: (marketId: MarketId) -> (vec PoolSnapshot) query;
+  getPreRegStoreStats: () ->
+   (record {
+      adoptPhase: nat;
+      adopted: nat;
+      cadenceNs: int;
+      cap: nat;
+      evicted: nat;
+      expired: nat;
+      graceNs: int;
+      oldestSeenNs: opt int;
+      preferences: nat;
+      profiles: nat;
+      promoted: nat;
+      size: nat;
+    }) query;
   getPriceFeedStats: () -> (PriceFeedStats) query;
   getPriceSources: () -> (vec PriceSourceInfo) query;
   getPublicTradesSince: (marketId: MarketId, sinceTradeId: nat) ->
@@ -1329,13 +1645,44 @@ service : {
        geptorDelayNs: int;
        nowNs: int;
        refPriceUpdatedNs: int;
+       releaseRefNs: int;
      }) query;
   getRuntimeEnv: () -> (text) query;
+  getSeasonArchives: (season: nat) ->
+   (vec record {
+          canisterId: text;
+          firstSeq: nat;
+          lastSeq: opt nat;
+        }) query;
+  getSeasonGaps: (season: nat) -> (vec record {
+                                         nat;
+                                         nat;
+                                         int;
+                                       }) query;
   getSeasonRecords: () -> (vec SeasonRecord) query;
+  getSeasonShedBaselines: (season: nat) -> (vec record {
+                                                  nat;
+                                                  nat;
+                                                }) query;
   getShedBaselines: () -> (vec record {
                                  nat;
                                  nat;
                                }) query;
+  getStagedIndexAudit: () ->
+   (record {
+      accEntries: nat;
+      consistent: bool;
+      detail: text;
+      execLive: nat;
+      indexedReadInstructions: nat64;
+      pmLive: nat;
+      recomputedReadInstructions: nat64;
+      releasedFromEntries: nat;
+      releasedLinks: nat;
+      swapLive: nat;
+    }) query;
+  getTakeableDepth: (marketId: MarketId, takerSide: Side, capPrice: nat) ->
+   (nat) query;
   getTestBalance: (user: principal, token: TokenId) -> (nat) query;
   getTradesSince: (marketId: MarketId, sinceTimestamp: int) ->
    (vec PublicTrade) query;
@@ -1357,6 +1704,7 @@ service : {
         }) query;
   getUserPreferences: () -> (UserPreferences);
   getUserStatus: () -> (UserStatus) query;
+  getVaultImpairment: () -> (VaultImpairment) query;
   getVaultValue: () -> (VaultValue) query;
   getVaultValueHistory: () -> (vec VaultSnapshot) query;
   getVaultWeights: () -> (vec VaultWeightInfo) query;
@@ -1413,12 +1761,6 @@ service : {
       err: text;
       ok: MatchResult;
     });
-  placeProtectedLimitOrder: (marketId: MarketId, side: Side, price: nat,
-   quantity: nat, windowSeconds: nat) ->
-   (variant {
-      err: text;
-      ok: PlaceLimitResult;
-    });
   playDepositAdmit: (user: principal, token: TokenId, amount: nat,
    outstanding: vec record {
                       TokenId;
@@ -1427,6 +1769,15 @@ service : {
                              err: text;
                              ok;
                            });
+  playDepositReservation: (user: principal, token: TokenId) ->
+   (variant {
+      err: text;
+      ok: record {
+            admitSeq: nat;
+            capActive: bool;
+            reservedUnits: nat;
+          };
+    }) query;
   playDepositReserve: (user: principal, token: TokenId, amount: nat, seq:
    nat) -> (variant {
               err: text;
@@ -1455,6 +1806,8 @@ service : {
       err: text;
       ok:
        record {
+         availableFrom: nat;
+         clampedByReserve: bool;
          consumedFrom: nat;
          exhausted: bool;
          feeQuote: nat;
@@ -1470,6 +1823,11 @@ service : {
                                err: text;
                                ok: UserProfile;
                              });
+  repayPoolDebt: (poolId: nat, token: TokenId, amount: nat) ->
+   (variant {
+      err: text;
+      ok: nat;
+    });
   replaceMyOrder: (cancelOrderId: nat, price: nat, quantity: nat) ->
    (variant {
       err: text;
@@ -1493,11 +1851,10 @@ service : {
   seedInsuranceFund: (amountUsd: nat) -> (nat);
   setAmmAutoInventory: (enabled: bool) -> ();
   setAmmConfig: (marketId: MarketId, spreadBps: nat, quoteDepthBase: 
-   nat, numLevels: nat, levelSpacingBps: nat, protectionWindowSec: nat) ->
-   (variant {
-      err: text;
-      ok;
-    });
+   nat, numLevels: nat, levelSpacingBps: nat) -> (variant {
+                                                    err: text;
+                                                    ok;
+                                                  });
   setAmmRebalanceConfig: (marketId: MarketId, thresholdPct: float64,
    fractionPerTick: float64, cooldownSec: nat, maxQtyPerTick: nat,
    maxSlippage: float64) -> (variant {
@@ -1521,35 +1878,109 @@ service : {
   setBlackholeAtSeal: (on: bool) -> ();
   setBridge: (p: principal) -> ();
   setFuelRoute: (ledger: opt principal, cmc: opt principal) -> ();
+  setFundingAuthority: (p: opt principal) -> ();
   setGoogleApiKey: (key: text) -> ();
+  setTestArbTakeableSpoof: (marketId: MarketId, armed: bool) ->
+   (variant {
+      err: text;
+      ok;
+    });
   setTestArchiveCap: (cap: opt nat) -> ();
+  setTestArchiveControllers: (cid: principal, controllers: vec principal) ->
+   (variant {
+      err: text;
+      ok;
+    });
+  setTestArchiveDeleted: (cid: principal) -> (variant {
+                                                err: text;
+                                                ok;
+                                              });
+  setTestArchiveMaxHops: (hops: opt nat) -> ();
+  setTestArchiveStopped: (cid: principal, stopped: bool) ->
+   (variant {
+      err: text;
+      ok;
+    });
   setTestBalance: (user: principal, token: TokenId, amount: nat) -> ();
+  setTestBridgeOverride: (p: opt principal) -> (variant {
+                                                  err: text;
+                                                  ok;
+                                                });
+  setTestDeadmanDeadline: (user: principal, deadlineNs: int) -> ();
+  setTestDeadmanMaxFires: (cap: opt nat) -> ();
   setTestDeferredExpiry: (orderId: nat, expiresAtNs: int) -> ();
+  setTestDeferredFok: (orderId: nat) -> ();
   setTestEmailBinding: (user: principal, rawEmail: text) ->
    (variant {
       err: text;
       ok;
     });
+  setTestExitCoalesceWindow: (secs: opt nat) -> ();
+  setTestFuelPendingSince: (ns: int) -> ();
+  setTestHbTrap: (name: opt text) -> ();
+  setTestInsuranceStakedAt: (user: principal, ns: int) -> ();
+  setTestLevelCap: (cap: opt nat) -> ();
   setTestMinSources: (n: opt nat) -> ();
   setTestOrderCap: (cap: opt nat) -> ();
   setTestOrderExpiry: (orderId: nat, expiryNs: int) -> ();
   setTestOrderTtl: (ttlSecs: opt nat) -> ();
-  setTestPendingJump: (asset: text, price: opt nat) -> ();
+  setTestPendingJump: (asset: text, price: opt nat, ageSecs: opt nat) -> ();
+  setTestPendingSpawn: (cid: opt principal, ageSecs: nat) ->
+   (variant {
+      err: text;
+      ok;
+    });
   setTestPlayDepositCap: (cap: opt nat) -> ();
+  setTestPreRegBounds: (cap: opt nat, graceNs: opt int, cadenceNs:
+   opt int) -> ();
   setTestRefPriceUpdatedNs: (marketId: MarketId, ns: int) -> ();
+  setTestReleasePacing: (maxReleases: opt nat, fillBudget: opt nat) -> ();
+  setTestReplayStepHold: (rounds: nat) -> ();
   setTestScorecard: (user: principal, makerVol: nat, takerVol: nat, samples:
    nat, passes: nat) -> (variant {
                            err: text;
                            ok;
                          });
+  setTestSeasonRow: (cid: principal, firstSeq: nat, lastSeq: opt nat, season:
+   nat) -> (variant {
+              err: text;
+              ok;
+            });
+  setTestSeasonSealRace: (armed: bool) -> (variant {
+                                             err: text;
+                                             ok;
+                                           });
+  setTestSeasonSealing: (on: bool) -> (variant {
+                                         err: text;
+                                         ok;
+                                       });
   setTestShedFloor: (floor: opt nat) -> ();
   setTestShipFailover: (fail: bool, rollThreshold: opt nat, hardCap: 
-   opt nat, shedTo: opt nat) -> (variant {
-                                   err: text;
-                                   ok;
-                                 });
+   opt nat, shedTo: opt nat, shearCap: opt nat, batchMax: opt nat,
+   memPressure: opt bool) -> (variant {
+                                err: text;
+                                ok;
+                              });
+  setTestShipShedBands: (bands: opt record {
+                                      nat;
+                                      nat;
+                                      nat;
+                                      nat;
+                                    }) -> ();
+  setTestSpawnOrphan: (ageSecs: nat) -> (variant {
+                                           err: text;
+                                           ok: principal;
+                                         });
+  setTestSpawnReconcileHold: (rounds: nat) -> (bool);
+  setTestStagedLpExpiry: (requestId: nat, expiresAtNs: int) -> ();
+  setTestStagedShedBands: (bands: opt record {
+                                        nat;
+                                        nat;
+                                        nat;
+                                        nat;
+                                      }) -> ();
   setTestTimersPaused: (paused: bool) -> ();
-  setTestXrcRate: (asset: text, rateE8: opt nat) -> ();
+  setTestXrcRate: (asset: text, rateE8: opt nat, ageSecs: opt nat) -> ();
   setUserPreferences: (prefs: UserPreferences) -> ();
   setXrcCanister: (p: opt principal) -> ();
   skimArbitrageur: (amount: nat) -> (variant {
@@ -1574,13 +2005,19 @@ service : {
    (record {
       admittedNow: bool;
       deadmanArmed: bool;
+      exitMethods: vec text;
+      exitsAdmitted: bool;
+      fundingAuthority: bool;
       myRank: nat;
       openOrderCap: nat;
       openOrderCount: nat;
+      preRegistrationAdmitted: bool;
+      preRegistrationMethods: vec text;
       registered: bool;
       shedFloor: nat;
       stagedCap: nat;
       stagedCount: nat;
+      timersPaused: bool;
     }) query;
   withdraw: (token: TokenId, amount: nat, destination: text) ->
    (variant {
@@ -1589,7 +2026,7 @@ service : {
     });
   withdrawLp: (lpAmount: nat) -> (variant {
                                     err: text;
-                                    ok: VaultBasket;
+                                    ok: StagedLpRequest;
                                   });
   withdrawMarginPool: (poolId: nat, amount: nat) -> (variant {
                                                        err: text;

@@ -24,13 +24,10 @@ source "$(dirname "$0")/_lib.sh"
 BACKEND_ID=$(icp canister status backend --identity anonymous 2>/dev/null | awk -F': ' '/^Canister Id/{print $2; exit}' | tr -d '[:space:]')
 [ -z "$BACKEND_ID" ] && { echo "backend canister not found — deploy it first (icp deploy)"; exit 1; }
 
-newid() { icp identity delete "$1" --yes >/dev/null 2>&1 || echo "y" | icp identity delete "$1" >/dev/null 2>&1 || true
-          icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; }
-
 echo "── test_credit_slice ──"
 
 # Fresh principal each run → its creditedSeq high-water starts at 0.
-U="creditslice"; newid "$U"; UPRIN=$(principal_of "$U")
+U="creditslice"; mdx_identity_new "$U"; UPRIN=$(principal_of "$U")   # deleted on EXIT (tests/_lib.sh)
 
 # On #play the allowance gate refuses an unbound principal at claim time
 # (playBucketFor). Bind a throwaway verified email — unique per run, since
@@ -41,7 +38,7 @@ call setTestEmailBinding "(principal \"$UPRIN\", \"cslice${RANDOM}$$@gmail.com\"
 # getTestBalance is scoped to self-or-controller, and $UPRIN is a throwaway
 # identity that is NOT us — so read it as the controller (anonymous, locally).
 bal() { extract_first_nat "$(call getTestBalance "(principal \"$UPRIN\", \"ICPUSD\")" --query --identity anonymous 2>/dev/null)"; }
-credit() { call creditAndRegister "(principal \"$UPRIN\", \"ICPUSD\", $1 : nat, $2 : nat)" --identity anonymous >/dev/null 2>&1; }
+credit() { call creditAndRegister "(principal \"$UPRIN\", \"ICPUSD\", $1 : nat, $2 : nat, null)" --identity anonymous >/dev/null 2>&1; }
 
 # (1) first confirmation: amount 100, seq 100 → credit 100 (creditedSeq 0→100)
 credit 100000000 100000000

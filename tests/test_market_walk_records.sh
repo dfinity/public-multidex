@@ -13,6 +13,7 @@
 
 set -u
 export PATH="$HOME/.local/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_ok — the only sanctioned #ok oracle); this suite keeps its own ok/nok frame and pipeline semantics
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
 ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
@@ -21,28 +22,27 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
 
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-S=$(mkid mwr_seed); W=$(mkid mwr_whale)
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-whl() { icp canister call --identity mwr_whale backend "$@" 2>&1; }
+mdx_identity_new mwr_seed; S=$(principal_of mwr_seed); mdx_identity_new mwr_whale; W=$(principal_of mwr_whale)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+whl() { icp canister call --candid "$MDX_CANDID" --identity mwr_whale backend "$@" 2>&1; }
 release() { adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null; adm requoteAmm '("ICP-ICPUSD")' >/dev/null; }
 
 adm setTestTimersPaused '(true)' >/dev/null 2>&1 || true
 adm resetExchange "()" >/dev/null 2>&1 || true
 adm createAmmPool '("ICP-ICPUSD")' >/dev/null 2>&1 || true
 # THIN ladder: 3 levels × 0.4 ICP per side ≈ 1.2 ICP takeable per pass.
-adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 0.4) : nat, 3:nat, 10:nat, 0:nat)" >/dev/null
+adm setAmmConfig "(\"ICP-ICPUSD\", 20:nat, $(e8 0.4) : nat, 3:nat, 10:nat)" >/dev/null
 adm setAmmRefPrice "(\"ICP-ICPUSD\", $(e8 10.0) : nat)" >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICP\", $(e8 10000.0) : nat)"     >/dev/null
 adm setTestBalance "(principal \"$S\", \"ICPUSD\", $(e8 100000.0) : nat)" >/dev/null
-icp canister call --identity mwr_seed backend seedAmmPool "(\"ICP-ICPUSD\", $(e8 10000.0) : nat, $(e8 100000.0) : nat)" >/dev/null 2>&1
+mdx_lp_deposit mwr_seed "ICP-ICPUSD" "$(e8 10000.0)" "$(e8 100000.0)" >/dev/null 2>&1
 adm enableAmm '("ICP-ICPUSD", true)' >/dev/null
 adm requoteAmm '("ICP-ICPUSD")' >/dev/null
 adm setTestBalance "(principal \"$W\", \"ICPUSD\", $(e8 10000.0) : nat)" >/dev/null
 
 echo "── whale MARKET buy 3 ICP against a ~1.2-ICP-per-pass ladder (must walk) ──"
 R=$(whl placeMarketOrder "(\"ICP-ICPUSD\", variant { buy }, $(e8 3.0) : nat, $(e8 0.05) : nat, false)")
-if echo "$R" | grep -q "ok"; then ok "market order staged"; else nok "placement" "$R"; fi
+if mdx_ok "$R"; then ok "market order staged"; else nok "placement" "$R"; fi
 
 # Drive enough release cycles for the full walk (each takes ≤ one ladder).
 for i in 1 2 3 4 5 6; do release; done

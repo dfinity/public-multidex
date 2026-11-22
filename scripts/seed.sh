@@ -12,11 +12,21 @@
 #   empty       No-op; just verifies markets are initialized.
 #   matching    2 traders, 1 market, known book. For matching-engine tests.
 #   amm         1 trader, AMM seeded + enabled + oracle price set. For AMM tests.
-#   pending     2 traders, 1 protected maker on the book. For pending-match tests.
+#   staged      2 traders, 1 BUY staged (sealed), counterparty funded. For the staged-order suites.
 #   load        N bulk-seeded principals + sparse book. For load testing.
 #
+# Env knobs (full mode):
+#   MDX_ORACLE_PRICES       history snapshot inject_history writes and step 3/4 read
+#   MDX_SEED_FEED_WAIT_SEC  cap on the post-seed wait for the first feed tick to
+#                           refresh the AMM marks (default 90; 0 disables). cold_start's
+#                           AMM-oracle-health phase polls the same evidence and ends
+#                           at once when this wait already landed the tick. The AMM
+#                           marks come from the live aggregate when the feed has
+#                           ticked on the venue, else the history snapshot, else
+#                           hardcoded defaults.
+#
 # Design note:
-#   Test modes (matching / amm / pending) are deliberately *minimal*. A
+#   Test modes (matching / amm / staged) are deliberately *minimal*. A
 #   test that asserts "there are exactly 2 open orders" should not break
 #   when the default seed adds a 3rd. Keep each fixture small and
 #   orthogonal to the others.
@@ -38,7 +48,7 @@ done
 
 if [ -z "$MODE" ]; then
   echo "Usage: bash scripts/seed.sh MODE [--traders N] [--history-days N]" >&2
-  echo "Modes: full | empty | matching | amm | pending | load" >&2
+  echo "Modes: full | empty | matching | amm | staged | load" >&2
   exit 1
 fi
 
@@ -56,6 +66,16 @@ err()   { echo -e "  ${RED}✗${NC} $1" >&2; }
 
 # Pipe "y" into icp canister call so the interactive confirm is
 # auto-accepted when candid can't be inferred.
+# Every call carries the checked-in Candid contract (`--candid`, icp 1.2.0):
+# icp then encodes arguments and decodes replies BY NAME from the file
+# instead of fetching the canister's candid:service metadata per call. That
+# fetch failed transiently on 2026-09-04 (task 1788507289) — "WARN could not
+# fetch candid type, serializing arguments with inferred types." — and icp
+# spelled a successful createAmmPool's unit `#ok` by its Candid field HASH,
+# `(variant { 24_860 })`, which the name-only matcher read as a refusal and
+# aborted a half-seeded venue. A stripped checkout without the file falls
+# back to the fetch; mdx_reply_ok's hashed spellings then still carry the verdict.
+SEED_CANDID="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../candid/backend.did"
 # Every call site MUST name its identity: the CLI's global default identity
 # is machine-shared mutable state that other sessions and connectors move at
 # will (mdex-process-safety §5), so an identity-less call here would sign as
@@ -66,12 +86,157 @@ call() {
     *" --identity "*) ;;
     *) err "call() without --identity (mdex-process-safety §5): $*"; return 1 ;;
   esac
-  echo "y" | icp canister call backend "$@" 2>&1
+  if [ -f "$SEED_CANDID" ]; then
+    echo "y" | icp canister call backend "$@" --candid "$SEED_CANDID" 2>&1
+  else
+    echo "y" | icp canister call backend "$@" 2>&1
+  fi
+}
+
+# ── Reply oracles (task 1788501249; the predicates live in scripts/lib/reply.sh) ──
+# `call` returns icp's exit status, and a Candid REFUSAL — `variant { err =
+# "..." }` — is a successful call as far as icp is concerned: exit 0. With
+# every seeding line's reply sent to /dev/null, a refused money-moving step
+# printed its ✓ anyway. Observed 2026-09-04: a `seed.sh full` whose
+# resetExchange never took effect printed all four "<market> enabled" lines
+# and "Seed 'full' complete." over four refused seedAmmPool deposits ("at
+# its vault concentration cap"), and cold_start — whose seed step this is —
+# handed over an enabled-but-hollow venue. The money-moving steps below now
+# assert their reply through the shared predicates (mdx_reply_ok /
+# mdx_reply_unit / mdx_reply_nat, plus the extractors mdx_one_line /
+# mdx_vault_nat / mdx_reply_nat_value): the `variant { ok }`
+# shape, named or HASH-spelled (`24_860` when icp's candid fetch misses —
+# task 1788507289; `err` = 5_048_165 is refused like the named form), see
+# scripts/lib/reply.sh for the whole doctrine. ONE copy for seed.sh,
+# play_start.sh and deploy.sh (task 1788503030) — hygiene §3d pins the source
+# line and the absence of a private copy; §6af unit-tests the lib.
+# A refusal is a ✗ line carrying the reply text and a non-zero exit — every
+# caller (cold_start's seed step, tests/_scratch.sh's seed_logged) aborts
+# on it instead of trusting a hollow venue.
+# shellcheck source=scripts/lib/reply.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/reply.sh"
+
+# seed_fail <what> <reply> — the loud exit. Resumes the timers if a fixture
+# had paused them, so an aborted seed does not strand a paused venue.
+SEED_TIMERS_PAUSED=false
+seed_fail() {
+  err "$1: $(mdx_one_line "$2")"
+  if [ "$SEED_TIMERS_PAUSED" = "true" ]; then
+    call setTestTimersPaused "(false)" --identity alice > /dev/null 2>&1 || true
+  fi
+  err "seed '$MODE' ABORTED — the venue is NOT seeded (see the ✗ line above)"
+  exit 1
+}
+
+# must_ok <label> <call args...>   — the call must answer `variant { ok ... }`
+must_ok() {
+  local label="$1"; shift
+  local out rc
+  out=$(call "$@"); rc=$?
+  if [ "$rc" -ne 0 ] || ! mdx_reply_ok "$out"; then
+    seed_fail "$label refused (rc=$rc)" "$out"
+  fi
+}
+# must_unit <label> <call args...> — a unit-returning admin call must answer `()`
+# (a trap — e.g. "Caller is not a canister controller" — is a non-zero exit
+# with the reject text on stdout+stderr, which the ✗ line then carries).
+must_unit() {
+  local label="$1"; shift
+  local out rc
+  out=$(call "$@"); rc=$?
+  if [ "$rc" -ne 0 ] || ! mdx_reply_unit "$out"; then
+    seed_fail "$label failed (rc=$rc)" "$out"
+  fi
+}
+# bulk_fund <batch entries> <entry count> — ONE bulkSetTestBalances call, its
+# reply READ. The method answers the number of balance rows it wrote
+# (`-> (nat)`; the lib's mdx_reply_nat gates the shape and its
+# mdx_reply_nat_value reads the N — task 1793496257), so the verdict is the
+# count: exactly entries × 4 (the four tokens every padded trader holds).
+# Anything else — a Candid parser error
+# (the CLI refuses the bare keyword `principal` as a record label: task
+# 1788536324 found every padded trader unfunded behind a "✓ balances seeded"
+# line because the reply went to /dev/null), a trap, a short count — aborts
+# through seed_fail. Never trust the ✓ line to a discarded reply again.
+bulk_fund() {
+  local batch="$1" entries="$2"
+  local want out rc got
+  want=$(( entries * 4 ))
+  out=$(call bulkSetTestBalances "(vec { $batch })" --identity alice); rc=$?
+  if [ "$rc" -ne 0 ] || ! mdx_reply_nat "$out"; then
+    seed_fail "bulkSetTestBalances ($entries accounts) did not answer (N : nat) (rc=$rc)" "$out"
+  fi
+  got=$(mdx_reply_nat_value "$out")
+  if [ "$got" != "$want" ]; then
+    seed_fail "bulkSetTestBalances wrote $got balance rows for $entries accounts (expected $want)" "$out"
+  fi
+  ok "bulkSetTestBalances: $got balance rows written for $entries accounts"
+}
+
+# vault_value — getVaultValue as one whitespace-normalized line.
+vault_value() {
+  echo "y" | icp canister call backend getVaultValue '()' --query --identity anonymous 2>&1 \
+    | tr -s '[:space:]' ' '
+}
+
+# reset_exchange — resetExchange answers unit, so its exit status alone
+# cannot tell "wiped" from "never delivered": assert the post-condition the
+# fixtures rely on (lpSupply 0, no AMM pools) before seeding on top of it.
+reset_exchange() {
+  must_unit "resetExchange" resetExchange '()' --identity alice
+  local vault lp pools
+  vault=$(vault_value)
+  lp=$(mdx_vault_nat "$vault" lpSupply)
+  [ "$lp" = "0" ] || seed_fail "resetExchange did not wipe the vault (lpSupply = ${lp:-unreadable}, expected 0)" "$vault"
+  pools=$(echo "y" | icp canister call backend getAmmPools '()' --query --identity anonymous 2>&1 | tr -s '[:space:]' ' ')
+  printf '%s' "$pools" | grep -qE '^\( ?vec \{ ?\},? ?\) ?$' \
+    || seed_fail "resetExchange did not wipe the AMM pools (expected (vec {}))" "$pools"
+}
+
+# assert_vault_seeded <base tokens...> — the post-condition an AMM seed
+# promises: LP supply minted AND every seeded pool's base leg present in the
+# basket. A refused deposit that somehow slipped past must_ok (or a vault
+# that survived the reset) shows up here as lpSupply 0 / an empty leg.
+assert_vault_seeded() {
+  local vault lp basket tok fld amt
+  vault=$(vault_value)
+  lp=$(mdx_vault_nat "$vault" lpSupply)
+  case "$lp" in
+    ''|0) seed_fail "post-seed lpSupply = ${lp:-unreadable} (expected > 0) — the vault deposits did not land" "$vault" ;;
+  esac
+  basket=$(printf '%s' "$vault" | sed -n 's/.*basket = record {\([^}]*\)}.*/\1/p')
+  for tok in "$@"; do
+    fld=$(printf '%s' "$tok" | tr 'A-Z' 'a-z')
+    amt=$(mdx_vault_nat "$basket" "$fld")
+    case "$amt" in
+      ''|0) seed_fail "post-seed basket has no $tok leg (${fld} = ${amt:-unreadable}) — the $tok pool's deposit did not land" "$vault" ;;
+    esac
+  done
+  ok "vault post-condition: lpSupply $lp · base legs present: $*"
 }
 
 # Integer-money: human decimal -> integer base units (10^8 / e8s). Money
 # args (balances, prices, qtys, amounts) are now Nat base units on the wire.
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
+
+# Live-feed mark for one asset: prints "<price> <age-seconds>" from the
+# top-level fields of getLastAggregate(<asset>) — `price` is a float64 in
+# quote units, the same human-decimal shape e8() takes — or nothing when no
+# aggregate exists yet (feed never ticked on this venue, or the venue was
+# reset since: resetExchange CLEARS lastAggregates, so a fixture that wants
+# the live mark must read it BEFORE it resets). The awk tracks brace depth
+# because every per-source record inside `readings = vec { ... }` carries its
+# own `price =` one level deeper than the aggregate's; the price is passed
+# through as text (awk's %.6g OFMT would round 80922.84 to 80922.8).
+live_aggregate_mark() {
+  local asset="$1" out
+  out=$(call getLastAggregate "(\"$asset\")" --query --identity anonymous) || return 0
+  printf '%s\n' "$out" | awk -v now="$(date +%s)" '
+    depth == 1 && $1 == "price"     { px = $3 }
+    depth == 1 && $1 == "timestamp" { ts = $3; gsub(/_/, "", ts); age = now - int(ts / 1000000000) }
+    { depth += gsub(/\{/, "{") - gsub(/\}/, "}") }
+    END { if (px + 0 > 0) print px, age + 0 }'
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -155,7 +320,7 @@ seed_empty() {
   # zero vault/orderbook/oracle state. A previous version of this
   # function only touched setTestBalance, leaving prior state intact —
   # which silently broke test_vault_lp's LP-anchor assertions.
-  call resetExchange --identity alice > /dev/null
+  reset_exchange
   call setTestBalance "(principal \"$alice\", \"ICPUSD\", $(e8 0.0))" --identity alice > /dev/null
   ok "markets initialized · reset complete"
 }
@@ -174,7 +339,7 @@ seed_matching() {
   local alice bob
   alice=$(ensure_identity alice)
   bob=$(ensure_identity bob)
-  call resetExchange --identity alice > /dev/null
+  reset_exchange
   call setTestBalance "(principal \"$alice\", \"BTC\",    $(e8 10.0))"      --identity alice > /dev/null
   call setTestBalance "(principal \"$alice\", \"ICPUSD\", $(e8 1000000.0))" --identity alice > /dev/null
   call setTestBalance "(principal \"$bob\",   \"BTC\",    $(e8 10.0))"      --identity alice > /dev/null
@@ -196,35 +361,39 @@ seed_amm() {
   log "mode=amm — AMM pool on BTC-ICPUSD, refPrice=75000"
   local alice
   alice=$(ensure_identity alice)
-  call resetExchange --identity alice > /dev/null
+  reset_exchange
   call setTestBalance "(principal \"$alice\", \"BTC\",    $(e8 50.0))"       --identity alice > /dev/null
   call setTestBalance "(principal \"$alice\", \"ICPUSD\", $(e8 10000000.0))" --identity alice > /dev/null
-  call createAmmPool '("BTC-ICPUSD")' --identity alice > /dev/null
-  call setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 75000.0))" --identity alice > /dev/null
-  call seedAmmPool "(\"BTC-ICPUSD\", $(e8 2.0), $(e8 150000.0))" --identity alice > /dev/null
-  call enableAmm '("BTC-ICPUSD", true)' --identity alice > /dev/null
+  must_ok "createAmmPool BTC-ICPUSD"  createAmmPool '("BTC-ICPUSD")' --identity alice
+  must_ok "setAmmRefPrice BTC-ICPUSD" setAmmRefPrice "(\"BTC-ICPUSD\", $(e8 75000.0))" --identity alice
+  must_ok "seedAmmPool BTC-ICPUSD"    seedAmmPool "(\"BTC-ICPUSD\", $(e8 2.0), $(e8 150000.0))" --identity alice
+  must_ok "enableAmm BTC-ICPUSD"      enableAmm '("BTC-ICPUSD", true)' --identity alice
+  assert_vault_seeded BTC
   ok "pool seeded: 2 BTC + 150,000 ICPUSD · refPrice 75000 · enabled"
 }
 
 # ═══════════════════════════════════════════════════════════════════
-# MODE: pending   (one protected maker, ready to be crossed)
+# MODE: staged   (one BUY staged, a counterparty funded)
 # ═══════════════════════════════════════════════════════════════════
 # Post-condition:
-#   alice has placed a protected BUY on BTC-ICPUSD at 75000.0 with a
-#   10-second settlement window. bob has BTC to sell. The fixture is
-#   the precondition for the pending-match regression test: bob
-#   places a taker SELL at 75000, expecting a pending match (not an
-#   immediate trade) to appear in getMyPendingMatches.
-seed_pending() {
-  log "mode=pending — alice places protected BUY, bob ready to cross"
+#   alice has placed a placeLimitOrder BUY on BTC-ICPUSD at 75000.0 for
+#   1.0 BTC (sealed: it STAGES and releases on the next GEPTOR / the
+#   users-only expiry release — no AMM pool here); bob has BTC to sell.
+#   The staged-order fixture the settlement, cancel/refund, zombie and
+#   GEPTOR-inflight suites build on. (Was `pending`: it placed the same
+#   order through placeProtectedLimitOrder with a window; that machinery
+#   is retired — task 1788516198 — and placeProtectedLimitOrder is now an
+#   inert alias, so the fixture names what it actually is.)
+seed_staged() {
+  log "mode=staged — alice stages a BUY, bob ready to cross"
   local alice bob
   alice=$(ensure_identity alice)
   bob=$(ensure_identity bob)
-  call resetExchange --identity alice > /dev/null
+  reset_exchange
   call setTestBalance "(principal \"$alice\", \"ICPUSD\", $(e8 1000000.0))" --identity alice > /dev/null
   call setTestBalance "(principal \"$bob\",   \"BTC\",    $(e8 5.0))"       --identity alice > /dev/null
-  call placeProtectedLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 75000.0), $(e8 1.0), 10:nat)" --identity alice > /dev/null
-  ok "alice: protected BUY 1.0 BTC @ 75000 · window 10s · bob: 5 BTC loaded"
+  call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 75000.0), $(e8 1.0))" --identity alice > /dev/null
+  ok "alice: BUY 1.0 BTC @ 75000 staged (sealed) · bob: 5 BTC loaded"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -243,7 +412,7 @@ seed_load() {
   local alice
   alice=$(ensure_identity alice)
   if [ "$SKIP_RESET" != "true" ]; then
-    call resetExchange --identity alice > /dev/null
+    reset_exchange
   fi
 
   # Principals are derived from create-read-delete throwaway identities
@@ -259,13 +428,20 @@ seed_load() {
   # Build a batched bulkSetTestBalances argument. Candid vecs on the
   # CLI are verbose, so we chunk into 50 accounts per call — below the
   # argument-size limit, and each call settles in well under a second.
+  # The record LABEL is spelled "principal" (quoted): `principal` is a
+  # Candid textual-syntax keyword and icp's parser rejects the bare form
+  # ("Unrecognized token `Equals` … Expected one of \"text\""), which is
+  # how every padded trader went unfunded for the script's whole life
+  # (task 1788536324; candid/backend.did spells it quoted too). bulk_fund
+  # reads each reply and aborts unless it counts entries × 4 rows.
   log "bulk-loading balances (50 per call)"
   local batch=""
   local n=0
   local batches=0
+  local rows=0
   while IFS= read -r p; do
     [ -z "$p" ] && continue
-    batch+="record { principal = principal \"$p\"; balances = vec {"
+    batch+="record { \"principal\" = principal \"$p\"; balances = vec {"
     batch+="record { token = \"ICPUSD\"; amount = 100000000000000 };"
     batch+="record { token = \"BTC\";    amount = 1000000000 };"
     batch+="record { token = \"ETH\";    amount = 10000000000 };"
@@ -273,16 +449,19 @@ seed_load() {
     batch+="}};"
     n=$(( n + 1 ))
     if [ "$n" -ge 50 ]; then
-      call bulkSetTestBalances "(vec { $batch })" --identity alice > /dev/null
+      bulk_fund "$batch" "$n"
+      rows=$(( rows + n * 4 ))
       batches=$(( batches + 1 ))
       batch=""; n=0
     fi
   done < "$tmpfile"
   if [ -n "$batch" ]; then
-    call bulkSetTestBalances "(vec { $batch })" --identity alice > /dev/null
+    bulk_fund "$batch" "$n"
+    rows=$(( rows + n * 4 ))
     batches=$(( batches + 1 ))
   fi
-  ok "balances seeded across $batches batched calls"
+  [ "$rows" -eq $(( count * 4 )) ] || seed_fail "padding wrote $rows balance rows for $count principals (expected $(( count * 4 )))" "rows=$rows batches=$batches"
+  ok "balances seeded: $rows balance rows ($count principals × 4 tokens) across $batches batched calls, every reply counted"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -403,7 +582,68 @@ seed_full() {
   alice=$(ensure_identity alice); bob=$(ensure_identity bob)
   charlie=$(ensure_identity charlie); dave=$(ensure_identity dave)
   eve=$(ensure_identity eve)
-  call resetExchange --identity alice > /dev/null
+
+  # Step 0: snapshot the LIVE marks before the reset below clears them.
+  # A standalone `seed.sh full --history-days 0` used to stamp the four AMM
+  # marks at the hardcoded fallbacks below (BTC 75000 ...) while the venue's
+  # real feed sat at ~81k: the first post-seed tick (≤30s) pended every leg
+  # (PRICE_JUMP_BPS 250), the pends confirmed only two ticks later, and for
+  # that whole ~65-95s window vaultPricesStale refused EVERY LP mint on the
+  # venue ("awaiting circuit-breaker confirmation") — task 3088500128,
+  # measured 2026-09-04. Marks taken from the live aggregate sit within the
+  # breaker band of the next tick, so no pend is created. Read here, not in
+  # step 4: resetExchange (next) clears lastAggregates and zeroes the feed
+  # counters, and the timers are paused while the pools are seeded, so no
+  # aggregate exists again until after the seed ends.
+  # A cached aggregate is often MISSING or STALE here, and then the fallback
+  # default lays the whole venue off the market: after a resetExchange there
+  # are no pools, so tickPriceRefresh fetches nothing until the next seed
+  # creates them; a fresh replica has never ticked; a fixture that paused the
+  # timers left the cache aging. Observed 2026-09-04 (task 3088527364): a
+  # `full` seed on a just-reset venue stamped ETH at the $3500 default while
+  # the feed sat at ~$2450 — the first post-unpause tick pended the -30% jump
+  # and confirmed it ~30s later, so the MARK moved to $2450 while the maker
+  # ladder seed_book_around had rested at $3500 stayed put, and every ETH buy
+  # capped off the mid (mark × 1.10) reached nothing (test_swap route 3,
+  # "swapper ETH balance grew: got 20.0"). So fetch on demand: for an asset
+  # with no cached aggregate, or one older than the venue's own
+  # maxRefPriceAgeSec (MDX_SEED_MARK_MAX_AGE_SEC, default 300), fire ONE
+  # fetchAndSetRefPrice(<asset>-ICPUSD) — the controller hook whose
+  # refreshMultiSourcePrice writes lastAggregates BEFORE the accept gate, so
+  # it caches the live mark even on a pool-less venue (the apply step then
+  # answers "No AMM pool", which is fine: the reset below wipes the pools
+  # anyway) — and re-read. Ladder and marks both come off the same value, so
+  # the book rests where the feed's next tick will confirm, inside the
+  # breaker band. The fetch's reply is deliberately not asserted: a venue
+  # with no reachable source answers a refusal (or a zero-priced aggregate
+  # the reader below discards), and THAT is the one case that still falls
+  # back to the defaults — where nothing will ever move the mark off them.
+  local live_BTC live_ETH live_SOL live_ICP live_age_BTC live_age_ETH live_age_SOL live_age_ICP
+  local live_how_BTC live_how_ETH live_how_SOL live_how_ICP
+  local feed_stats a m px age fetched=""
+  local mark_max_age="${MDX_SEED_MARK_MAX_AGE_SEC:-300}"
+  feed_stats=$(call getPriceFeedStats "()" --query --identity anonymous | tr -d '\n' \
+    | grep -oE '(successCount|suspendedCount) = [0-9]+' | tr '\n' ' ')
+  for a in BTC ETH SOL ICP; do
+    m=$(live_aggregate_mark "$a")
+    read -r px age <<< "$m"
+    printf -v "live_how_$a" '%s' ""
+    if [ -z "$px" ] || [ "${age:-0}" -gt "$mark_max_age" ]; then
+      call fetchAndSetRefPrice "(\"$a-ICPUSD\")" --identity alice > /dev/null 2>&1 || true
+      m=$(live_aggregate_mark "$a")
+      read -r px age <<< "$m"
+      if [ -n "$px" ]; then fetched="$fetched $a"; printf -v "live_how_$a" '%s' "fetched"; fi
+    fi
+    printf -v "live_$a" '%s' "$px"
+    printf -v "live_age_$a" '%s' "$age"
+  done
+  if [ -n "$live_BTC$live_ETH$live_SOL$live_ICP" ]; then
+    ok "live aggregate marks snapshotted before reset (feed: ${feed_stats:-no stats}; fetched on demand:${fetched:- none})"
+  else
+    warn "no live aggregate on this venue and the on-demand fetch cached none (feed: ${feed_stats:-no stats}) — marks fall back to history/defaults"
+  fi
+
+  reset_exchange
   log "funding named traders"
   # Balances generous enough that the biggest order spec (80×unit for
   # alice at mid × (1+8%)) still fits with room to spare across all
@@ -453,21 +693,34 @@ seed_full() {
     ok "history injection skipped (--history-days 0)"
   fi
 
+  # Mark precedence, per asset — prints "<price> <source>":
+  #   1. the history snapshot inject_history wrote to $MDX_ORACLE_PRICES
+  #      (--history-days N>0): the candles and the book are anchored at
+  #      THOSE prices, so the AMM must open where the injected tape ends;
+  #   2. the live aggregate snapshotted in step 0 — cached, or fetched on
+  #      demand there when the cache was empty/stale (the feed's own mark,
+  #      so the next tick lands inside the breaker band — see step 0);
+  #   3. the hardcoded fallback — only a venue with no reachable price
+  #      source gets here (the on-demand fetch cached nothing usable).
   oracle_price() {
-    local asset="$1" fallback="$2"
+    local asset="$1" fallback="$2" p live age how
     if [ -f "$oracle_file" ]; then
-      local p
       p=$(awk -v a="$asset" '$1 == a { print $2; exit }' "$oracle_file")
-      if [ -n "$p" ]; then echo "$p"; return; fi
+      if [ -n "$p" ]; then echo "$p history-snapshot"; return; fi
     fi
-    echo "$fallback"
+    live="live_$asset"; live="${!live}"
+    age="live_age_$asset"; age="${!age}"
+    how="live_how_$asset"; how="${!how}"
+    if [ -n "$live" ]; then echo "$live live-aggregate(${how:+$how,}${age}s-old)"; return; fi
+    echo "$fallback fallback-default"
   }
 
-  local btc_px eth_px sol_px icp_px
-  btc_px=$(oracle_price BTC 75000)
-  eth_px=$(oracle_price ETH 3500)
-  sol_px=$(oracle_price SOL 200)
-  icp_px=$(oracle_price ICP 2.5)
+  local btc_px eth_px sol_px icp_px btc_src eth_src sol_src icp_src
+  read -r btc_px btc_src <<< "$(oracle_price BTC 75000)"
+  read -r eth_px eth_src <<< "$(oracle_price ETH 3500)"
+  read -r sol_px sol_src <<< "$(oracle_price SOL 200)"
+  read -r icp_px icp_src <<< "$(oracle_price ICP 2.5)"
+  ok "mark sources — BTC $btc_px ← $btc_src · ETH $eth_px ← $eth_src · SOL $sol_px ← $sol_src · ICP $icp_px ← $icp_src"
 
   # Step 3: seed the order book around the current oracle prices.
   log "book seeding at oracle prices (BTC $btc_px · ETH $eth_px · SOL $sol_px · ICP $icp_px)"
@@ -478,8 +731,9 @@ seed_full() {
 
   # Step 4: AMM pools — refPrice already right, pool sized for
   # robustness against simulator flow. After deploy, the price-feed
-  # timer takes over refreshing refPrice every 30s via non-replicated
-  # outcalls.
+  # heartbeat takes over refreshing refPrice via non-replicated outcalls —
+  # every ~60s PER POOL (a 30s beat whose 45s stale gate quantises each
+  # pool to two beats; measured, task 1788503312).
   #
   # tvl_target sizing: each pool needs `numLevels × quoteDepthBase`
   # of base inventory for the ask ladder AND the same value in
@@ -492,7 +746,8 @@ seed_full() {
   # refPrice as a >2.5% jump vs the live market, pend it (circuit breaker), and
   # the LP-deposit freshness gate would then block later pool seeds (it refuses
   # to mint while a HELD asset's price is frozen). Unpaused right after seeding.
-  call setTestTimersPaused "(true)" --identity alice > /dev/null
+  must_unit "setTestTimersPaused(true)" setTestTimersPaused "(true)" --identity alice
+  SEED_TIMERS_PAUSED=true
   local tvl_target=500000
   for triplet in \
     "BTC-ICPUSD $btc_px" \
@@ -505,7 +760,7 @@ seed_full() {
     local base_amt quote_amt
     base_amt=$(python3 -c "print(round($tvl_target / $price / 2, 4))")
     quote_amt=$(python3 -c "print($tvl_target / 2)")
-    call createAmmPool  "(\"$market\")"                       --identity alice > /dev/null
+    must_ok "createAmmPool $market" createAmmPool "(\"$market\")" --identity alice
     # Inventory target + per-quote depth are NOT set here — auto-inventory
     # (enabled below) derives both from the live vault every requote: equal USD
     # per asset at 50% assets / 50% cash, with the ladder showing a fixed
@@ -514,27 +769,89 @@ seed_full() {
     # the first requote derives the real value (decimal point required — the icp
     # CLI parses a bare "1" as Int and rejects the Float arg with no candid file).
     # spread 20bps · 15 levels · 35bps spacing → a ~5% quoted band each side.
-    call setAmmConfig "(\"$market\", 20:nat, $(e8 1.0):nat, 15:nat, 35:nat, 8:nat)" --identity alice > /dev/null
-    call setAmmRefPrice "(\"$market\", $(e8 $price))"               --identity alice > /dev/null
-    call seedAmmPool    "(\"$market\", $(e8 $base_amt), $(e8 $quote_amt))" --identity alice > /dev/null
+    must_ok "setAmmConfig $market"   setAmmConfig "(\"$market\", 20:nat, $(e8 1.0):nat, 15:nat, 35:nat)" --identity alice
+    must_ok "setAmmRefPrice $market" setAmmRefPrice "(\"$market\", $(e8 $price))" --identity alice
+    # The vault deposit itself — the step the 2026-09-04 hollow seed lost
+    # (refused "at its vault concentration cap" over a surviving vault).
+    must_ok "seedAmmPool $market"    seedAmmPool "(\"$market\", $(e8 $base_amt), $(e8 $quote_amt))" --identity alice
     # Phase 4 skew INTENSITY (200bps) — the target it leans toward is derived by
     # auto-inventory, not this seeded base amount. When holdings drift off the
     # derived target the AMM shifts its whole ladder in the opposite direction
     # (bidding less when long, asking less when short); that feedback loop, plus
     # the rebalancer, pulls the vault back toward the equal-weight allocation.
-    call setAmmSkewConfig "(\"$market\", $(e8 $base_amt), 200:nat)" --identity alice > /dev/null
-    call enableAmm        "(\"$market\", true)"               --identity alice > /dev/null
+    must_ok "setAmmSkewConfig $market" setAmmSkewConfig "(\"$market\", $(e8 $base_amt), 200:nat)" --identity alice
+    must_ok "enableAmm $market"        enableAmm "(\"$market\", true)" --identity alice
     ok "$market enabled · $base_amt base + $quote_amt ICPUSD · refPrice $price · skew 200bps"
   done
+  # The post-condition the comment block above promises: LP supply minted
+  # and all four base legs in the basket — asserted, not assumed.
+  assert_vault_seeded BTC ETH SOL ICP
 
   # Auto-inventory: from now on each pool derives its target + quoted depth from
   # the live vault (equal USD per asset, 50/50 assets/cash). The vault was seeded
   # at that allocation above, so it starts on-target; any drift self-corrects.
-  call setAmmAutoInventory "(true)" --identity alice > /dev/null
+  must_unit "setAmmAutoInventory(true)" setAmmAutoInventory "(true)" --identity alice
   ok "auto-inventory enabled — AMM targets equal-weight 50/50, depth derived from vault"
   # Resume timers — the oracle now refreshes the seed prices toward live market
   # (a confirmed >2.5% gap applies after two readings; cold_start waits for it).
-  call setTestTimersPaused "(false)" --identity alice > /dev/null
+  must_unit "setTestTimersPaused(false)" setTestTimersPaused "(false)" --identity alice
+  SEED_TIMERS_PAUSED=false
+  # Re-stamp every mark AFTER the timers resume. Seeding four pools takes long
+  # enough that the FIRST pool's refPriceUpdatedNs is ~30-40s old by now,
+  # against LP_DEPOSIT_MAX_REF_AGE_NS = 60s, and the first post-unpause feed
+  # tick lands ~45-50s after the unpause (the 30s HB_PRICE_NS beat whose 45s
+  # stale gate makes the steady-state per-pool cadence 60s — task 1788503312 —
+  # plus outcall latency) — measured 2026-09-04 (task 3088500128): a standalone seed
+  # answered "LP deposit paused: BTC refPrice is stale" from +31s after the
+  # seed until that tick, and stamps taken BEFORE the unpause still left a
+  # ~7s stale gap (their own ~15s of call latency ate the margin). Stamping
+  # after the unpause starts the 60s grace as late as possible, ~20s past the
+  # expected tick. Same prices, so the vault's marks do not move; a tick that
+  # races a stamp is harmless either way (both write the live mark, and a
+  # direct set supersedes any pend). setAmmRefPrice is a #dev hook, which this
+  # whole fixture already requires (posture guard above).
+  for triplet in \
+    "BTC-ICPUSD $btc_px" \
+    "ETH-ICPUSD $eth_px" \
+    "SOL-ICPUSD $sol_px" \
+    "ICP-ICPUSD $icp_px"
+  do
+    local market price
+    read -r market price <<< "$triplet"
+    must_ok "setAmmRefPrice $market (re-stamp)" setAmmRefPrice "(\"$market\", $(e8 $price))" --identity alice
+  done
+  ok "marks re-stamped after unpause (fresh refPriceUpdatedNs for the 60s LP-deposit staleness grace)"
+  # ...and wait, bounded, for that first tick to land — measured at +45..70s
+  # after the unpause, so the 60s grace alone still left a ~10s "refPrice is
+  # stale" gap. The wait ends the moment EVERY pool's refPriceUpdatedNs has
+  # moved past the stamps (only a feed tick can do that), which is exactly
+  # the freshness vaultPricesStale checks; it is skipped when the marks came
+  # from the fallback defaults (no feed has ever ticked here — nothing to
+  # wait for) and on the timeout it warns and proceeds: a mint then meets the
+  # gate's own refusal, not a hang. MDX_SEED_FEED_WAIT_SEC caps it (default
+  # 90; 0 disables). cold_start.sh's AMM-oracle-health phase is condition-
+  # driven on successCount, so it adds ~0s once this wait has seen the tick.
+  local wait_max="${MDX_SEED_FEED_WAIT_SEC:-90}" t_stamped waited=0 fresh=0
+  t_stamped=$(date +%s)
+  case "$btc_src$eth_src$sol_src$icp_src" in
+    *live-aggregate*|*history-snapshot*) ;;
+    *) wait_max=0; ok "no live feed on this venue — skipping the first-tick wait" ;;
+  esac
+  while [ "$wait_max" -gt 0 ]; do
+    fresh=$(call getAmmPools "()" --query --identity anonymous | tr -d '\n_' \
+      | grep -oE 'refPriceUpdatedNs = [0-9]+' \
+      | awk -v t="$t_stamped" '{ if ($3 + 0 > t * 1000000000) n++ } END { print n + 0 }')
+    waited=$(( $(date +%s) - t_stamped ))
+    if [ "$fresh" -ge 4 ]; then
+      ok "first post-unpause feed tick refreshed all 4 marks after ${waited}s — LP mints are unblocked"
+      break
+    fi
+    if [ "$waited" -ge "$wait_max" ]; then
+      warn "feed refreshed only $fresh/4 marks within ${wait_max}s — LP mints on the stale legs refuse until it does"
+      break
+    fi
+    sleep 3
+  done
 
   # Step 5: pad with load-test trader principals.
   if [ "$TRADERS" -gt 5 ]; then
@@ -549,7 +866,7 @@ case "$MODE" in
   empty)    seed_empty    ;;
   matching) seed_matching ;;
   amm)      seed_amm      ;;
-  pending)  seed_pending  ;;
+  staged)   seed_staged   ;;
   load)     seed_load     ;;
   *) err "unknown mode: $MODE"; exit 1 ;;
 esac

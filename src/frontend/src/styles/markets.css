@@ -10,16 +10,36 @@
 }
 
 /* ── Market Selector Dropdown ─────────────────────────────────────── */
+/* A MENU BUTTON (main.js wireMenuButton, 1793506246): .market-selector is the
+   positioning wrapper that carries the .open state; .market-selector-trigger
+   the real <button> — inside the h2, so the title keeps its heading — that
+   draws what the wrapper drew (no box: title and chevron 6px apart, the
+   pointer cursor); .market-dropdown the role=menu; .market-dropdown-item its
+   role=menuitem buttons, reset so they render exactly as the divs they
+   replace, plus :focus-visible rings in the accent token. */
 .market-selector {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 6px;
-  cursor: pointer;
-  user-select: none;
   flex-shrink: 0; /* don't shrink/clip the name — overflow drives auto-compact */
 }
 .market-selector h2 { margin: 0; }
+.market-selector-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+}
+.market-selector-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
 /* Base-asset logo (public/assets/<TOKEN>.svg) shown in the selector title and
    dropdown rows. Inline (not flex) so "BTC/ICPUSD" stays one text run. */
 .market-logo {
@@ -36,10 +56,12 @@
   margin-right: 6px;
 }
 /* Desktop only: shrink the market-selector title (it's oversized on wide
-   layouts). Uses the #id so it beats the later `.market-header h2` 28px
-   rule regardless of source order. Mobile keeps its own size. */
+   layouts). Two classes deep so it beats the later `.market-header h2` 28px
+   rule regardless of source order. It sits on the h2 — not on #market-title,
+   the text span inside the trigger button now — so the heading's line box,
+   the header's height, is what it was. Mobile keeps its own size. */
 @media (min-width: 901px) {
-  #market-title { font-size: 19px; font-weight: 600; }
+  .market-header .market-selector h2 { font-size: 19px; font-weight: 600; }
   /* The Account tab carries the username on desktop — the header-right chip
      would be a duplicate. !important beats the JS inline display:flex. */
   #user-chip { display: none !important; }
@@ -64,7 +86,7 @@
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  box-shadow: var(--shadow-pop);
   z-index: 60;
 }
 .market-selector.open .market-dropdown {
@@ -82,15 +104,24 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  width: 100%;
+  margin: 0;
   padding: 10px 14px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   cursor: pointer;
   transition: background 0.15s;
 }
-.market-dropdown-item:hover {
+.market-dropdown-item:hover, .market-dropdown-item:focus-visible {
   background: var(--bg-hover);
 }
+/* The list scrolls (overflow-y: auto), so the ring sits inside. */
+.market-dropdown-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .market-dropdown-item.active {
-  background: rgba(229,169,83,0.10);
+  background: var(--cta-tint);
   box-shadow: inset 2px 0 0 var(--accent);
 }
 .market-dropdown-item .dd-name {
@@ -144,7 +175,6 @@
   transition: color 0.3s ease;
 }
 .market-header-spacer { flex: 1; }
-.market-header #chart-btn { display: none; }
 
 /* Hyperliquid-style stat cells: small label on top, larger value below.
    Shown on desktop only; mobile keeps the existing inline price + change. */
@@ -165,13 +195,31 @@
   display: none;
   align-items: center;
   justify-content: center;
-  gap: 6px;
   flex: 1;
   min-width: 0;
   position: relative;
+}
+/* Its trigger is a real <button> — a disclosure (main.js wireDisclosure,
+   1793506246: Enter / Space toggle, Escape closes, aria-expanded mirrors the
+   wrapper's .open) — stretched across the wrapper so the tap target is the
+   strip it was, drawing what the wrapper drew. */
+.msm-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
 }
+.msm-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .msm-summary {
   display: flex;
   flex-direction: column;
@@ -194,7 +242,7 @@
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-pop);
   padding: 4px 6px;
 }
 .market-stats-mobile.open .market-stats-dropdown { display: block; }
@@ -235,6 +283,27 @@
 }
 .market-stat-more:hover .ms-more-chevron { color: var(--text); }
 .market-stat-more.open .ms-more-chevron { transform: rotate(180deg); }
+/* The overflow trigger's keyboard half (1793506246): ONE shared <button>
+   (#market-stats-more, index.html) that updateMarketHeaderMode parks in the
+   trigger cell beside the popup — a disclosure over the hidden stats
+   (aria-expanded / aria-controls; main.js wireDisclosure). It lies over the
+   cell, transparent and textless (the chevron in the label stays the visible
+   affordance, the cell's text stays the cell's), so Tab reaches exactly the
+   cell that is the trigger and the ring draws around it. Shown only while
+   its cell is the trigger, like the chevron. */
+.market-stat .ms-more-btn { display: none; }
+.market-stat-more .ms-more-btn {
+  display: block;
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.market-stat-more .ms-more-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
 /* Reuses the mobile popup's structural styles; only `display` is toggled.
    right:0 on the popup means it grows LEFTWARD from the trigger cell, away
    from the header's right edge. */

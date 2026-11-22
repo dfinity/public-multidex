@@ -6,6 +6,7 @@
 import AMM "../src/backend/lib/AMM";
 import Debug "mo:core/Debug";
 import Runtime "mo:core/Runtime";
+import Text "mo:core/Text";
 
 func eq(name : Text, actual : Int, expected : Int) {
   if (actual != expected) { Runtime.trap("FAIL: " # name # " — expected " # debug_show expected # " got " # debug_show actual) };
@@ -223,5 +224,31 @@ truth("long: bids back away",          ladLong.bids[0].0 < lad.bids[0].0);
 truth("round trip pays the vault under short skew", ladShort.asks[0].0 > ladShort.bids[0].0);
 truth("round trip pays the vault under long skew",  ladLong.asks[0].0 > ladLong.bids[0].0);
 truth("round trip pays the vault under wild skews", ladWild.asks[0].0 > ladWild.bids[0].0);
+
+// ── H-33 (F47): markStaleReason — the play-deposit ADMISSION freshness verdict ──
+// null = the mark may value a deposit; ?reason = refuse (the Bridge relays it).
+// The bar is the caller's (main.mo passes the 5-min margin wall); pinned here:
+// the boundary is inclusive (age == bar fresh, bar + 1 ns stale), a pend
+// refuses regardless of age, a zero mark and a never-stamped mark refuse.
+let BAR : Int = 300_000_000_000;                      // 5 min, the margin wall
+let T0  : Int = 1_700_000_000_000_000_000;
+let stamped = AMM.withRefPrice(AMM.emptyPool("BTC-ICPUSD", "BTC"), 6_000_000_000_000, T0);
+func isFresh(r : ?Text) : Bool = switch (r) { case null { true }; case (?_) { false } };
+func reasonHas(name : Text, r : ?Text, needle : Text) {
+  switch (r) {
+    case (?t) { if (not Text.contains(t, #text needle)) { Runtime.trap("FAIL: " # name # " — reason '" # t # "' lacks '" # needle # "'") }; Debug.print("  ✓ " # name) };
+    case null { Runtime.trap("FAIL: " # name # " — expected a refusal, got fresh") };
+  };
+};
+truth("H-33: a just-stamped mark is fresh",                 isFresh(AMM.markStaleReason(stamped, false, T0, BAR)));
+truth("H-33: age 45 s (the quiet-market refresh gap) is fresh", isFresh(AMM.markStaleReason(stamped, false, T0 + 45_000_000_000, BAR)));
+truth("H-33: age 240 s — past the 60 s LP bar, under the wall — is fresh", isFresh(AMM.markStaleReason(stamped, false, T0 + 240_000_000_000, BAR)));
+truth("H-33: age == bar is fresh (inclusive)",               isFresh(AMM.markStaleReason(stamped, false, T0 + BAR, BAR)));
+reasonHas("H-33: age == bar + 1 ns is stale",                AMM.markStaleReason(stamped, false, T0 + BAR + 1, BAR), "BTC mark is stale");
+reasonHas("H-33: the stale reason carries the age and the bar", AMM.markStaleReason(stamped, false, T0 + 400_000_000_000, BAR), "400s ago, bar 300s");
+reasonHas("H-33: a pended mark refuses even when just stamped", AMM.markStaleReason(stamped, true, T0, BAR), "pending a price-jump confirmation");
+reasonHas("H-33: a zero mark refuses",                        AMM.markStaleReason(AMM.emptyPool("BTC-ICPUSD", "BTC"), false, T0, BAR), "no mark price for BTC");
+reasonHas("H-33: a never-stamped positive mark refuses",      AMM.markStaleReason({ stamped with refPriceUpdatedNs = 0 }, false, T0, BAR), "never been stamped");
+truth("H-33: a clock behind the stamp (negative age) is fresh", isFresh(AMM.markStaleReason(stamped, false, T0 - 1_000_000_000, BAR)));
 
 Debug.print("── AMM.test PASS ──");

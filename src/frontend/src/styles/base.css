@@ -18,7 +18,35 @@ div[data-lastpass-infield] {
     pointer-events: none !important;
 }
 
+/* ── Design tokens: two themes, one vocabulary ─────────────────────
+   The bare :root block is the DARK theme — the app is dark-first, so it is
+   also what renders when nothing has chosen. The :root[data-theme="light"]
+   block below re-states the same token names for the light theme. Every
+   component stylesheet, the chart options (theme.js chartThemeOptions, read
+   by main.js), the depth bars, the liquidation heat map and the identicon
+   read the TOKENS — never a literal — so a theme is a token table and
+   nothing else. tests/frontend_display_integrity.test.mjs §P pins that: no
+   rgba()/hex literal survives outside these two blocks (the allowlist is
+   pure-black shadows/scrims, which are dark in both themes, and the brand
+   marks of the vault-mix bar in oracle.css).
+
+   WHO SETS data-theme. <html data-theme="dark|light">, stamped by
+   /theme-boot.js — a render-blocking classic script in <head>, ahead of this
+   stylesheet (an inline block is forbidden by the CSP's script-src 'self') —
+   so the first paint is already the right theme: the saved choice
+   (localStorage `mdx.theme`) or, with none, prefers-color-scheme. theme.js
+   owns the sun/moon toggle, persistence, following the system preference
+   until the user picks, and the `mdx:theme` change notification the charts
+   and the heat map re-skin on.
+
+   TWO KINDS OF TOKEN. CSS-only tints are color-mix() of the base tokens, so
+   they follow a theme for free and need no restating below. Tokens read
+   from JS (theme.js themeToken) are authored as CONCRETE rgba()/hex values
+   in BOTH blocks: lightweight-charts and the canvas parse colour strings
+   themselves and do not understand color-mix(). */
 :root {
+  color-scheme: dark;
+
   /* ── Layout ────────────────────────────────────────────────── */
   /* Rendered height of the sticky top chrome (#top-chrome = fuel banner +
      header). This 56px matches the desktop header height and is only the
@@ -46,12 +74,16 @@ div[data-lastpass-infield] {
   --accent: #38BDF0;          /* Glacier Cyan */
   --accent-hover: #2C9FCE;    /* Cyan Dim — hover/pressed */
   --accent-text: #04222E;     /* near-black text on cyan surfaces */
-  --accent-border: rgba(56,189,240,0.30); /* subtle cyan hairline — box outlines */
+  --accent-border: color-mix(in srgb, var(--accent) 30%, transparent); /* subtle cyan hairline — box outlines */
 
   /* ── Primary call-to-action (Uplands Amber, retained) ──────── */
   --cta: #E5A953;             /* Amber — primary buttons only (Swap, Place Order, Sign In) */
   --cta-hover: #B78235;       /* Amber Dim — hover/pressed */
   --cta-text: #1A1206;        /* near-black text on amber surfaces */
+  /* Amber as TEXT (badge names, diverged quotes, the amber health tier): the
+     same amber here; the light theme deepens it to stay legible on white
+     while the amber FILLS above keep their colour. */
+  --cta-ink: var(--cta);
 
   /* ── Text (Snowfall / Fog / Mist) ──────────────────────────── */
   /* Text tiers, brightened 2026-07 for legibility on the darkened surfaces.
@@ -64,21 +96,198 @@ div[data-lastpass-infield] {
 
   /* ── Trading semantics (Alpine Mint / Ember Clay) ──────────── */
   --green: #5EE6B4;           /* Alpine Mint — buys, longs, positive */
-  --green-dim: rgba(94,230,180,0.08);  /* Mint Tint — depth bars */
+  --green-hover: #55CFA2;     /* Mint Dim — the Swap CTA's hover */
+  --green-dim: color-mix(in srgb, var(--green) 8%, transparent);  /* Mint Tint — depth bars */
   --green-text: #062418;      /* text on mint buttons */
   --red: #F07A6C;             /* Ember Clay — sells, shorts, negative */
-  --red-dim: rgba(240,122,108,0.08);   /* Clay Tint — depth bars */
+  --red-dim: color-mix(in srgb, var(--red) 8%, transparent);      /* Clay Tint — depth bars */
   --red-text: #2A0C08;        /* text on clay buttons */
 
   /* ── Info / warning accents ────────────────────────────────── */
   --glacier: #3BB8D4;         /* links, info, crosshair */
   --glacier-text: #07242E;    /* text on glacier buttons */
   --heather: #C48BD9;         /* warnings, liquidation alerts */
-  --heather-tint: rgba(196,139,217,0.10);
+  --heather-tint: color-mix(in srgb, var(--heather) 10%, transparent);
+  /* The oracle-divergence alarm strip: a solid goldenrod with cream text,
+     the one amber that is an ALARM rather than an invitation. */
+  --alarm-amber: #B8860B;
+  --alarm-amber-text: #FFF8E7;
+
+  /* ── Derived tints (CSS-only — color-mix of the tokens above) ── */
+  /* Named by role, not by alpha, so a component says what it means:
+       tint-1  resting fills (cards, rows, chips, banners)
+       tint-2  selected / active fills
+       tint-3  strong highlight chips
+       outline the 1.5px cyan box outline family (Swap, Place Order, Deposit,
+               the signed-in pill); -strong is its hover
+       glow    the hover bloom on those boxes */
+  --accent-tint-0: color-mix(in srgb, var(--accent) 4%, transparent);
+  --accent-tint-1: color-mix(in srgb, var(--accent) 6%, transparent);
+  --accent-tint-2: color-mix(in srgb, var(--accent) 12%, transparent);
+  --accent-tint-3: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-outline: color-mix(in srgb, var(--accent) 45%, transparent);
+  --accent-outline-strong: color-mix(in srgb, var(--accent) 65%, transparent);
+  --accent-glow: 0 0 28px color-mix(in srgb, var(--accent) 13%, transparent),
+                 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  /* The soft accent panel: the Swap Sell/Buy boxes, the profile card, the
+     deposit on-ramp and unlock card all share this gradient. */
+  --accent-panel: linear-gradient(160deg, var(--accent-tint-2), var(--accent-tint-0));
+  --cta-tint: color-mix(in srgb, var(--cta) 10%, transparent);
+  --cta-outline: color-mix(in srgb, var(--cta) 30%, transparent);
+  --green-tint: color-mix(in srgb, var(--green) 14%, transparent);   /* badges, category chips */
+  --green-flash: color-mix(in srgb, var(--green) 42%, transparent);  /* book/trade change pulse — above the depth bars' 0.32 edge */
+  --red-tint: color-mix(in srgb, var(--red) 14%, transparent);
+  --red-flash: color-mix(in srgb, var(--red) 42%, transparent);
+  --red-outline: color-mix(in srgb, var(--red) 30%, transparent);
+  --glacier-tint: color-mix(in srgb, var(--glacier) 14%, transparent);
+  /* Ink tints: a whisper of the TEXT colour over a surface — the divider
+     band between asks and bids, input wells, the sealed-ledger badge. White
+     on dark, black on light, by construction. */
+  --text-tint-1: color-mix(in srgb, var(--text) 4%, transparent);
+  --text-tint-2: color-mix(in srgb, var(--text) 16%, transparent);
+  /* Translucent surfaces: the chart overlay, the heat-map tooltip, table
+     cells — the page colour at high alpha so blur/scroll still read through. */
+  --bg-overlay: color-mix(in srgb, var(--bg) 95%, transparent);
+  --bg-overlay-soft: color-mix(in srgb, var(--bg) 85%, transparent);
+  --bg-row: color-mix(in srgb, var(--bg-input) 50%, transparent);
+  /* Modal scrim and the logo shimmer band. */
+  --scrim: rgba(0,0,0,0.6);
+  --shine: rgba(255,255,255,0.85);
 
   --radius: 12px;
   --radius-sm: 8px;
-  --shadow: 0 4px 24px rgba(0,0,0,0.4);
+  --shadow: 0 4px 24px rgba(0,0,0,0.4);          /* cards, modals, toasts */
+  --shadow-pop: 0 8px 24px rgba(0,0,0,0.45);     /* dropdown menus, popovers */
+  --shadow-modal: 0 18px 60px rgba(0,0,0,0.5);   /* the error dialog */
+
+  /* ── Chart + canvas tokens (read by JS — concrete values only) ── */
+  /* theme.js chartThemeOptions() feeds these to lightweight-charts at
+     createChart and re-applies them on `mdx:theme`; the depth bars put them
+     in inline gradients via var(); the heat map parses the ramp below. */
+  --chart-text: #7A8699;                          /* axis labels (Fog) */
+  --chart-grid: rgba(34,46,64,0.5);               /* Ridge at low opacity */
+  --chart-border: rgba(34,46,64,0.7);             /* axes + pane separator */
+  --chart-separator-hover: rgba(59,184,212,0.35);
+  --chart-crosshair: rgba(59,184,212,0.5);        /* Glacier at ~50% — dashed crosshair */
+  --chart-up: #5EE6B4;                            /* Alpine Mint candles */
+  --chart-down: #F07A6C;                          /* Ember Clay candles */
+  --chart-up-vol: rgba(94,230,180,0.4);
+  --chart-down-vol: rgba(240,122,108,0.4);
+  --chart-track: rgba(56,189,240,0.9);            /* oracle-tracking candles + the swap rate line */
+  /* Depth bars (both order books): bright anchored edge → dim tip. */
+  --depth-bid-edge: rgba(94,230,180,0.32);
+  --depth-bid-tip: rgba(94,230,180,0.10);
+  --depth-ask-edge: rgba(240,122,108,0.32);
+  --depth-ask-tip: rgba(240,122,108,0.10);
+  /* The liquidation heat map's thermal ramp (8 stops at 0, .16, .34, .52,
+     .70, .85, .94, 1 — main.js HEAT_STOPS). Cold cells sleep near the page
+     background so empty price space stays quiet; the hot end runs blue →
+     cyan → green → yellow → orange → red → white-hot. margin-ui.css's
+     .hm2-scale-bar is the same ramp as a legend strip. */
+  --heat-0: #0F172A;
+  --heat-1: #1D4E9C;
+  --heat-2: #0694BA;
+  --heat-3: #22C55E;
+  --heat-4: #EAB308;
+  --heat-5: #F97316;
+  --heat-6: #EF4444;
+  --heat-7: #FEE4DC;
+  --heat-mark: rgba(255,255,255,0.88);            /* the mark-price trace */
+  --heat-mark-glow: rgba(255,255,255,0.35);
+  --heat-grid: rgba(148,163,184,0.07);
+  /* The aurora wash behind the page (body below): accent sweeping in from
+     the top-left, a heather counter-glow top-right, a whisper of amber at
+     the base. Alphas stay ≤0.10 so solid surfaces on top differ from the
+     local gradient shade by only ~1–2 RGB steps. */
+  --aurora-accent-1: color-mix(in srgb, var(--accent) 10%, transparent);
+  --aurora-accent-2: color-mix(in srgb, var(--accent) 4%, transparent);
+  --aurora-heather-1: color-mix(in srgb, var(--heather) 7%, transparent);
+  --aurora-heather-2: color-mix(in srgb, var(--heather) 3%, transparent);
+  --aurora-cta: color-mix(in srgb, var(--cta) 6%, transparent);
+}
+
+/* ── Light theme ──────────────────────────────────────────────────
+   Same vocabulary, re-stated. Surfaces run page → card → input → hover from
+   a cool off-white to white (the card is the brightest so it still lifts
+   off the field; borders carry the separation exactly as in the dark set).
+   The brand hues are kept — Glacier Cyan and Uplands Amber — but every
+   colour that is read as TEXT is deepened to clear the same contrast bars
+   the dark set documents, measured on --bg-card (#FFFFFF):
+     primary #141A24 17.5:1 · secondary #4F5B6B 6.9:1 · tertiary #5F6B7C 5.4:1
+     accent #0A74A6 5.2:1 (and white on it 5.2:1) · amber ink #8F5D0C 5.6:1
+     mint #0B7F57 5.0:1 · clay #C9362A 5.2:1 · glacier #0E7D9A 4.8:1 ·
+     heather #8A4BB0 5.7:1
+   The amber CTA fill stays #E5A953 (its near-black text reads 8.9:1); the
+   cyan/mint/clay FILLS take white text (the -text tokens flip), since the
+   fills themselves are now deep enough to carry it. The chart tokens trade
+   the pale night-sky lines for ink at low alpha, and the heat ramp inverts
+   its ends — cold sleeps near the (light) page, hot burns to a dark ember —
+   so brightness still means "more liquidates here" on a white field. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #F4F6F9;
+  --bg-card: #FFFFFF;
+  --bg-input: #EDF0F4;
+  --bg-hover: #E2E7ED;
+  --border: #D5DCE5;
+
+  --accent: #0A74A6;          /* Glacier Cyan, deep */
+  --accent-hover: #09699A;
+  --accent-text: #FFFFFF;
+
+  --cta: #E5A953;             /* Uplands Amber — fills only */
+  --cta-hover: #C98E3C;
+  --cta-text: #1A1206;
+  --cta-ink: #8F5D0C;         /* amber as text */
+
+  --text: #141A24;
+  --text-dim: #4F5B6B;
+  --text-muted: #5F6B7C;
+
+  --green: #0B7F57;           /* Alpine Mint, deep */
+  --green-hover: #0A7050;
+  --green-text: #FFFFFF;
+  --red: #C9362A;             /* Ember Clay, deep */
+  --red-text: #FFFFFF;
+
+  --glacier: #0E7D9A;
+  --glacier-text: #FFFFFF;
+  --heather: #8A4BB0;
+  --alarm-amber: #B8860B;
+  --alarm-amber-text: #FFF8E7;
+
+  --scrim: rgba(0,0,0,0.45);
+  --shine: rgba(255,255,255,0.9);
+  --shadow: 0 4px 24px rgba(16,24,40,0.12);
+  --shadow-pop: 0 8px 24px rgba(16,24,40,0.16);
+  --shadow-modal: 0 18px 60px rgba(16,24,40,0.22);
+
+  --chart-text: #5F6B7C;
+  --chart-grid: rgba(20,26,36,0.08);
+  --chart-border: rgba(20,26,36,0.18);
+  --chart-separator-hover: rgba(14,125,154,0.35);
+  --chart-crosshair: rgba(14,125,154,0.5);
+  --chart-up: #0B7F57;
+  --chart-down: #C9362A;
+  --chart-up-vol: rgba(11,127,87,0.35);
+  --chart-down-vol: rgba(201,54,42,0.35);
+  --chart-track: rgba(10,116,166,0.9);
+  --depth-bid-edge: rgba(11,127,87,0.28);
+  --depth-bid-tip: rgba(11,127,87,0.08);
+  --depth-ask-edge: rgba(201,54,42,0.28);
+  --depth-ask-tip: rgba(201,54,42,0.08);
+  --heat-0: #E4EBF5;
+  --heat-1: #8FB4EA;
+  --heat-2: #2AA7CF;
+  --heat-3: #16A34A;
+  --heat-4: #D99A06;
+  --heat-5: #EA6A0F;
+  --heat-6: #DC2626;
+  --heat-7: #5A0A0A;
+  --heat-mark: rgba(20,26,36,0.88);
+  --heat-mark-glow: rgba(20,26,36,0.25);
+  --heat-grid: rgba(20,26,36,0.07);
 }
 
 /* Number inputs: no spinner arrows. ±1 steps are useless against prices/
@@ -103,25 +312,24 @@ button, input, select, textarea { font-family: inherit; }
 body {
   font-family: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-optical-sizing: auto;
-  /* AURORA over the peaks: an asymmetric night-sky wash — cyan sweeping in
-     from the top-left, a heather counter-glow off the upper right, and only
-     a whisper of the old amber alpenglow left at the base. Cooler and more
-     directional than the symmetric dawn (glacier-over-alpenglow) it replaces.
-     Fixed attachment anchors the glows to the VIEWPORT so every page gets
-     the same quiet depth and the transparent cyan-outline boxes let it shine
-     through. Alphas stay ≤0.10 — solid --bg/--bg-card surfaces sitting on
-     top differ from the local gradient shade by ~1–2 RGB steps. */
+  /* AURORA over the peaks: an asymmetric sky wash — accent sweeping in from
+     the top-left, a heather counter-glow off the upper right, and only a
+     whisper of amber alpenglow at the base. Fixed attachment anchors the
+     glows to the VIEWPORT so every page gets the same quiet depth and the
+     transparent accent-outline boxes let it shine through. The colours are
+     the --aurora-* tokens (tints of the theme's own accent/heather/amber),
+     so the wash follows the theme. */
   background:
     radial-gradient(ellipse 90% 70% at 8% -10%,
-      rgba(56,189,240,0.10) 0%,
-      rgba(56,189,240,0.04) 40%,
+      var(--aurora-accent-1) 0%,
+      var(--aurora-accent-2) 40%,
       transparent 68%),
     radial-gradient(ellipse 70% 55% at 100% 12%,
-      rgba(196,139,217,0.07) 0%,
-      rgba(196,139,217,0.03) 40%,
+      var(--aurora-heather-1) 0%,
+      var(--aurora-heather-2) 40%,
       transparent 62%),
     radial-gradient(ellipse 120% 45% at 50% 118%,
-      rgba(229,169,83,0.06) 0%,
+      var(--aurora-cta) 0%,
       transparent 65%),
     var(--bg);
   background-attachment: fixed;
@@ -129,4 +337,3 @@ body {
   min-height: 100vh;
   line-height: 1.5;
 }
-

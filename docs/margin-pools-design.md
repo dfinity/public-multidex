@@ -122,8 +122,8 @@ All scoped to the pool principal `P = poolPrincipal(owner, poolId)`, reusing exi
 |---|---|
 | **Create pool** | allocate id; record `Pool`; (no funds yet) |
 | **Fund margin** | transfer ICPUSD `owner` free wallet → `P` (the segregation boundary) |
-| **Open/Increase Long** (size S) | `BorrowEngine.borrow(P, QUOTE, …)` for the leveraged part (gated to INITIAL on `P`), then place a buy for `S` as taker `P`; `applyFill` updates the position |
-| **Open/Increase Short** (S) | `borrow(P, base, S)`, sell `S` as taker `P`; `applyFill` |
+| **Open/Increase Long** (size S) | `BorrowEngine.borrowCheck(P, QUOTE, …)` for the leveraged part (gated to INITIAL on `P`, reserving nothing), stage a buy for `S` as `P`; each FILL slice borrows exactly its shortfall (`poolFundForFill`, H-34 / D5 (d)); `applyFill` updates the position |
+| **Open/Increase Short** (S) | `borrowCheck(P, base, S)`, stage a sell for `S` as `P`; the fill borrows the base it delivers; `applyFill` |
 | **Decrease / Close** | trade out of the net exposure as `P`, `repay` the matching debt; `applyFill` realizes PnL; settle interest dust via `settleAllFromQuote` |
 | **Withdraw margin** | only down to keeping `health(P) ≥ INITIAL`; transfer `P` → owner free wallet |
 

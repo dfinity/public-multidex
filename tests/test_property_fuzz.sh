@@ -53,7 +53,11 @@ echo "  seed=$SEED  rounds=$ROUNDS"
 # we want to fuzz).
 
 TRADERS=(alice bob charlie dave eve)
-for t in "${TRADERS[@]}"; do icp identity new "$t" --storage plaintext 2>/dev/null || true; done
+# All five are the venue's STANDING fixtures (scripts/seed.sh ensure_identity
+# seeds them; run_tests.sh / deploy.sh mint alice/bob/charlie; 20+ suites sign
+# with them) — ensured, never deleted. A name added here that is NOT a seed
+# fixture belongs in the mdx_identity_new arm so it leaves with the run.
+for t in "${TRADERS[@]}"; do case "$t" in alice|bob|charlie|dave|eve) mdx_identity_ensure "$t" ;; *) mdx_identity_new "$t" ;; esac; done
 
 # Generous initial balances — orders are randomly sized but capped
 # below 1 BTC / 5 ETH / 25 SOL / 1000 ICP so plenty of headroom.

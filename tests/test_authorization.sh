@@ -65,7 +65,7 @@ assert_contains "alice's order survived bob's attack" "$ALICE_AFTER" "$(e8 67600
 # the cancel is deterministic whether the order is still staged or resting.
 sleep 3.2
 ALICE_CANCEL=$(call cancelMyOrder "($ALICE_ORDER_ID : nat)" --identity alice)
-assert_contains "alice can cancel her own order" "$ALICE_CANCEL" "ok"
+assert_ok "alice can cancel her own order" "$ALICE_CANCEL"
 
 # ── (3) Admin endpoints are controller-gated (Phase-6) ──────────
 # Charlie is authenticated but NOT a canister controller (the local

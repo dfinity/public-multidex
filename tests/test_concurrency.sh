@@ -27,7 +27,11 @@ setup_mode empty
 # Six traders + the AMM principal — wide enough sample to catch
 # accounting drift but small enough to stay under a minute.
 TRADERS=(alice bob charlie dave eve)
-for t in "${TRADERS[@]}"; do icp identity new "$t" --storage plaintext 2>/dev/null || true; done
+# All five are the venue's STANDING fixtures (scripts/seed.sh ensure_identity
+# seeds them; run_tests.sh / deploy.sh mint alice/bob/charlie; 20+ suites sign
+# with them) — ensured, never deleted. A name added here that is NOT a seed
+# fixture belongs in the mdx_identity_new arm so it leaves with the run.
+for t in "${TRADERS[@]}"; do case "$t" in alice|bob|charlie|dave|eve) mdx_identity_ensure "$t" ;; *) mdx_identity_new "$t" ;; esac; done
 AMM_PRI=$(call getAmmPrincipal '()' | grep -oE 'principal "[^"]+"' | head -1 | sed 's/principal "//; s/"//')
 
 # Fund traders with both legs so they can cross. (setTestBalance takes a
@@ -83,15 +87,16 @@ echo "  pre-trade total BTC = $(from_e8 "$BTC_BEFORE")  ICPUSD = $(from_e8 "$ICP
 # 75000 with a small delta — every order should fill.
 
 for i in 1 2 3 4 5 6 7 8; do
+  LOG=$(scratch_new "conc-$i.log") || exit 1
   # 4 buys at increasing prices (75001 .. 75004), 4 sells at
   # decreasing (75004 .. 75001) — mixed, ensures crosses.
   # (price + qty are base-unit Nats now → e8.)
   if [ $((i % 2)) -eq 0 ]; then
     call placeLimitOrder "(\"BTC-ICPUSD\", variant { buy }, $(e8 $((75000 + i / 2 + 1))) : nat, $(e8 0.1) : nat)" \
-      --identity "${TRADERS[$((i % 5))]}" > /tmp/uplands-conc-$i.log 2>&1 &
+      --identity "${TRADERS[$((i % 5))]}" > "$LOG" 2>&1 &
   else
     call placeLimitOrder "(\"BTC-ICPUSD\", variant { sell }, $(e8 $((75001 + i / 2))) : nat, $(e8 0.1) : nat)" \
-      --identity "${TRADERS[$((i % 5))]}" > /tmp/uplands-conc-$i.log 2>&1 &
+      --identity "${TRADERS[$((i % 5))]}" > "$LOG" 2>&1 &
   fi
 done
 
@@ -101,10 +106,9 @@ wait
 # Quick sanity: enumerate how many succeeded.
 ACCEPTED=0
 for i in 1 2 3 4 5 6 7 8; do
-  if grep -q "ok" /tmp/uplands-conc-$i.log 2>/dev/null; then
+  if mdx_ok "$(cat "$TEST_SCRATCH/conc-$i.log" 2>/dev/null)"; then
     ACCEPTED=$((ACCEPTED + 1))
   fi
-  rm -f /tmp/uplands-conc-$i.log
 done
 echo "  accepted $ACCEPTED of 8 concurrent orders"
 assert_gt "at least 6 orders accepted" "$ACCEPTED" "5"

@@ -4,14 +4,25 @@
 # converted, NEVER ICPUSD left stranded as a side effect.
 #
 # Setup makes the BUY leg (BTC) THIN so it can absorb far less than a full sale of
-# the source (ICP) would raise. Expect: ICPUSD ≈ 0 residual, some BTC bought, and
-# most of the source ICP left unconverted.
+# the source (ICP) would raise. Expect: ICPUSD residual bounded by the slippage-band
+# fraction of leg 2's spend, some BTC bought, and most of the source ICP left
+# unconverted.
+#
+# Residual bound (task 1787204744, tightening the 1787189218 band-fraction
+# slack): the buy leg passes its sell proceeds to the engine as maxQuoteSpend
+# (a cost+takerFee budget) and sizes its quantity at the BEST ask — the engine
+# stops every fill walk exactly at the budget, so it can NEVER spend beyond
+# the proceeds into the owner's unrelated ICPUSD (see test_cross_swap_budget.sh)
+# AND fills landing below the cap no longer strand a band-fraction residual
+# (the old cap-sizing left up to spend×slip/(1+slip) ≈ $12 here; the engine
+# stop leaves sub-dollar conversion crumbs only).
 #
 # RUN WITH THE TRADING BOT PAUSED:
-#     bash scripts/stop_local_bots.sh
+#     bash scripts/stop_bots_local.sh
 #     bash tests/test_cross_swap_sizing.sh
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 pass=0; fail=0
@@ -24,8 +35,7 @@ nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 # converts base→human so the human-scale assertions below stay unchanged.
 e8()      { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 from_e8() { awk -v x="$1" 'BEGIN{ printf "%.8f", x/100000000 }'; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-adm()  { icp canister call --identity anonymous backend "$@" 2>&1; }
+adm()  { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
 # Resolve the AMM principal LIVE — a hardcoded id goes stale on every redeploy.
 AMM=$(adm getAmmPrincipal '()' | grep -oE '"[a-z0-9-]+"' | tr -d '"')
 # bal → HUMAN units: pull the base-unit Nat (strip Candid underscores) and /1e8.
@@ -34,16 +44,16 @@ bal()  { local n; n=$(adm getTestBalance "(principal \"$1\", \"$2\")" | tr -d '_
 # ICPUSD conservation set must include it (resetExchange zeroes it at setup).
 treas() { local n; n=$(adm getTreasury '()' | tr -d '_' | grep -oE "balanceUsd = [0-9]+" | grep -oE "[0-9]+"); [ -z "$n" ] && n=0; from_e8 "$n"; }
 
-S=$(mkid amm_seed); UA=$(mkid amm_uA)
-u() { icp canister call --identity amm_uA backend "$@" 2>&1; }
+mdx_identity_new amm_seed; S=$(principal_of amm_seed); mdx_identity_new amm_uA; UA=$(principal_of amm_uA)
+u() { icp canister call --candid "$MDX_CANDID" --identity amm_uA backend "$@" 2>&1; }
 seedpool() { # market base refprice baseSeed quoteSeed depth
   adm createAmmPool "(\"$1\")" >/dev/null 2>&1
   # (quoteDepthBase is a base-unit Nat quantity now; the other knobs stay plain nats.)
-  adm setAmmConfig "(\"$1\", 20:nat, $(e8 "$6") : nat, 5:nat, 25:nat, 8:nat)" >/dev/null
+  adm setAmmConfig "(\"$1\", 20:nat, $(e8 "$6") : nat, 5:nat, 25:nat)" >/dev/null
   adm setAmmRefPrice "(\"$1\", $(e8 "$3") : nat)" >/dev/null
   adm setTestBalance "(principal \"$S\", \"$2\", $(e8 "$4") : nat)" >/dev/null
   adm setTestBalance "(principal \"$S\", \"ICPUSD\", $(e8 "$5") : nat)" >/dev/null
-  icp canister call --identity amm_seed backend seedAmmPool "(\"$1\", $(e8 "$4") : nat, $(e8 "$5") : nat)" >/dev/null 2>&1
+  mdx_lp_deposit amm_seed "$1" "$(e8 "$4")" "$(e8 "$5")" >/dev/null 2>&1
   adm enableAmm "(\"$1\", true)" >/dev/null
   adm requoteAmm "(\"$1\")" >/dev/null
 }
@@ -81,8 +91,12 @@ sleep 2
 ICPUSD_UA=$(bal "$UA" ICPUSD); BTC_UA=$(bal "$UA" BTC); ICP_UA=$(bal "$UA" ICP)
 echo "   UA after: ICP=$ICP_UA  BTC=$BTC_UA  ICPUSD=$ICPUSD_UA"
 
-# 1) KEY: no stranded ICPUSD.
-if awk -v x="$ICPUSD_UA" 'BEGIN{exit (x<0.01?0:1)}'; then ok "no residual ICPUSD (≈0) — leg 1 sized to leg 2's capacity"; else nok "ICPUSD was stranded as a side effect" "ICPUSD=$ICPUSD_UA"; fi
+# 1) KEY: residual ICPUSD ≈ 0 — the engine's maxQuoteSpend stop converts the
+#    whole leg-2 budget (sub-dollar crumbs only: per-level floor rounding plus
+#    any sliver the walk can't fit at the last price). Pre-1787204744 the
+#    cap-sizing left ~$12 here (spend×slip/(1+slip)) and this assertion reads
+#    RED on that build.
+if awk -v x="$ICPUSD_UA" 'BEGIN{exit (x<1.0?0:1)}'; then ok "residual ICPUSD ($ICPUSD_UA) ≈ 0 (<\$1) — budget-stop converts the whole leg-2 spend"; else nok "ICPUSD residual beyond the engine-stop bound" "ICPUSD=$ICPUSD_UA"; fi
 # 2) Got some BTC (leg 2 executed).
 if awk -v x="$BTC_UA" 'BEGIN{exit (x>2.0?0:1)}'; then ok "bought BTC (~$BTC_UA, leg 2 executed up to the thin depth)"; else nok "leg 2 should have bought BTC" "BTC=$BTC_UA"; fi
 # 3) Source under-converted (most ICP kept) — the accepted worst case.

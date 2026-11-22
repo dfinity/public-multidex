@@ -1,34 +1,33 @@
 # Dependabot configuration — https://docs.github.com/code-security/dependabot
 # Security updates (auto-PRs for known CVEs) are enabled separately in repo
-# Settings and do NOT require this file. This file adds *scheduled version
-# updates*: weekly PRs bumping deps to their latest versions, CVE or not.
+# Settings and do NOT require this file.
 #
-# Note: mops (Motoko: core/json/sha2) has no Dependabot ecosystem, so those
-# are not covered here — track them manually via `mops outdated`.
+# VERSION-UPDATE PRs ARE INTENTIONALLY OFF (open-pull-requests-limit: 0).
+# The public repository is a downstream force-synced snapshot of the private
+# tree: PRs opened against it can never be merged in place, so scheduled bump
+# PRs here only generate un-mergeable noise (see the closed #1/#31–#34).
+# Dependency bumps are applied deliberately in the upstream tree and arrive
+# with each mirror refresh. Limits stay declared (rather than deleting the
+# file) so this policy is visible and this comment survives.
+#
+# Note: mops (Motoko: core/json/sha2) has no Dependabot ecosystem — tracked
+# manually via `mops outdated`.
 version: 2
 updates:
-  # Frontend / build tooling (npm)
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      # Bundle dev/build tooling into one PR instead of several
-      dev-tooling:
-        patterns:
-          - "vite"
-          - "postcss"
-          - "@types/*"
 
-  # GitHub Actions (takes effect once CI workflows are added)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "chore(ci)"

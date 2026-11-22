@@ -61,17 +61,33 @@ module {
   };
 
   public func getUserBalances(state : AccountState, user : Principal) : [(Types.TokenId, Nat)] {
+    // W5-19 (F10): the balance map is ordered and keyed "principal#token", so
+    // one user's rows are a contiguous range — seek to the prefix and stop at
+    // the first key past it, instead of scanning every account on the venue.
+    // This is a QUERY-reachable path (the ~8×-lower instruction ceiling).
     let prefix = Principal.toText(user) # "#";
     let results = Map.empty<Text, Nat>();
-    for ((key, bal) in Map.entries(state.balances)) {
-      if (Text.startsWith(key, #text prefix)) {
-        let token = textAfter(key, Text.size(prefix));
-        if (bal > 0) {
-          Map.add(results, Text.compare, token, bal);
-        };
+    label walk for ((key, bal) in Map.entriesFrom(state.balances, Text.compare, prefix)) {
+      if (not Text.startsWith(key, #text prefix)) { break walk };
+      let token = textAfter(key, Text.size(prefix));
+      if (bal > 0) {
+        Map.add(results, Text.compare, token, bal);
       };
     };
     Iter.toArray(Map.entries(results));
+  };
+
+  // Does this principal hold ANY positive balance? The same prefix seek as
+  // getUserBalances, stopping at the first hit — an emptiness test for the
+  // margin-pool scans (H-30: a pool with no holdings and no debt carries no
+  // position, so it must not count toward HEAT_MAX_POOLS).
+  public func hasAnyBalance(state : AccountState, user : Principal) : Bool {
+    let prefix = Principal.toText(user) # "#";
+    label walk for ((key, bal) in Map.entriesFrom(state.balances, Text.compare, prefix)) {
+      if (not Text.startsWith(key, #text prefix)) { break walk };
+      if (bal > 0) { return true };
+    };
+    false
   };
 
   func textAfter(t : Text, skip : Nat) : Text {

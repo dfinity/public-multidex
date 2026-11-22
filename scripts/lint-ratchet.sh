@@ -39,15 +39,29 @@
 #   4. CANDID      — the PUBLISHED contract (candid/backend.did) must be (a) FRESH:
 #                    byte-equal to what the pinned moc emits from the current source
 #                    (a changed surface without scripts/gen-did.sh = silent API
-#                    drift), and (b) when `didc` is installed, a SUBTYPE of the
+#                    drift) — the two sibling contracts candid/archive.did and
+#                    candid/bridge.did get the same freshness check (task
+#                    1788510196) — and (b) when `didc` is installed, a SUBTYPE of the
 #                    origin/main merge-base's — the additive-only stability promise,
-#                    mechanically enforced instead of reviewed by eye. Without didc
-#                    the subtype half skips (install: `cargo install didc`, or a
-#                    release binary from github.com/dfinity/candid).
+#                    mechanically enforced instead of reviewed by eye. The check
+#                    runs via mops (already a hard requirement), didc as fallback;
+#                    with NEITHER available it FAILS — "could not check" is not
+#                    treated as "compatible".
 #   5. BADGE SYNC  — the backend badge catalog (getBadgeCatalog — the source of
 #                    truth) vs the frontend's BADGE_META shelf table and the docs
 #                    page: ids, icons, names, prose, and thresholds-quoted-in-prose
 #                    must all agree (scripts/check-badge-sync.mjs).
+#
+# Before them, check 0 (TOOLCHAIN) verifies the machine, not the tree: the
+# .mops/ lockfile re-hash and the two version pins (mops CLI, ic-wasm). Its
+# failures are a SEPARATE CLASS from checks 1-5 (OhShii #51 follow-up, item
+# 4): they set `toolfail`, never `fail`, so a wrong ic-wasm on a developer's
+# machine does not skip the Candid gate — that gate's inputs are the pinned
+# moc (mops.toml [toolchain]) and the source tree, neither of which the pins
+# govern — and the exit code tells the two apart: 1 = broken tree, 2 =
+# toolchain mismatch, 3 = both. Each pin miss prints the exact install line;
+# before this split a version miss took the same "fix the failures above
+# first" skip as a type error, and the exit it invited was --no-verify.
 #
 # Baseline history:
 #   21 (65b9c31) — initial audit. Unknown to us then, moc was SUPPRESSING all
@@ -75,10 +89,75 @@ fi
 # Our hand-written backend — exclude vendored OQL. Glob the filesystem (NOT
 # `git ls-files`) so brand-new, not-yet-tracked files are gated too — that is
 # exactly the code most likely to introduce a regression.
-OUR_FILES=$(find src/backend -name '*.mo' -not -path 'src/backend/oql/*' | sort)
+# src/bridge and src/arb are OURS too (W5-18, #36.2): the ratchet's input set
+# and its path filter both said src/backend, so a bridge/arb regression was a
+# verified no-op — moc reported the sites and the filter dropped them.
+OUR_FILES=$(find src/backend src/bridge src/arb -name '*.mo' -not -path 'src/backend/oql/*' | sort)
 # Every tests/*.mo — the `mops test` suite. Same reason to glob the filesystem.
 TEST_FILES=$(find tests -name '*.mo' 2>/dev/null | sort)
+# Two failure classes, two variables, two exit bits (header, "check 0"):
+#   fail     — the TREE is broken (type error, lint, M0155, stale/breaking
+#              candid, badge drift). Gates the Candid step: a tree that does
+#              not compile cannot emit an interface, so it fails fast.
+#   toolfail — the MACHINE is off (lock re-hash, mops CLI pin, ic-wasm pin).
+#              Never gates anything: every later check still runs, so the
+#              output shows the tree's real state alongside the install line.
+# Section 0 sets ONLY toolfail; sections 1-5 set ONLY fail. Pinned by
+# tests/test_deploy_hygiene.sh §6z — keep the two apart.
 fail=0
+toolfail=0
+
+# ── 0. TOOLCHAIN INTEGRITY ─────────────────────────────────────────────
+# .gitignore de-vendored .mops/ (286 tracked files) on the claim that
+# mops.lock's per-file SHA-256s make integrity "verified rather than
+# vendored" — but every build path (mops sources/test/build, the recipe)
+# resolves with the check disabled, so THIS is the one place the hashes
+# are actually enforced (OhShii #40.1). `--lock check` re-hashes the
+# installed .mops/ tree against the lockfile.
+if mops install --lock check >/dev/null 2>&1; then
+  echo "✓ toolchain: .mops/ tree matches mops.lock (per-file SHA-256)"
+else
+  echo "✗ toolchain: mops.lock integrity check FAILED — a file under .mops/ does not" >&2
+  echo "  match its pinned SHA-256 (or the lock is stale). The .gitignore de-vendoring" >&2
+  echo "  rests on this check. Diagnose with: mops install --lock check" >&2
+  echo "  install: rm -rf .mops && mops install   (re-materialises the tree from the lock)" >&2
+  toolfail=1
+fi
+# The two build tools the lockfile structurally CANNOT pin: the mops CLI
+# itself (whose defaults decide whether integrity is checked anywhere
+# else) and ic-wasm (the @dfinity/motoko recipe runs two metadata passes
+# over mops build's output — the installed wasm is ic-wasm's output, not
+# moc's). Pinned here; README prerequisites name the same versions AND
+# the same install lines — change all three together.
+MOPS_CLI_PIN="2.19.2"
+IC_WASM_PIN="0.11.0"
+MOPS_CLI_INSTALL="npm install -g ic-mops@$MOPS_CLI_PIN"
+IC_WASM_INSTALL="cargo install ic-wasm --version $IC_WASM_PIN"
+MOPS_CLI_V=$(mops --version 2>/dev/null | grep -oE 'CLI [0-9.]+' | grep -oE '[0-9.]+')
+if [ "${MOPS_CLI_V:-}" = "$MOPS_CLI_PIN" ]; then
+  echo "✓ toolchain: mops CLI $MOPS_CLI_PIN"
+else
+  echo "✗ toolchain: mops CLI is '${MOPS_CLI_V:-absent}', pinned $MOPS_CLI_PIN (its defaults decide" >&2
+  echo "  whether lockfile integrity is checked anywhere else)." >&2
+  echo "  install: $MOPS_CLI_INSTALL" >&2
+  echo "  (bumping the pin on purpose? update it here and in README prerequisites together," >&2
+  echo "  reviewing the new version's resolver defaults.)" >&2
+  toolfail=1
+fi
+IC_WASM_V=$(ic-wasm --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [ "${IC_WASM_V:-}" = "$IC_WASM_PIN" ]; then
+  echo "✓ toolchain: ic-wasm $IC_WASM_PIN"
+else
+  echo "✗ toolchain: ic-wasm is '${IC_WASM_V:-absent}', pinned $IC_WASM_PIN — it REWRITES the" >&2
+  echo "  built wasm (metadata passes), so its version is part of the build." >&2
+  echo "  install: $IC_WASM_INSTALL   (or the $IC_WASM_PIN binary from github.com/dfinity/ic-wasm/releases)" >&2
+  echo "  (bumping the pin on purpose? update it here and in README prerequisites together.)" >&2
+  toolfail=1
+fi
+if [ "$toolfail" -ne 0 ]; then
+  echo "  toolchain mismatch is its own failure class — the tree checks below (type-check," >&2
+  echo "  lints, M0155, candid, badges) still run and are judged on their own." >&2
+fi
 
 # The project's REAL build flags — keep in sync with mops.toml
 # [canisters.backend].args. (The candid step below already passed these; the
@@ -94,17 +173,22 @@ MOC_FLAGS=(--default-persistent-actors --implicit-package=core)
 # GATE ON THE EXIT CODE, never on a text pattern: moc --check exits 0 when
 # there are only warnings and non-zero when there is any error, which is
 # precisely the question being asked. Warnings are surfaced as info.
-TYPE_OUT=$("$MOC" $SRCS "${MOC_FLAGS[@]}" --check src/backend/main.mo 2>&1)
-TYPE_RC=$?
-if [ "$TYPE_RC" -ne 0 ]; then
-  echo "✗ type-check FAILED — src/backend/main.mo (moc --check exit $TYPE_RC):" >&2
-  printf '%s\n' "$TYPE_OUT" | grep -E 'error \[M' | head -20 >&2
-  fail=1
-else
-  WARN_N=$(printf '%s\n' "$TYPE_OUT" | grep -E ': warning \[M' | grep -v 'M0155' \
-           | grep -oE 'src/backend/[^:]+:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
-  echo "✓ type-check: src/backend ok (${WARN_N} non-M0155 moc warning(s) — run 'mops check' to see them)"
-fi
+# All four program ROOTS (W5-18): src/arb and src/bridge were never compiled
+# by this hook — a syntax error there pushed green while the deploy path
+# failed on it. Each root pulls in its own import closure.
+for ROOT_MO in src/backend/main.mo src/backend/ArchiveCanister.mo src/bridge/main.mo src/arb/main.mo; do
+  TYPE_OUT=$("$MOC" $SRCS "${MOC_FLAGS[@]}" --check "$ROOT_MO" 2>&1)
+  TYPE_RC=$?
+  if [ "$TYPE_RC" -ne 0 ]; then
+    echo "✗ type-check FAILED — $ROOT_MO (moc --check exit $TYPE_RC):" >&2
+    printf '%s\n' "$TYPE_OUT" | grep -E 'error \[M' | head -20 >&2
+    fail=1
+  else
+    WARN_N=$(printf '%s\n' "$TYPE_OUT" | grep -E ': warning \[M' | grep -v 'M0155' \
+             | grep -oE 'src/[^:]+:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
+    echo "✓ type-check: $ROOT_MO ok (${WARN_N} non-M0155 moc warning(s))"
+  fi
+done
 
 # 1b) Type-check every tests/*.mo, ONE FILE AT A TIME.
 #
@@ -157,7 +241,7 @@ fi
 # analysis, so this "hard zero gate" was reporting 0 because it was analysing
 # nothing. Adding the flags is what makes the count real.
 M0155_N=$(for f in $OUR_FILES; do "$MOC" $SRCS "${MOC_FLAGS[@]}" --check "$f" 2>&1 | grep 'M0155'; done \
-          | grep -oE 'src/backend/[^:]+\.mo:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
+          | grep -oE 'src/(backend|bridge|arb)/[^:]+\.mo:[0-9]+' | grep -v '/oql/' | sort -u | wc -l | tr -d ' ')
 if [ "$M0155_N" -gt "$M0155_BASELINE" ]; then
   echo "✗ M0155 (Nat-subtraction may-trap): $M0155_N > baseline $M0155_BASELINE — a new" >&2
   echo "  unguarded subtraction was added. Use SafeMath.subOrZero(a, b) for a defensive" >&2
@@ -172,7 +256,12 @@ fi
 # 4) Published Candid contract — freshness (always) + subtype vs origin/main
 # (mops-first, didc fallback — and "could not check" now FAILS instead of
 # silently passing). The full compile (--idl needs codegen, ~40s) only runs
-# when checks 1-3 passed, so a broken tree fails fast above.
+# when checks 1-3 passed, so a broken tree fails fast above. The gate is on
+# `fail` (the TREE class) ONLY — a toolchain pin miss (`toolfail`) does not
+# skip it: mdx_emit_candid needs just the pinned moc from mops.toml, and the
+# baseline is git history, so neither the mops CLI nor ic-wasm version is an
+# input here. The one toolchain touch is the subtype comparison itself, which
+# runs THROUGH the mops CLI — flagged in the output when that pin is off.
 if [ "$fail" -eq 0 ]; then
   DID_TMP=$(mktemp -d)
   trap 'rm -rf "$DID_TMP"' EXIT
@@ -189,6 +278,30 @@ if [ "$fail" -eq 0 ]; then
     else
       echo "✓ candid: committed contract matches the source"
     fi
+    # The two SIBLING contracts gen-did.sh publishes beside it (task
+    # 1788510196): same helper, same header, same freshness rule — a
+    # changed archive/bridge surface without gen-did.sh would leave the
+    # display battery §K holding main.js's hand-written IDL to a stale
+    # file. No subtype gate for them: neither carries an apiVersion.
+    for pair in "archive:src/backend/ArchiveCanister.mo" "bridge:src/bridge/main.mo"; do
+      sib="${pair%%:*}"; sibsrc="${pair#*:}"
+      if [ ! -f "candid/$sib.did" ]; then
+        echo "✗ candid: candid/$sib.did is MISSING — run scripts/gen-did.sh and commit." >&2
+        fail=1
+      elif mdx_emit_candid "$DID_TMP/new-$sib.did" "$sibsrc"; then
+        mdx_published_body "$DID_TMP/published-$sib.did" "candid/$sib.did"
+        if ! diff -q "$DID_TMP/published-$sib.did" "$DID_TMP/new-$sib.did" >/dev/null 2>&1; then
+          echo "✗ candid: candid/$sib.did is STALE — $sibsrc's surface changed without" >&2
+          echo "  regenerating the published contract. Run scripts/gen-did.sh and commit." >&2
+          fail=1
+        else
+          echo "✓ candid: candid/$sib.did matches $sibsrc"
+        fi
+      else
+        echo "✗ candid: could not extract the $sib interface from $sibsrc" >&2
+        fail=1
+      fi
+    done
     # The subtype gate enforces "additive-only WITHIN a major apiVersion". The
     # qualifier is load-bearing and the gate had no way to express it: a
     # deliberate major bump is EXACTLY a non-subtype change, so without this
@@ -205,12 +318,32 @@ if [ "$fail" -eq 0 ]; then
       fi | head -1 | grep -oE '[0-9]+$'
     }
     BASE_REF=$(git merge-base HEAD origin/main 2>/dev/null || true)
-    NEW_MAJOR=$(api_major_of "")
+    # The NEW side reads HEAD, not the working tree: the design above says the
+    # hatch is "a visible, reviewable, COMMITTED act", and a working-tree read
+    # let it open from an unstaged edit — what reached origin/main was the
+    # breaking change with no declaration anywhere in history (OhShii #37.6).
+    NEW_MAJOR=$(api_major_of "HEAD")
+    WT_MAJOR=$(api_major_of "")
     BASE_MAJOR=$(api_major_of "$BASE_REF")
-    if [ -n "$NEW_MAJOR" ] && [ -n "$BASE_MAJOR" ] && [ "$NEW_MAJOR" != "$BASE_MAJOR" ]; then
+    if [ -n "$WT_MAJOR" ] && [ "$WT_MAJOR" != "${NEW_MAJOR:-}" ]; then
+      echo "  note: working tree sets MM_API_VERSION major to $WT_MAJOR but HEAD has '${NEW_MAJOR:-none}'."
+      echo "  The hatch reads the COMMITTED value — commit the bump to take it."
+    fi
+    if [ -n "$BASE_REF" ] && { [ -z "$NEW_MAJOR" ] || [ -z "$BASE_MAJOR" ]; }; then
+      # Digits-or-empty by construction (the grep), so empty here means the
+      # constant is missing/malformed at that ref. The policy hinges on this
+      # value — refuse loudly instead of falling through to look compatible.
+      echo "✗ candid: MM_API_VERSION major unreadable (HEAD=${NEW_MAJOR:-none} base=${BASE_MAJOR:-none}) —" >&2
+      echo "  expected MM_API_VERSION : Text = \"N.…\" in src/backend/main.mo at both refs." >&2
+      fail=1
+    elif [ -n "$NEW_MAJOR" ] && [ -n "$BASE_MAJOR" ] && [ "$NEW_MAJOR" -gt "$BASE_MAJOR" ]; then
       echo "✓ candid: apiVersion major $BASE_MAJOR → $NEW_MAJOR — breaking changes ALLOWED;"
       echo "  subtype gate skipped by declaration. Record it under 'Major bumps so far'"
       echo "  in candid/README.md if you have not already."
+    elif [ -n "$NEW_MAJOR" ] && [ -n "$BASE_MAJOR" ] && [ "$NEW_MAJOR" -lt "$BASE_MAJOR" ]; then
+      echo "✗ candid: apiVersion major DOWNGRADED $BASE_MAJOR → $NEW_MAJOR — a downgrade does" >&2
+      echo "  not open the hatch, and is itself an anomaly (majors are monotonic)." >&2
+      fail=1
     elif [ -n "$BASE_REF" ] \
        && git show "$BASE_REF:candid/backend.did" 2>/dev/null \
           | tail -n +$((MDX_CANDID_HEADER_LINES + 1)) > "$DID_TMP/base.did" \
@@ -236,6 +369,9 @@ if [ "$fail" -eq 0 ]; then
         fail=1
       elif "${CANDID_CHECK[@]}" "$DID_TMP/new.did" "$DID_TMP/base.did" > "$DID_TMP/didc.out" 2>&1; then
         echo "✓ candid: backward-compatible with origin/main (${CANDID_CHECK[0]} subtype check)"
+        if [ "${CANDID_CHECK[0]}" = "mops" ] && [ "${MOPS_CLI_V:-}" != "$MOPS_CLI_PIN" ]; then
+          echo "  note: that subtype check ran through mops CLI '${MOPS_CLI_V:-absent}', not the pinned $MOPS_CLI_PIN."
+        fi
       else
         echo "✗ candid: BREAKING interface change vs origin/main — the published API is" >&2
         echo "  additive-only within a major apiVersion (see candid/backend.did header):" >&2
@@ -270,5 +406,14 @@ else
   echo "lint-ratchet: node not installed — skipping the badge FE/BE sync gate." >&2
 fi
 
-[ "$fail" -eq 0 ] && echo "lint-ratchet: PASS" || echo "lint-ratchet: FAIL — push blocked (override with 'git push --no-verify')." >&2
-exit $fail
+# Two classes, two verdict lines, two exit bits — never the same exit for a
+# wrong ic-wasm and a type error (the former's remedy is an install, and the
+# `--no-verify` the old single verdict invited would have shipped a wasm from
+# an unpinned rewriter).
+if [ "$fail" -eq 0 ] && [ "$toolfail" -eq 0 ]; then
+  echo "lint-ratchet: PASS"
+else
+  [ "$fail" -ne 0 ] && echo "lint-ratchet: FAIL — the tree has failures above; push blocked (override with 'git push --no-verify')." >&2
+  [ "$toolfail" -ne 0 ] && echo "lint-ratchet: TOOLCHAIN MISMATCH — install the pinned versions named above (mops CLI $MOPS_CLI_PIN, ic-wasm $IC_WASM_PIN), then re-run; push blocked." >&2
+fi
+exit $(( fail + 2 * toolfail ))

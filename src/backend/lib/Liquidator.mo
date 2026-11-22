@@ -387,6 +387,12 @@ module {
     if (q > buyerDebtX)      { q := buyerDebtX };
     if (q == 0) { return zero };
     let cash = Fixed.mul(q, mid, false);
+    // W4-03: `cash` floors to 0 when the netted base is worth less than one
+    // ICPUSD unit. Below this line writeOffLoan(seller, 0) is REJECTED (and
+    // ignored), subtractBalance(buyer, 0) vacuously succeeds, and the
+    // buyer's base debt is forgiven by q anyway — an unrecorded mutation
+    // the caller's `cash > 0` gate never books. Mirror the q guard.
+    if (cash == 0) { return zero };
     // Seller: X → vault, ICPUSD debt written off by `cash`.
     if (not Accounts.subtractBalance(accounts, seller, baseToken, q)) { return zero };
     Accounts.addBalance(accounts, vaultPrincipal, baseToken, q);

@@ -85,7 +85,25 @@ canisters:
 
   - name: frontend
     recipe:
-      type: "@dfinity/asset-canister@v2.2.1"
+      # @dfinity/static-site = the certified-assets canister (task 1793503326,
+      # 2026-11-01; was @dfinity/asset-canister@v2.2.1). Configured by
+      # src/frontend/public/_headers (the CSP + security headers, caching)
+      # and _redirects (the SPA fallback), copied into dist/ by the build —
+      # NOT by .ic-assets.json5, which this canister never reads. The recipe
+      # version IS the canister version (a matched canister + sync-plugin
+      # pair): a 0.x MINOR bump is breaking and needs `icp canister install
+      # frontend --mode reinstall` before the next deploy (static-site skill,
+      # Pitfall 11). MIGRATING A VENUE THAT STILL RUNS THE LEGACY WASM: the two
+      # canisters have unrelated Candid interfaces, so a plain `icp deploy`
+      # refuses the upgrade as BREAKING before installing anything — the one
+      # cure is `icp deploy frontend --mode reinstall` (the frontend holds no
+      # state; `--yes` would instead upgrade in place onto stable memory the
+      # new wasm cannot read). scripts/cold_start.sh and `deploy.sh local
+      # frontend` run that reinstall themselves on a LOCAL venue when they
+      # detect the legacy wasm (mdx_frontend_is_legacy_asset_canister,
+      # scripts/lib/targets.sh); a remote venue is the operator's explicit
+      # `--mode reinstall` — deploy.sh names it instead of running it.
+      type: "@dfinity/static-site@v0.4.2"
       configuration:
         dir: dist
         build:

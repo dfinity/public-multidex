@@ -288,6 +288,17 @@ module {
   /// resolved `toPredRow` (unknown until `build()`). A container wrapper that
   /// owns a maintained index (e.g. `IndexedMap`) uses this so the executor's
   /// planner can answer sargable queries from the index instead of scanning.
+  /// ── UNREACHABILITY NOTE (W6-08, 2026-08-15 — #21 part two / #39) ──
+  /// In THIS tree, `withServed` has exactly two occurrences: this definition
+  /// and one call site inside oql/IndexedMap.mo — and IndexedMap is not used
+  /// outside oql/. So the executor's aggPlan / planServed / planJoin paths
+  /// are DEAD CODE in the deployed canister and every live query is a full
+  /// scan. Four latent defects are known on those paths (three in issue #21
+  /// part two; one in #39: a synthesised `__N` column name can collide with
+  /// a declared one, after which the OWNER CHECK authorises on the wrong
+  /// cell). Adopting served entities, secondary indexes, or the aggregate/
+  /// join planner REQUIRES fixing all four first — see
+  /// docs/tasks/W6-08-latent-oql-watch-item.md.
   public func withServed<T>(self : Builder<T>, servedOf : (T -> Predicate.Row) -> Served) : Builder<T> {
     self.servedOf.clear();
     self.servedOf.add(servedOf);

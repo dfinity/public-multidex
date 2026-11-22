@@ -1,0 +1,15 @@
+# Routing rules for the static-site (certified-assets) canister that hosts
+# MULTI/DEX — copied into dist/ by Vite (publicDir), read there by the recipe's
+# sync plugin at `icp deploy`, never served. Netlify `_redirects` syntax:
+# `from  to  status`, one rule per line, first match wins — and a REAL FILE
+# always wins before any rule (resolution: exact file, then the canister's own
+# clean-URL rules, then these rules in order, then the 404 fallback).
+#
+# SPA fallback (task 1793503326). MULTI/DEX routes under `#` (hash routes), so
+# `/` is the only document path the app links itself — but a path typed, pasted
+# or bookmarked from an older build must still get the shell, exactly as the
+# legacy asset canister's built-in index.html fallback served it. `200` makes
+# this a REWRITE (the shell's bytes at the requested URL, no visible redirect);
+# declaring `/*` also replaces the canister's built-in 404 page with the shell,
+# so a typo'd /assets/… name answers with HTML — the same as before the switch.
+/*  /index.html  200

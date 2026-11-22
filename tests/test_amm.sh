@@ -10,7 +10,9 @@ echo "── test_amm ──"
 setup_mode amm
 
 POOL=$(call getAmmPool '("BTC-ICPUSD")')
-assert_contains "pool refPrice 75000"  "$POOL" "refPrice = 75000.0"
+# refPrice is a base-unit Nat (75000 * 10^8); the old "75000.0" needle's `.`
+# was a grep wildcard over the digits, not a decimal point (#51.8).
+assert_contains "pool refPrice 75000"  "$POOL" "refPrice = 7500000000000 "
 assert_contains "pool enabled"         "$POOL" "enabled = true"
 assert_contains "pool has baseToken"   "$POOL" "baseToken = \"BTC\""
 
@@ -19,7 +21,7 @@ assert_contains "pool has baseToken"   "$POOL" "baseToken = \"BTC\""
 # every 2s, so depending on wall-clock timing the ladder may already
 # be populated by the time the first query lands.)
 REQUOTE=$(call requoteAmm '("BTC-ICPUSD")' --identity alice)
-assert_contains "requote ok" "$REQUOTE" "ok"
+assert_ok "requote ok" "$REQUOTE"
 
 POOL2=$(call getAmmPool '("BTC-ICPUSD")')
 # The default pool config has numLevels = 3 → 6 orders (3 bids + 3 asks).

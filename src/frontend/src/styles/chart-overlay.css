@@ -3,7 +3,7 @@
   position: fixed;
   inset: 0;
   z-index: 250;
-  background: rgba(11,18,32,0.96);
+  background: var(--bg-overlay);
   display: flex;
   flex-direction: column;
   backdrop-filter: blur(8px);
@@ -40,7 +40,7 @@
   transition: all 0.15s;
 }
 .chart-interval-btn:hover {
-  background: rgba(229,169,83,0.10);
+  background: var(--cta-tint);
   border-color: var(--accent);
   color: var(--text);
 }
@@ -66,14 +66,28 @@
   flex-shrink: 0;
 }
 .chart-close-btn:hover {
-  background: rgba(240,122,108,0.15);
+  background: var(--red-tint);
   border-color: var(--red);
   color: var(--red);
 }
+/* Focused programmatically on open (main.js openChart) so Escape and Tab
+   have a home — the ring belongs on its controls, not around the viewport. */
+.chart-overlay:focus { outline: none; }
 .chart-container {
   flex: 1;
   min-height: 0;
   padding: 8px;
+}
+/* Under the app's mobile breakpoint the header's three parts — the title,
+   seven interval buttons (~300px on their own), the × — do not fit one row at
+   375px, and a row that overflows pushes the × off the right edge. Wrap:
+   title + × on the first row, the intervals on a row of their own (scrolling
+   sideways if a viewport is narrower still). */
+@media (max-width: 900px) {
+  .chart-overlay-header { flex-wrap: wrap; gap: 8px 12px; padding: 10px 12px; }
+  .chart-title { flex: 1; font-size: 16px; }
+  .chart-intervals { order: 1; flex: 0 0 100%; justify-content: flex-start; overflow-x: auto; }
+  .chart-container { padding: 4px; }
 }
 
 /* ── Order Panel Auth Overlay ──────────────────────────────────── */
@@ -84,7 +98,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(11,18,32,0.85);
+  background: var(--bg-overlay-soft);
   backdrop-filter: blur(6px);
   border-radius: var(--radius);
 }

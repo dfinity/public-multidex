@@ -65,7 +65,7 @@ export const MONEY_KEYS = new Set([
   "estimatedValue", "eth", "factor", "filled", "freeQuote", "freeWalletValueUsd",
   "fromAmount", "grossBidValue", "headroom", "healthAfter", "healthBefore",
   "healthRatio", "high", "icp", "icpusd", "inventoryTargetBase", "lastPrice",
-  "lastVolSamplePrice", "limitPrice", "low", "lpBalance", "lpBurned", "lpMinted",
+  "lastVolSamplePrice", "limitPrice", "low", "lpAmount", "lpBalance", "lpBurned", "lpMinted", "minted",
   "lpSupply", "ltv", "maintenanceRatio", "makerDebitAmount", "marginUsage",
   "markPrice", "maxAllowed", "maxSlippage", "netAccountValueUsd", "newQuantity",
   "notionalUsd", "oldQuantity", "open", "originalQuantity", "payoutUsd",
@@ -103,6 +103,21 @@ export const MONEY_KEYS = new Set([
   // and it clears every `> 0` gate that decides whether to show the figure
   // at all.
   "pendingYieldUsd",
+  // getMaxInstantWithdraw (task 1788465539): the LP's instant-liquidity quote.
+  // exitFeeBps is bps and deliberately absent; lentOutFraction is a 0..1
+  // fraction at e8 (like sharePercent — the render owns the ×100).
+  "withdrawableNowUsd", "withdrawableNowLp", "totalNavUsd", "lentOutFraction",
+  "vaultHoldingsUsd", "vaultLentOutUsd", "vaultNavUsd",
+  // Locked shares (task 1788475756): the caller's locked LP, the vault-wide
+  // total, and the NAV the locked shares carry.
+  "lockedLp", "vaultLockedLp", "vaultLockedNavUsd",
+  // The impairment reserve (task 1788475754): the vault-level expected-loss
+  // deduction inside NAV and the caller's share of it; getVaultImpairment's
+  // figure set (stressBps / maintenanceRatio are not money and stay raw).
+  "vaultImpairmentReserveUsd", "provisionedLossUsd",
+  "reserveUsd", "grossExpectedLossUsd", "insuranceFirstLossUsd", "loanBookUsd",
+  "impairedDebtUsd", "impairedCollateralUsd",
+  "impairmentReserveUsd", "impairmentGrossUsd",
 ]);
 
 // Recursively scale money bigints (by key) to human Numbers, in place. Recurses
@@ -129,14 +144,19 @@ export function normMoney(x) {
 }
 
 // Methods whose result the field-keyed walker can't reach because the money is
-// unnamed (bare scalar return) or tuple-positional, plus the three mutations
-// that return `#ok(money)`.
+// unnamed (bare scalar return) or tuple-positional, plus the two mutations
+// that return `#ok(money)`. depositLp is NOT one of them since apiVersion
+// 6.0.0 (task 1788731608): the sealed door returns `#ok(StagedLpRequest)` — a
+// record normMoney walks (its baseAmount / quoteAmount legs scale, its id / ts
+// / expiresAt stay bigint). Listed here, the record went through fromE8 and
+// came back NaN, so the Earn card read `Number(r.ok.id)` as NaN and polled
+// twelve rounds for a request that could never match (task 1793558036).
 const BARE_MONEY = new Set([
   "getBalance", "getMyAvailableBalance", "getMyLpBalance", "getMyReservedBalance",
   "getMyVaultLp", "getNettedVolumeUsd", "getTestBalance",
 ]); // -> (nat) money. NB: purgeZombieOrders/bulkSetTestBalances/seedInsuranceFund return COUNTS — excluded.
 const TUPLE_BALANCES = new Set(["getBalances"]); // -> vec record { TokenId; nat }
-const OK_MONEY = new Set(["depositLp", "stakeInsurance", "unstakeInsurance"]); // -> variant { ok: nat; err }
+const OK_MONEY = new Set(["stakeInsurance", "unstakeInsurance"]); // -> variant { ok: nat; err }
 
 // Wrap a real (non-mock) actor so every call's result is money-normalized to
 // human Numbers. Reads flow through unchanged for the UI; the mock actor is

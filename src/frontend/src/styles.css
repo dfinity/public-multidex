@@ -23,3 +23,4 @@
 @import "./styles/intelli.css";       /* Intelli: data explorer + assistant */
 @import "./styles/deposit.css";       /* Deposit tab (Bridge canister stub) */
 @import "./styles/docs.css";          /* Docs tab (on-site levels/fees/badges) */
+@import "./styles/home.css";          /* Home (#home) landing page — hero, feature boxes, proof strip, open source */

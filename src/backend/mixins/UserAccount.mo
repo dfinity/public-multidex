@@ -5,12 +5,13 @@
 //
 // All endpoints are `requireAuth` (non-anonymous principal). None
 // require controller privileges. State (userProfiles, userPreferences,
-// accounts, userDeposits, userAdjustments, userStatuses, orderStore,
+// accounts, userDeposits, userAdjustmentsV2, userStatuses, orderStore,
 // registeredUsers) is owned by the actor and passed by reference.
 
 import Principal "mo:core/Principal";
 import Text "mo:core/Text";
 import Map "mo:core/Map";
+import Runtime "mo:core/Runtime";
 import List "mo:core/List";
 import Iter "mo:core/Iter";
 import Option "mo:core/Option";
@@ -26,6 +27,7 @@ import SafeMath "../lib/SafeMath";
 mixin (
   accounts        : Accounts.AccountState,
   orderStore      : OrderBook.OrderStore,
+  userTradeIndex  : OrderBook.UserTradeIndex,   // H-31: principal → own fills, tape order
   marginAccounts  : MarginEngine.MarginState,
   marginPriceLookup : MarginEngine.PriceLookup,
   availableBalance  : (Principal, Types.TokenId) -> Nat,
@@ -33,7 +35,10 @@ mixin (
   userProfiles    : Map.Map<Text, Types.UserProfile>,
   userPreferences : Map.Map<Text, Types.UserPreferences>,
   userDeposits    : Map.Map<Text, List.List<Types.DepositRecord>>,
-  userAdjustments : Map.Map<Text, List.List<Types.OrderAdjustment>>,
+  // The full adjustment history (pre-reason fossil rows were swept in by
+  // the one-shot migration — they carry reason = null; V2 = the deployed
+  // stable-field name).
+  userAdjustmentsV2 : Map.Map<Text, List.List<Types.OrderAdjustment>>,
   userStatuses    : Map.Map<Text, Types.UserStatus>,
   registeredUsers : Map.Map<Text, Bool>,
   requireAuth     : Principal -> (),
@@ -53,6 +58,22 @@ mixin (
   // actor's appendDeposit wrapper) — the mixin must not append to the map
   // directly or the archive would miss faucet deposits.
   recordDeposit   : (Principal, Types.DepositRecord) -> (),
+  // H-32: the withdrawal half — same in-canister record, but the TAPE row
+  // goes through the actor's per-principal exit window (a dust withdrawal
+  // inside the window is coalesced, never refused). Args: (caller, the
+  // journal size read BEFORE the debit, the record, the withdrawable balance
+  // read before the debit — spend-all is genuine at any size).
+  recordWithdrawal : (Principal, Nat, Types.DepositRecord, Nat) -> (),
+  sealingRefusal  : () -> ?Text,   // #54.1 season sealing latch (main.mo)
+  // H-36 (D4 (a′)): the bounded pre-registration store's two hooks. Every
+  // pre-registration WRITE below calls preRegTouch BEFORE it writes — an
+  // unregistered caller is stamped most-recently-seen and, when new at the
+  // cap, the least-recently-seen unregistered principal's profile and
+  // preferences are evicted (the hard cap that bounds the peak). The #dev
+  // faucet — the dev registration path — calls preRegPromote like every
+  // other registration site: the caller leaves the bounded store for good.
+  preRegTouch     : Principal -> (),
+  preRegPromote   : Principal -> (),
 ) {
 
   // Bounds on the one payload a free, unregistered identity can persist.
@@ -68,6 +89,10 @@ mixin (
   public shared (msg) func getMyProfile() : async Types.UserProfile {
     requireAuth(msg.caller);
     let key = Principal.toText(msg.caller);
+    // H-36: stamp (and, at the cap, evict the least-recently-seen unregistered
+    // principal) BEFORE the read — so the record created below is the newest
+    // slot and can never be the one evicted by its own creation.
+    preRegTouch(msg.caller);
     switch (Map.get(userProfiles, Text.compare, key)) {
       case (?p) { p };
       case null {
@@ -88,6 +113,7 @@ mixin (
   public shared (msg) func regenerateUsername() : async { #ok : Types.UserProfile; #err : Text } {
     requireAuth(msg.caller);
     let key = Principal.toText(msg.caller);
+    preRegTouch(msg.caller);   // H-36: a regeneration is activity on the pre-registration record
     switch (Map.get(userProfiles, Text.compare, key)) {
       case null { #err("Profile not found — call getMyProfile first") };
       case (?profile) {
@@ -131,6 +157,10 @@ mixin (
       case null { };
     };
     let key = Principal.toText(msg.caller);
+    // H-36: the COUNT bound (the payload bound above is triage 1.8's). Touch
+    // before the write: an unregistered caller takes the newest slot, and at
+    // the cap the least-recently-seen unregistered record is dropped instead.
+    preRegTouch(msg.caller);
     Map.add(userPreferences, Text.compare, key, prefs);
   };
 
@@ -142,10 +172,17 @@ mixin (
   // vault-redeemable, and `requireAuth` is NOT a guard (any principal
   // self-authenticates), so this must be dead on any public deploy.
   public shared (msg) func addTestTokens(token : Types.TokenId, amount : Nat) : async () {
-    if (faucetDisabled) { return };
+    // THE RULE (main.mo requireDevHook): refuse loudly — no Result channel
+    // here, so trap. This was the one posture gate still SILENT on the live
+    // #play posture (W6-02 / #41.2 step 5).
+    if (faucetDisabled) { Runtime.trap("addTestTokens is a dev-only faucet (posture: play/production)") };
     requireAuth(msg.caller);
+    // #54.1: the faucet emits a deposit row — refuse inside the seal window
+    // like every other emitting entry path (trap: no Result channel here).
+    switch (sealingRefusal()) { case (?e) { Runtime.trap(e) }; case null {} };
     Accounts.addBalance(accounts, msg.caller, token, amount);
     Map.add(registeredUsers, Text.compare, Principal.toText(msg.caller), true);
+    preRegPromote(msg.caller);   // H-36: registration lifts the caller out of the bounded store
     recordDeposit(msg.caller, {
       token; amount; timestamp = Time.now(); kind = #deposit
     });
@@ -213,30 +250,40 @@ mixin (
     };
     let _ = destination;   // no custody leg yet — see the interlock above
     if (amount == 0) { return #err("Amount must be positive") };
-    if (availableBalance(msg.caller, token) < amount) {
+    let avail = availableBalance(msg.caller, token);
+    if (avail < amount) {
       return #err("Insufficient withdrawable " # token # " in your wallet");
     };
+    let j0 = List.size(accounts.journal);   // H-32: the rows this exit appends start here
     if (not Accounts.subtractBalance(accounts, msg.caller, token, amount)) {
       return #err("Withdrawal failed");
     };
-    recordDeposit(msg.caller, { token; amount; timestamp = Time.now(); kind = #withdrawal });
+    // H-32: the record lands as before; the tape row is the exit window's call.
+    recordWithdrawal(msg.caller, j0, { token; amount; timestamp = Time.now(); kind = #withdrawal }, avail);
     UserStatus.bumpVersion(userStatuses, orderStore, msg.caller);
     #ok
   };
 
   // ── History queries ─────────────────────────────────────────
+  // H-31: both read the per-principal index — O(min(own fills, 200)) instead
+  // of a full-tape walk — and the anonymous principal returns inside the
+  // lookup before anything is touched (it can hold no fills; these are
+  // deliberately open queries, so the cost of an unauthenticated request is
+  // what is bounded here, not its access).
   public query (msg) func getMyTradeHistory() : async [Types.Trade] {
-    OrderBook.getUserTrades(orderStore, msg.caller, 200);
+    OrderBook.getUserTradesIndexed(userTradeIndex, msg.caller, 200);
   };
 
   public query (msg) func getMyTradeHistorySince(sinceTimestamp : Int) : async [Types.Trade] {
-    OrderBook.getUserTradesSince(orderStore, msg.caller, sinceTimestamp, 200);
+    OrderBook.getUserTradesSinceIndexed(userTradeIndex, msg.caller, sinceTimestamp, 200);
   };
 
   public query (msg) func getMyAdjustments() : async [Types.OrderAdjustment] {
     let key = Principal.toText(msg.caller);
-    let lst = Option.get(Map.get(userAdjustments, Text.compare, key), List.empty<Types.OrderAdjustment>());
-    let all = Iter.toArray(List.values(lst));
+    let all = switch (Map.get(userAdjustmentsV2, Text.compare, key)) {
+      case (?lst) { Iter.toArray(List.values(lst)) };
+      case null { [] };
+    };
     let n = all.size();
     if (n <= 200) { return all };
     let result = List.empty<Types.OrderAdjustment>();
@@ -289,9 +336,8 @@ mixin (
   // Whole-wallet cross-margin is gone: the Wallet is pure custody, never
   // collateral. Leverage/short happen only in margin pools (main.mo
   // createMarginPool / openPosition), which own their own margin accounts on
-  // the pool principal. getMyMarginAccount stays as a now-always-empty compat
-  // read for the caller's OWN principal. See docs/wallet-and-positions-design.md.
-  public query (msg) func getMyMarginAccount() : async ?Types.MarginAccount {
-    MarginEngine.get(marginAccounts, msg.caller);
-  };
+  // the pool principal. The always-empty compat read getMyMarginAccount was
+  // RETIRED here (W5-23): the frontend dropped its callers when model 2
+  // landed (src/frontend/src/main.js records it), and the removal rides the
+  // still-unpublished API 3.0.0 window. See docs/wallet-and-positions-design.md.
 };

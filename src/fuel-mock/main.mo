@@ -67,6 +67,21 @@ actor {
   // block → (e8s received, consumed-by-notify)
   let blocks = Map.empty<Nat, { e8s : Nat; var consumed : Bool }>();
 
+  // Test hook (W3-02): trap the NEXT transfers so the DEX's catch sees a
+  // canister_error — the NOT-clean reject class its ambiguous interlock is
+  // for. Trapping first line = no mock state changes either.
+  var trapTransfers : Bool = false;
+  public shared func setTrapTransfers(on : Bool) : async () { trapTransfers := on };
+
+  // Test hook (#47.2): answer every notify with #Err(#Processing) — the real
+  // CMC's "not settled yet" reply. The backend KEEPS its pending record on
+  // this (the saga latch), which is exactly the stranded state whose
+  // auto-retry test_fuel_topup §3c exercises. Block untouched: a later
+  // notify with the mode off completes the SAME top-up, like the real CMC
+  // finishing its processing.
+  var processingNotifies : Bool = false;
+  public shared func setProcessingNotifies(on : Bool) : async () { processingNotifies := on };
+
   public shared func icrc1_transfer(arg : {
     from_subaccount : ?Blob;
     to : { owner : Principal; subaccount : ?Blob };
@@ -75,6 +90,7 @@ actor {
     memo : ?Blob;
     created_at_time : ?Nat64;
   }) : async { #Ok : Nat; #Err : Icrc1TransferError } {
+    if (trapTransfers) { assert false };
     let block = nextBlock;
     nextBlock += 1;
     Map.add(blocks, Nat.compare, block, { e8s = arg.amount; var consumed = false });
@@ -84,6 +100,7 @@ actor {
   public shared func notify_top_up(arg : { block_index : Nat64; canister_id : Principal }) : async {
     #Ok : Nat; #Err : NotifyError;
   } {
+    if (processingNotifies) { return #Err(#Processing) };
     switch (Map.get(blocks, Nat.compare, Nat64.toNat(arg.block_index))) {
       case null { #Err(#InvalidTransaction("no such block")) };
       case (?b) {

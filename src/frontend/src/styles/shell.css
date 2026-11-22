@@ -22,8 +22,8 @@
 .btn-secondary:hover { background: var(--bg-hover); }
 .btn-lg { padding: 14px 24px; font-size: 16px; width: 100%; border-radius: var(--radius); }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
-.btn-danger { background: var(--red-dim); color: var(--red); border: 1px solid rgba(240,122,108,0.3); }
-.btn-danger:hover { background: rgba(240,122,108,0.18); }
+.btn-danger { background: var(--red-dim); color: var(--red); border: 1px solid var(--red-outline); }
+.btn-danger:hover { background: var(--red-tint); }
 
 /* ── Hover bloom ───────────────────────────────────────────────────
    The cyan-outlined ACTION cards (Swap, Place Order, Deposit) catch the
@@ -34,10 +34,8 @@
     transition: box-shadow 0.25s ease, border-color 0.25s ease;
   }
   .swap-card:hover, .order-panel:hover, .deposit-card:hover {
-    border-color: rgba(56, 189, 240, 0.65);
-    box-shadow:
-      0 0 28px rgba(56, 189, 240, 0.13),
-      0 0 3px rgba(56, 189, 240, 0.22);
+    border-color: var(--accent-outline-strong);
+    box-shadow: var(--accent-glow);
   }
 }
 
@@ -134,7 +132,7 @@
   inset: 0;
   background: linear-gradient(105deg,
     transparent 38%,
-    rgba(255, 255, 255, 0.85) 50%,
+    var(--shine) 50%,
     transparent 62%);
   background-size: 250% 100%;
   background-repeat: no-repeat;

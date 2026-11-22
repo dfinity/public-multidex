@@ -45,7 +45,7 @@
 .hm2-tip {
   position: absolute;
   pointer-events: none;
-  background: rgba(11, 18, 32, 0.94);
+  background: var(--bg-overlay);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 6px 9px;
@@ -78,8 +78,9 @@
   width: 90px;
   height: 6px;
   border-radius: 3px;
-  /* Must match HEAT_STOPS in main.js — this strip is the colour key. */
-  background: linear-gradient(90deg, #0f1728, #1d4e9c, #0694ba, #22c55e, #eab308, #f97316, #ef4444, #fee4dc);
+  /* The --heat-0…7 ramp (base.css) — the same stops main.js's heat map
+     parses, so this strip is the colour key in either theme. */
+  background: linear-gradient(90deg, var(--heat-0), var(--heat-1), var(--heat-2), var(--heat-3), var(--heat-4), var(--heat-5), var(--heat-6), var(--heat-7));
 }
 
 /* "What this vault underwrites" — aggregate margin exposure on the Earn card.
@@ -105,13 +106,19 @@
 }
 /* Utilisation / distress accents — these are the two figures an LP should
    react to, so they get colour; everything else stays neutral. */
-.margin-risk .mr-warm { color: var(--yellow, #d9a441); }
+.margin-risk .mr-warm { color: var(--cta-ink); }
 .margin-risk .mr-hot  { color: var(--red); }
 .margin-risk-note {
   font-size: 11px;
   color: var(--text-muted);
   margin-top: 6px;
 }
+/* Staged LP requests (task 1788731609): one line per pending request with a
+   Cancel button that is disabled — with the backend's refusal text beside
+   it — while the staged-order commit rule holds. */
+.earn-staged-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; }
+.earn-staged-cancel { padding: 1px 8px; font-size: 11px; line-height: 1.5; }
+.earn-staged-refusal { color: var(--text-muted); font-style: italic; }
 .earn-stats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -206,7 +213,7 @@
    so the locked card reads as "this slot is committed". */
 .balance-token-card--locked {
   border-color: var(--accent);
-  outline: 1px solid rgba(180, 130, 40, 0.22);
+  outline: 1px solid var(--cta-outline);
 }
 .balance-token-tag {
   font-size: 11px;
@@ -247,7 +254,7 @@
 }
 .history-table td {
   padding: 9px 8px;
-  border-bottom: 1px solid rgba(34,46,64,0.5);
+  border-bottom: 1px solid var(--border);
   color: var(--text-dim);
   vertical-align: middle;
 }
@@ -271,9 +278,9 @@
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
-.badge-red    { background: rgba(240,122,108,0.15); color: var(--red); }
+.badge-red    { background: var(--red-tint); color: var(--red); }
 .badge-yellow { background: var(--heather-tint); color: var(--heather); }
-.badge-green  { background: rgba(94,230,180,0.15); color: var(--green); }
+.badge-green  { background: var(--green-tint); color: var(--green); }
 
 /* ── Mobile: stat tiles become label/value ROWS ──────────────────
    Defined HERE, not in responsive.css: that file is imported earlier, so at

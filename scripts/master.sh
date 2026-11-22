@@ -3,7 +3,7 @@
 #
 # Single command: takes UPLANDS from any state (replica down, frozen
 # canister, fresh checkout) to the repo's DEFAULT deployment — a running
-# #play exchange: seeded $1M AMM vault, $50k insurance fund, live-feed
+# #play exchange: seeded $5,125,000 AMM vault, $144k insurance fund, live-feed
 # prices, maker ladder, and the sim bots hammering it.
 #
 # Equivalent to:

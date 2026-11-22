@@ -17,6 +17,7 @@
 # (setAmmRefPrice + requoteAmm). Sim killed. ⚠️ Calls resetExchange.
 
 set -u
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"; set +o pipefail   # shared helpers (mdx_identity_new / principal_of — throwaway identities that LEAVE the store); this suite keeps its own ok/nok frame and pipeline semantics
 export PATH="$HOME/.local/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
@@ -25,12 +26,11 @@ ok()  { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 nok() { echo -e "${RED}✗${NC} $1 — $2"; fail=$((fail+1)); }
 e8() { awk -v x="$1" 'BEGIN{ printf "%.0f", x*100000000 }'; }
 
-adm() { icp canister call --identity anonymous backend "$@" 2>&1; }
-mkid() { icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; icp identity principal --identity "$1" 2>/dev/null | tail -1; }
-A_P=$(mkid bookagg_a); B_P=$(mkid bookagg_b)
+adm() { icp canister call --candid "$MDX_CANDID" --identity anonymous backend "$@" 2>&1; }
+mdx_identity_new bookagg_a; A_P=$(principal_of bookagg_a); mdx_identity_new bookagg_b; B_P=$(principal_of bookagg_b)
 M="BTC-ICPUSD"
 place() { # identity side price qty  (prices/qtys already in e8)
-  icp canister call --identity "$1" backend placeLimitOrder "(\"$M\", variant { $2 }, $3 : nat, $4 : nat)" 2>&1
+  icp canister call --candid "$MDX_CANDID" --identity "$1" backend placeLimitOrder "(\"$M\", variant { $2 }, $3 : nat, $4 : nat)" 2>&1
 }
 release() { adm setAmmRefPrice "(\"$M\", $(e8 60000.0) : nat)" >/dev/null; adm requoteAmm "(\"$M\")" >/dev/null; }
 verify_clean() { # label
@@ -38,7 +38,7 @@ verify_clean() { # label
   if echo "$V" | grep -q 'vec {}'; then ok "aggregates consistent: $1"; else nok "aggregate drift: $1" "$(echo "$V" | head -c 300)"; fi
 }
 open_count() { # identity — resting only (call after release(), staged queue empty)
-  icp canister call --identity "$1" backend getMyOrders '()' --query 2>/dev/null | grep -c "id ="
+  icp canister call --candid "$MDX_CANDID" --identity "$1" backend getMyOrders '()' --query 2>/dev/null | grep -c "id ="
 }
 
 # The sim must be dead (header: its churn would move the book mid-assertion).
@@ -93,9 +93,9 @@ if [ "$CAP1" -le 2 ] && [ "$CAP1" -ge 1 ]; then ok "depth 1 returns ≤1 level p
 if [ "$FULL" -gt "$CAP1" ]; then ok "null depth returns the whole book"; else nok "full ≤ capped" "cap1=$CAP1 full=$FULL"; fi
 
 echo "── §3 cancel ──"
-OID=$(icp canister call --identity bookagg_a backend getMyOrders '()' --query | tr -d '_' | grep -oE "id = [0-9]+" | head -1 | grep -oE "[0-9]+")
+OID=$(icp canister call --candid "$MDX_CANDID" --identity bookagg_a backend getMyOrders '()' --query | tr -d '_' | grep -oE "id = [0-9]+" | head -1 | grep -oE "[0-9]+")
 if [ -n "${OID:-}" ]; then
-  icp canister call --identity bookagg_a backend cancelMyOrder "($OID : nat)" >/dev/null 2>&1
+  icp canister call --candid "$MDX_CANDID" --identity bookagg_a backend cancelMyOrder "($OID : nat)" >/dev/null 2>&1
   verify_clean "after cancel #$OID"
 else
   nok "no order id to cancel" "getMyOrders empty"

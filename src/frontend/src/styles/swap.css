@@ -1,9 +1,11 @@
 /* ── Swap ─────────────────────────────────────────────────────────── */
-/* Hero strap above the boxes: big, bold, centered — the page's one-line
-   pitch. Sits OUTSIDE .swap-container (a sibling): the container becomes a
-   grid with explicit row placements on wide screens, and a child strap
-   would collide with them. clamp() scales it from phone to desktop. */
-.swap-strap {
+/* .strap — the one-line pitch at the top of a page: big, bold, centered.
+   SHARED by Swap (.swap-strap) and Home (.home-strap, sized up in home.css);
+   both h1s carry `strap` plus their page class. On Swap it sits OUTSIDE
+   .swap-container (a sibling): the container becomes a grid with explicit
+   row placements on wide screens, and a child strap would collide with
+   them. clamp() scales it from phone to desktop. */
+.strap {
   text-align: center;
   font-size: clamp(26px, 3.4vw, 40px);
   font-weight: 640;
@@ -17,7 +19,7 @@
    geometric Inter — the editorial flourish, in the same white as the rest
    of the strap. A touch larger and lighter than the Inter around it so the
    two faces sit at the same optical weight and height. */
-.swap-strap .strap-accent {
+.strap .strap-accent {
   font-family: 'Newsreader Variable', Georgia, 'Times New Roman', serif;
   font-style: italic;
   font-weight: 560;
@@ -33,8 +35,10 @@
   /* 24px = the view's top padding, so the gap between the Swap box and the
      market box matches the gap above the Swap box (header → Swap box). */
   gap: 24px;
-  /* + the view's 24px = 48px below the header — the same distance the
-     Deposit page's box sits at (.deposit-container's 24px top padding). */
+  /* + the view's 24px = 48px below the header. (The Deposit box once sat at
+     the same offset as a top-level page; it now lives under the Account tabs
+     and follows the Account panes' rhythm - deposit.css .deposit-container -
+     so this value is the Swap page's own.) */
   padding-top: 24px;
 }
 .swap-card, .swap-orders-card {
@@ -48,7 +52,7 @@
    stronger cyan outline than the default hairline carrying the box edge. */
 .swap-card {
   background: transparent;
-  border-color: rgba(56, 189, 240, 0.45);
+  border-color: var(--accent-outline);
   border-width: 1.5px;   /* slightly thicker than the default 1px card border */
 }
 /* h2 defaults to bold (700); 540 gives a lighter title consistent with the
@@ -61,8 +65,8 @@
    with matching hairline, on E's generous geometry (20px padding, 16px
    radius, 28px amount type below). */
 .swap-input-group {
-  background: linear-gradient(160deg, rgba(56, 189, 240, 0.12), rgba(56, 189, 240, 0.04));
-  border: 1px solid rgba(56, 189, 240, 0.20);
+  background: var(--accent-panel);
+  border: 1px solid var(--accent-border);
   border-radius: 16px;
   padding: 20px;
 }
@@ -110,8 +114,8 @@
    Lighter weight + darker near-black text (matching #place-order-btn) keeps it
    crisp on the mint fill. Overrides the inherited .btn-primary hover (would
    flip to amber); disabled ("Insufficient liquidity") stays neutral. */
-#swap-execute-btn { background: var(--green); color: #060706; font-weight: 370; }
-#swap-execute-btn:hover:not(:disabled) { background: #55CFA2; color: #060706; }
+#swap-execute-btn { background: var(--green); color: var(--green-text); font-weight: 370; }
+#swap-execute-btn:hover:not(:disabled) { background: var(--green-hover); color: var(--green-text); }
 #swap-execute-btn:disabled { background: var(--bg-hover); color: var(--text-muted); }
 
 .swap-preview {
@@ -145,8 +149,21 @@
   border-radius: 4px;
 }
 .swap-preview-impact.low    { color: var(--green); background: var(--green-dim); }
-.swap-preview-impact.medium { color: var(--accent); background: rgba(229,169,83,0.12); }
+.swap-preview-impact.medium { color: var(--accent); background: var(--cta-tint); }
 .swap-preview-impact.high   { color: var(--red);   background: var(--red-dim); }
+/* The reserve clamp line (quoteSwap availableFrom/clampedByReserve): the
+   estimate above is for the full amount, this says how much of it can
+   actually convert. Clickable like the partial-fill rate warning. */
+.swap-preview-avail {
+  font-size: 12px;
+  color: var(--red);
+  margin-top: 4px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+.swap-preview-avail:hover { filter: brightness(1.2); }
 
 /* The "To" amount shows estimated in slightly dimmer text when it's an estimate */
 #swap-to-amount.estimated { color: var(--text-dim); }
@@ -220,7 +237,7 @@
 }
 /* Lighter weight (600 → 520), compensated by darker on-cyan text — matches the
    Place Order box's toggle treatment (orderform.css). */
-.slip-btn.active { background: var(--accent); color: #010B0F; border-color: var(--accent); font-weight: 480; }
+.slip-btn.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 480; }
 
 .checkbox-label {
   display: flex; align-items: center; gap: 8px;

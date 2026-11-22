@@ -24,14 +24,55 @@ mdx_engine_for() {
   esac
 }
 
+# Is $1 (a PID read from a PID file) actually THIS target's fleet?
+#
+# A bare `kill -0` only proves that SOME process owns the number. After a
+# reboot the kernel hands PIDs out again from the bottom, so a recorded low
+# PID is very likely to name an unrelated process: on 2026-09-07 the subnet
+# fleet's PID 818 came back as Jump Desktop Connect, the start guard refused
+# "already running" 1,180 times over 40 hours, and the stop path would have
+# killed the remote-desktop session's process tree. So the PID has to carry
+# the fleet's own argv — the engine script and `--target <target>` — before
+# either path treats it as the fleet. Both modes exec the engine, so the
+# recorded PID's command line is always `bash …/scripts/<engine> --target …`.
+mdx_pid_is_fleet() {
+  local pid="$1" target="$2" cmd
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null) || return 1
+  case "$cmd" in
+    *"scripts/$(mdx_engine_for "$target")"*" --target $target "*|*"scripts/$(mdx_engine_for "$target")"*" --target $target") return 0 ;;
+  esac
+  return 1
+}
+
+# What the recorded PID is, for the message that says why it was not trusted.
+mdx_pid_describe() {
+  local pid="$1" cmd
+  if kill -0 "$pid" 2>/dev/null; then
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null | cut -c1-80)
+    echo "pid $pid is alive but is not this fleet: ${cmd:-<unreadable>}"
+  else
+    echo "pid $pid is not running"
+  fi
+}
+
 mdx_bots_start() {
   local target="$1"; shift
   mdx_target_valid "$target" || mdx_die "unknown target '$target'"
   mkdir -p "$MDX_RUN_DIR"
 
   local pidfile; pidfile=$(mdx_pidfile "$target")
-  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
-    mdx_die "bots already running for '$target' (pid $(cat "$pidfile")) — stop_bots_$target.sh first"
+  if [ -f "$pidfile" ]; then
+    local recorded; recorded=$(cat "$pidfile" 2>/dev/null)
+    if mdx_pid_is_fleet "$recorded" "$target"; then
+      mdx_die "bots already running for '$target' (pid $recorded) — stop_bots_$target.sh first"
+    fi
+    # A PID file whose number is dead, or owned by something that is not this
+    # fleet (a reused PID after a reboot), must not block the start — under
+    # launchd KeepAlive that is a throttled refusal loop that never ends.
+    mdx_warn "stale PID file for '$target' cleared ($(mdx_pid_describe "$recorded"))"
+    rm -f "$pidfile"
   fi
 
   # Bare calls: these must be able to kill THIS shell (see targets.sh).
@@ -39,6 +80,25 @@ mdx_bots_start() {
   mdx_assert_identity "$target"
   local mode="$MDX_POSTURE" identity="$MDX_IDENTITY"
   local env_name; env_name=$(mdx_env_for "$target")
+  # The FUNDING identity (task 1789609263): refills sign as the designated
+  # funding authority, never as the controller key above. Resolved here
+  # (env > target conf > nothing) and handed to the engine as
+  # MDX_FUNDING_IDENTITY on every launch line; an empty value makes the
+  # engine fall back to BOT_IDENTITY — the pre-1789609263 behaviour — and
+  # that fallback is named LOUDLY, because a remote fleet still signing
+  # refills with the controller is the finding this exists to close.
+  local funding; funding=$(mdx_funding_identity_for "$target")
+  if mdx_is_remote "$target"; then
+    if [ -n "$funding" ]; then
+      icp identity principal --identity "$funding" >/dev/null 2>&1 \
+        || mdx_die "funding identity '$funding' unusable for '$target' (not in this icp store?) — icp identity new $funding, then designate its principal: setFundingAuthority as the controller"
+      mdx_info "refills sign as the funding authority '$funding' (the controller key '$identity' signs no refill)"
+    else
+      mdx_warn "no funding identity for '$target' — refills will sign as the CONTROLLER identity '$identity'.
+   Designate one (setFundingAuthority as $identity, task 1789609263) and set SN_FUNDING_IDENTITY / CE_FUNDING_IDENTITY
+   in the target conf (or MDX_FUNDING_IDENTITY in the environment) so the controller key does one job."
+    fi
+  fi
   local engine;   engine=$(mdx_engine_for "$target")
   local bots="${MDX_BOTS:-$(mdx_bots_for "$target")}" interval="${MDX_INTERVAL:-$(mdx_interval_for "$target")}"
   local pool_fund="${POOL_FUND_USD:-$(mdx_pool_fund_for "$target")}"
@@ -64,7 +124,7 @@ mdx_bots_start() {
       exec env MDX_TARGET="$target" BOT_PREFIX="${target}bot" POOL_FUND_USD="$pool_fund" \
         bash "$MDX_ROOT/scripts/$engine" --target "$target" --bots "$bots" --interval "$interval"
     else
-      exec env MDX_TARGET="$target" IC_ENV="$env_name" BOT_IDENTITY="$identity" BOT_PREFIX="${target}bot" POOL_FUND_USD="$pool_fund" \
+      exec env MDX_TARGET="$target" IC_ENV="$env_name" BOT_IDENTITY="$identity" MDX_FUNDING_IDENTITY="$funding" BOT_PREFIX="${target}bot" POOL_FUND_USD="$pool_fund" \
         bash "$MDX_ROOT/scripts/$engine" --target "$target" --bots "$bots" --interval "$interval"
     fi
   fi
@@ -74,7 +134,7 @@ mdx_bots_start() {
       bash "$MDX_ROOT/scripts/$engine" --target "$target" --bots "$bots" --interval "$interval" \
       > "$log" 2>&1 &
   else
-    nohup env MDX_TARGET="$target" IC_ENV="$env_name" BOT_IDENTITY="$identity" BOT_PREFIX="${target}bot" POOL_FUND_USD="$pool_fund" \
+    nohup env MDX_TARGET="$target" IC_ENV="$env_name" BOT_IDENTITY="$identity" MDX_FUNDING_IDENTITY="$funding" BOT_PREFIX="${target}bot" POOL_FUND_USD="$pool_fund" \
       bash "$MDX_ROOT/scripts/$engine" --target "$target" --bots "$bots" --interval "$interval" \
       > "$log" 2>&1 &
   fi
@@ -104,8 +164,10 @@ mdx_bots_stop() {
   fi
 
   local pid; pid=$(cat "$pidfile" 2>/dev/null)
-  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    mdx_ok "bots for '$target' already stopped (stale PID file cleared)"
+  if ! mdx_pid_is_fleet "$pid" "$target"; then
+    # Never kill a number we cannot prove is the fleet: after a reboot the
+    # recorded PID can belong to anything (see mdx_pid_is_fleet).
+    mdx_ok "bots for '$target' already stopped (stale PID file cleared — $(mdx_pid_describe "${pid:-0}"))"
     rm -f "$pidfile"
     return 0
   fi

@@ -185,6 +185,13 @@ module {
   /// Everything else (sum/avg, multi-aggregate, residual predicates, non-indexed
   /// or `#hash` min/max) returns `null`. `orderBy`/`limit`/`select` are applied
   /// by `finishRows` over the synthetic rows, exactly as for the scan path.
+  // ── DEAD IN THIS TREE (W6-08): aggPlan/planServed/planJoin are reachable
+  // only through a `withServed` registration, whose sole call site is
+  // oql/IndexedMap.mo — unused outside oql/. Every live query full-scans.
+  // Four latent defects are documented on these paths (#21 pt 2, #39 —
+  // including an authorisation misdirect via `__N` column-name collision).
+  // Do NOT enable this planner without fixing them: the gating note lives at
+  // Entity.withServed and docs/tasks/W6-08-latent-oql-watch-item.md.
   func aggPlan(s : Entity.Served, q : Query.Query) : ?([Row], [Text]) {
     if (q.aggregate.size() != 1) return null;
     let st = switch (s.stats) { case (?x) { x }; case null { return null } };

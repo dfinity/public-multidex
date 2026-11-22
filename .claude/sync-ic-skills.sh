@@ -8,9 +8,27 @@
 #
 # Idempotent and offline-safe. Only skills this script installed are ever pruned,
 # so your own local skills are never touched.
+#
+# H-03 (F7, 2026-09-04): the manifest is the ONLY authority over what this
+# script may replace or prune. A name the remote index carries is INSTALLED only
+# when $DEST/<name> is absent or was installed by this script (listed in the
+# manifest); an existing directory the manifest does not list — a skill the
+# repo owns, or anything else someone put there — is never moved aside,
+# replaced, recorded or pruned, whatever the index says. Git-tracked paths
+# under $DEST (the repo's own guardrail skills, .gitignore's exceptions) are
+# refused even when a poisoned manifest names them. The mirror's fetches are
+# pinned to the origin: https only, redirects may not leave $BASE. SYNC_BASE
+# overrides the origin for OFFLINE fixtures (file:///…) — tests only; the
+# hygiene suite (tests/test_deploy_hygiene.sh §3f) drives every refusal.
 set -euo pipefail
 
-BASE="https://skills.internetcomputer.org/.well-known/skills"
+BASE="${SYNC_BASE:-https://skills.internetcomputer.org/.well-known/skills}"
+BASE="${BASE%/}"
+case "$BASE" in
+  https://*) PROTO="https" ;;
+  file:///*) PROTO="file" ;;   # offline fixture tree (tests); never a network scheme
+  *) echo "[autosync-ic-skills] SYNC_BASE must be https://… or file:///… (got: $BASE) — keeping cached skills" >&2; exit 0 ;;
+esac
 INDEX_URL="$BASE/index.json"
 DEST=".claude/skills"
 MANIFEST="$DEST/.ic-managed.json"   # { "<skill>": "<hash>" } of skills this script manages
@@ -45,6 +63,36 @@ is_safe_relpath() {  # a file path within a skill: subdirs ok, but not absolute 
   esac
 }
 
+# --- Ownership guards (H-03). `is_tracked` asks git whether anything under
+#     $DEST/<name> is committed — the repo's own skills are, the mirror never is
+#     (.gitignore). Outside a git checkout, or without git, it answers "no" and
+#     the manifest guard below still applies: unknown directories are refused,
+#     tracked ones are refused twice. ---
+is_tracked() {   # is_tracked <name>: 0 iff git tracks a file under $DEST/<name>
+  git ls-files --error-unmatch -- "$DEST/$1" >/dev/null 2>&1
+}
+is_managed() {   # is_managed <name>: 0 iff the CURRENT manifest lists <name>
+  grep -qxF -- "$1" <<<"$MANAGED"
+}
+
+# --- Origin-pinned fetch. The scheme is the one $BASE carries (https, or file
+#     for offline fixtures) — nothing else, on the first hop or after a
+#     redirect — and the URL curl ends up at must still sit under $BASE: a
+#     redirect that leaves the origin discards the download and fails the fetch. ---
+fetch() {   # fetch <url> <out-file>
+  local eff
+  if ! eff="$(curl -fsSL --max-time 20 --proto "=$PROTO" --proto-redir "=$PROTO" \
+              -w '%{url_effective}' -o "$2" -- "$1")"; then
+    rm -f "$2"; return 1
+  fi
+  case "$eff" in
+    "$BASE"/*) return 0 ;;
+  esac
+  echo "[autosync-ic-skills] warning: $1 redirected off-origin to $eff — discarded" >&2
+  rm -f "$2"
+  return 1
+}
+
 # --- Recover from a run interrupted mid-swap. A `.old-<name>.<pid>` dir is the
 #     previous good copy of <name>, moved aside just before its swap. If that swap
 #     never finished (the skill dir is now missing), restore it; otherwise it is
@@ -62,7 +110,7 @@ for backup in "$DEST"/.old-*; do
 done
 
 # --- Fetch the index. On any network failure, keep cached skills and exit cleanly. ---
-if ! curl -fsSL --max-time 20 "$INDEX_URL" -o "$TMP_INDEX"; then
+if ! fetch "$INDEX_URL" "$TMP_INDEX"; then
   echo "[autosync-ic-skills] could not reach $INDEX_URL — keeping cached skills" >&2
   exit 0
 fi
@@ -98,12 +146,19 @@ NEW_NAMES="$(jq -r '.skills[].name' "$TMP_INDEX")"
 MANAGED="$(managed_names)"
 echo '{}' > "$NEW_MANIFEST"
 
-# --- Prune: drop previously-managed skills that are no longer in the index. ---
-removed=0
+# --- Prune: drop previously-managed skills that are no longer in the index.
+#     A git-tracked name is never pruned even if the manifest lists it (a
+#     manifest is a plain file; the repo's own skills are not its to give). ---
+removed=0; refused=0
 while IFS= read -r old; do
   [ -n "$old" ] || continue
   is_safe_name "$old" || { echo "[autosync-ic-skills] skipping unsafe managed name: $old" >&2; continue; }
   if ! grep -qxF "$old" <<<"$NEW_NAMES"; then
+    if is_tracked "$old"; then
+      refused=$((refused + 1))
+      echo "[autosync-ic-skills] refused to prune '$old': git-tracked (repo-owned), dropped from the manifest instead" >&2
+      continue
+    fi
     rm -rf "${DEST:?}/$old"
     removed=$((removed + 1))
     echo "[autosync-ic-skills] removed: $old" >&2
@@ -118,6 +173,22 @@ while IFS= read -r entry; do
   is_safe_name "$name" || { echo "[autosync-ic-skills] skipping skill with unsafe name: $name" >&2; continue; }
   new_hash="$(jq -r '.hash // ""' <<<"$entry")"
   old_hash="$(stored_hash "$name")"
+
+  # H-03: the index has no authority over a directory this script did not
+  # install. Refuse — before any download, without recording — when the name
+  # is git-tracked (repo-owned, whatever the manifest says) or when $DEST/$name
+  # already exists and the manifest does not list it. The manifest is rebuilt
+  # from what is recorded, so a refused name also leaves the manifest.
+  if is_tracked "$name"; then
+    refused=$((refused + 1))
+    echo "[autosync-ic-skills] refused to install '$name': git-tracked (repo-owned) — the index does not get to replace it" >&2
+    continue
+  fi
+  if [ -e "$DEST/$name" ] && ! is_managed "$name"; then
+    refused=$((refused + 1))
+    echo "[autosync-ic-skills] refused to install '$name': $DEST/$name exists and was not installed by this script — left untouched" >&2
+    continue
+  fi
 
   # Skip when the hash is known, unchanged, and the files are already on disk.
   if [ -n "$new_hash" ] && [ "$new_hash" = "$old_hash" ] && [ -d "$DEST/$name" ]; then
@@ -140,7 +211,7 @@ while IFS= read -r entry; do
       break
     fi
     mkdir -p "$(dirname "$STAGING/$f")"   # files may live in subdirs (e.g. scripts/)
-    if ! curl -fsSL --max-time 20 "$BASE/$name/$f" -o "$STAGING/$f"; then
+    if ! fetch "$BASE/$name/$f" "$STAGING/$f"; then
       echo "[autosync-ic-skills] warning: failed to fetch $name/$f" >&2
       ok=0
       break
@@ -193,12 +264,16 @@ mv "$NEW_MANIFEST" "$MANIFEST"
 # fields are surfaced. We emit a single JSON object on stdout:
 #   - systemMessage    -> rendered to the USER as a visible system notice
 #   - additionalContext -> injected into Claude's context so it can mention it too
-if [ $((added + updated + removed)) -gt 0 ]; then
-  summary="[autosync-ic-skills] ${added} added, ${updated} updated, ${removed} removed (${unchanged} unchanged) in $DEST"
-  jq -n --arg msg "$summary" '{
+#   A refusal (H-03) is reported too — an index naming a directory this script
+#   does not own is exactly the event the operator should see — without a
+#   skills reload, since nothing on disk changed for it.
+if [ $((added + updated + removed + refused)) -gt 0 ]; then
+  summary="[autosync-ic-skills] ${added} added, ${updated} updated, ${removed} removed, ${refused} refused (${unchanged} unchanged) in $DEST"
+  reload=false; [ $((added + updated + removed)) -gt 0 ] && reload=true
+  jq -n --arg msg "$summary" --argjson reload "$reload" '{
     systemMessage: $msg,
     hookSpecificOutput: {
-      reloadSkills: true,
+      reloadSkills: $reload,
       hookEventName: "SessionStart",
       additionalContext: $msg
     }

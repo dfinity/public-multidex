@@ -3,6 +3,7 @@ import Array "mo:core/Array";
 import Text "mo:core/Text";
 import Float "mo:core/Float";
 import Nat "mo:core/Nat";
+import Int "mo:core/Int";
 import Types "Types";
 import Fixed "Fixed";
 
@@ -35,7 +36,15 @@ module {
     quoteDepthBase      : Nat;   // base-token quantity per level (10^8)
     numLevels           : Nat;   // levels per side (e.g. 3)
     levelSpacingBps     : Nat;   // spacing between adjacent levels (bps)
-    protectionWindowSec : Nat;   // settlement window applied to every AMM quote
+    // (The fossil `protectionWindowSec` — task 1788516198 retired the
+    // settlement window it named, apiVersion 6.0.0 removed it from the
+    // public view — was DROPPED from the stored record by the sixth one-shot
+    // migration, task 1788744109: `pools` is a stable map of this record and
+    // enhanced orthogonal persistence refuses even a record-field drop on a
+    // plain upgrade as a "Memory-incompatible program upgrade" (IC0503, seen
+    // live 2026-09-07), so the sweep mapped every stored pool onto this
+    // shape — applied to both mainnet targets 2026-11-03/04 and RETIRED with
+    // 1793580820. See the NOTE above the actor in main.mo.)
     enabled             : Bool;
 
     // Inventory target & skew parameters (used in Phase 4).
@@ -61,6 +70,16 @@ module {
     lastRebalanceNs     : Int;
   };
 
+  // The PUBLIC pool IS the stored Pool again: the apiVersion 6.0.0
+  // projection (a PoolView record minus the fossil, plus toView) collapsed
+  // back into Pool when the sixth one-shot migration swept the field (task
+  // 1788744109). The name stays as an ALIAS because it is the published
+  // Candid's record name (`type PoolView = record {…}` in
+  // candid/backend.did, read by bots since 6.0.0) — the contract is
+  // byte-identical across the sweep. getAmmPool / getAmmPools hand out the
+  // stored record directly.
+  public type PoolView = Pool;
+
   public func emptyPool(marketId : Types.MarketId, baseToken : Types.TokenId) : Pool = {
     marketId;
     baseToken;
@@ -68,7 +87,6 @@ module {
     quoteDepthBase      = 5_000_000;   // 0.05 base
     numLevels           = 3;
     levelSpacingBps     = 15;
-    protectionWindowSec = 8;
     enabled             = false;
     inventoryTargetBase = 0;
     skewIntensityBps    = 0;
@@ -187,7 +205,17 @@ module {
     // Widen half-spread when vol is elevated: base half-spread + 0.5 * stdev(bps).
     let volWideningBps = pool.volRegime * 0.5;
     let halfBps = Float.fromInt(pool.spreadBps) + volWideningBps;
-    let half = halfBps / 10000.0;
+    // W4-23 (R12 retargeted): bound the COMBINED half-spread. Every widening
+    // term feeds this line (vol regime, staleness, breaker — the
+    // caller folds the last two in ×2 via withVol), and one unbounded term
+    // was reachable: an UNCONFIRMED breaker pend proposing >2× ref put
+    // breakerBps past 9,980, drove half ≥ 1.0, zeroed the whole bid ladder —
+    // and ammApplyQuotes' off-ladder sweep then CANCELLED every resting bid,
+    // silently. A 50% half-spread already quotes nothing tradeable; beyond
+    // it, extra width only withdraws liquidity. Clamping HERE bounds all
+    // four contributors at once (clamping volRegime alone leaves breakerBps
+    // open — R12 aimed at the wrong term).
+    let half = Float.min(0.5, halfBps / 10000.0);
     let spacing = bpsToFraction(pool.levelSpacingBps);
     let depth = pool.quoteDepthBase;
 
@@ -291,7 +319,10 @@ module {
     let alpha = 0.1;
     let oldVar = (pool.volRegime / 10000.0) * (pool.volRegime / 10000.0);
     let newVar = (1.0 - alpha) * oldVar + alpha * r * r;
-    let newStdBps = Float.sqrt(newVar) * 10000.0;
+    // W4-23: clamp the STABLE field too — 2× the ladder's half-clamp
+    // threshold, so an absurd regime cannot persist across an upgrade or sit
+    // undecayed on a disabled pool (requote early-returns there).
+    let newStdBps = Float.min(20_000.0, Float.sqrt(newVar) * 10000.0);
     withVol(pool, newStdBps, newMid, now);
   };
 
@@ -303,14 +334,12 @@ module {
     quoteDepthBase : Nat,
     numLevels : Nat,
     levelSpacingBps : Nat,
-    protectionWindowSec : Nat,
   ) : Pool = {
     pool with
     spreadBps;
     quoteDepthBase;
     numLevels;
     levelSpacingBps;
-    protectionWindowSec;
   };
 
   public func withEnabled(pool : Pool, enabled : Bool) : Pool = {
@@ -321,6 +350,28 @@ module {
     pool with
     refPrice          = price;
     refPriceUpdatedNs = now;
+  };
+
+  // H-33 (F47): the ADMISSION-VALUATION freshness verdict — may this pool's
+  // mark price a play deposit right now? `null` = fresh (a positive mark,
+  // stamped, within `maxAgeNs`, and not held out by the circuit breaker);
+  // otherwise the reason, phrased for the depositor (the Bridge relays it
+  // verbatim and rolls its write-ahead back on any #err — W3-04). Pure over
+  // (pool, pended, now, bar) so the boundary is unit-pinned (AMM.test.mo):
+  // age == bar is fresh, age == bar + 1 ns is stale; a NEVER-stamped mark
+  // (refPriceUpdatedNs = 0) is stale — the margin wall's shape, not the
+  // swap gate's `> 0 and` pass-through: a deposit valued at a mark nobody
+  // ever stamped is exactly the frozen-mark charge this closes.
+  public func markStaleReason(pool : Pool, pended : Bool, now : Int, maxAgeNs : Int) : ?Text {
+    if (pool.refPrice == 0) { return ?("no mark price for " # pool.baseToken # " yet; try again once its market is live") };
+    if (pended) { return ?("the " # pool.baseToken # " mark is held pending a price-jump confirmation; try again in a few minutes once the mark is confirmed") };
+    if (pool.refPriceUpdatedNs <= 0) { return ?("the " # pool.baseToken # " mark has never been stamped by the oracle; try again once it refreshes") };
+    let age : Int = now - pool.refPriceUpdatedNs;
+    if (age > maxAgeNs) {
+      return ?("the " # pool.baseToken # " mark is stale (last refreshed " # Int.toText(age / 1_000_000_000)
+        # "s ago, bar " # Int.toText(maxAgeNs / 1_000_000_000) # "s); try again once the oracle refreshes");
+    };
+    null;
   };
 
   public func withActiveOrders(pool : Pool, bidIds : [Nat], askIds : [Nat], now : Int) : Pool = {

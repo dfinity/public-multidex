@@ -27,12 +27,14 @@ import Nat "mo:core/Nat";
 import Nat64 "mo:core/Nat64";
 import Int "mo:core/Int";
 import Array "mo:core/Array";
+import VarArray "mo:core/VarArray";
 import Order "mo:core/Order";
 import Region "mo:core/Region";
 import Cycles "mo:core/Cycles";
 import CertifiedData "mo:core/CertifiedData";
 import Blob "mo:core/Blob";
 import Time "mo:core/Time";
+import Timer "mo:core/Timer";
 import Prim "mo:⛔"; // rts_memory_size / rts_heap_size for the Stats → Archive panel
 import Types "lib/Types";
 import EventChain "lib/EventChain";
@@ -66,10 +68,25 @@ persistent actor class Archive(owner : Principal) {
   // ledger) without a full per-query scan of millions of events. Built by
   // advancing `dwCursor` through globalIndex IN ORDER, so dwIndex stays
   // seq-ascending and its tail is the newest D/W. Populated incrementally on
-  // append + by the controller-driven backfill (backfillDwIndex) for the events
-  // that predate this index.
+  // append + by the self-driven index backfill (the postupgrade timer below,
+  // task 1793495003) for the events that predate this index; backfillDwIndex
+  // is the owner's EXPLICIT driver for the same catch-up.
   let dwIndex = List.empty<(Nat64, Nat)>();
   var dwCursor : Nat = 0;   // globalIndex positions [0, dwCursor) already scanned into dwIndex
+
+  // Per-principal FILL index (task 1793489930) — the kind-filtered slice of
+  // userIndex the history views page. Spot History / Positions History /
+  // Account → Spot want a user's FILLS, and the all-kinds userIndex made a
+  // fill-less segment cost ceil(total/200) hops just to learn it held none:
+  // every #delta (one per balance mutation), deposit and config row paged out
+  // to be dropped in the browser. Built like dwIndex — by advancing
+  // `fillCursor` through globalIndex IN ORDER (live catch-up per append; the
+  // self-driven backfill below after an upgrade) — so each per-principal list
+  // stays seq-ascending and newest-first is a reverse walk: no gather, no
+  // sort. Each entry is the SAME tuple the other indexes hold (one pointer
+  // per fill, not a second copy of the offsets).
+  let userFillIndex = Map.empty<Text, List.List<(Nat64, Nat)>>();
+  var fillCursor : Nat = 0;   // globalIndex positions [0, fillCursor) already scanned into userFillIndex
 
   // ── Low-memory early warning ──────────────────────────────────────
   // Fires when this canister's wasm memory first crosses its
@@ -171,6 +188,81 @@ persistent actor class Archive(owner : Principal) {
     scanned
   };
 
+  // Advance the fill index by up to `maxScan` more globalIndex positions (in
+  // seq order), filing every #fill's offset under its principal. Returns the
+  // positions scanned this call. Live catch-up per append + the backfill timer.
+  func fillScan(maxScan : Nat) : Nat {
+    let n = List.size(globalIndex);
+    let stop = Nat.min(fillCursor + maxScan, n);
+    var i = fillCursor;
+    while (i < stop) {
+      switch (List.get(globalIndex, i)) {
+        case (?entry) {
+          switch (load(entry)) {
+            case (?e) {
+              switch (e.kind) {
+                case (#fill _) {
+                  let key = Principal.toText(e.user);
+                  let lst = switch (Map.get(userFillIndex, Text.compare, key)) {
+                    case (?l) { l };
+                    case null {
+                      let l = List.empty<(Nat64, Nat)>();
+                      Map.add(userFillIndex, Text.compare, key, l);
+                      l
+                    };
+                  };
+                  List.add(lst, entry);
+                };
+                case _ {};
+              };
+            };
+            case null {};
+          };
+        };
+        case null {};
+      };
+      i += 1;
+    };
+    let scanned : Nat = stop - fillCursor;
+    fillCursor := stop;
+    scanned
+  };
+  func fillIndexComplete() : Bool { fillCursor >= List.size(globalIndex) };
+  func dwIndexComplete()   : Bool { dwCursor >= List.size(globalIndex) };
+  func indexesComplete()   : Bool { fillIndexComplete() and dwIndexComplete() };
+
+  // ── Index backfill (self-driven; the FILL and the D/W cursor) ──────
+  // A segment upgraded onto this code holds events stored before an index
+  // existed (that cursor = 0 on first arrival here: fillCursor since task
+  // 1793489930; dwCursor on a segment that predates the D/W index, or was
+  // upgraded with a backlog), and a SEALED segment never sees another
+  // appendBatch to catch it up — so postupgrade arms a one-shot timer that
+  // scans a chunk of EVERY lagging cursor and re-arms itself while either is
+  // behind, then goes quiet: no heartbeat, nothing once complete.
+  // Operator-free by design (adminUpgradeArchives walks a chain of dozens of
+  // segments; each heals itself). Task 1793495003 folded the D/W cursor in:
+  // before it the exchange's adminBackfillArchiveDw drove backfillDwIndex on
+  // the active tip ONLY, so a sealed segment's getDepositWithdrawals silently
+  // under-reported for good. 50k decodes per tick ≈ a few seconds, far inside
+  // the update budget (backfillDwIndex's owner-driven chunk is 200k) — SPLIT
+  // between the two cursors while both are behind, so a tick never decodes
+  // more than the single-index tick did. While a backlog remains the filtered
+  // pager answers by gather-time filtering — correct, slower
+  // (getEventsForPrincipalsFiltered) — and getDepositWithdrawals serves the
+  // D/W rows indexed so far (stats.dwIndexCursor < eventCount says so).
+  transient let INDEX_BACKFILL_CHUNK : Nat = 50_000;
+  func indexBackfillTick() : async () {
+    let fillBehind = not fillIndexComplete();
+    let dwBehind   = not dwIndexComplete();
+    let chunk = if (fillBehind and dwBehind) { INDEX_BACKFILL_CHUNK / 2 } else { INDEX_BACKFILL_CHUNK };
+    if (fillBehind) { ignore fillScan(chunk) };
+    if (dwBehind)   { ignore dwScan(chunk) };
+    if (not indexesComplete()) { ignore Timer.setTimer<system>(#seconds 1, indexBackfillTick) };
+  };
+  system func postupgrade() {
+    if (not indexesComplete()) { ignore Timer.setTimer<system>(#seconds 1, indexBackfillTick) };
+  };
+
   // Append a strictly-ordered batch. Replays of already-stored seqs are
   // skipped (the shipper re-sends on unknown outcomes); a gap is an error —
   // the shipper never skips ahead, so a gap means a bug, and storing around
@@ -228,6 +320,7 @@ persistent actor class Archive(owner : Principal) {
     // the tape end, this scans exactly the batch just stored; while a backlog
     // remains it chips away (the controller backfill does the bulk).
     ignore dwScan(events.size() + 16);
+    ignore fillScan(events.size() + 16);
     if (full) { return #full(nextExpected) };
     #ok(nextExpected);
   };
@@ -252,10 +345,27 @@ persistent actor class Archive(owner : Principal) {
   };
 
   // Recompute + verify the chain over a stored range (bounded per call —
-  // page a full audit). Checks BOTH directions of integrity: each event's
-  // recomputed hash equals its successor's prevHash. `ok=false` pinpoints
-  // the first broken seq. Anyone may call; the stronger, trustless variant
-  // is the same computation done client-side under the certified head.
+  // page a full audit). Two kinds of check: every INTERNAL link (each
+  // event's recomputed hash equals its successor's stored prevHash), and —
+  // when the walk reaches the tape end — the OUTBOUND ANCHOR: the last
+  // event's own recomputed hash must equal the certified chainHead
+  // (W2-01, #18 F50). Without the anchor, the newest event's hash was
+  // never compared against anything (no successor reads it), so
+  // corrupting it — or consistently rewriting any tail suffix — verified
+  // clean; on a sealed season archive nothing would ever surface that.
+  // `ok=false` pinpoints the first broken seq. Anyone may call; the
+  // stronger, trustless variant is the same computation done client-side
+  // under the certified head (src/frontend/src/ledger.js anchors the same
+  // way).
+  //
+  // SCOPE (W2-04/R11): this verifies links WITHIN this archive only. The
+  // anchor below starts at whatever event arrived first — the canister is
+  // never told its predecessor's head, so the inbound cross-archive join
+  // is not checked here and cannot be. That is not a security hole to fix
+  // with plumbing: this is an uncertified self-diagnostic (a hostile host
+  // returns ok=true regardless), for honest bugs and storage corruption.
+  // The cross-archive joins are verified OFF-chain, by the two verifiers,
+  // under per-segment IC certificates.
   //
   // BOUNDARY LINKS: `prev` starts empty on every call, so the first event of a
   // page has nothing to check its inbound prevHash against. Left that way, a
@@ -270,14 +380,18 @@ persistent actor class Archive(owner : Principal) {
   // predecessor cannot be loaded, the link is unverifiable — that is reported
   // as ok=false, never passed over: silence is what made this a bug.
   //
-  // `linksChecked` reports how many prevHash links this call actually verified,
+  // `linksChecked` reports how many hash comparisons this call actually made,
   // so the COVERAGE of an audit is itself auditable — "ok = true" alone cannot
   // distinguish a thorough pass from a vacuous one. A page of k events verifies
   // k links when its inbound link was seeded and k−1 when it starts at the
-  // anchor (whose own prevHash points before this chain), so a paged walk sums
-  // to exactly the single-call total, N−1. That identity is the regression
-  // test: it held only by accident of paging before, and now holds by
-  // construction. tests/test_archive_chain_paged.sh asserts it.
+  // anchor (whose own prevHash points before this chain); a page that reaches
+  // the TAPE END verifies one more — the head anchor. So a paged walk sums to
+  // exactly the single-call total: N−1 for a window strictly inside the tape,
+  // N when the walk reaches the end. That identity is the regression test.
+  // tests/test_archive_chain_paged.sh asserts the interior case (its window
+  // deliberately stops short of the tail, so live appends cannot flake it);
+  // tests/test_archive_chain.sh asserts the anchored case on a SEALED
+  // archive, where the count is deterministic forever.
   public query func verifyChain(fromSeq : Nat, limit : Nat) : async {
     checked : Nat; linksChecked : Nat; ok : Bool; brokenAt : ?Nat; nextSeq : ?Nat;
   } {
@@ -324,6 +438,33 @@ persistent actor class Archive(owner : Principal) {
       checked += 1;
       s += 1;
     };
+    // OUTBOUND ANCHOR (W2-01, #18 F50). The loop above only ever compares an
+    // event's stored prevHash against its predecessor's recomputed hash —
+    // every comparison is INTERNAL to the range. When the walk reaches the
+    // tape end there is no successor to read the last event's hash, so
+    // without this block the newest event was never checked against
+    // anything and the function returned ok = true unconditionally:
+    // corrupting the newest stored event, or consistently rewriting a whole
+    // tail suffix, verified clean — permanently so on a sealed archive. The
+    // certified chainHead is the one value a tamperer cannot forge; anchor
+    // the recomputed tail to it. A range that stops short of the end makes
+    // no claim about the head (nextSeq tells the caller to keep paging).
+    if (s >= nextExpected) {
+      switch (prev, chainHead) {
+        case (?p, ?h) {
+          if (EventChain.hash(p) != h) {
+            return { checked; linksChecked = links; ok = false; brokenAt = ?p.seq; nextSeq = null };
+          };
+          links += 1;
+        };
+        case (?p, null) {
+          // Events were walked but no head is recorded — structurally
+          // impossible (the head advances on every store); refuse to vouch.
+          return { checked; linksChecked = links; ok = false; brokenAt = ?p.seq; nextSeq = null };
+        };
+        case (null, _) {};   // zero-length walk (limit 0): nothing to anchor
+      };
+    };
     { checked; linksChecked = links; ok = true; brokenAt = null; nextSeq = if (s < nextExpected) { ?s } else { null } };
   };
 
@@ -364,8 +505,17 @@ persistent actor class Archive(owner : Principal) {
   // by-principal lookups (leaderboard → rival's principal → position → liq
   // price). The public whole-tape reads (getEventsRange, getDepositWithdrawals)
   // stay open: the chain verifier + PoR need them, and they carry no easy
-  // per-human attribution index. Region offset is monotonic with global seq, so
-  // sorting the gathered index entries by offset descending = newest-first.
+  // per-human attribution INDEX — but not zero attribution (W6-10.1/R6): a
+  // fundMarginPool debits the human and credits the pool in one awaitless
+  // message, and the journal drains in insertion order, so the raw tape
+  // carries the two #delta rows at CONSECUTIVE seqs with matched magnitude —
+  // a derivable owner↔pool join for anyone willing to scan linearly
+  // (getEventsRange pages ≤200/call; there is no by-principal shortcut, that
+  // is what the gate below closes). Derivable-by-scan is the accepted cost
+  // of the replay invariant: #delta rows must fold per REAL principal
+  // (main.mo's drainLedgerJournal cites this note), so remapping them is not
+  // an option. Region offset is monotonic with global seq, so sorting the
+  // gathered index entries by offset descending = newest-first.
   public query (msg) func getEventsForPrincipals(principals : [Principal], offset : Nat, limit : Nat) : async {
     events : [Types.UserEvent];
     total  : Nat;
@@ -389,6 +539,124 @@ persistent actor class Archive(owner : Principal) {
       i += 1;
     };
     { events = Iter.toArray(List.values(result)); total };
+  };
+
+  // UserEvent.kind → the tag vocabulary the exchange's OQL `kind` column
+  // speaks (main.mo oqlEvKind — kept in step by hand; #deposit splits by its
+  // record's kind). No catch-all BY DESIGN: a new kind must be named here.
+  func kindTag(k : Types.UserEventKind) : Text = switch k {
+    case (#fill _)             { "fill" };
+    case (#deposit r)          { switch (r.kind) { case (#deposit) { "deposit" }; case (#withdrawal) { "withdrawal" } } };
+    case (#orderClosed _)      { "orderClosed" };
+    case (#liquidation _)      { "liquidation" };
+    case (#borrow _)           { "borrow" };
+    case (#repay _)            { "repay" };
+    case (#lpDeposit _)        { "lpDeposit" };
+    case (#lpWithdraw _)       { "lpWithdraw" };
+    case (#insuranceStake _)   { "insuranceStake" };
+    case (#insuranceUnstake _) { "insuranceUnstake" };
+    case (#delta _)            { "delta" };
+    case (#debtDelta _)        { "debtDelta" };
+    case (#lpShareDelta _)     { "lpShareDelta" };
+    case (#insShareDelta _)    { "insShareDelta" };
+    case (#config _)           { "config" };
+    case (#gap _)              { "gap" };
+  };
+  func kindIn(k : Types.UserEventKind, kinds : [Text]) : Bool {
+    let t = kindTag(k);
+    for (w in kinds.vals()) { if (w == t) { return true } };
+    false
+  };
+
+  // Kind-filtered form of getEventsForPrincipals (task 1793489930): `total`
+  // and the pages count only events whose kind tag is in `kinds` (the OQL
+  // `kind` vocabulary — "fill", "deposit", "withdrawal", …; [] = every kind),
+  // so a segment holding none of the caller's fills answers total = 0 in ONE
+  // hop, and a heavy user's non-fill rows (a #delta per balance mutation,
+  // deposits, config) never page out just to be dropped client-side. Same
+  // owner gate, same newest-first order, same 200 cap; `offset` counts in
+  // the FILTERED sequence — the same sequence whichever path below serves
+  // it, so a caller's paging stays consistent across a backfill completing.
+  //
+  // Two paths, both sort-free (each per-principal list is seq-ascending, so
+  // the merge across principals is a k-way reverse walk — the unfiltered
+  // pager re-gathers and re-sorts the whole per-principal index per page):
+  //   • kinds = ["fill"] with the fill index complete → userFillIndex,
+  //     O(k × (offset + limit)) index steps, decoding only the page;
+  //   • anything else → userIndex with a decode-and-test predicate, O(own
+  //     events in this segment) decodes: the general form for other kinds,
+  //     and the fallback while an upgraded segment's backfill still runs.
+  public query (msg) func getEventsForPrincipalsFiltered(principals : [Principal], kinds : [Text], offset : Nat, limit : Nat) : async {
+    events : [Types.UserEvent];
+    total  : Nat;
+  } {
+    if (not Principal.equal(msg.caller, owner)) { return { events = []; total = 0 } };
+    let fillsOnly = kinds.size() == 1 and kinds[0] == "fill";
+    let indexed = fillsOnly and fillIndexComplete();
+    let everyEntry = indexed or kinds.size() == 0;   // no predicate: each index entry is a hit
+    let source = if (indexed) { userFillIndex } else { userIndex };
+    // Distinct principals only — a repeated principal would double its rows.
+    let lists = List.empty<List.List<(Nat64, Nat)>>();
+    let seen = List.empty<Text>();
+    for (p in principals.vals()) {
+      let key = Principal.toText(p);
+      if (not List.contains(seen, Text.equal, key)) {
+        List.add(seen, key);
+        switch (Map.get(source, Text.compare, key)) { case (?l) { List.add(lists, l) }; case null {} };
+      };
+    };
+    let ls = Iter.toArray(List.values(lists));
+    let k = ls.size();
+    var sizes : Nat = 0;
+    for (l in ls.vals()) { sizes += List.size(l) };
+    let capped = if (limit > 200) { 200 } else { limit };
+    let result = List.empty<Types.UserEvent>();
+    // k-way reverse merge: a cursor per list starts at its tail; each step
+    // takes the entry with the greatest Region offset (= greatest seq).
+    let cur = VarArray.repeat<Int>(-1, k);
+    var i = 0;
+    while (i < k) { cur[i] := (List.size(ls[i]) : Int) - 1; i += 1 };
+    var matched = 0;   // hits seen so far = the next hit's position in the filtered sequence
+    label walk loop {
+      if (everyEntry and List.size(result) >= capped) { break walk };
+      var best : Int = -1;
+      var bestOff : Nat64 = 0;
+      var j = 0;
+      while (j < k) {
+        if (cur[j] >= 0) {
+          switch (List.get(ls[j], Int.abs(cur[j]))) {
+            case (?e) { if (best < 0 or e.0 > bestOff) { best := j; bestOff := e.0 } };
+            case null {};
+          };
+        };
+        j += 1;
+      };
+      if (best < 0) { break walk };
+      let bi = Int.abs(best);
+      switch (List.get(ls[bi], Int.abs(cur[bi]))) {
+        case (?entry) {
+          if (everyEntry) {
+            if (matched >= offset) {
+              switch (load(entry)) { case (?e) { List.add(result, e) }; case null {} };
+            };
+            matched += 1;
+          } else {
+            switch (load(entry)) {
+              case (?e) {
+                if (kindIn(e.kind, kinds)) {
+                  if (matched >= offset and List.size(result) < capped) { List.add(result, e) };
+                  matched += 1;
+                };
+              };
+              case null {};
+            };
+          };
+        };
+        case null {};
+      };
+      cur[bi] -= 1;
+    };
+    { events = Iter.toArray(List.values(result)); total = if (everyEntry) { sizes } else { matched } };
   };
 
   // Public tape: events by global seq, ascending from `startSeq`.
@@ -427,6 +695,18 @@ persistent actor class Archive(owner : Principal) {
     // hook is unarmed — see the hook), and how many times.
     lowMemoryAtNs  : Int;
     lowMemoryCount : Nat;
+    // Fill-index progress (task 1793489930): globalIndex positions scanned
+    // into userFillIndex; == eventCount means complete (the filtered pager
+    // serves fills off the index), less means the self-driven backfill is
+    // still running (it serves them by gather-time filtering meanwhile).
+    // opt so a reader's IDL listing it still decodes a pre-index segment.
+    fillIndexCursor : ?Nat;
+    // D/W-index progress (task 1793495003): globalIndex positions scanned
+    // into dwIndex; == eventCount means getDepositWithdrawals covers the
+    // whole tape, less means the same self-driven backfill is still catching
+    // it up (the sealed segments adminBackfillArchiveDw never used to reach).
+    // opt for the same decode-safety reason.
+    dwIndexCursor : ?Nat;
   } {
     {
       firstSeq;
@@ -441,13 +721,17 @@ persistent actor class Archive(owner : Principal) {
       chainHead;
       lowMemoryAtNs;
       lowMemoryCount;
+      fillIndexCursor = ?fillCursor;
+      dwIndexCursor   = ?dwCursor;
     };
   };
 
   // Recent deposits & withdrawals across ALL users, newest-first. Public by
   // design (the money-flow ledger — funds in/out of the exchange are auditable).
   // Reads the kind-filtered dwIndex, so it's bounded regardless of tape size.
-  // Coverage grows as backfillDwIndex catches the index up over the backlog.
+  // Coverage grows as the self-driven backfill (or the owner's backfillDwIndex)
+  // catches the index up over the backlog; stats.dwIndexCursor vs eventCount
+  // says how far along a segment is.
   public query func getDepositWithdrawals(offset : Nat, limit : Nat) : async [Types.UserEvent] {
     let total = List.size(dwIndex);
     let capped = if (limit > 200) { 200 } else { limit };
@@ -465,8 +749,11 @@ persistent actor class Archive(owner : Principal) {
 
   // Owner-only (the controlling exchange canister): advance the D/W index over
   // the pre-index backlog. Call repeatedly until `done`; each call scans up to
-  // `maxScan` tape positions. Idempotent and monotonic (the cursor only moves
-  // forward), so re-runs are safe.
+  // `maxScan` tape positions (0 = report the cursor, scan nothing). Idempotent
+  // and monotonic (the cursor only moves forward), so re-runs are safe. The
+  // EXPLICIT driver — adminBackfillArchiveDw walks every segment with it; the
+  // postupgrade timer above does the same catch-up unprompted, so this is for
+  // an operator who wants the backlog gone now, or the cursor reported.
   public shared (msg) func backfillDwIndex(maxScan : Nat) : async {
     scanned : Nat; cursor : Nat; total : Nat; dwCount : Nat; done : Bool;
   } {

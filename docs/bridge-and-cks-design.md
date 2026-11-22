@@ -182,3 +182,57 @@ Arguably, users should be made to claim deposits of chain key asset twins, to pr
 - Gas-pool target sizing per chain and the Treasury rebalancing cadence.
 - Whether large withdrawals get a time-lock / review (custodian hygiene) given NNS-only, no-hotfix upgrades.
 - Concrete `auth_data` shapes per chain (PSBT blob, SOL message, 7702 authorization).
+
+## Season boundaries (W4-12, 2026-08-15)
+
+A season reset is TWO-PHASE with the Bridge: `resetSeason` first calls the
+Bridge's `adminSeasonWipe` (caller must be the wired DEX or a controller),
+which REFUSES while any claim or admission is in flight — a refusal aborts
+the reset before anything is wiped. Only on `#ok` does the DEX proceed to
+wipe its own half: `playReservedUnits`, `creditedSeq` AND `playAdmitSeq`
+(leaving the admit high-water behind inverted the bug — post-reset deposits
+up to the old high-water replayed as already-reserved and were admitted with
+ZERO allowance charge). The Bridge clears `ledgers` + `admittedUnits`, so
+both seq spaces restart together. Design decision recorded: the Bridge gets
+a season hook rather than reservations surviving the boundary — a #play
+season boundary means the venue restarts, and a claimable surviving on one
+side of the pair is exactly the divergence #25.2 reported. In-flight case:
+covered by the refusal above.
+
+**How the DEX finds the Bridge at the boundary (#55.2, 2026-09-03).**
+`resetSeason` resolves the Bridge exactly as every other Bridge-facing site
+does — `effectiveBridge()`: the `setBridge` break-glass override if one was
+ever set, else the `PUBLIC_CANISTER_ID:bridge` env var icp injects on every
+deploy. No shipped script calls `setBridge` (deploy.sh, cold_start.sh and
+play_start.sh all rely on the env wiring), so the boundary MUST go through
+the env path too: the original W4-12 code switched on the raw stored
+override and silently took `case null` on every scripted venue, the live
+subnet included — the Bridge kept every confirmed−claimed balance across
+the boundary, #25.2 verbatim, and the suite was green only because
+`test_bridge_deposit_claim.sh` happened to call `setBridge` earlier in the
+alphabetical run. `getBridgeWiring` (query) shows which wiring is in force;
+`tests/test_season_seal.sh` §1 pins the env path by clearing the override
+first (`setTestBridgeOverride(null)`, #dev).
+
+**The sealing window (#54.1, landed with #55.2).** The three seal gates
+(cursor sanity, unshipped events, unshipped ledger journal) are evaluated
+before the `await adminSeasonWipe()` round-trip, and the `SeasonRecord` is
+built from state read after it. An emitting message landing in that window
+would be written into the permanent record (a `finalEventSeq` one past the
+archive's certified extent, a `chainHead` no archive can certify) and then
+deleted unshipped by the wipe. Two mechanisms close it: a transient
+**sealing latch** (`_seasonSealing`, set before the await, cleared by
+`performWorldWipe` and on the abort arms) under which every EMITTING entry
+path — orders, swaps, margin funding/opening, insurance stakes, LP
+deposits, vault donations, the faucet, `creditAndRegister`, `extMarketSwap`
+— refuses with a typed `#err`, and under which the recurring timers hold;
+the EXIT SET (cancels, closes, unstakes, withdrawals) is deliberately NOT
+gated — a user may always leave. Then a **post-await re-check** of the same
+gates: a failure there cannot abort (the Bridge's half is already wiped), so
+the record is sealed HONESTLY — `finalEventSeq = shippedSeq` and
+`chainHead` = the archive's certified head (the `prevHash` of the first
+unshipped event), with the dropped count in the operator log. Calling the
+Bridge before the gates was rejected: every gate refusal would then leave the
+pair half-wiped. `getCanisterInfo.seasonSealing` exposes the latch;
+`test_season_seal.sh` §2/§3 pin both mechanisms via the #dev hooks
+`setTestSeasonSealing` and `setTestSeasonSealRace`.

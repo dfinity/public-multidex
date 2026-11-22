@@ -41,14 +41,12 @@ source "$SCRIPT_DIR/_lib.sh"
 
 echo "── test_price_collar ──"
 
-PICK=$(icp canister call backend getAmmPools '()' --query --identity anonymous 2>&1 \
+PICK=$(icp canister call --candid "$MDX_CANDID" backend getAmmPools '()' --query --identity anonymous 2>&1 \
   | tr '}' '\n' | grep -oE 'marketId = "[^"]*"' | head -1 | grep -oE '"[^"]*"' | tr -d '"')
 MKT="${PICK:-BTC-ICPUSD}"
 BASE="${MKT%%-*}"
 
-newid() { echo "y" | icp identity delete "$1" >/dev/null 2>&1 || true
-          icp identity new "$1" --storage plaintext >/dev/null 2>&1 || true; }
-U="collar_u"; newid "$U"
+U="collar_u"; mdx_identity_new "$U"   # virgin each run, deleted on EXIT (tests/_lib.sh)
 UPRIN=$(icp identity principal --identity "$U" 2>/dev/null | tail -1)
 
 MARK=$(call getAmmPool "(\"$MKT\")" --query --identity anonymous | grep -oE 'refPrice = [0-9_]+' | head -1 | grep -oE '[0-9_]+' | tr -d '_')
@@ -184,6 +182,5 @@ assert_contains "§6 a resting sell 500x above the mark still hits the 100x band
   "$(placePO sell "$ABSURD")" "$FATFINGER"
 
 call cancelAllMyOrders '(null)' --identity "$U" >/dev/null 2>&1 || true
-echo "y" | icp identity delete "$U" >/dev/null 2>&1 || true
 
 finish_test "price_collar"

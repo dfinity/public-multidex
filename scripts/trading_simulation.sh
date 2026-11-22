@@ -82,6 +82,19 @@ if [ -n "${IC_ENV:-}" ]; then ENV_FLAG="-e ${IC_ENV}"; REMOTE=true; fi
 CE_IDENTITY=""
 [ -f scripts/.cloud-engine.conf ] && . scripts/.cloud-engine.conf 2>/dev/null
 [ -n "${BOT_IDENTITY:-}" ] && CE_IDENTITY="$BOT_IDENTITY"
+# The FUNDING identity (task 1789609263): fund_call and bal_of sign as
+# FUND_IDENTITY — the controller-designated funding authority handed in as
+# MDX_FUNDING_IDENTITY by scripts/lib/bots.sh (the operator's `mdex-bots`
+# key) — and only fall back to the controller identity above when none is
+# set. Local: anonymous unless overridden. Nothing below reads CE_IDENTITY /
+# BOT_IDENTITY for a refill.
+if $REMOTE; then FUND_IDENTITY="${MDX_FUNDING_IDENTITY:-$CE_IDENTITY}"
+else             FUND_IDENTITY="${MDX_FUNDING_IDENTITY:-anonymous}"; fi
+if $REMOTE && [ -n "${MDX_FUNDING_IDENTITY:-}" ]; then
+  echo "funding: refills sign as the FUNDING AUTHORITY '$FUND_IDENTITY' (the controller key signs no refill)"
+elif $REMOTE && [ -n "$FUND_IDENTITY" ]; then
+  echo "funding: no MDX_FUNDING_IDENTITY — refills sign as the CONTROLLER identity '$FUND_IDENTITY'; designate a funding authority (setFundingAuthority, task 1789609263)"
+fi
 
 MARKETS=("BTC-ICPUSD" "ETH-ICPUSD" "SOL-ICPUSD" "ICP-ICPUSD")
 export ENV_FLAG INTERVAL
@@ -144,17 +157,11 @@ FLOOR_ASSET_USD=${FLOOR_ASSET_USD:-4000}
 MARGIN_SEED_CASH=${MARGIN_SEED_CASH:-$(awk -v p="${POOL_FUND_USD:-25000}" 'BEGIN{ printf "%.0f", p + 25000 }')}
 MARGIN_FLOOR_CASH=${MARGIN_FLOOR_CASH:-$(awk -v p="${POOL_FUND_USD:-25000}" 'BEGIN{ printf "%.0f", p * 0.35 }')}
 
-fund_call() {
-  if $REMOTE && [ -n "$CE_IDENTITY" ]; then
-    icp canister call --identity "$CE_IDENTITY" $ENV_FLAG backend "$@" >/dev/null 2>&1 || true
-  else
-    icp canister call --identity anonymous $ENV_FLAG backend "$@" >/dev/null 2>&1 || true
-  fi
+fund_call() {   # setTestBalance as the FUNDING identity (never the controller key)
+  icp canister call --identity "${FUND_IDENTITY:-anonymous}" $ENV_FLAG backend "$@" >/dev/null 2>&1 || true
 }
-bal_of() {
-  local as=anonymous
-  $REMOTE && [ -n "$CE_IDENTITY" ] && as="$CE_IDENTITY"
-  icp canister call --query --identity "$as" $ENV_FLAG backend getTestBalance \
+bal_of() {      # the refill loop's read — same identity as fund_call (getTestBalance is scoped to self / controller / the funding authority)
+  icp canister call --query --identity "${FUND_IDENTITY:-anonymous}" $ENV_FLAG backend getTestBalance \
     "(principal \"$1\", \"$2\")" 2>&1 | grep -oE "[0-9][0-9_]*" | head -1 | tr -d '_'
 }
 

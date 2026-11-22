@@ -10,7 +10,7 @@
 .modal-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(0,0,0,0.6);
+  background: var(--scrim);
 }
 .modal-content {
   position: relative;
@@ -46,7 +46,7 @@
   transition: border-color 0.12s, background 0.12s;
 }
 .signin-opt:hover { border-color: var(--accent-border); }
-.signin-opt:has(input:checked) { border-color: var(--accent); background: rgba(56, 189, 240, 0.06); }
+.signin-opt:has(input:checked) { border-color: var(--accent); background: var(--accent-tint-1); }
 .signin-opt input, .signin-check input { accent-color: var(--accent); flex-shrink: 0; }
 /* In-memory-key toggle — orthogonal to the length above. */
 .signin-check {
@@ -57,7 +57,7 @@
   transition: border-color 0.12s, background 0.12s;
 }
 .signin-check:hover { border-color: var(--accent-border); }
-.signin-check:has(input:checked) { border-color: var(--accent); background: rgba(56, 189, 240, 0.06); }
+.signin-check:has(input:checked) { border-color: var(--accent); background: var(--accent-tint-1); }
 .signin-check input { margin-top: 2px; }
 .signin-check small { display: block; margin-top: 3px; color: var(--text-dim); font-size: 11px; line-height: 1.4; }
 
@@ -146,7 +146,7 @@
   background: var(--bg-card);
   border: 1px solid var(--accent-border);
   border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-pop);
   font-size: 13px;
   color: var(--text);
   max-width: min(92vw, 420px);

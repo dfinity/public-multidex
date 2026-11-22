@@ -51,4 +51,7 @@ MDX_SIM_LOG="${MDX_SIM_LOG:-$MDX_RUN_DIR/sim.log}"
 MDX_NETWORK_START_LOG="${MDX_NETWORK_START_LOG:-$MDX_RUN_DIR/network-start.log}"
 MDX_PLAY_BUILD_LOG="${MDX_PLAY_BUILD_LOG:-$MDX_RUN_DIR/play-build.log}"
 MDX_PLAY_FRONTEND_LOG="${MDX_PLAY_FRONTEND_LOG:-$MDX_RUN_DIR/play-frontend.log}"
-export MDX_SIM_LOG MDX_NETWORK_START_LOG MDX_PLAY_BUILD_LOG MDX_PLAY_FRONTEND_LOG
+# cold_start.sh's `icp deploy` output — written here so the failure arm can READ it
+# back (an IC0207 reject names the frozen canister and its cure; task 1788665638).
+MDX_COLD_DEPLOY_LOG="${MDX_COLD_DEPLOY_LOG:-$MDX_RUN_DIR/cold-start-deploy.log}"
+export MDX_SIM_LOG MDX_NETWORK_START_LOG MDX_PLAY_BUILD_LOG MDX_PLAY_FRONTEND_LOG MDX_COLD_DEPLOY_LOG
